@@ -156,14 +156,6 @@ pub fn clone_dest(params: &str) -> io::Result<DevNo> {
     }
 }
 
-/// The device of a `linear` table: `<device> <offset>`.
-pub fn linear_device(params: &str) -> io::Result<DevNo> {
-    match params.split_whitespace().collect::<Vec<_>>().as_slice() {
-        [device, _] => DevNo::parse(device),
-        _ => Err(invalid(format!("not linear params: {params:?}"))),
-    }
-}
-
 /// The `DEVNAME=` line of a sysfs `uevent` file.
 pub fn devname(uevent: &str) -> io::Result<String> {
     uevent
@@ -297,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn clone_dest_is_the_second_device_and_linear_the_only_one() {
+    fn clone_dest_is_the_second_device() {
         let clone = "252:3 252:4 259:0 128 2 no_hydration no_discard_passdown 0";
         assert_eq!(
             clone_dest(clone).unwrap(),
@@ -306,14 +298,6 @@ mod tests {
                 minor: 4
             }
         );
-        assert_eq!(
-            linear_device("252:4 0").unwrap(),
-            DevNo {
-                major: 252,
-                minor: 4
-            }
-        );
-        assert!(linear_device("252:4").is_err());
     }
 
     #[test]

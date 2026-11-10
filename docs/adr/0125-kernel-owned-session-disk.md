@@ -188,7 +188,7 @@ thin-provisioning tools it calls at run time (`thin_dump`,
    behind the running guest; the guest starts at once and reads a
    region the copy has not reached through the device's source, a
    ublk device the host-agent serves from the fill engine. Once every
-   region is copied the device is reloaded to a plain mapping of its
+   region is copied the device is reloaded as a thin snapshot of its
    destination and the source goes. Guest swap (ADR 0112) starts as a
    fresh thin volume with no origin and is checkpointed with the root
    disk from then on (see the divergences). The pool's volume names
@@ -335,7 +335,7 @@ region with a ranged `Demand` read and the kernel's ascending copy
 with whole-chunk `Hydrate` reads; the chunks the guest read first on
 the session's last window are fetched at `Prefix` before the copy
 reaches them. A settle task polls the clone's status and, when every
-region is copied, suspends the device, reloads it to `linear` over the
+region is copied, suspends the device, reloads it as a thin snapshot of the
 destination, resumes it and stops the source: the path Firecracker
 opened never changes. A checkpoint in the window diffs the snapshot's
 mapping against the base: a block whose mapping changed (copied or

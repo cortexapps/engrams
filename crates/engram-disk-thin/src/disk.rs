@@ -154,14 +154,13 @@ impl ThinPoolDisk {
     }
 
     /// The thin a volume's data lives on, and its size: the volume
-    /// itself for a thin, the destination for a hydrating or settled
-    /// device. A snapshot of the volume is a snapshot of that thin.
+    /// itself for a thin, the destination for a hydrating device. A
+    /// snapshot of the volume is a snapshot of that thin.
     async fn thin_under(&self, name: &VolumeName) -> io::Result<(ThinParams, u64)> {
         let target = self.target_of(name).await?;
         let devno = match target.kind.as_str() {
             "thin" => return self.thin_of(name).await,
             "clone" => parse::clone_dest(&target.params)?,
-            "linear" => parse::linear_device(&target.params)?,
             kind => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -397,6 +396,21 @@ fn single_target(targets: &[dm::Target], kind: &str) -> io::Result<String> {
     }
 }
 
+/// A snapshot of thin `origin` under the next free id. The caller holds
+/// the origin's device suspended.
+async fn create_snap(dm: &dm::Dm, pool: &str, next_id: &AtomicU32, origin: u32) -> io::Result<u32> {
+    loop {
+        let id = next_id.fetch_add(1, Ordering::Relaxed) & ID_MASK;
+        match dm
+            .message(pool, &format!("create_snap {id} {origin}"))
+            .await
+        {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            created => return created.map(|()| id),
+        }
+    }
+}
+
 #[async_trait]
 impl SessionDisk for ThinPoolDisk {
     async fn create(&self, name: &VolumeName, size_bytes: u64) -> io::Result<Volume> {
@@ -421,16 +435,7 @@ impl SessionDisk for ThinPoolDisk {
         let next_id = self.next_id.clone();
         let (created, resumed) = self
             .while_suspended(self.device_name(&origin.name), move |dm| async move {
-                loop {
-                    let id = next_id.fetch_add(1, Ordering::Relaxed) & ID_MASK;
-                    match dm
-                        .message(&pool, &format!("create_snap {id} {}", thin.id))
-                        .await
-                    {
-                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                        created => return created.map(|()| id),
-                    }
-                }
+                create_snap(&dm, &pool, &next_id, thin.id).await
             })
             .await?;
         let id = match (created, resumed) {
@@ -451,7 +456,7 @@ impl SessionDisk for ThinPoolDisk {
         let target = self.target_of(name).await?;
         let sectors = match target.kind.as_str() {
             "thin" => self.thin_of(name).await?.1,
-            "clone" | "linear" => target.length_sectors,
+            "clone" => target.length_sectors,
             kind => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -463,12 +468,12 @@ impl SessionDisk for ThinPoolDisk {
     }
 
     /// Waits a bounded time for the last holder to close the device. A
-    /// hydrating or settled device takes its metadata thin with it.
+    /// hydrating device takes its metadata thin with it.
     async fn delete(&self, name: &VolumeName) -> io::Result<()> {
         let target = self.target_of(name).await?;
         match target.kind.as_str() {
             "thin" => self.delete_thin(name).await,
-            "clone" | "linear" => {
+            "clone" => {
                 self.remove_device(name).await?;
                 self.delete_metadata(name).await
             }
@@ -494,7 +499,7 @@ impl SessionDisk for ThinPoolDisk {
             match self.dm.table(&device).await {
                 Ok(targets) => {
                     if let [target] = targets.as_slice() {
-                        if ["thin", "clone", "linear"].contains(&target.kind.as_str()) {
+                        if ["thin", "clone"].contains(&target.kind.as_str()) {
                             names.push(name);
                         }
                     }
@@ -598,7 +603,7 @@ impl SessionDisk for ThinPoolDisk {
                     source: dm::device_path(parse::clone_source(&table)?).await?,
                 })
             }
-            [target] if target.kind == "linear" || target.kind == "thin" => Ok(Hydration::Settled),
+            [target] if target.kind == "thin" => Ok(Hydration::Settled),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("{name} is not a session volume: {status:?}"),
@@ -606,9 +611,13 @@ impl SessionDisk for ThinPoolDisk {
         }
     }
 
-    /// Reloads the device as `linear` over `dest` under a suspend. A
-    /// failed reload resumes the clone table. The metadata thin goes
-    /// last: the kernel closes it when the clone table is destroyed.
+    /// Under the device's suspend, snapshots `dest`'s thin and reloads
+    /// the device as that snapshot: a thin like any other, which shares
+    /// blocks with `dest` and nothing else. `dest` is suspended for its
+    /// snapshot, as the pool requires of an active origin. A failed
+    /// reload resumes the clone table and deletes the snapshot. The
+    /// metadata thin goes last: the kernel closes it when the clone
+    /// table is destroyed.
     async fn settle(&self, name: &VolumeName, dest: &Volume) -> io::Result<()> {
         match self.hydration(name).await? {
             Hydration::Hydrating {
@@ -620,12 +629,30 @@ impl SessionDisk for ThinPoolDisk {
                 ));
             }
             Hydration::Hydrating { .. } => {
-                let (_, sectors) = self.thin_of(&dest.name).await?;
-                let params = format!("{} 0", dm::devno_of(&dest.path)?);
+                let (thin, sectors) = self.thin_of(&dest.name).await?;
                 let device = self.device_name(name);
+                let dest_device = self.device_name(&dest.name);
+                let (pool, pool_dev, next_id) =
+                    (self.pool.clone(), self.pool_dev, self.next_id.clone());
                 let (loaded, resumed) = self
                     .while_suspended(device.clone(), move |dm| async move {
-                        dm.load(&device, sectors, "linear", &params).await
+                        dm.suspend(&dest_device).await?;
+                        let created = create_snap(&dm, &pool, &next_id, thin.id).await;
+                        let dest_resumed = dm.resume(&dest_device).await;
+                        let id = created?;
+                        let loaded = match dest_resumed {
+                            Ok(()) => {
+                                dm.load(&device, sectors, "thin", &format!("{pool_dev} {id}"))
+                                    .await
+                            }
+                            Err(e) => Err(e),
+                        };
+                        if loaded.is_err() {
+                            if let Err(error) = dm.message(&pool, &format!("delete {id}")).await {
+                                tracing::warn!(%pool, id, %error, "thin left behind by a failed settle");
+                            }
+                        }
+                        loaded
                     })
                     .await?;
                 loaded.and(resumed)?;

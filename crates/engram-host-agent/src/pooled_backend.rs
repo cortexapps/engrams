@@ -1060,21 +1060,25 @@ const SETTLE_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 async fn settle_disks(volumes: Arc<SessionVolumes>, id: SandboxId, roles: Vec<DiskRole>) {
     for role in roles {
         let started = crate::time_source::metrics_now();
-        let mut regions = 0;
+        // The regions the copy still had to bring in when this driver
+        // first looked; none when the volume was complete by then.
+        let mut regions: Option<u64> = None;
         loop {
             match volumes.settle(id, role).await {
                 Ok(engram_host_core::Hydration::Settled) => {
                     tracing::info!(
                         sandbox_id = %id,
                         role = %role,
-                        regions,
+                        regions = regions.unwrap_or(0),
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "disk settled",
                     );
                     break;
                 }
-                Ok(engram_host_core::Hydration::Hydrating { total, .. }) => {
-                    regions = total;
+                Ok(engram_host_core::Hydration::Hydrating {
+                    hydrated, total, ..
+                }) => {
+                    regions.get_or_insert(total - hydrated);
                     tokio::time::sleep(SETTLE_POLL).await;
                 }
                 Err(error) => {

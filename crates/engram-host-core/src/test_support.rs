@@ -199,6 +199,11 @@ impl SessionDisk for HydratingDisk {
                 format!("{name}: {} chunks are not copied", clone.pending.len()),
             ));
         }
+        // The device stops sharing the destination's file: a volume of
+        // its own, as the pool makes it.
+        let own = clone.device.with_extension("settling");
+        std::fs::copy(&clone.device, &own)?;
+        std::fs::rename(&own, &clone.device)?;
         clone.settled = true;
         self.holders.lock().unwrap().remove(&clone.source);
         Ok(())

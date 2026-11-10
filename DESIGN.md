@@ -237,7 +237,7 @@ the test named beside it.
   the host agent serves out of the fill engine. A guest read of a region the copy has not
   reached goes through the source at `Demand`; the chunks the guest read first on the
   session's last window are fetched at `Prefix` ahead of the copy. When every region is
-  copied the device is reloaded to a plain mapping of its destination and the source
+  copied the device is reloaded as a thin snapshot of its destination and the source
   stops; the path Firecracker opened never changes
   (`a_hydrating_device_copies_only_the_delta_and_settles_onto_its_destination`,
   `a_lazy_resume_reads_cold_chunks_through_the_source_and_settles`). A checkpoint in the

@@ -882,9 +882,9 @@ impl SessionVolumes {
     }
 
     /// One step of a hydrating role's way to a settled volume: its
-    /// progress, and once every region is in, the cutover onto the
-    /// destination and the end of its source. `Settled` when the live
-    /// volume maps straight onto its destination.
+    /// progress, and once every region is in, the cutover to a volume
+    /// of its own and the end of its source. `Settled` when the live
+    /// volume no longer hydrates.
     pub async fn settle(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<Hydration> {
         let live = live_name(sandbox, role);
         match self.disk.hydration(&live).await? {

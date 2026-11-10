@@ -174,12 +174,23 @@ async fn a_hydrating_device_copies_only_the_delta_and_settles_onto_its_destinati
         "the skipped chunk 0 still shares its blocks with the origin"
     );
 
+    // The settled device is a volume of its own: a write to it leaves
+    // the destination as it was, and the destination goes while the
+    // device stays open and readable.
+    device.write_chunk(ChunkIndex(6), fill(9)).await.unwrap();
+    device.sync().await.unwrap();
+    assert_eq!(dest.read_chunk(ChunkIndex(6)).await.unwrap(), fill(0));
+    let dest_name = dest.name.clone();
+    drop(dest);
+    pool.delete(&dest_name).await.unwrap();
+    assert_eq!(device.read_chunk(ChunkIndex(3)).await.unwrap(), fill(4));
+    assert_eq!(device.read_chunk(ChunkIndex(6)).await.unwrap(), fill(9));
+
     // A volume holds its device open; a delete needs it closed.
-    let names = (device.name.clone(), dest.name.clone(), base.name.clone());
-    drop((device, dest, base));
-    let (device, dest, base) = names;
+    let names = (device.name.clone(), base.name.clone());
+    drop((device, base));
+    let (device, base) = names;
     pool.delete(&device).await.unwrap();
-    pool.delete(&dest).await.unwrap();
     pool.delete(&base).await.unwrap();
     assert!(!pool
         .list()

@@ -469,7 +469,8 @@ pub trait SessionDisk: Send + Sync {
         Ok(Hydration::Settled)
     }
 
-    /// Map a fully hydrated device straight onto `dest`. Every I/O in
+    /// Make a fully hydrated device a volume of its own with `dest`'s
+    /// content; `dest` stays, and is the caller's to delete. Every I/O in
     /// flight completes first; open handles keep working; `source` is
     /// not read again.
     async fn settle(&self, name: &VolumeName, dest: &Volume) -> io::Result<()> {
