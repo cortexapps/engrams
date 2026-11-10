@@ -70,6 +70,8 @@ export async function runOperation(
   let verifiedOutcome: ExecutionResult["outcome"] | undefined;
   let callSent = false;
   let requests = 0;
+  let cleanupSignal: AbortSignal | undefined;
+  let cleanupSession: string | undefined;
   const scopedFetch: FetchLike = async (input, init) => {
     signal.throwIfAborted();
     const target = input instanceof Request ? input.url : String(input);
@@ -79,28 +81,38 @@ export async function runOperation(
       init?.method ?? (input instanceof Request ? input.method : "GET");
     // Do not open background subscription streams or recover legacy sessions.
     if (method === "GET") return new Response(null, { status: 405 });
-    if (method !== "POST") throw Error("method_denied");
-    if (typeof init?.body !== "string") throw Error("request_body_invalid");
-    const message: unknown = JSON.parse(init.body);
-    if (
-      !object(message) ||
-      typeof message.method !== "string" ||
-      ![
-        "server/discover",
-        "initialize",
-        "notifications/initialized",
-        "tools/list",
-        "tools/call",
-        "notifications/cancelled",
-      ].includes(message.method)
-    )
-      throw Error("rpc_denied");
-    if (message.method === "tools/call") {
-      if (operation.kind !== "execute" || callSent)
-        throw Error("repeat_call_denied");
-      callSent = true;
+    const headers = new Headers(init?.headers);
+    if (cleanupSignal) {
+      cleanupSignal.throwIfAborted();
+      if (
+        method !== "DELETE" ||
+        !cleanupSession ||
+        headers.get("mcp-session-id") !== cleanupSession
+      )
+        throw Error("session_cleanup_denied");
+    } else {
+      if (method !== "POST") throw Error("method_denied");
+      if (typeof init?.body !== "string") throw Error("request_body_invalid");
+      const message: unknown = JSON.parse(init.body);
+      if (
+        !object(message) ||
+        typeof message.method !== "string" ||
+        ![
+          "server/discover",
+          "initialize",
+          "notifications/initialized",
+          "tools/list",
+          "tools/call",
+          "notifications/cancelled",
+        ].includes(message.method)
+      )
+        throw Error("rpc_denied");
+      if (message.method === "tools/call") {
+        if (operation.kind !== "execute" || callSent)
+          throw Error("repeat_call_denied");
+        callSent = true;
+      }
     }
-    const headers = new Headers(init.headers);
     if (operation.credential)
       headers.set(operation.credential.header, operation.credential.value);
     // The SDK does not receive the credential through an auth provider or cache.
@@ -108,7 +120,10 @@ export async function runOperation(
       ...init,
       headers,
       redirect: "error",
-      signal: AbortSignal.any([signal, ...(init.signal ? [init.signal] : [])]),
+      signal: AbortSignal.any([
+        cleanupSignal ?? signal,
+        ...(init?.signal ? [init.signal] : []),
+      ]),
     });
   };
   const client = new Client(
@@ -261,6 +276,15 @@ export async function runOperation(
       } satisfies ExecutionResult;
     throw Error("discovery_failed");
   } finally {
+    cleanupSession = transport.sessionId;
+    if (cleanupSession && !signal.aborted) {
+      // Legacy sessions are operation-owned. Cleanup has its own short bound
+      // inside the approved intent lifetime and never changes a known result.
+      cleanupSignal = AbortSignal.any([signal, AbortSignal.timeout(1000)]);
+      await abortable(transport.terminateSession(), cleanupSignal).catch(
+        () => {},
+      );
+    }
     await client.close().catch(() => {});
   }
 }

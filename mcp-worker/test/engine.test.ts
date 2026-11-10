@@ -50,6 +50,106 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"] as const)
           fixture.requests.find((r) => r.method === "tools/call")?.sessionId,
         );
     });
+for (const version of ["2025-11-25", "2025-06-18", "2026-07-28"] as const)
+  test(`worker releases only its authenticated legacy session ${version}`, async (t) => {
+    const fixture = await startMcpFixture({
+      version,
+      requireAuth: true,
+      apiKey: "cleanup-token",
+    });
+    t.after(() => fixture.close());
+    const deletions: {
+      target: string;
+      session: string | null;
+      credential: string | null;
+    }[] = [];
+    const deletionStatuses: number[] = [];
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      if (init?.method === "DELETE") {
+        const headers = new Headers(init.headers);
+        deletions.push({
+          target: String(input),
+          session: headers.get("mcp-session-id"),
+          credential: headers.get("authorization"),
+        });
+      }
+      const response = await fixture.fetch(input, init);
+      if (init?.method === "DELETE") deletionStatuses.push(response.status);
+      return response;
+    };
+    const result = await runOperation(
+      {
+        ...execute(fixture.url),
+        credential: { header: "authorization", value: "Bearer cleanup-token" },
+      },
+      fetch,
+      AbortSignal.timeout(20000),
+    );
+    assert.equal((result as { outcome: string }).outcome, "succeeded");
+    assert.equal(fixture.writes, 1);
+    assert.deepEqual(deletionStatuses, version === "2026-07-28" ? [] : [200]);
+    if (version === "2026-07-28") assert.deepEqual(deletions, []);
+    else
+      assert.deepEqual(deletions, [
+        {
+          target: fixture.url,
+          session: fixture.requests.find(
+            (request) => request.method === "tools/call",
+          )?.sessionId,
+          credential: "Bearer cleanup-token",
+        },
+      ]);
+  });
+
+for (const cleanup of ["refused", "failed", "stalled", "expired"] as const)
+  test(`legacy cleanup ${cleanup} preserves the result without replay`, async (t) => {
+    const fixture = await startMcpFixture({ version: "2025-11-25" });
+    t.after(() => fixture.close());
+    const controller = new AbortController();
+    let deletions = 0;
+    let cleanupAborted = false;
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      if (init?.method !== "DELETE") return fixture.fetch(input, init);
+      deletions++;
+      if (cleanup === "refused") return new Response(null, { status: 405 });
+      if (cleanup === "failed") throw Error("cleanup failed");
+      assert.ok(init.signal);
+      const signal = init.signal;
+      const blocked = new Promise<Response>((_, reject) => {
+        signal.addEventListener(
+          "abort",
+          () => {
+            cleanupAborted = true;
+            reject(signal.reason);
+          },
+          { once: true },
+        );
+      });
+      if (cleanup === "expired") controller.abort();
+      return blocked;
+    };
+    const result = await runOperation(
+      execute(fixture.url),
+      fetch,
+      controller.signal,
+    );
+    assert.deepEqual(result, {
+      outcome: "succeeded",
+      delivery: "available",
+      output: {
+        content: [{ type: "text", text: "count=2" }],
+        structuredContent: { count: 2 },
+        isError: false,
+      },
+    });
+    assert.equal(fixture.writes, 1);
+    assert.equal(deletions, 1);
+    assert.equal(
+      cleanupAborted,
+      cleanup === "stalled" || cleanup === "expired",
+    );
+  });
+
 for (const response of [
   "image",
   "audio",
