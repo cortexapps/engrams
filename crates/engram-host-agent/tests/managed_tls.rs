@@ -172,17 +172,23 @@ async fn managed_host_requires_pinned_mutual_tls() {
             &std::fs::read(dir.join(format!("{name}.der"))).unwrap(),
         )])
     };
-    let server = tokio::spawn(engram_host_agent::grpc_server::boot_with_managed_tls(
+    let prepared = engram_host_agent::grpc_server::PreparedHostServer::bind(
         addr,
-        local.clone(),
-        engram_host_agent::session_epochs::SessionEpochStore::open(dir.join("epochs")).unwrap(),
-        None,
         Some(engram_host_agent::managed_tls::ManagedHostTls {
             certificate: dir.join("host.pem"),
             key: dir.join("host.key"),
             client_ca: dir.join("ca.pem"),
             coordinator_pins: pins("coord"),
         }),
+    )
+    .unwrap();
+    // The serving task owns the parsed identity and does not reopen key files.
+    std::fs::remove_file(dir.join("host.pem")).unwrap();
+    std::fs::remove_file(dir.join("host.key")).unwrap();
+    let server = tokio::spawn(prepared.serve(
+        local.clone(),
+        engram_host_agent::session_epochs::SessionEpochStore::open(dir.join("epochs")).unwrap(),
+        None,
     ));
     let address = format!("https://{addr}");
     let mut client = HostClientTls {

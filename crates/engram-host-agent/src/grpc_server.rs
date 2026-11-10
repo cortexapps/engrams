@@ -179,31 +179,80 @@ pub fn bind(
     Ok(incoming.with_nodelay(Some(true)))
 }
 
-/// Bind `listen_addr` and serve the `HostService` until the caller drops
-/// the returned future.
+/// A bound listener with its TLS identity and caller pins already validated.
+pub struct PreparedHostServer {
+    incoming: tonic::transport::server::TcpIncoming,
+    server: tonic::transport::Server,
+    pins: Option<std::collections::BTreeSet<String>>,
+}
+
+impl PreparedHostServer {
+    pub fn bind(
+        listen_addr: std::net::SocketAddr,
+        tls: Option<crate::managed_tls::ManagedHostTls>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::from_incoming(bind(listen_addr)?, tls)
+    }
+
+    fn from_incoming(
+        incoming: tonic::transport::server::TcpIncoming,
+        tls: Option<crate::managed_tls::ManagedHostTls>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let mut server = tonic::transport::Server::builder();
+        let pins = match tls {
+            Some(config) => {
+                server =
+                    server.tls_config(config.server_config().map_err(std::io::Error::other)?)?;
+                Some(config.coordinator_pins)
+            }
+            None => None,
+        };
+        Ok(Self {
+            incoming,
+            server,
+            pins,
+        })
+    }
+
+    pub async fn serve(
+        self,
+        inner: Arc<dyn HostClient>,
+        epochs: SessionEpochStore,
+        peer: Option<Arc<crate::peer_fill::PeerServe>>,
+    ) -> Result<(), tonic::transport::Error> {
+        serve_inner(self.incoming, inner, epochs, peer, self.server, self.pins).await
+    }
+}
+
+/// Bind and serve the ordinary lifecycle listener.
 pub async fn boot(
     listen_addr: std::net::SocketAddr,
     inner: Arc<dyn HostClient>,
     epochs: SessionEpochStore,
     peer: Option<Arc<crate::peer_fill::PeerServe>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let incoming = bind(listen_addr)?;
-    Ok(serve(incoming, inner, epochs, peer).await?)
+    Ok(PreparedHostServer::bind(listen_addr, None)?
+        .serve(inner, epochs, peer)
+        .await?)
 }
 
-/// Serve the `HostService` on a bound listener until the caller drops
-/// the returned future. Ends with `Err` on a server error; a clean
-/// Ctrl-C just drops the future, which the runtime collects.
+/// Serve the ordinary lifecycle listener until the caller drops the future.
 pub async fn serve(
     incoming: tonic::transport::server::TcpIncoming,
     inner: Arc<dyn HostClient>,
     epochs: SessionEpochStore,
     peer: Option<Arc<crate::peer_fill::PeerServe>>,
 ) -> Result<(), tonic::transport::Error> {
-    serve_inner(incoming, inner, epochs, peer, None).await
+    PreparedHostServer {
+        incoming,
+        server: tonic::transport::Server::builder(),
+        pins: None,
+    }
+    .serve(inner, epochs, peer)
+    .await
 }
 
-/// Serve one authenticated listener for all lifecycle operations in managed mode.
+/// Bind and serve the single lifecycle listener with optional managed TLS.
 pub async fn boot_with_managed_tls(
     listen_addr: std::net::SocketAddr,
     inner: Arc<dyn HostClient>,
@@ -211,11 +260,12 @@ pub async fn boot_with_managed_tls(
     peer: Option<Arc<crate::peer_fill::PeerServe>>,
     tls: Option<crate::managed_tls::ManagedHostTls>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let incoming = bind(listen_addr)?;
-    serve_with_managed_tls(incoming, inner, epochs, peer, tls).await
+    Ok(PreparedHostServer::bind(listen_addr, tls)?
+        .serve(inner, epochs, peer)
+        .await?)
 }
 
-/// Serve the bound lifecycle listener with optional managed authentication.
+/// Serve a bound lifecycle listener with optional managed TLS.
 pub async fn serve_with_managed_tls(
     incoming: tonic::transport::server::TcpIncoming,
     inner: Arc<dyn HostClient>,
@@ -223,13 +273,9 @@ pub async fn serve_with_managed_tls(
     peer: Option<Arc<crate::peer_fill::PeerServe>>,
     tls: Option<crate::managed_tls::ManagedHostTls>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let tls = tls
-        .map(|config| {
-            let server = config.server_config().map_err(std::io::Error::other)?;
-            Ok::<_, std::io::Error>((server, config.coordinator_pins))
-        })
-        .transpose()?;
-    Ok(serve_inner(incoming, inner, epochs, peer, tls).await?)
+    Ok(PreparedHostServer::from_incoming(incoming, tls)?
+        .serve(inner, epochs, peer)
+        .await?)
 }
 
 async fn serve_inner(
@@ -237,23 +283,14 @@ async fn serve_inner(
     inner: Arc<dyn HostClient>,
     epochs: SessionEpochStore,
     peer: Option<Arc<crate::peer_fill::PeerServe>>,
-    tls: Option<(
-        tonic::transport::ServerTlsConfig,
-        std::collections::BTreeSet<String>,
-    )>,
+    server: tonic::transport::Server,
+    pins: Option<std::collections::BTreeSet<String>>,
 ) -> Result<(), tonic::transport::Error> {
     let mut svc = HostServiceImpl::new(inner, epochs);
     if let Some(p) = peer {
         svc = svc.with_peer_serve(p);
     }
-    svc.managed_tls = tls.is_some();
-    let (server, pins) = match tls {
-        Some((config, pins)) => (
-            tonic::transport::Server::builder().tls_config(config)?,
-            Some(pins),
-        ),
-        None => (tonic::transport::Server::builder(), None),
-    };
+    svc.managed_tls = pins.is_some();
     let service = HostServiceServer::new(svc)
         .max_encoding_message_size(32 * 1024 * 1024)
         .max_decoding_message_size(9 * 1024 * 1024);

@@ -245,7 +245,7 @@ impl HostAgent {
                 self.cfg.managed_tls.is_some(),
             )?,
         };
-        if let Some(tls) = &self.cfg.managed_tls {
+        let managed_server = if let Some(tls) = &self.cfg.managed_tls {
             if self.cfg.grpc_listen_addr.is_none()
                 || !self
                     .cfg
@@ -257,8 +257,16 @@ impl HostAgent {
             {
                 return Err(HostAgentError::Config("managed host mode requires an HTTPS lifecycle listener, stable host identity, and egress proxy".into()));
             }
-            tls.server_config().map_err(HostAgentError::Config)?;
-        }
+            Some(
+                grpc_server::PreparedHostServer::bind(
+                    self.cfg.grpc_listen_addr.expect("managed listener checked"),
+                    Some(tls.clone()),
+                )
+                .map_err(|error| HostAgentError::Config(error.to_string()))?,
+            )
+        } else {
+            None
+        };
         tracing::info!(?self.cfg.work_dir, "host-agent starting");
         let _ = self.cloud.host_metadata().await;
 
@@ -1006,13 +1014,16 @@ impl HostAgent {
             // the `grpc_self_connect` probe, and a probe that runs before
             // the bind fails, which keeps the host out of placement until
             // the next heartbeat. The server starts serving it below.
-            let grpc_incoming = self.cfg.grpc_listen_addr.and_then(|addr| {
-                grpc_server::bind(addr)
-                    .inspect_err(|e| {
-                        tracing::error!(addr = %addr, error = %e, "gRPC listener bind failed");
-                    })
-                    .ok()
-            });
+            let host_server = match managed_server {
+                Some(server) => Some(server),
+                None => self.cfg.grpc_listen_addr.and_then(|addr| {
+                    grpc_server::PreparedHostServer::bind(addr, None)
+                        .inspect_err(|e| {
+                            tracing::error!(addr = %addr, error = %e, "gRPC listener bind failed");
+                        })
+                        .ok()
+                }),
+            };
             let mut registration_task: Option<tokio::task::JoinHandle<()>> = None;
             if let Some(advertise_addr) = self.cfg.grpc_advertise_addr.clone() {
                 // hostname: prefer the env-supplied value (set by
@@ -1131,9 +1142,8 @@ impl HostAgent {
             // via /api/hosts/register) to dispatch coord→host
             // RPCs. Required in production; mode=all leaves
             // `grpc_listen_addr=None`.
-            let grpc_task = grpc_incoming.map(|incoming| {
+            let grpc_task = host_server.map(|server| {
                 let local_for_grpc = local_host.clone();
-                let managed_tls = self.cfg.managed_tls.clone();
                 let peer_for_grpc = peer_serve.clone();
                 // ADR 0079: the per-session fencing-epoch high-water,
                 // durable under work_dir like the binding records.
@@ -1141,15 +1151,7 @@ impl HostAgent {
                     session_epochs::SessionEpochStore::open(self.cfg.work_dir.join("epochs"))
                         .expect("open session epoch store under work_dir (ADR 0079)");
                 tokio::spawn(async move {
-                    if let Err(e) = grpc_server::serve_with_managed_tls(
-                        incoming,
-                        local_for_grpc,
-                        epochs,
-                        peer_for_grpc,
-                        managed_tls,
-                    )
-                    .await
-                    {
+                    if let Err(e) = server.serve(local_for_grpc, epochs, peer_for_grpc).await {
                         tracing::error!(error = %e, "gRPC server terminated with error");
                     }
                 })
@@ -2096,3 +2098,105 @@ pub mod managed_tls;
 
 mod managed_assets;
 pub mod managed_boot;
+
+#[cfg(test)]
+mod managed_startup_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct StartupBoundary(AtomicBool);
+    #[async_trait::async_trait]
+    impl CloudBackend for StartupBoundary {
+        async fn host_metadata(
+            &self,
+        ) -> Result<engram_core::types::host::HostMetadata, engram_core::BackendError> {
+            self.0.store(true, Ordering::SeqCst);
+            std::future::pending().await
+        }
+        async fn provision_host(
+            &self,
+            _: engram_core::types::host::HostSpec,
+        ) -> Result<engram_core::HostId, engram_core::BackendError> {
+            unreachable!()
+        }
+        async fn deprovision_host(
+            &self,
+            _: engram_core::HostId,
+        ) -> Result<(), engram_core::BackendError> {
+            unreachable!()
+        }
+    }
+
+    async fn rejects_before_startup(malformed: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let ca = engram_egress_proxy::Ca::load_or_generate(&temp.path().join("ca")).unwrap();
+        let certificate = temp.path().join("host.pem");
+        let key = temp.path().join("host.key");
+        std::fs::write(
+            &certificate,
+            if malformed {
+                "not a certificate"
+            } else {
+                &ca.cert_pem
+            },
+        )
+        .unwrap();
+        std::fs::write(&key, ca.key_pair.serialize_pem()).unwrap();
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = occupied.local_addr().unwrap();
+        // Malformed TLS must fail even with an available listener.
+        let occupied = if malformed {
+            drop(occupied);
+            None
+        } else {
+            Some(occupied)
+        };
+        let cloud = Arc::new(StartupBoundary(AtomicBool::new(false)));
+        let config = HostAgentConfig {
+            managed_tls: Some(managed_tls::ManagedHostTls {
+                certificate: certificate.clone(),
+                key,
+                client_ca: certificate,
+                coordinator_pins: std::collections::BTreeSet::from(["a".repeat(64)]),
+            }),
+            work_dir: temp.path().join("host"),
+            grpc_listen_addr: Some(addr),
+            grpc_advertise_addr: Some(format!("https://{addr}")),
+            coordinator_endpoint: Some("http://127.0.0.1:1".into()),
+            ..HostAgentConfig::default()
+        };
+        let agent = HostAgent::new(
+            config,
+            Arc::new(engram_sandbox_process::ProcessBackend::new(
+                temp.path().join("ordinary"),
+            )),
+            cloud.clone(),
+        )
+        .with_host_id("00000000-0000-0000-0000-000000000001".parse().unwrap())
+        .with_egress(Arc::new(egress::HostEgress::new(
+            Arc::new(proxyd_client::ProxydHandle::new(
+                temp.path().join("absent.sock"),
+            )),
+            ca.cert_pem,
+            None,
+        )));
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), agent.run()).await;
+        drop(occupied);
+        assert!(
+            outcome.is_ok_and(|result| result.is_err()),
+            "invalid managed listener must fail startup"
+        );
+        assert!(
+            !cloud.0.load(Ordering::SeqCst),
+            "failure must precede startup work and coordinator registration"
+        );
+    }
+    #[tokio::test]
+    async fn malformed_managed_tls_cannot_reach_registration() {
+        rejects_before_startup(true).await;
+    }
+    #[tokio::test]
+    async fn occupied_managed_listener_cannot_reach_registration() {
+        rejects_before_startup(false).await;
+    }
+}
