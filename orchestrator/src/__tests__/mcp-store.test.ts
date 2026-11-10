@@ -108,7 +108,7 @@ describe("MCP durable authority", () => {
             f.draft.id,
             1,
             [{ ...tool, classification: "write", enabled: true }],
-            "admin",
+            f.publisherId,
             f.now,
           ),
         ),
@@ -130,7 +130,7 @@ describe("MCP durable authority", () => {
           f.draft.id,
           2,
           [{ ...tool, classification: "write", enabled: true }],
-          "admin",
+          f.publisherId,
           f.now,
         ),
       ).rejects.toThrow("stale");

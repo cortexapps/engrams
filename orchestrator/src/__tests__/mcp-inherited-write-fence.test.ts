@@ -37,7 +37,7 @@ async function family(withOtherConnection = false) {
         classification: index === 0 ? "write" : "read",
         enabled: true,
       })),
-      f.actorId,
+      f.publisherId,
       f.now,
     );
     await f.repository.setEnabled(f.connection.id, 1, true, f.now);

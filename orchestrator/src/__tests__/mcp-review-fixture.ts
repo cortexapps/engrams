@@ -39,6 +39,7 @@ export async function reviewFixture(documents: Record<string, unknown>[] = [], t
   const profileId = crypto.randomUUID();
   const db = getDb(),
     actorId = crypto.randomUUID(),
+    publisherId = crypto.randomUUID(),
     taskId = crypto.randomUUID(),
     sessionId = crypto.randomUUID(),
     deploymentId: string = crypto.randomUUID();
@@ -50,6 +51,14 @@ export async function reviewFixture(documents: Record<string, unknown>[] = [], t
     name: "Review owner",
     email: `${actorId}@example.test`,
     role: "user",
+    createdAt: now,
+    updatedAt: now,
+  });
+  await db.insert(user).values({
+    id: publisherId,
+    name: "Catalog publisher",
+    email: `${publisherId}@example.test`,
+    role: "admin",
     createdAt: now,
     updatedAt: now,
   });
@@ -81,7 +90,7 @@ export async function reviewFixture(documents: Record<string, unknown>[] = [], t
     draft.id,
     0,
     tools.map((tool) => ({ ...tool, classification: "write", enabled: true })),
-    actorId,
+    publisherId,
     now,
   );
   await repository.setEnabled(connection.id, 1, true, now);
@@ -210,6 +219,7 @@ export async function reviewFixture(documents: Record<string, unknown>[] = [], t
     },
     profileId,
     actorId,
+    publisherId,
     draft,
     actor: actorId,
     taskId,
@@ -230,6 +240,7 @@ export async function reviewFixture(documents: Record<string, unknown>[] = [], t
       await connections.delete(connection.id);
       await db.delete(profile).where(eq(profile.id, profileId));
       await db.delete(user).where(eq(user.id, actorId));
+      await db.delete(user).where(eq(user.id, publisherId));
     },
   };
 }

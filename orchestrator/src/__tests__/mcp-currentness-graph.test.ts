@@ -42,7 +42,7 @@ test("currentness reads a deep multi-connection graph within the one-second fenc
         draft.id,
         0,
         tools.map((t) => ({ ...t, classification: "write", enabled: true })),
-        f.actorId,
+        f.publisherId,
         f.now,
       );
       await f.repository.setEnabled(connection.id, 1, true, f.now);

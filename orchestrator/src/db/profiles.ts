@@ -6,15 +6,14 @@
  * fake. Drizzle-backed by default. Soft delete only (deleted_at).
  */
 
-import { and, eq, inArray, isNull, ne } from "drizzle-orm";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 
 import { notifyMcpAuthorityChanged } from "../mcp/authority-notification.ts";
 import { canonicalDigest } from "../mcp/hash.ts";
-import { isServiceAccountEmail } from "../rpc/api-key.ts";
+import { lockMcpPublisher } from "../authz/publisher.ts";
 import { getDb } from "./client.ts";
 import {
   profile as profileTable,
-  user,
   DEFAULT_PROFILE_NETWORK,
   type ProfileApp,
   type ProfileNetwork,
@@ -154,7 +153,7 @@ export function makeProfileStore(db: ReturnType<typeof getDb> = getDb()): Profil
     },
     async create(input, publication) {
       return db.transaction(async (tx) => {
-        await lockPublisher(tx, publication);
+        if (publication) await lockMcpPublisher(tx, publication.actorId);
         const provenance = publicationFor([], null, input.integrationGrants, publication);
         const [row] = await tx
           .insert(profileTable)
@@ -165,7 +164,7 @@ export function makeProfileStore(db: ReturnType<typeof getDb> = getDb()): Profil
     },
     async update(id, input, publication) {
       const result = await db.transaction(async (tx) => {
-        await lockPublisher(tx, publication);
+        if (publication) await lockMcpPublisher(tx, publication.actorId);
         const [existing] = await tx
           .select()
           .from(profileTable)
@@ -238,13 +237,6 @@ export function makeProfileStore(db: ReturnType<typeof getDb> = getDb()): Profil
   };
 }
 
-type ProfileTx = Parameters<Parameters<ReturnType<typeof getDb>["transaction"]>[0]>[0];
-async function lockPublisher(tx: ProfileTx, publication?: PublishMcpGrants) {
-  if (!publication) return;
-  const [actor] = await tx.select().from(user).where(eq(user.id, publication.actorId)).for("share");
-  if (!actor || actor.banned || actor.role !== "admin" || isServiceAccountEmail(actor.email))
-    throw new Error("current human administrator required for MCP grant publication");
-}
 function publicationFor(
   previous: ProfileIntegrationGrant[],
   provenance: McpGrantPublication | null,

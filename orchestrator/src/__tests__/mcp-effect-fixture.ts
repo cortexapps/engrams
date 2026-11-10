@@ -139,7 +139,7 @@ export async function effectFixture(
         classification: index === 0 ? classification : "read",
         enabled: true,
       })),
-      f.actorId,
+      f.publisherId,
       new Date(),
     );
     await f.repository.setEnabled(current.id, 1, true, new Date());

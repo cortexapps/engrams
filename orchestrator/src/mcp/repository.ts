@@ -1,4 +1,5 @@
 import { notifyMcpAuthorityChanged } from "./authority-notification.ts";
+import { lockMcpPublisher } from "../authz/publisher.ts";
 import { and, desc, eq } from "drizzle-orm";
 import { getDb } from "../db/client.ts";
 import { integrationConnection as connection, mcpCatalog as catalog } from "../db/schema.ts";
@@ -126,6 +127,7 @@ export function makeMcpRepository(db = getDb()) {
     ) {
       const tools = reviewCatalog(input);
       const result = await db.transaction(async (tx) => {
+        await lockMcpPublisher(tx, actorId);
         const [row] = await tx
           .select()
           .from(connection)
