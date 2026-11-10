@@ -704,9 +704,11 @@ fn queue_loop(
             offset: iod.start_sector << 9,
             len: iod.nr_sectors << 9,
         };
-        if requests.send(request).is_err() {
-            complete(queue, tag, buf.as_slice(), -libc::EIO);
-        }
+        // No receiver: the runtime is shutting down with the process. The
+        // read stays unanswered, and the kernel gives it to the next
+        // server (`UBLK_F_USER_RECOVERY_REISSUE`); an error here would
+        // reach the guest.
+        let _ = requests.send(request);
     });
 }
 
