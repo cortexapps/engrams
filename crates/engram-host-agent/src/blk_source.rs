@@ -565,7 +565,7 @@ impl Shared {
     }
 }
 
-/// A whole verified chunk for the stream window: at `Hydrate`, and at
+/// A whole chunk for the stream window: at `Hydrate`, and at
 /// `Demand` too once that has waited `STREAM_PATIENCE`.
 async fn stream_chunk(engine: &FillEngine, hash: ChunkHash) -> Result<Bytes, ChunkStoreError> {
     let hydrate = engine.read(hash, Class::Hydrate);
