@@ -742,17 +742,29 @@ impl SessionVolumes {
             .await?;
         drop(base_volume);
         shape_matches(&dest, wanted)?;
-        for chunk in &plan.zero {
-            dest.zero_chunk(*chunk).await?;
+        // The zeroing and the source's start do not touch each other.
+        let zero = async {
+            for chunk in &plan.zero {
+                dest.zero_chunk(*chunk).await?;
+            }
+            Ok::<_, io::Error>(())
         }
-        let source = sources
+        .instrument(tracing::info_span!("disk.hydrate.zero"));
+        let serve = sources
             .serve(fill.clone(), wanted, plan.delta.clone(), region_bytes)
-            .await?;
-        let live = match self
-            .disk
-            .hydrate(&dest, source.path(), &live_name(sandbox, role), &plan.skip)
-            .await
-        {
+            .instrument(tracing::info_span!("disk.hydrate.source"));
+        let (zeroed, source) = tokio::join!(zero, serve);
+        let source = source?;
+        let live = match zeroed {
+            Ok(()) => {
+                self.disk
+                    .hydrate(&dest, source.path(), &live_name(sandbox, role), &plan.skip)
+                    .instrument(tracing::info_span!("disk.hydrate.device"))
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        let live = match live {
             Ok(live) => live,
             Err(e) => {
                 if let Err(error) = source.stop().await {
