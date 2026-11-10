@@ -6994,7 +6994,10 @@ impl MetadataStore for SimMetadataStore {
         use engram_core::types::oauth::{OAuthFlowStatus, OAuthSubjectKind};
         self.gate()?;
         let mut db = self.db.lock();
-        let flow = db.oauth_flows.get(&id).ok_or(MetaError::NotFound)?;
+        let flow = db
+            .oauth_flows
+            .get(&id)
+            .ok_or_else(|| MetaError::Conflict("MCP state unavailable".into()))?;
         if key.subject_kind != OAuthSubjectKind::Mcp
             || &flow.key != key
             || flow.status != OAuthFlowStatus::Pending

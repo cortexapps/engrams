@@ -7549,6 +7549,10 @@ async fn mcp_flow_consume(ctx: &Ctx) {
         ciphertext: vec![3; 64],
         key_id: "test".into(),
     };
+    assert!(matches!(
+        ctx.meta.consume_mcp_oauth_flow(id, &key).await,
+        Err(MetaError::Conflict(_))
+    ));
     ctx.meta
         .create_mcp_oauth_flow(flow.clone(), state.clone())
         .await
