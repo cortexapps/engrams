@@ -24,7 +24,6 @@ use async_trait::async_trait;
 
 use crate::error::SandboxError;
 use crate::traits::sandbox::{BrowserStart, ForgeSink, HarnessDial, HarnessSink, UploadSink};
-use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
 use crate::types::port::PortTunnel;
 use crate::types::sandbox::{
@@ -282,6 +281,18 @@ pub trait HostClient: Send + Sync {
     ) -> Result<(), SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `migration_abort`".into(),
+        ))
+    }
+
+    /// See `SandboxBackend::migration_abort_unserved`.
+    async fn migration_abort_unserved(
+        &self,
+        _id: SandboxId,
+        _export_id: &str,
+        _fence: SessionFence,
+    ) -> Result<bool, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support `migration_abort_unserved`".into(),
         ))
     }
     /// ADR 0014 issue #1/#2: commit a snapshot whose post-snapshot
@@ -625,41 +636,4 @@ pub trait HostClient: Send + Sync {
     /// [`set_forge_sink`](Self::set_forge_sink) — `LocalHostClient`
     /// forwards to its inner `SandboxBackend`; remote impls no-op.
     fn set_upload_sink(&self, _sink: UploadSink) {}
-
-    /// ADR 0016 Phase A: per-sandbox COW diagnostic snapshot.
-    /// `None` if this host doesn't have a chunk-tracked view of
-    /// the sandbox (backend not NBD-attached, or the
-    /// `sandbox_id` isn't bound here). The caller — `cow_state`
-    /// fan-out at coord — treats `Ok(None)` and `Err(NotFound)`
-    /// uniformly. Default returns `None` so `HostClient` impls
-    /// that don't forward this can compile without changes.
-    async fn cow_state(&self, _id: SandboxId) -> Result<Option<CowState>, SandboxError> {
-        Ok(None)
-    }
-
-    /// ADR 0016 Phase A: bulk variant. One record per chunk-tracked
-    /// sandbox this host owns. Cheaper than `list() + N ×
-    /// cow_state()` over the wire — single RPC, single map walk on
-    /// the host. Default empty so non-host-agent impls (mocks,
-    /// in-proc test glue) compile.
-    async fn cow_state_all(&self) -> Result<Vec<CowStateRecord>, SandboxError> {
-        Ok(Vec::new())
-    }
-
-    /// ADR 0016 Phase B commit 4a — admin trigger for the
-    /// FlushScheduler primitive. Coord's
-    /// `POST /api/admin/sessions/:id/flush-now` calls this on the
-    /// session's bound host to force a flush + manifest publish.
-    /// Returns the new `ManifestRef` if any chunks were drained;
-    /// `None` if the sandbox isn't chunk-tracked or no dirty bytes
-    /// were buffered.
-    ///
-    /// Default `Ok(None)` so mocks and the warm-start scheduler-less
-    /// pre-Phase-B impls compile unchanged.
-    async fn flush_sandbox(
-        &self,
-        _id: SandboxId,
-    ) -> Result<Option<crate::types::manifest::ManifestRef>, SandboxError> {
-        Ok(None)
-    }
 }

@@ -252,6 +252,9 @@ pub enum BlobError {
     NotFound,
     /// Underlying SDK or HTTP error.
     Sdk(BoxError),
+    /// The store refused the request because of load (HTTP 429, or 503
+    /// and S3 `SlowDown`). The request can succeed after a backoff.
+    Throttled(BoxError),
     /// Configuration was invalid or missing (no creds, bad endpoint).
     Config(String),
     /// Backend returned an unexpected response shape.
@@ -259,6 +262,9 @@ pub enum BlobError {
     /// Local filesystem error (only the `local` backend; SDK backends
     /// fold IO errors into `Sdk`).
     Io(std::io::Error),
+    /// A ranged read ([`crate::traits::BlobStorage::get_range`]) asked
+    /// for no bytes, or for bytes past the end of the object.
+    RangeOutOfBounds { offset: u64, len: u64 },
 }
 
 impl fmt::Display for BlobError {
@@ -266,9 +272,13 @@ impl fmt::Display for BlobError {
         match self {
             Self::NotFound => write!(f, "blob not found"),
             Self::Sdk(e) => write!(f, "blob sdk error: {e}"),
+            Self::Throttled(e) => write!(f, "blob store throttled the request: {e}"),
             Self::Config(msg) => write!(f, "blob config error: {msg}"),
             Self::Protocol(msg) => write!(f, "blob protocol error: {msg}"),
             Self::Io(e) => write!(f, "blob io error: {e}"),
+            Self::RangeOutOfBounds { offset, len } => {
+                write!(f, "blob range [{offset}, +{len}) is empty or past the end")
+            }
         }
     }
 }
@@ -276,7 +286,7 @@ impl fmt::Display for BlobError {
 impl StdError for BlobError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            Self::Sdk(e) => Some(&**e),
+            Self::Sdk(e) | Self::Throttled(e) => Some(&**e),
             Self::Io(e) => Some(e),
             _ => None,
         }

@@ -88,9 +88,8 @@ pub(crate) async fn resolve_explicit_secret_ref(
 ) -> Result<Option<String>, engram_core::SecretError> {
     // An empty ref is persistent config state ("not configured"), not
     // a lookup to attempt: the GCP backend would render it as
-    // `projects/<p>/secrets//versions/latest` and 400 on every call
-    // (prod 2026-08-03, session 51fc6af7 — 77 such entries made a
-    // deterministic defect look transient).
+    // `projects/<p>/secrets//versions/latest` and 400 on every call,
+    // which makes a deterministic defect look transient.
     if secret_ref.trim().is_empty() {
         return Ok(None);
     }
@@ -640,7 +639,6 @@ async fn boot_prepared(
     oauth_credential: Option<engram_core::types::oauth::OAuthCredentialKey>,
 ) -> Result<CreateSessionResponse, ApiError> {
     let crate::session_boot::PreparedBoot {
-        nbd_slot_need,
         inputs,
         memory_mib,
         cpu_budget_vcpus,
@@ -667,7 +665,6 @@ async fn boot_prepared(
     // a capacity miss does. A straggler host that hasn't staged yet simply
     // isn't in the ranked pool; its next heartbeat un-gates it.
     let ctx = crate::placement::ScheduleContext {
-        nbd_slot_need,
         repo: &image_repo,
         image_version: &image_tag,
         // ADR 0078: a base snapshot is fleet-wide (prewarmed on many
@@ -746,7 +743,6 @@ async fn boot_prepared(
     };
 
     let write_set = engram_core::traits::SessionCreateWriteSet {
-        nbd_slot_need,
         session_id,
         spec: inputs.spec.clone(),
         mem_budget_mib: memory_mib as i64,
@@ -1497,7 +1493,6 @@ async fn prepare_inner(
     let manifest_digest = bundle.enabled.manifest_digest.clone();
 
     Ok(crate::session_boot::PreparedBoot {
-        nbd_slot_need: 1 + u32::from(config.resolved_swap_mib() > 0),
         inputs: crate::session_boot::BootInputs {
             session_id,
             spec,
@@ -1616,52 +1611,51 @@ pub(crate) async fn delete_session_core(
     )
     .await
     .map_err(|e| ApiError::Internal(format!("destroy enqueue failed: {e}")))?;
-    // `Duplicate` = a prior DELETE already enqueued/ran the destroy (the
-    // burned idempotency key) — observe the session row alone.
+    // `Duplicate` = a prior DELETE's destroy op is still queued or running
+    // (the keyed row) — observe that op.
     let op_id = match outcome {
         EnqueueOutcome::Claimed(op) | EnqueueOutcome::Queued(op) => Some(op.id),
-        EnqueueOutcome::Duplicate => None,
+        EnqueueOutcome::Duplicate => state
+            .services
+            .meta
+            .op_latest_for_kind(id, OpKind::Destroy)
+            .await
+            .ok()
+            .flatten()
+            .map(|op| op.id),
     };
 
-    let deadline = state.services.clock.now_mono() + DESTROY_OBSERVE_TIMEOUT;
-    loop {
-        // The terminal flip is the user-visible outcome; it lands before
-        // the (best-effort, can-take-seconds) sandbox destroy finishes.
-        match state.services.meta.get_session(id).await {
-            Ok(s) if s.status.is_terminal() => return Ok(()),
-            Ok(_) => {}
-            // Row hard-deleted (FK cascade) — idempotent 204.
-            Err(engram_core::MetaError::NotFound) => return Ok(()),
-            Err(e) => return Err(e.into()),
-        }
-        if let Some(op_id) = op_id {
-            if let Ok(Some(op)) = state.services.meta.op_get(op_id).await {
-                match op.state {
-                    OpState::Done => return Ok(()),
-                    OpState::Failed => {
-                        return Err(ApiError::Internal(format!(
-                            "session teardown failed: {}",
-                            op.error.as_deref().unwrap_or("destroy op failed")
-                        )));
-                    }
-                    OpState::Cancelled => {
-                        return Err(ApiError::Conflict(
-                            "session teardown was cancelled; retry the delete".into(),
-                        ));
-                    }
-                    OpState::Queued | OpState::Running => {}
-                }
+    crate::session_ops::observe_op(
+        state,
+        op_id,
+        DESTROY_OBSERVE_TIMEOUT,
+        "session teardown in flight (destroy op enqueued behind an in-flight op); retry \
+         shortly",
+        |op| async move {
+            // The terminal flip is the user-visible outcome; it lands before
+            // the (best-effort, can-take-seconds) sandbox destroy finishes.
+            match state.services.meta.get_session(id).await {
+                Ok(s) if s.status.is_terminal() => return Ok(Some(())),
+                Ok(_) => {}
+                // Row hard-deleted (FK cascade) — idempotent 204.
+                Err(engram_core::MetaError::NotFound) => return Ok(Some(())),
+                Err(e) => return Err(e.into()),
             }
-        }
-        if state.services.clock.now_mono() >= deadline {
-            return Err(ApiError::Conflict(
-                "session teardown in flight (destroy op enqueued behind an in-flight \
-                 op); retry shortly"
-                    .into(),
-            ));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
+            let Some(op) = op else { return Ok(None) };
+            match op.state {
+                OpState::Done => Ok(Some(())),
+                OpState::Failed => Err(ApiError::Internal(format!(
+                    "session teardown failed: {}",
+                    op.error.as_deref().unwrap_or("destroy op failed")
+                ))),
+                OpState::Cancelled => Err(ApiError::Conflict(
+                    "session teardown was cancelled; retry the delete".into(),
+                )),
+                OpState::Queued | OpState::Running => Ok(None),
+            }
+        },
+    )
+    .await
 }
 
 /// ADR 0023: when a forge is configured and the image declares `[git]`,
@@ -1795,11 +1789,9 @@ fn loopback_endpoint(state: &SharedState) -> Option<String> {
 /// (universal — the `engram-share` skill is baked into every image).
 ///
 /// This is THE injector for both harness-spawn paths — session
-/// create and resume's harness rebuild. They diverged once (resume
-/// missed the upload env, so `engram-share` broke after every
-/// idle→resume hop until the next cold create — prod session
-/// 5cfb90b8); a single shared entry point makes that class of skew
-/// impossible. If you add an env here, both paths get it.
+/// create and resume's harness rebuild. One shared entry point keeps
+/// the two from drifting apart (a resume that misses the upload env
+/// breaks `engram-share` until the next cold create). If you add an env here, both paths get it.
 pub(crate) async fn inject_harness_env(
     state: &SharedState,
     session_id: SessionId,
@@ -2196,10 +2188,10 @@ mod tests {
         }
     }
 
-    /// Prod 2026-08-03 (session 51fc6af7): an empty `secret_ref`
-    /// reached the GCP backend as `projects/<p>/secrets//versions/latest`
-    /// and 400'd on every call — a persistent config defect that read
-    /// as a transient failure. An empty ref is "not configured": it
+    /// An empty `secret_ref` sent to the GCP backend becomes
+    /// `projects/<p>/secrets//versions/latest` and 400s on every call —
+    /// a persistent config defect that reads as a transient failure.
+    /// An empty ref is "not configured": it
     /// resolves to `None` with ZERO store calls.
     #[tokio::test]
     async fn empty_secret_ref_is_not_configured_never_a_store_call() {

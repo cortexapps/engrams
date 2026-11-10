@@ -2,10 +2,9 @@
 //!
 //! Each host watches the heartbeat-ack's `enabled_images` set and warms each
 //! enabled image's **base-snapshot working set** (disk + memory chunks) onto
-//! local NVMe. Once those chunks are all reachable via `chunk_store.get_chunk()`
-//! (cache-tier hit), the image's `manifest_digest` is added to `ImageReadiness`
-//! — which the heartbeat builder reads on every tick to populate
-//! `Heartbeat.ready_images`. Coord's scheduler gates session placement on hosts
+//! local NVMe. Once those chunks are all in the local chunk cache, the image's
+//! `manifest_digest` is added to `ImageReadiness` — which the heartbeat builder
+//! reads on every tick to populate `Heartbeat.ready_images`. Coord's scheduler gates session placement on hosts
 //! that report the requested image's digest in their ready set; non-ready hosts
 //! surface as HTTP 503 `image_not_ready` to the API caller.
 //!
@@ -25,28 +24,28 @@
 //! roll. The base-snapshot chunks live in the GCS chunk store (flushed at
 //! enable), so this path is GCS-backed, not registry-backed.
 //!
-//! Storage tier model (for the per-chunk `get_chunk` walk on the supervisor's
-//! `ChunkStore`, which uses the default `BlobStorageResolver`):
+//! Storage tier model:
 //!   - Tier 1: local NVMe `ChunkCache` (canonical "ready" inventory; a hit
 //!     here = chunk is local + counts toward readiness).
-//!   - Tier 2: `BlobStorage` at `chunks/sha256/<hex>` (GCS) — where the base
-//!     snapshot's chunks are flushed at enable. This is the hot tier here.
+//!   - Tier 2: a peer host that holds the chunks (the fill engine's peer
+//!     source).
+//!   - Tier 3: `BlobStorage` at `chunks/sha256/<hex>` (GCS) — where the base
+//!     snapshot's chunks are flushed at enable.
 //!
-//! (The OCI-fallback `TieredChunkResolver` is installed only on the
-//! host-agent's per-restore chunked-OCI store, not on this supervisor's
-//! store.) `chunk_store.get_chunk(hash)` resolves NVMe → BlobStorage, so the
-//! prefetch driver is just an eager loop over the base snapshot's chunk hashes.
+//! The prefetch driver fills the base snapshot's chunk hashes through the
+//! host's `FillEngine` at `Class::Background`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use engram_chunk_store::manifest::ChunkHash;
-use engram_chunk_store::{ChunkCache, ChunkStore, Manifest};
+use engram_chunk_store::{ChunkCache, Manifest};
 use engram_core::types::SnapshotId;
+use engram_fill::{Class, FillEngine};
 use engram_protocol::heartbeat::{EnabledImageRef, ManifestDigest};
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::watch;
 
 /// ADR 0039 (cache locality): per-enabled-image record of the canonical
 /// base-manifest (disk + memory) chunk hashes this host has pinned in the
@@ -236,21 +235,6 @@ pub fn union_image_refs(
     out
 }
 
-/// Concurrency cap on in-flight chunk fetches, applied across all
-/// images this host is prefetching. 16 permits ~ 400 MiB in flight
-/// at the default 25 MiB chunk size — leaves 10 Gbps NIC headroom
-/// for in-flight sessions' lazy faults. Tunable via the env var
-/// `ENGRAM_PREFETCH_CONCURRENCY`.
-const DEFAULT_PREFETCH_CONCURRENCY: usize = 16;
-
-fn concurrency_from_env() -> usize {
-    std::env::var("ENGRAM_PREFETCH_CONCURRENCY")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_PREFETCH_CONCURRENCY)
-}
-
 /// ADR 0092: population policy for the tmpfs (resume) base-shm.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BaseShmMode {
@@ -266,7 +250,7 @@ enum BaseShmMode {
 }
 
 /// `ENGRAM_FC_BASE_SHM_MODE` ∈ {`full` (default), `lazy`}, read once at
-/// startup (mirrors `restore_mode_from_env`'s parse/warn shape).
+/// startup.
 fn base_shm_mode_from_env() -> BaseShmMode {
     static MODE: std::sync::OnceLock<BaseShmMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("ENGRAM_FC_BASE_SHM_MODE") {
@@ -321,7 +305,7 @@ const RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30)
 type InflightPrefetches = Arc<parking_lot::Mutex<HashSet<ManifestDigest>>>;
 
 pub fn spawn_supervisor(
-    chunk_store: ChunkStore,
+    fill: FillEngine,
     chunk_cache: ChunkCache,
     readiness: Arc<ImageReadiness>,
     // ADR 0022 Option A: when `Some`, also materialize each enabled
@@ -345,15 +329,12 @@ pub fn spawn_supervisor(
     tokio::task::JoinHandle<()>,
 ) {
     let (tx, mut rx) = watch::channel(Vec::<EnabledImageRef>::new());
-    let permits = concurrency_from_env();
-    let semaphore = Arc::new(Semaphore::new(permits));
     // ADR 0095: requester-side peer health cache — shared across every
     // prefetch task so one dead seed is skipped fleet-wide on this host
     // for the lost-window instead of once per image.
     let peer_health = crate::peer_fill::PeerHealth::new();
     let inflight: InflightPrefetches = Arc::new(parking_lot::Mutex::new(HashSet::new()));
     tracing::info!(
-        permits,
         recheck_secs = RECHECK_INTERVAL.as_secs(),
         base_memfile = base_memfile_dir.is_some(),
         "image prefetch supervisor starting (base-snapshot only; no OCI prefetch)",
@@ -389,9 +370,8 @@ pub fn spawn_supervisor(
             reconcile(
                 &enabled,
                 readiness.clone(),
-                chunk_store.clone(),
+                fill.clone(),
                 chunk_cache.clone(),
-                semaphore.clone(),
                 peer_health.clone(),
                 base_memfile_dir.as_ref(),
                 &mut memfiles,
@@ -443,9 +423,8 @@ fn enabled_base_shm_paths(enabled: &[EnabledImageRef]) -> HashSet<PathBuf> {
 async fn reconcile(
     enabled: &[EnabledImageRef],
     readiness: Arc<ImageReadiness>,
-    chunk_store: ChunkStore,
+    fill: FillEngine,
     chunk_cache: ChunkCache,
-    semaphore: Arc<Semaphore>,
     peer_health: Arc<crate::peer_fill::PeerHealth>,
     base_memfile_dir: Option<&SnapshotDirResolver>,
     memfiles: &mut HashMap<ManifestDigest, MemfileState>,
@@ -519,14 +498,14 @@ async fn reconcile(
     // For each enabled image we haven't filled yet, fan out a
     // prefetch task. We don't gather here — completing prefetches
     // mark themselves ready and the heartbeat picks them up
-    // independently. The shared semaphore caps total in-flight
-    // chunk fetches across all images.
+    // independently. The fill engine orders their fetches behind
+    // every resume's.
     for image in enabled {
         if current.contains(&image.manifest_digest) {
             // ADR 0039 (honest readiness): a `ready` image must still have
             // ALL its base chunks locally resolvable. Re-verify against the
             // pinned set (the disk + memory hashes recorded at prefetch) —
-            // if the LRU evicted any, or a `write_local` silently failed so a
+            // if the LRU evicted any, or a `put_trusted` silently failed so a
             // pinned hash never actually landed on NVMe, flip to not-ready so
             // this round re-prefetches. Without this the host keeps
             // advertising `ready` while a restore cold-fetches (or EIOs) the
@@ -631,26 +610,15 @@ async fn reconcile(
         let image = image.clone();
         let inflight = inflight.clone();
         let readiness = readiness.clone();
-        let chunk_store = chunk_store.clone();
+        let fill = fill.clone();
         let chunk_cache = chunk_cache.clone();
-        let semaphore = semaphore.clone();
         let peer_health = peer_health.clone();
         let pinned_manifests = pinned_manifests.clone();
         let ram_ledger = ram_ledger.clone();
         let tracked_base_shm = tracked_base_shm.clone();
         let headroom_skipped = headroom_skipped.clone();
         tokio::spawn(async move {
-            match prefetch_one(
-                &image,
-                &chunk_store,
-                &chunk_cache,
-                &semaphore,
-                &peer_health,
-                base_memfile,
-                &ram_ledger,
-            )
-            .await
-            {
+            match prefetch_one(&image, &fill, &peer_health, base_memfile, &ram_ledger).await {
                 Ok(warmed) => {
                     // ADR 0039: pin the canonical base manifest (disk +
                     // memory) so the LRU never evicts the shared base while
@@ -782,8 +750,8 @@ async fn reconcile(
     // cache (both under the work dir) and its sweeper can't evict them —
     // reserve their allocated bytes out of the cache's ceiling so the
     // cache yields the space instead of racing the memfiles to the
-    // kubelet eviction line (the 2026-07-14 w8wq DiskPressure incident:
-    // a warm at-budget cache + 40 GB of unbudgeted memfiles).
+    // kubelet eviction line (a warm at-budget cache + 40 GB of
+    // unbudgeted memfiles trips DiskPressure).
     chunk_cache.set_co_tenant_reserved("memfiles", memfile_bytes);
 }
 
@@ -834,101 +802,12 @@ struct WarmedManifest {
 /// read at session time. Both manifests are always present (the
 /// `enabled_images` columns are NOT NULL, migrations 0042/0043). Returns the
 /// chunk count + the deduped base-manifest hash set for pinning.
-/// ADR 0095: best-effort peer pre-pass. Bulk-pull a manifest's
-/// locally-missing chunks from a coordinator-hinted warm sibling (LAN,
-/// CRC32C landings) BEFORE the verifying per-chunk loop — which then
-/// finds them resident and completes only the remainder through GCS.
-/// Every failure mode degrades to that loop untouched:
-/// - no hints / all peers health-cached lost ⇒ no dial, pure GCS;
-/// - dial/stream failure ⇒ peer marked lost, try the one alternate
-///   hint (bounded: ≤2 peers × ≤2 pulls);
-/// - `RESOURCE_EXHAUSTED` backpressure ⇒ one jittered retry (the seed
-///   was busy, not dead), then GCS;
-/// - per-chunk `missing` ⇒ that chunk stays for the GCS loop.
-async fn peer_prepass(
-    image: &EnabledImageRef,
-    manifest: &Manifest,
-    chunk_cache: &ChunkCache,
-    peer_health: &Arc<crate::peer_fill::PeerHealth>,
-) {
-    use engram_protocol::grpc_client::PeerChunkScope;
-    if image.warm_peers.is_empty() {
-        return;
-    }
-    let missing_set = |cache: &ChunkCache, manifest: &Manifest| {
-        let cache = cache.clone();
-        let hashes: Vec<ChunkHash> = manifest.chunks.iter().map(|c| c.hash).collect();
-        async move {
-            let mut missing = Vec::new();
-            for h in hashes {
-                if !cache.contains(h).await {
-                    missing.push(h);
-                }
-            }
-            missing
-        }
-    };
-    let mut missing = missing_set(chunk_cache, manifest).await;
-    if missing.is_empty() {
-        return;
-    }
-    let scope = PeerChunkScope::BaseImage(image.manifest_digest.as_str().to_string());
-    for peer in image.warm_peers.iter().take(2) {
-        let started = crate::time_source::metrics_now();
-        let mut stats = crate::peer_fill::pull_chunks_from_peer(
-            &peer.addr,
-            scope.clone(),
-            &missing,
-            chunk_cache,
-            peer_health,
-        )
-        .await;
-        if stats.backpressure && !stats.failed {
-            // The seed's serve semaphore was full — busy, not dead. One
-            // jittered retry (pid-keyed so concurrent warmers spread),
-            // then whatever is left goes to GCS. Never a retry ladder.
-            let jitter_ms = 2_000 + (std::process::id() as u64 % 3_000);
-            tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
-            missing = missing_set(chunk_cache, manifest).await;
-            if missing.is_empty() {
-                return;
-            }
-            stats = crate::peer_fill::pull_chunks_from_peer(
-                &peer.addr,
-                scope.clone(),
-                &missing,
-                chunk_cache,
-                peer_health,
-            )
-            .await;
-        }
-        tracing::info!(
-            image = %image.manifest_digest,
-            peer = %peer.addr,
-            landed = stats.landed,
-            landed_bytes = stats.landed_bytes,
-            missing_on_peer = stats.missing,
-            failed = stats.failed,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "peer pre-pass window complete",
-        );
-        if !stats.failed {
-            return; // success (or honest misses) — GCS loop mops up
-        }
-        // Peer lost mid-window: recompute what still needs pulling and
-        // try the alternate hint (if any).
-        missing = missing_set(chunk_cache, manifest).await;
-        if missing.is_empty() {
-            return;
-        }
-    }
-}
-
+///
+/// A chunk is asked of the first warm peer the coordinator hints that is
+/// not lost, then of the store.
 async fn prefetch_one(
     image: &EnabledImageRef,
-    chunk_store: &ChunkStore,
-    chunk_cache: &ChunkCache,
-    semaphore: &Arc<Semaphore>,
+    fill: &FillEngine,
     peer_health: &Arc<crate::peer_fill::PeerHealth>,
     // ADR 0022 Option A: when `Some`, after warming the memory chunks,
     // assemble them into the contiguous per-template base memfile at this
@@ -988,19 +867,24 @@ async fn prefetch_one(
     // (1) ADR 0021 P2 — the base snapshot's rootfs. The session restores from
     // the per-image base snapshot, whose disk manifest carries the runtime
     // files written at template-boot (Bun / node_modules / claude). Warming
-    // these on NVMe keeps the resuming guest's rootfs page-in off GCS — the
-    // serial 16 MiB-chunk fetches during `resume` were the measured substrate
-    // cost.
+    // these on NVMe lets the image volume stage from local disk, not GCS.
+    let fill = &match crate::peer_fill::PeerFetcher::first_live(
+        image.warm_peers.iter().map(|peer| peer.addr.as_str()),
+        engram_protocol::grpc_client::PeerChunkScope::BaseImage(
+            image.manifest_digest.as_str().to_string(),
+        ),
+        peer_health,
+    ) {
+        Some(peer) => fill.with_peer(peer),
+        None => fill.clone(),
+    };
+    let chunk_store = fill.store();
     let disk_manifest: Manifest = chunk_store
         .get_manifest(image.base_snapshot_disk_manifest)
         .await
         .map_err(|e| PrefetchError::ManifestLoad(format!("base snapshot disk: {e}")))?;
     record_hashes(&disk_manifest);
-    // ADR 0095: LAN peer pre-pass, then the verifying loop completes
-    // the remainder (and every chunk on a peer-less fleet) via GCS.
-    peer_prepass(image, &disk_manifest, chunk_cache, peer_health).await;
-    let mut total =
-        prefetch_manifest_chunks(disk_manifest, chunk_store, chunk_cache, semaphore).await?;
+    let mut total = prefetch_manifest_chunks(disk_manifest, fill).await?;
 
     // ADR 0045 addendum: the base shm file readiness will rest on, if any
     // (see `WarmedManifest::base_shm`).
@@ -1023,10 +907,7 @@ async fn prefetch_one(
             .await
             .map_err(|e| PrefetchError::ManifestLoad(format!("base snapshot memory: {e}")))?;
         record_hashes(&memory_manifest);
-        peer_prepass(image, &memory_manifest, chunk_cache, peer_health).await;
-        total +=
-            prefetch_manifest_chunks(memory_manifest.clone(), chunk_store, chunk_cache, semaphore)
-                .await?;
+        total += prefetch_manifest_chunks(memory_manifest.clone(), fill).await?;
 
         // ADR 0045 (the handshake-breakdown follow-up): pre-warm the
         // SUBSTRATE's per-image base shm file from the just-prefetched
@@ -1093,9 +974,7 @@ async fn prefetch_one(
                         base_path.clone(),
                         pending_bytes,
                     );
-                    let prewarm_result =
-                        prewarm_base_shm(&base_path, &memory_manifest, chunk_store, chunk_cache)
-                            .await;
+                    let prewarm_result = prewarm_base_shm(&base_path, &memory_manifest, fill).await;
                     ram_ledger.settle_pending(&memory_ref);
                     match prewarm_result {
                         Ok(written) => {
@@ -1131,7 +1010,9 @@ async fn prefetch_one(
         if let Some(dest) = base_memfile {
             if tokio::fs::metadata(&dest).await.is_err() {
                 chunk_store
-                    .materialize_to_file_cached(&memory_manifest, &dest, chunk_cache)
+                    .clone()
+                    .with_class(Class::Background)
+                    .materialize_to_file_from(&memory_manifest, &dest, fill)
                     .await
                     .map_err(|e| {
                         PrefetchError::MemfileMaterialize(format!("{}: {e}", dest.display()))
@@ -1175,14 +1056,14 @@ fn manifest_non_hole_bytes(manifest: &Manifest) -> u64 {
 }
 
 /// ADR 0045: populate a per-image base shm file from a memory
-/// manifest's chunks (NVMe-warm after the preceding prefetch). Grow-only
-/// size like the handler's `BaseShm::open`; chunk bytes land at their
-/// manifest offsets; elided ranges stay holes. Returns chunks written.
+/// manifest's chunks (NVMe-warm after the preceding prefetch), read
+/// through the fill engine at `Background`. Grow-only size like the
+/// handler's `BaseShm::open`; chunk bytes land at their manifest offsets;
+/// elided ranges stay holes. Returns chunks written.
 async fn prewarm_base_shm(
     path: &std::path::Path,
     manifest: &Manifest,
-    chunk_store: &ChunkStore,
-    chunk_cache: &engram_chunk_store::ChunkCache,
+    fill: &FillEngine,
 ) -> Result<usize, String> {
     use std::os::unix::fs::FileExt;
     if let Some(parent) = path.parent() {
@@ -1204,8 +1085,8 @@ async fn prewarm_base_shm(
     let file = std::sync::Arc::new(file);
     let mut written = 0usize;
     for chunk in &manifest.chunks {
-        let bytes = chunk_cache
-            .get(chunk.hash, || chunk_store.get_chunk(chunk.hash))
+        let bytes = fill
+            .read(chunk.hash, Class::Background)
             .await
             .map_err(|e| format!("chunk {}: {e}", chunk.hash))?;
         let file = file.clone();
@@ -1219,46 +1100,19 @@ async fn prewarm_base_shm(
     Ok(written)
 }
 
-/// Pull every chunk of one chunked manifest through the tiered
-/// resolver into the local NVMe cache, bounded by `semaphore`.
-/// Returns the chunk count. Shared by the base-snapshot disk + memory
-/// prefetch paths.
+/// Make every chunk of `manifest` resident at `Background`; returns the
+/// chunk count.
 async fn prefetch_manifest_chunks(
     manifest: Manifest,
-    chunk_store: &ChunkStore,
-    chunk_cache: &ChunkCache,
-    semaphore: &Arc<Semaphore>,
+    fill: &FillEngine,
 ) -> Result<usize, PrefetchError> {
     let total = manifest.chunks.len();
-    let mut handles = Vec::with_capacity(total);
-    for chunk in manifest.chunks.into_iter() {
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| PrefetchError::SemaphoreClosed)?;
-        let chunk_store = chunk_store.clone();
-        let chunk_cache = chunk_cache.clone();
-        let hash = chunk.hash;
-        handles.push(tokio::spawn(async move {
-            let _permit = permit;
-            // Singleflight'd through ChunkCache::prefetch — concurrent
-            // calls for the same chunk dedup, and a successful fetch
-            // writes the bytes to the NVMe cache so the lazy-fault
-            // path on session boot hits tier 1 instead of paying a
-            // BlobStorage round-trip per page.
-            chunk_cache
-                .prefetch(hash, || async move { chunk_store.get_chunk(hash).await })
-                .await
-        }));
-    }
-
-    for h in handles {
-        h.await
-            .map_err(|e| PrefetchError::JoinError(format!("{e}")))?
-            .map_err(|e| PrefetchError::ChunkFetch(format!("{e}")))?;
-    }
-
+    fill.fill(
+        manifest.chunks.into_iter().map(|c| c.hash).collect(),
+        Class::Background,
+    )
+    .await
+    .map_err(|e| PrefetchError::ChunkFetch(e.to_string()))?;
     Ok(total)
 }
 
@@ -1266,8 +1120,6 @@ async fn prefetch_manifest_chunks(
 enum PrefetchError {
     ManifestLoad(String),
     ChunkFetch(String),
-    SemaphoreClosed,
-    JoinError(String),
     MemfileMaterialize(String),
     /// ADR 0045: the substrate is configured but its base dir isn't a
     /// tmpfs/shmem mount yet (node-prep hasn't mounted it). Withhold
@@ -1280,8 +1132,6 @@ impl std::fmt::Display for PrefetchError {
         match self {
             Self::ManifestLoad(m) => write!(f, "load chunk manifest: {m}"),
             Self::ChunkFetch(m) => write!(f, "chunk fetch: {m}"),
-            Self::SemaphoreClosed => write!(f, "prefetch semaphore closed"),
-            Self::JoinError(m) => write!(f, "task join: {m}"),
             Self::MemfileMaterialize(m) => write!(f, "materialize base memfile: {m}"),
             Self::SubstrateNotReady(m) => write!(f, "substrate base dir not ready: {m}"),
         }
@@ -1385,22 +1235,9 @@ mod tests {
         assert_eq!(union, vec![r]);
     }
 
-    #[test]
-    fn concurrency_env_override_clamps_to_default_on_garbage() {
-        // SAFETY: tests are single-threaded; setting an env we
-        // immediately consume.
-        unsafe { std::env::set_var("ENGRAM_PREFETCH_CONCURRENCY", "not-a-number") };
-        assert_eq!(concurrency_from_env(), DEFAULT_PREFETCH_CONCURRENCY);
-        unsafe { std::env::set_var("ENGRAM_PREFETCH_CONCURRENCY", "0") };
-        assert_eq!(concurrency_from_env(), DEFAULT_PREFETCH_CONCURRENCY);
-        unsafe { std::env::set_var("ENGRAM_PREFETCH_CONCURRENCY", "32") };
-        assert_eq!(concurrency_from_env(), 32);
-        unsafe { std::env::remove_var("ENGRAM_PREFETCH_CONCURRENCY") };
-    }
-
     // ---- ADR 0022 Option A: residency memfile materialization ----
 
-    use engram_chunk_store::{ChunkCacheConfig, ManifestKind};
+    use engram_chunk_store::{ChunkCacheConfig, ChunkStore, ManifestKind};
     use engram_core::traits::BlobStorage;
     use engram_core::types::manifest::ManifestRef;
     use engram_storage_local::LocalBlobStorage;
@@ -1429,13 +1266,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blob: StdArc<dyn BlobStorage> =
             StdArc::new(LocalBlobStorage::new(dir.path().join("blob")));
-        let store = ChunkStore::new(blob);
         let cache = ChunkCache::new(ChunkCacheConfig {
             root: dir.path().join("cache"),
             budget_bytes: 256 * 1024 * 1024,
             sweep_debounce_ms: 0,
             eviction_enabled: true,
         });
+        let store = ChunkStore::new(blob).with_chunk_cache(cache.clone());
         // Distinct disk + memory payloads so a mix-up would be caught.
         let disk_bytes = (0..37u8).cycle().take(2 * 1024 * 1024).collect::<Vec<_>>();
         let mem_bytes = (3..200u8).cycle().take(3 * 1024 * 1024).collect::<Vec<_>>();
@@ -1479,10 +1316,27 @@ mod tests {
         }
     }
 
+    /// An engine whose one slot is held for good, so a fetch through it
+    /// waits forever.
+    fn parked(store: &ChunkStore) -> FillEngine {
+        let fill = FillEngine::new(
+            store.clone(),
+            engram_fill::Config {
+                in_flight: 1,
+                max_in_flight: 1,
+                demand_reserve: 0,
+                ..engram_fill::Config::default()
+            },
+        );
+        let held = futures::executor::block_on(fill.admission().acquire(Class::Demand));
+        std::mem::forget(held);
+        fill
+    }
+
     #[tokio::test]
     async fn prefetch_materializes_base_memfile_and_is_idempotent() {
-        let (store, cache, dir, disk_ref, mem_ref, mem_bytes) = seed().await;
-        let sem = Arc::new(Semaphore::new(8));
+        let (store, _, dir, disk_ref, mem_ref, mem_bytes) = seed().await;
+        let fill = FillEngine::new(store.clone(), engram_fill::Config::default());
         let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
         let base_id = SnapshotId::new();
         let dest = dir
@@ -1494,9 +1348,7 @@ mod tests {
         let img = image_ref(base_id, disk_ref, Some(mem_ref));
         prefetch_one(
             &img,
-            &store,
-            &cache,
-            &sem,
+            &fill,
             &crate::peer_fill::PeerHealth::new(),
             Some(dest.clone()),
             &ledger,
@@ -1517,9 +1369,7 @@ mod tests {
             .unwrap();
         prefetch_one(
             &img,
-            &store,
-            &cache,
-            &sem,
+            &fill,
             &crate::peer_fill::PeerHealth::new(),
             Some(dest.clone()),
             &ledger,
@@ -1541,8 +1391,8 @@ mod tests {
     async fn prefetch_skips_memfile_for_disk_only_image() {
         // VZ / cold-boot: base_snapshot_memory_manifest == None. Even with a
         // dest path supplied, no memfile is built — density is FC-only.
-        let (store, cache, dir, disk_ref, _mem_ref, _mem_bytes) = seed().await;
-        let sem = Arc::new(Semaphore::new(8));
+        let (store, _, dir, disk_ref, _mem_ref, _mem_bytes) = seed().await;
+        let fill = FillEngine::new(store.clone(), engram_fill::Config::default());
         let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
         let base_id = SnapshotId::new();
         let dest = dir
@@ -1554,9 +1404,7 @@ mod tests {
         let img = image_ref(base_id, disk_ref, None);
         prefetch_one(
             &img,
-            &store,
-            &cache,
-            &sem,
+            &fill,
             &crate::peer_fill::PeerHealth::new(),
             Some(dest.clone()),
             &ledger,
@@ -1577,8 +1425,8 @@ mod tests {
         // chunk hashes, deduped. We pin exactly this set; the disable
         // path unpins exactly it. Verify the set matches the manifests'
         // union (a mix-up between disk/memory chunks would surface here).
-        let (store, cache, dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
-        let sem = Arc::new(Semaphore::new(8));
+        let (store, _, dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
+        let fill = FillEngine::new(store.clone(), engram_fill::Config::default());
         let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
         let base_id = SnapshotId::new();
         let _ = dir; // tempdir kept alive
@@ -1595,9 +1443,7 @@ mod tests {
         let img = image_ref(base_id, disk_ref, Some(mem_ref));
         let warmed = prefetch_one(
             &img,
-            &store,
-            &cache,
-            &sem,
+            &fill,
             &crate::peer_fill::PeerHealth::new(),
             None,
             &ledger,
@@ -1622,7 +1468,7 @@ mod tests {
         // chunk shared with a still-enabled image stays pinned (refcount).
         let (store, cache, dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
         let _ = dir;
-        let sem = Arc::new(Semaphore::new(8));
+        let fill = FillEngine::new(store.clone(), engram_fill::Config::default());
         let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
         let readiness = ImageReadiness::new();
         let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
@@ -1649,9 +1495,8 @@ mod tests {
         reconcile(
             std::slice::from_ref(&img),
             readiness.clone(),
-            store.clone(),
+            fill.clone(),
             cache.clone(),
-            sem.clone(),
             crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
@@ -1683,9 +1528,8 @@ mod tests {
         reconcile(
             &[],
             readiness.clone(),
-            store.clone(),
+            fill.clone(),
             cache.clone(),
-            sem.clone(),
             crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
@@ -1705,10 +1549,10 @@ mod tests {
     async fn reconcile_flips_ready_to_unready_when_base_chunk_is_gone() {
         // ADR 0039 (honest readiness): if a `ready` image's base chunks are
         // no longer resolvable on local NVMe (LRU eviction / a silently-
-        // failed write_local), the next reconcile must flip it back to
+        // failed put_trusted), the next reconcile must flip it back to
         // not-ready so a restore never lands on a ready-but-cold host.
         let (store, cache, _dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
-        let sem = Arc::new(Semaphore::new(8));
+        let fill = FillEngine::new(store.clone(), engram_fill::Config::default());
         let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
         let readiness = ImageReadiness::new();
         let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
@@ -1722,9 +1566,8 @@ mod tests {
         reconcile(
             std::slice::from_ref(&img),
             readiness.clone(),
-            store.clone(),
+            fill.clone(),
             cache.clone(),
-            sem.clone(),
             crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
@@ -1748,7 +1591,7 @@ mod tests {
 
         // Simulate the chunk going cold: delete one pinned chunk's on-disk
         // cache file out from under the cache (what an LRU sweep or a failed
-        // write_local would leave behind — pinned-but-not-resident).
+        // put_trusted would leave behind — pinned-but-not-resident).
         let victim = *pinned
             .lock()
             .get(&img.manifest_digest)
@@ -1764,9 +1607,8 @@ mod tests {
         reconcile(
             std::slice::from_ref(&img),
             readiness.clone(),
-            store.clone(),
+            fill.clone(),
             cache.clone(),
-            sem.clone(),
             crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
@@ -1791,7 +1633,7 @@ mod tests {
         // the scheduler stops sending sessions that would pay full lazy
         // population.
         let (store, cache, dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
-        let sem = Arc::new(Semaphore::new(8));
+        let fill = FillEngine::new(store.clone(), engram_fill::Config::default());
         let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
         let readiness = ImageReadiness::new();
         let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
@@ -1807,9 +1649,8 @@ mod tests {
         reconcile(
             std::slice::from_ref(&img),
             readiness.clone(),
-            store.clone(),
+            fill.clone(),
             cache.clone(),
-            sem.clone(),
             crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
@@ -1837,9 +1678,8 @@ mod tests {
         reconcile(
             std::slice::from_ref(&img),
             readiness.clone(),
-            store.clone(),
+            fill.clone(),
             cache.clone(),
-            sem.clone(),
             crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
@@ -1863,9 +1703,8 @@ mod tests {
         reconcile(
             std::slice::from_ref(&img),
             readiness.clone(),
-            store.clone(),
+            parked(&store),
             cache.clone(),
-            Arc::new(Semaphore::new(0)),
             crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
@@ -1901,8 +1740,8 @@ mod tests {
         // SAFETY: nextest process-per-test; no concurrent env readers.
         unsafe { std::env::set_var("ENGRAM_FC_UFFD_BASE_DIR", base_dir.path()) };
 
-        let (store, cache, _dir, disk_ref, mem_ref, mem_bytes) = seed().await;
-        let sem = Arc::new(Semaphore::new(8));
+        let (store, _, _dir, disk_ref, mem_ref, mem_bytes) = seed().await;
+        let fill = FillEngine::new(store.clone(), engram_fill::Config::default());
         let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
         let img = image_ref(SnapshotId::new(), disk_ref, Some(mem_ref));
 
@@ -1920,9 +1759,7 @@ mod tests {
         // Fresh pre-warm: file written + reported.
         let warmed = prefetch_one(
             &img,
-            &store,
-            &cache,
-            &sem,
+            &fill,
             &crate::peer_fill::PeerHealth::new(),
             None,
             &ledger,
@@ -1943,9 +1780,7 @@ mod tests {
             .unwrap();
         let warmed = prefetch_one(
             &img,
-            &store,
-            &cache,
-            &sem,
+            &fill,
             &crate::peer_fill::PeerHealth::new(),
             None,
             &ledger,
@@ -1966,9 +1801,7 @@ mod tests {
         std::fs::remove_file(&expected_path).unwrap();
         let warmed = prefetch_one(
             &img,
-            &store,
-            &cache,
-            &sem,
+            &fill,
             &crate::peer_fill::PeerHealth::new(),
             None,
             &ledger,
@@ -1998,8 +1831,8 @@ mod tests {
         unsafe { std::env::set_var("ENGRAM_FC_UFFD_BASE_DIR", base_dir.path()) };
         unsafe { std::env::set_var("ENGRAM_FC_BASE_SHM_MODE", "lazy") };
 
-        let (store, cache, _dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
-        let sem = Arc::new(Semaphore::new(8));
+        let (store, _, _dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
+        let fill = FillEngine::new(store.clone(), engram_fill::Config::default());
         let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
         let img = image_ref(SnapshotId::new(), disk_ref, Some(mem_ref));
         let expected_path =
@@ -2007,9 +1840,7 @@ mod tests {
 
         let warmed = prefetch_one(
             &img,
-            &store,
-            &cache,
-            &sem,
+            &fill,
             &crate::peer_fill::PeerHealth::new(),
             None,
             &ledger,
@@ -2036,7 +1867,7 @@ mod tests {
     #[tokio::test]
     async fn headroom_retry_reprefetches_without_flipping_readiness() {
         let (store, cache, _dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
-        let sem = Arc::new(Semaphore::new(8));
+        let fill = FillEngine::new(store.clone(), engram_fill::Config::default());
         let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
         let readiness = ImageReadiness::new();
         let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
@@ -2049,9 +1880,8 @@ mod tests {
         reconcile(
             std::slice::from_ref(&img),
             readiness.clone(),
-            store.clone(),
+            fill.clone(),
             cache.clone(),
-            sem.clone(),
             crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
@@ -2077,9 +1907,8 @@ mod tests {
         reconcile(
             std::slice::from_ref(&img),
             readiness.clone(),
-            store.clone(),
+            parked(&store),
             cache.clone(),
-            Arc::new(Semaphore::new(0)),
             crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
@@ -2101,9 +1930,8 @@ mod tests {
         reconcile(
             std::slice::from_ref(&img),
             readiness.clone(),
-            store.clone(),
+            fill.clone(),
             cache.clone(),
-            sem.clone(),
             crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
@@ -2134,7 +1962,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_flips_ready_when_base_memfile_vanishes() {
         let (store, cache, dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
-        let sem = Arc::new(Semaphore::new(8));
+        let fill = FillEngine::new(store.clone(), engram_fill::Config::default());
         let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
         let readiness = ImageReadiness::new();
         let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
@@ -2146,9 +1974,8 @@ mod tests {
         reconcile(
             std::slice::from_ref(&img),
             readiness.clone(),
-            store.clone(),
+            fill.clone(),
             cache.clone(),
-            sem.clone(),
             crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
@@ -2180,9 +2007,8 @@ mod tests {
         reconcile(
             std::slice::from_ref(&img),
             readiness.clone(),
-            store.clone(),
+            fill.clone(),
             cache.clone(),
-            sem.clone(),
             crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
@@ -2203,9 +2029,8 @@ mod tests {
         reconcile(
             std::slice::from_ref(&img),
             readiness.clone(),
-            store.clone(),
+            parked(&store),
             cache.clone(),
-            Arc::new(Semaphore::new(0)),
             crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
@@ -2231,11 +2056,10 @@ mod tests {
         // ADR 0092: the memfiles share the chunk cache's filesystem and
         // its sweeper can't evict them — every reconcile tick publishes
         // their allocated bytes as the cache's co-tenant reserve so the
-        // cache stops aiming for disk the memfiles occupy (the 2026-07-14
-        // w8wq DiskPressure incident: at-budget warm cache + 40 GB of
-        // unbudgeted memfiles).
+        // cache stops aiming for disk the memfiles occupy (an at-budget
+        // warm cache + 40 GB of unbudgeted memfiles trips DiskPressure).
         let (store, cache, dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
-        let sem = Arc::new(Semaphore::new(8));
+        let fill = FillEngine::new(store.clone(), engram_fill::Config::default());
         let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
         let readiness = ImageReadiness::new();
         let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
@@ -2249,9 +2073,8 @@ mod tests {
         reconcile(
             std::slice::from_ref(&img),
             readiness.clone(),
-            store.clone(),
+            fill.clone(),
             cache.clone(),
-            sem.clone(),
             crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
@@ -2292,9 +2115,8 @@ mod tests {
         reconcile(
             std::slice::from_ref(&img),
             readiness.clone(),
-            store.clone(),
+            fill.clone(),
             cache.clone(),
-            sem.clone(),
             crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
@@ -2315,9 +2137,8 @@ mod tests {
         reconcile(
             &[],
             readiness.clone(),
-            store.clone(),
+            fill.clone(),
             cache.clone(),
-            sem.clone(),
             crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
@@ -2361,6 +2182,7 @@ mod tests {
 #[cfg(test)]
 mod prewarm_tests {
     use super::*;
+    use engram_chunk_store::ChunkStore;
     use std::sync::Arc;
 
     /// ADR 0045: the pre-warm writes each manifest chunk at its
@@ -2373,9 +2195,6 @@ mod prewarm_tests {
             engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
         );
         let store = ChunkStore::new(blob);
-        let cache = engram_chunk_store::ChunkCache::new(
-            engram_chunk_store::cache::ChunkCacheConfig::new(tmp.path().join("cache")),
-        );
 
         // A sparse image: chunk at 0 (0xAA), HOLE at 4096, chunk at 8192 (0xBB).
         let img = tmp.path().join("img.bin");
@@ -2390,7 +2209,8 @@ mod prewarm_tests {
         assert_eq!(manifest.chunks.len(), 2, "the zero chunk is elided");
 
         let base = tmp.path().join("shm").join("base.base");
-        let written = prewarm_base_shm(&base, &manifest, &store, &cache)
+        let fill = FillEngine::new(store.clone(), engram_fill::Config::default());
+        let written = prewarm_base_shm(&base, &manifest, &fill)
             .await
             .expect("prewarm");
         assert_eq!(written, 2);

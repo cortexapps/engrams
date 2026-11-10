@@ -19,7 +19,7 @@ name: CI
 #   - test-fc-*:        every `#[ignore]`'d FC integration test under
 #                       nested virt, split across four parallel KVM
 #                       jobs (unprivileged / pooled host-agent /
-#                       NBD + root net / true-e2e) that share setup
+#                       root / true-e2e) that share setup
 #                       via .github/actions/fc-setup. See the block
 #                       comment above the jobs for the batch split.
 #   - web:              pnpm install + oxfmt + oxlint + tsc +
@@ -130,7 +130,6 @@ jobs:
       test_fc: ${{ steps.lanes.outputs.test_fc }}
       test_web: ${{ steps.lanes.outputs.test_web }}
       test_orchestrator: ${{ steps.lanes.outputs.test_orchestrator }}
-      test_host_sim: ${{ steps.lanes.outputs.test_host_sim }}
       test_cosim: ${{ steps.lanes.outputs.test_cosim }}
       test_buf: ${{ steps.lanes.outputs.test_buf }}
       test_integrations_cli: ${{ steps.lanes.outputs.test_integrations_cli }}
@@ -247,6 +246,20 @@ jobs:
                 -f "$chart/ci/render-values.yaml" -f "$stub" > /dev/null
             done
           done
+      # Node prep's disk scheduler script against constructed sysfs trees,
+      # and the chart default that turns it on.
+      - name: host-fleet io scheduler
+        run: |
+          set -euo pipefail
+          chart=deploy/helm/engram-host-fleet
+          sh "$chart/ci/io-scheduler-test.sh"
+          helm template test-release "$chart" -f "$chart/ci/render-values.yaml" \
+            | grep -q 'IO_SCHEDULER="none"'
+          if helm template test-release "$chart" -f "$chart/ci/render-values.yaml" \
+            --set storage.ioScheduler= | grep -q 'io-scheduler'; then
+            echo "storage.ioScheduler=\"\" still renders the io-scheduler step" >&2
+            exit 1
+          fi
       - name: terraform fmt -check
         run: terraform fmt -check -recursive -diff deploy/terraform
       - name: terraform validate (every root)
@@ -720,18 +733,23 @@ jobs:
       - uses: pnpm/action-setup@v6
         with:
           version: 9
-      # Node 24 ("Krypton") is the newest LTS line: LTS since 2025-10-28,
-      # maintenance 2026-10-20, EOL 2028-04-30. Only even majors ever go LTS.
+      # Node 26 ("Lithium") is the newest Active LTS line: LTS since
+      # 2026-10-28, maintenance 2027-10-20, EOL 2029-04-30. Node 26 is the
+      # last release under the two-per-year model; from Node 27 every annual
+      # major becomes LTS (no odd/even distinction). Node 24 moved to
+      # Maintenance LTS on 2026-10-20.
       #
-      # This major is pinned in THREE places that must move together:
+      # This major is pinned in FIVE places that must move together:
       #   - here (the web lane)
+      #   - the site lane below (same `setup-node` version)
+      #   - .github/workflows/site-deploy.yml
       #   - docker/web.Dockerfile   (`FROM node:<major>-alpine`)
       #   - flake.nix               (`nodejs_<major>`, the `nix develop` shell)
       # They had drifted to 20 / 24 / 22 respectively; Node 20 went EOL
       # 2026-04-30, so CI was building on an unsupported runtime.
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 26
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
 
@@ -783,7 +801,7 @@ jobs:
           version: 9
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 26
           cache: pnpm
           cache-dependency-path: site/pnpm-lock.yaml
 
@@ -1050,7 +1068,6 @@ jobs:
             --test lifecycle \
             --test reattach_detach \
             --test snapshot \
-            --test snapshot_uffd \
             --test exec \
             --test exec_real_vm \
             --test agentd_bundle_reexec \
@@ -1115,8 +1132,8 @@ jobs:
             --no-fail-fast \
             --test-threads=1
 
-  test-fc-nbd-net:
-    name: tests (firecracker NBD + root net, Linux + KVM)
+  test-fc-root:
+    name: tests (firecracker root, Linux + KVM)
     needs: detect
     if: needs.detect.outputs.test_fc == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -1126,85 +1143,65 @@ jobs:
       - uses: ./.github/actions/fc-setup
         with:
           gh-token: ${{ secrets.GITHUB_TOKEN }}
-          rust-cache-shared-key: fc-nbd-net
+          rust-cache-shared-key: fc-root
 
-      # ADR 0007 Phase 4: NBD daemon serves chunked disks. The
-      # `nbd_chunked_disk` integration test boots a real FC microVM
-      # with `/dev/nbd0` as the rootfs; the kernel's NBD client
-      # talks to our daemon, which serves chunk-store reads on
-      # demand. Validates the kernel-userspace NBD boundary that
-      # the unit tests can't exercise.
-      #
-      # Blacksmith DOES ship NBD — it's compiled BUILT-IN
-      # (`CONFIG_BLK_DEV_NBD=y`) in the runner's guest kernel (a bare
-      # `6.5.13`), not as a loadable module. That distinction is why
-      # this test was skipped for so long: the old gate keyed off
-      # `modprobe nbd` succeeding, but you can't modprobe a built-in
-      # driver — it FATALs with "Module nbd not found" even though
-      # the kernel already registered `/dev/nbd0..15` at boot and they
-      # work. Verified by the `nbd-probe` workflow: on both Blacksmith
-      # sizes CONFIG_BLK_DEV_NBD=y, /dev/nbd0 exists, and a qemu-nbd
-      # read/write round trip passes. So we gate on the DEVICE NODE,
-      # not on modprobe's exit code.
-      - name: Detect NBD availability
-        id: nbd_setup
-        run: |
-          # `=m` kernels (the GitHub-hosted control, dev VM) need the
-          # module loaded; `=y` kernels (Blacksmith) already expose the
-          # devices and modprobe is a harmless FATAL. Either way the
-          # truth is whether /dev/nbd0 exists afterward — so try the
-          # load best-effort and decide on the device node.
-          sudo modprobe nbd nbds_max=16 2>/dev/null || true
-          if [ -e /dev/nbd0 ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-            ls -la /dev/nbd0
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::warning title=NBD unavailable::/dev/nbd0 absent after modprobe — NBD integration tests skipped on this runner."
-          fi
-
-      # Runs under `sudo -E` (not plain cargo): the test's own preamble
-      # (nbd_chunked_disk.rs) notes that current kernels gate NBD
-      # configuration (netlink AND ioctl) behind CAP_SYS_ADMIN
-      # regardless of the device's permission bits, mirroring the
-      # root-required FC tests below. `env "PATH=$PATH"` re-adds the
-      # cargo/rustc PATH that sudo scrubs; `-E` preserves
-      # ENGRAM_TEST_NBD_DEVICE + FC_TEST_KERNEL/FC_TEST_ROOTFS.
-      #
-      # Stays `--test-threads=1`. Per-slot `/dev/nbd{N}` keying fixes the
-      # device collision, but nbd_netlink_reconfigure's parked-IO assertion
-      # is coupled to a dead-connection timeout that -j4 CPU contention
-      # pushes past its window (it timed out under parallelism in CI). The
-      # contention can't be slot-partitioned away, so this batch stays
-      # serial; the dedup below is the win that doesn't risk a flake.
+      # Root-only lanes: the pagemap and idle-page scans, the post-copy
+      # moves that use them, the dm-thin pool, and the TAP/netns tests.
+      # `sudo -E env "PATH=$PATH"` keeps the cargo env sudo scrubs.
       - name: Idle-page tracking and advisory drain tests (root)
         run: |
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-host-agent -p engram-uffd-handler --lib \
-            -E 'test(page_idle::tests::anonymous_mapping_accesses_clear_idle_bits) | test(fake_capture_and_destination_poller_deliver_final_hot_trace) | test(peer_mode_drains_sealed_chunks_and_sweep_never_overwrites_them)'
+            -E 'test(page_idle::tests::anonymous_mapping_accesses_clear_idle_bits) | test(peer_mode_drains_sealed_chunks_and_sweep_never_overwrites_them)'
 
-      - name: NBD chunked-disk + netlink tests (Linux + KVM + nbd, root)
-        if: steps.nbd_setup.outputs.available == 'true'
-        env:
-          ENGRAM_TEST_NBD_DEVICE: /dev/nbd0
+      # Post-copy moves: the capture seals the guest's dirty pages from
+      # its pagemap (root) and the disks move as session-volume
+      # checkpoints. Serial: one PooledBackend per host owns host-global
+      # resources (the vsock CID allocator, the chunk cache).
+      - name: Post-copy teleport tests (root)
         run: |
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-host-agent \
             --test migration_source \
             --test two_host_live_teleport \
             --test two_host_drain_wave \
-            --test nbd_chunked_disk \
-            --test nbd_netlink_reconfigure \
-            --test nbd_restore_cancel \
-            --test nbd_shutdown_abandon_race \
-            --test nbd_shutdown_final_flush \
-            --test nbd_two_devices \
-            --test swap_nbd_snapshot \
-            --test nbd_spec_reserve \
-            --test nbd_verify_on_read \
-            --test nbd_proc_holder \
-            --test nbd_connected_inventory \
             --test postcopy_source_fresh_create \
+            --run-ignored ignored-only \
+            --no-fail-fast \
+            --test-threads=1
+
+      # ADR 0125: the session-disk pool, built by the same script
+      # node-prep runs in production. A runner that cannot build one
+      # fails the lane: the pool tests are the production disk path.
+      - name: Build the dm-thin pool
+        run: |
+          sudo apt-get install -y -qq --no-install-recommends thin-provisioning-tools
+          sudo env POOL_DIR=/var/lib/engram/thin POOL_DATA_SIZE=4G POOL_META_SIZE=128M \
+            sh deploy/helm/engram-host-fleet/files/thin-pool.sh
+
+      # Every state node prep can find: a used disk, a disk without room,
+      # a crash before the first activation, a restart.
+      - name: Node-prep pool states (root)
+        run: sudo sh scripts/thin-pool-states-test.sh
+
+      # The disk over the pool, then the session disk under a real guest
+      # over the same pool (`session_disk` reads ENGRAM_TEST_THIN_POOL).
+      # The ublk source's tests run in `test-ublk-root`: this runner's
+      # kernel has no ublk driver.
+      - name: dm-thin session-disk tests (root)
+        env:
+          ENGRAM_TEST_THIN_POOL: engram-pool
+        run: |
+          sudo -E env "PATH=$PATH" cargo nextest run \
+            -p engram-disk-thin \
+            --test thin_pool \
+            --test clone \
+            --run-ignored ignored-only \
+            --no-fail-fast \
+            --test-threads=1
+          sudo -E env "PATH=$PATH" cargo nextest run \
+            -p engram-host-agent \
+            --test session_disk \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
@@ -1253,6 +1250,86 @@ jobs:
         if: always()
         run: |
           sudo chown -R "$USER":"$USER" target/ ~/.cargo ~/.docker 2>/dev/null || true
+
+  # ------------------------------------------------------------------
+  # The ublk source of a hydrating session volume (ADR 0125), as root
+  # over a dm-thin pool. No guest boots, so no KVM. It runs on a
+  # GitHub-hosted runner because the Blacksmith kernel is built without
+  # `CONFIG_BLK_DEV_UBLK`; Ubuntu's kernel has `ublk_drv` as a module,
+  # as the production node image does.
+  # ------------------------------------------------------------------
+  test-ublk-root:
+    name: tests (ublk source, root)
+    needs: detect
+    if: needs.detect.outputs.test_fc == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc and the pool tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            protobuf-compiler thin-provisioning-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ublk-root
+      - uses: taiki-e/install-action@nextest
+      - name: Build the dm-thin pool and load ublk
+        run: |
+          sudo env POOL_DIR=/var/lib/engram/thin POOL_DATA_SIZE=4G POOL_META_SIZE=128M \
+            sh deploy/helm/engram-host-fleet/files/thin-pool.sh
+          # Some Ubuntu kernels keep `ublk_drv` in a separate package.
+          if ! sudo modprobe ublk_drv; then
+            sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
+            sudo modprobe ublk_drv
+          fi
+          test -e /dev/ublk-control
+      - name: ublk source and lazy restore tests (root)
+        env:
+          ENGRAM_TEST_THIN_POOL: engram-pool
+          ENGRAM_TEST_UBLK: "1"
+        run: |
+          sudo -E env "PATH=$PATH" cargo nextest run \
+            -p engram-host-agent \
+            --test blk_source \
+            --test lazy_restore \
+            --run-ignored ignored-only \
+            --no-fail-fast \
+            --test-threads=1 &
+          run=$!
+          # A thread blocked in the kernel on a ublk device cannot be
+          # killed, so a hung test never ends: show where it waits.
+          for _ in $(seq 1 120); do
+            kill -0 "$run" 2>/dev/null || break
+            sleep 5
+          done
+          if kill -0 "$run" 2>/dev/null; then
+            echo "::error::the ublk tests did not end in 10 minutes"
+            for exe in /proc/[0-9]*/exe; do
+              case "$(sudo readlink "$exe" 2>/dev/null)" in
+                */deps/blk_source-*|*/deps/lazy_restore-*) ;;
+                *) continue ;;
+              esac
+              pid=${exe#/proc/}; pid=${pid%/exe}
+              for task in /proc/"$pid"/task/*; do
+                echo "== pid $pid task ${task##*/} $(cat "$task/comm") $(cut -d' ' -f3 "$task/stat")"
+                sudo cat "$task/stack" 2>/dev/null || true
+              done
+            done
+            for dev in /sys/block/ublkb*; do
+              [ -e "$dev" ] && echo "$dev inflight: $(cat "$dev/inflight") holders: $(ls "$dev/holders")"
+            done
+            sudo dmsetup ls || true
+            sudo dmesg | tail -60
+            exit 1
+          fi
+          wait "$run"
+      - name: Restore ownership after sudo tests
+        if: always()
+        run: |
+          sudo chown -R "$USER":"$USER" target/ ~/.cargo 2>/dev/null || true
 
   test-fc-e2e:
     name: tests (firecracker true-e2e, Linux + KVM)
@@ -1712,10 +1789,12 @@ jobs:
           # egress daemon (fail-closed), so the stack ships the daemon
           # binary beside it. `engram-cli` is the `engrams` binary the
           # e2e lane drives enable/registry/session with (ENGRAMS_BIN).
+          # Every resume spawns `engram-uffd-handler` beside the host agent.
           cargo build --release \
               -p engram-coordinator \
               -p engram-host-agent \
               -p engram-egress-proxyd \
+              -p engram-uffd-handler \
               -p engram-publish-builtin-harness \
               -p engram-cli
 
@@ -1732,6 +1811,7 @@ jobs:
             target/release/engram-coordinator
             target/release/engram-host-agent
             target/release/engram-egress-proxyd
+            target/release/engram-uffd-handler
             target/release/engram-publish-builtin-harness
             target/release/engrams
             target/x86_64-unknown-linux-musl/release/engram-agentd
@@ -1895,14 +1975,26 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends \
               musl-tools jq bc python3
 
-      - name: Install firecracker (v1.16.0)
+      # The forked firecracker the host image ships, as in the fc-setup
+      # action: keyed by the submodule's gitlink SHA, and an error when the
+      # artifact is missing.
+      - uses: oras-project/setup-oras@v2
+        with:
+          version: 1.3.0
+
+      - name: Install forked firecracker
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          FC_VER=v1.16.0
-          curl -fL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VER}/firecracker-${FC_VER}-x86_64.tgz" \
-            -o /tmp/fc.tgz
-          tar -xzf /tmp/fc.tgz -C /tmp
-          sudo install -m 0755 "/tmp/release-${FC_VER}-x86_64/firecracker-${FC_VER}-x86_64" \
-              /usr/local/bin/firecracker
+          set -euo pipefail
+          FC_SHA="$(git ls-tree HEAD third_party/firecracker | awk '{print $3}')"
+          echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          mkdir -p "$HOME/fc-fork"
+          if ! oras pull "ghcr.io/${{ github.repository }}/firecracker:$FC_SHA" --output "$HOME/fc-fork"; then
+            echo "::error::forked firecracker artifact firecracker:$FC_SHA is not published; dispatch bake-images on this branch to build it"
+            exit 1
+          fi
+          sudo install -m 0755 "$HOME/fc-fork/firecracker" /usr/local/bin/firecracker
           firecracker --version
 
       - name: Cache FC kernel + rootfs artifacts
@@ -1948,10 +2040,10 @@ jobs:
 
       - name: Mark e2e binaries executable
         run: |
-          chmod +x target/release/engram-{coordinator,host-agent,egress-proxyd,publish-builtin-harness}
+          chmod +x target/release/engram-{coordinator,host-agent,egress-proxyd,uffd-handler,publish-builtin-harness}
           chmod +x target/release/engrams
           chmod +x target/x86_64-unknown-linux-musl/release/engram-agentd
-          ls -l target/release/engram-{coordinator,host-agent,egress-proxyd,publish-builtin-harness} \
+          ls -l target/release/engram-{coordinator,host-agent,egress-proxyd,uffd-handler,publish-builtin-harness} \
                 target/release/engrams \
                 target/x86_64-unknown-linux-musl/release/engram-agentd
 
@@ -2026,6 +2118,20 @@ jobs:
       - name: Install squashfs-tools (for bundles-squashfs)
         run: sudo apt-get update -qq && sudo apt-get install -y -qq squashfs-tools
 
+      # A Firecracker host-agent needs a session-disk pool; Tilt names
+      # engram-pool for the Firecracker backend, and engram-pool-b for the
+      # second host-agent of the two-host variant.
+      - name: Build the dm-thin pools
+        run: |
+          sudo apt-get install -y -qq --no-install-recommends thin-provisioning-tools
+          sudo env POOL_DIR=/var/lib/engram/thin POOL_DATA_SIZE=12G POOL_META_SIZE=256M \
+            sh deploy/helm/engram-host-fleet/files/thin-pool.sh
+          if [ "${{ matrix.two_hosts }}" = "1" ]; then
+            sudo env POOL_NAME=engram-pool-b POOL_DIR=/var/lib/engram/thin-b \
+              POOL_DATA_SIZE=12G POOL_META_SIZE=256M \
+              sh deploy/helm/engram-host-fleet/files/thin-pool.sh
+          fi
+
       - name: Bring up prod-shape stack (tilt)
         env:
           ENGRAM_INTEG_BIN_DIR: ./target/release
@@ -2093,15 +2199,6 @@ jobs:
           # ENGRAM_E2E_IMAGE_URI set via $GITHUB_ENV in the bake step;
           # points at the just-baked `demo` image (harness-free; ADR 0062 —
           # the `claude` harness rides the host `current_bundles` stamp).
-          #
-          # Blacksmith's kernel ships NBD built-in (CONFIG_BLK_DEV_NBD=y),
-          # so the root host-agent sizes its NBD pool from the kernel and
-          # NBD-attaches the chunked disk (the teleport variant's two
-          # host-agents get disjoint device ranges from the Tiltfile).
-          # Assert it: a null cow-state here is now a real
-          # regression, not the old "no nbd.ko" environment gap, so the
-          # Phase B chunked-disk tests fail loud instead of skipping.
-          ENGRAM_EXPECT_NBD: "1"
           # suite: "" → the two-host evac test self-skips (and is filtered out
           # below anyway). teleport: "1" → the evac test hard-asserts that >=2
           # hosts registered (a single-host regression fails loud instead of
@@ -2322,47 +2419,9 @@ jobs:
       - name: calm swarm (100 seeds x 1500 steps, faithful hosts)
         run: cargo run -p engram-dst --release --bin sim -- --faithful --seeds 0..100 --steps 1500 --profile calm
 
-  # ADR 0098 P9: the HOST-INTERNAL deterministic-simulation swarm
-  # (engram-dst-host — Flows A-F over the real host-agent machinery on a
-  # per-run tempdir). Fixed seed windows (a failure is always locally
-  # reproducible: `just sim-host <n> <steps> <profile>`); the deep-horizon
-  # arm is nightly-sim.yml's host-swarm job. Gated on the sim binary's own
-  # release closure (detect's `test_host_sim`), which is disjoint from
-  # engram-dst's coordinator closure by construction.
-  test-host-sim:
-    name: host simulation swarm (engram-dst-host)
-    needs: detect
-    if: needs.detect.outputs.test_host_sim == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install protoc
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
-      - name: Setup mold linker
-        uses: rui314/setup-mold@v1
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: workspace-release-host-sim
-      - name: replay-twice determinism self-check (seed 5, chaos)
-        # Two runs of one seed must produce byte-identical per-seed output
-        # (the bin's success lines are a pure function of the seed) — the
-        # cheapest whole-binary guard against a nondeterminism leak
-        # (BTreeMap discipline, entropy stream, paused-clock ordering).
-        run: |
-          cargo run -p engram-dst-host --release --bin sim-host -- --seed 5 --steps 800 --profile chaos > "$RUNNER_TEMP/replay-a.txt"
-          cargo run -p engram-dst-host --release --bin sim-host -- --seed 5 --steps 800 --profile chaos > "$RUNNER_TEMP/replay-b.txt"
-          diff "$RUNNER_TEMP/replay-a.txt" "$RUNNER_TEMP/replay-b.txt"
-      - name: chaos swarm (60 seeds x 1000 steps)
-        run: cargo run -p engram-dst-host --release --bin sim-host -- --seeds 0..60 --steps 1000 --profile chaos
-      - name: calm swarm (30 seeds x 1000 steps)
-        run: cargo run -p engram-dst-host --release --bin sim-host -- --seeds 0..30 --steps 1000 --profile calm
-
   # ADR 0098 R-CoSim (rung 1): the coordinator↔host BOUNDARY simulator
-  # (engram-dst-cosim). Unlike test-sim / test-host-sim (swarm binaries over
-  # disjoint closures), this is a small set of DIRECTED pinned-seed scenarios
+  # (engram-dst-cosim). Unlike test-sim (a swarm binary over the coordinator
+  # closure), this is a small set of DIRECTED pinned-seed scenarios
   # — the real coordinator drivers and the real host-agent flows co-simulated
   # over one shared clock — so it runs as `nextest`, not a swarm bin. Gated on
   # the crate's own (deliberately spanning) release closure (detect's
@@ -2473,12 +2532,12 @@ jobs:
       - buf
       - test-fc-unprivileged
       - test-fc-pooled
-      - test-fc-nbd-net
+      - test-fc-root
+      - test-ublk-root
       - test-fc-e2e
       - vz
       - test-macos
       - test-sim
-      - test-host-sim
       - test-cosim
       # The end-to-end coord lane + its upstream bake/artifact deps. Previously
       # omitted (e2e was non-required), which let a red e2e merge — now gated.

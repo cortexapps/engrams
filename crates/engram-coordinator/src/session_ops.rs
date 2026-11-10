@@ -22,8 +22,11 @@ use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState, SessionOp}
 use engram_core::types::BindingDisposition;
 use engram_core::types::SessionState;
 use engram_core::SessionId;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Notify;
+use tracing::Instrument as _;
 
+use crate::error::ApiError;
 use crate::state::SharedState;
 
 /// Fallback rescan cadence — crash-recovery/missed-notify bound only.
@@ -73,8 +76,9 @@ pub enum OpOutcome {
     /// backoff is wrong twice: the wait is not a failure, and the
     /// inflated attempts counter then slows the retries that matter
     /// (the 2026-07-31 incident recovered at a 40 s cadence for this
-    /// reason). The attempts counter still increments in the store;
-    /// only the pacing is fixed.
+    /// reason). The requeue gives back the attempt the claim counted, so
+    /// a wait never grows a later `Retry` backoff or spends a verb's
+    /// attempt budget.
     RetryAfter(Duration, String),
     /// Terminal failure.
     Failed(String),
@@ -111,6 +115,7 @@ impl OpCtx<'_> {
             .services
             .meta
             .op_record_step(self.op.id, self.epoch, step)
+            .instrument(tracing::info_span!("coord.op.step", step))
             .await
         {
             Ok(true) => true,
@@ -176,7 +181,7 @@ pub async fn enqueue_claim(
 /// executor loop picks it up (NOTIFY-hot).
 ///
 /// Returns the enqueue outcome so wire handlers can bounded-observe the
-/// row (`op_get` on the returned id) for API compatibility.
+/// row with [`observe_op`] for API compatibility.
 pub async fn enqueue(
     state: &SharedState,
     session_id: SessionId,
@@ -189,14 +194,78 @@ pub async fn enqueue(
         // Drive detached from the caller's (possibly wire-lifetime)
         // future: the op row is the durable owner, this spawn is just
         // compute. A cancelled request cancels nothing but its own
-        // observation; a dead pod's op is reclaimed by the sweep.
+        // observation; a dead pod's op is reclaimed by the sweep. The
+        // claimed op joins the enqueuer's trace; the ops the completion
+        // re-drive claims after it start their own.
         let state = state.clone();
         let op = op.clone();
+        let parent = tracing::Span::current();
         tokio::spawn(async move {
-            drive_claimed(&state, op).await;
+            drive_claimed_under(&state, op, parent).await;
         });
     }
     Ok(outcome)
+}
+
+/// How often [`observe_op`] re-reads the op row when no op-finished id
+/// arrives: an id lost to a listener reconnect, or an op ended by a build
+/// that does not send one.
+pub(crate) const OP_OBSERVE_FALLBACK_POLL: Duration = Duration::from_secs(2);
+
+/// Reads the `op_id` row and gives it to `settle` until `settle` returns
+/// a result, or returns the retryable `in_flight` conflict after
+/// `timeout`. `settle` gets `None` when there is no row to read. Between
+/// reads it waits for the op's id on [`AppState::op_finished`] (sent when
+/// the op ends on any replica), and re-reads every
+/// [`OP_OBSERVE_FALLBACK_POLL`] without one.
+///
+/// [`AppState::op_finished`]: crate::state::AppState::op_finished
+pub(crate) async fn observe_op<T, F, Fut>(
+    state: &SharedState,
+    op_id: Option<i64>,
+    timeout: Duration,
+    in_flight: &str,
+    mut settle: F,
+) -> Result<T, ApiError>
+where
+    F: FnMut(Option<SessionOp>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<T>, ApiError>>,
+{
+    let deadline = state.services.clock.now_mono() + timeout;
+    // Subscribed before the first read, so an end after that read is seen.
+    let mut ended = state.op_finished.subscribe();
+    loop {
+        let op = match op_id {
+            Some(op_id) => state.services.meta.op_get(op_id).await.ok().flatten(),
+            None => None,
+        };
+        if let Some(settled) = settle(op).await? {
+            return Ok(settled);
+        }
+        let remaining = deadline.saturating_sub(state.services.clock.now_mono());
+        if remaining.is_zero() {
+            return Err(ApiError::Conflict(in_flight.to_string()));
+        }
+        let mut fallback = state
+            .services
+            .clock
+            .sleep(remaining.min(OP_OBSERVE_FALLBACK_POLL));
+        loop {
+            tokio::select! {
+                () = &mut fallback => break,
+                msg = ended.recv() => match msg {
+                    Ok(id) if Some(id) == op_id => break,
+                    Ok(_) => {}
+                    // Our id may be among the dropped ones.
+                    Err(RecvError::Lagged(_)) => break,
+                    Err(RecvError::Closed) => {
+                        fallback.await;
+                        break;
+                    }
+                },
+            }
+        }
+    }
 }
 
 /// Apply a session state transition under `fence`. Epoch 0 (a caller
@@ -398,8 +467,7 @@ impl OpClaim {
         let op_id = self.op.id;
         let epoch = self.epoch;
         let handle = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(20));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut tick = engram_core::periodic(Duration::from_secs(20));
             tick.tick().await; // consume the immediate first tick
             loop {
                 tick.tick().await;
@@ -432,6 +500,7 @@ impl OpClaim {
             .meta
             .op_finish(self.op.id, self.epoch, outcome, error)
             .await;
+        publish_op_finished(&self.state, self.op.id);
         // Completion re-drive: a queued op behind this inline claim must
         // not wait for the fallback poll.
         let state = self.state.clone();
@@ -466,9 +535,17 @@ impl Drop for OpClaim {
                     Some("inline claim dropped without an explicit finish"),
                 )
                 .await;
+            publish_op_finished(&state, op_id);
             drive_session(&state, session_id).await;
         });
     }
+}
+
+/// Wakes this replica's waiters for `op_id` without the NOTIFY round
+/// trip that wakes the other replicas.
+fn publish_op_finished(state: &SharedState, op_id: i64) {
+    // No receivers is the normal case: no RPC is waiting.
+    let _ = state.op_finished.send(op_id);
 }
 
 /// RAII handle for an inline claim's heartbeat task.
@@ -493,8 +570,7 @@ impl Drop for OpClaimHeartbeat {
 fn spawn_op_heartbeat(state: &SharedState, op_id: i64, epoch: i64) -> OpHeartbeat {
     let state = state.clone();
     let handle = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(OP_HEARTBEAT_INTERVAL);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut tick = engram_core::periodic(OP_HEARTBEAT_INTERVAL);
         tick.tick().await; // consume the immediate first tick
         loop {
             tick.tick().await;
@@ -715,8 +791,13 @@ pub async fn drive_session(state: &SharedState, session_id: SessionId) {
 /// Drive an ALREADY-CLAIMED op (the reclaim sweep's continuation).
 /// `pub` so the DST harness mirrors the sweep (engram-dst, ADR 0098 D5).
 pub async fn drive_claimed(state: &SharedState, op: SessionOp) {
+    drive_claimed_under(state, op, tracing::Span::current()).await;
+}
+
+/// [`drive_claimed`] with the claimed op's span parented on `parent`.
+async fn drive_claimed_under(state: &SharedState, op: SessionOp, parent: tracing::Span) {
     let session_id = op.session_id;
-    drive_one(state, op).await;
+    drive_one(state, op).instrument(parent).await;
     // Completion re-drive — iterative (review finding #13).
     drive_session(state, session_id).await;
 }
@@ -724,6 +805,11 @@ pub async fn drive_claimed(state: &SharedState, op: SessionOp) {
 /// Drive exactly one CLAIMED op to its terminal row state. No re-drive —
 /// the caller ([`drive_session`]'s loop, or [`drive_claimed`]) owns
 /// continuation.
+#[tracing::instrument(
+    name = "coord.op",
+    skip_all,
+    fields(op_id = op.id, kind = op.kind.as_str(), session_id = %op.session_id, attempts = op.attempts),
+)]
 async fn drive_one(state: &SharedState, op: SessionOp) {
     let epoch = op.epoch.expect("claimed op carries its epoch");
     // Enqueue→claim latency, from when the row became CLAIMABLE — for a
@@ -748,13 +834,12 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
     // (RAII abort) before `op_finish` so the beat never re-stamps a
     // just-finished row.
     let heartbeat = spawn_op_heartbeat(state, op.id, epoch);
-    // ADR 0079 backstop / the 2026-07-17 resume-stall incident (session
-    // 03e6535e): the within-step liveness heartbeat above PROVES the
+    // ADR 0079 backstop: the within-step liveness heartbeat above PROVES the
     // executor is alive independently of step progress — by design, so a
     // long-but-healthy host RPC is never reclaimed. Its failure mode is an
     // executor that is alive but WEDGED: a verb `await` that never returns
-    // (there, `host.start_agent` on a resume `finish` step hung on a dead
-    // rootfs device) keeps the row heartbeating forever, so the 180s
+    // (for example, `host.start_agent` on a resume `finish` step hung on
+    // a dead rootfs device) keeps the row heartbeating forever, so the 180s
     // stale-op reclaim can never fire and the op is pinned until a deploy
     // rolls the pod (34 minutes, in the incident). The per-RPC
     // `grpc-timeout`s (restore/start_agent, 240s) are the first line; this
@@ -778,8 +863,8 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
     // concurrently with the successor op (a retry's fresh capture, or a
     // Deliver/Resume against the same guest), corrupting snapshot
     // quiescence. So `op_deadline` returns `None` for those verbs (they keep
-    // their own bounds — the ADR-0090 quarantine capture timeout, and the
-    // 180s reclaim on genuine executor death); Resume/CreateBoot leave only
+    // their own bound, the 180s reclaim on genuine executor death);
+    // Resume/CreateBoot leave only
     // an orphan-reaped half-restore or a reattach-idempotent half-spawn, and
     // Deliver/Destroy have no shared-sandbox cleanup, so those are bounded.
     // Stamp the attempt start on the injected clock: the requeue arms
@@ -817,8 +902,7 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
         // the bare delay. DST finding (ADR 0108 swarm, seed 33043259):
         // an attempt whose dispatch burns LONGER than its requeue delay
         // — a hung host RPC resolved only by `op_deadline` (Deliver
-        // 120s) or by an in-verb bound (evict's capture timeout) —
-        // re-arms every SIBLING op on the session whose ≤60s-capped
+        // 120s) — re-arms every SIBLING op on the session whose ≤60s-capped
         // backoff it just outlasted. Two such ops mutually re-arm:
         // each one's burn makes the other due again, `drive_session`'s
         // claim loop never runs dry, and the lane churns hung RPCs
@@ -854,13 +938,16 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
         OpOutcome::RetryAfter(delay, e) => {
             let paced = attempt_elapsed(state, attempt_started) + delay;
             tracing::debug!(op_id = op.id, session_id = %op.session_id, kind = op.kind.as_str(), attempts = op.attempts, delay_ms = paced.as_millis() as u64, error = %e, "op deferred (fixed cadence)");
-            let requeued = meta.op_requeue_with_backoff(op.id, epoch, paced, &e).await;
+            let requeued = meta.op_requeue_wait(op.id, epoch, paced, &e).await;
             if matches!(requeued, Ok(true)) {
                 arm_maturity_wake(state, paced);
             }
             requeued
         }
     };
+    if terminal {
+        publish_op_finished(state, op.id);
+    }
     // An attach event can arrive after the step's last read but before
     // requeue. Its queued-only wake then misses the running op. Recheck
     // after requeue so that this race cannot retain the full pacing delay.
@@ -994,8 +1081,7 @@ fn backoff(attempts: i32) -> Duration {
 /// (Teleport), where dropping the host RPC spawns unfenced CaptureUnwind /
 /// abort cleanup on the shared sandbox that would race a successor op (see
 /// the cancellation-safety note in [`drive_one`]). Those verbs keep their
-/// existing bounds: the ADR-0090 quarantine capture timeout and the 180s
-/// reclaim on genuine executor death.
+/// existing bound: the 180s reclaim on genuine executor death.
 fn op_deadline(kind: OpKind) -> Option<Duration> {
     let deadline = match kind {
         // The worst legitimate case: restore (≤240s grpc) in the `restore`
@@ -1012,8 +1098,7 @@ fn op_deadline(kind: OpKind) -> Option<Duration> {
     };
     // Operators can pin a single global backstop (and tests set a short one)
     // via `ENGRAM_OP_DEADLINE_SECS` — applied only to deadline-eligible
-    // verbs, never to force one onto a cancel-unsafe verb. Mirrors the
-    // `ENGRAM_QUARANTINE_CAPTURE_TIMEOUT_SECS` knob.
+    // verbs, never to force one onto a cancel-unsafe verb.
     let deadline = std::env::var("ENGRAM_OP_DEADLINE_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())

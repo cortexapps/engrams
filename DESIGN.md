@@ -184,7 +184,7 @@ Git is **not** in this table. Agents that want their work to land in a remote do
 ### Host agent (`engram-host-agent`)
 
 **Responsibilities:**
-- Host-side `PooledBackend` wrapper composes the chunked-OCI image cache, tiered chunk resolver, egress proxy, and NBD pool onto any `SandboxBackend` (FC / VZ / process). Each session-create resolves the image's rootfs through the cache (NVMe → BlobStorage → OCI registry; ADR 0008) before delegating to the underlying backend. The `PooledBackend` is what the host-agent's `LocalHostClient` wraps as its `SandboxBackend` inner; `LocalHostClient` itself adds harness routing (`bind_session`/`unbind_session`/`send_prompt`) by referencing a shared `HarnessHub` (ADR 0011).
+- Host-side `PooledBackend` wrapper composes the image cache, the chunk store, egress proxy, and the session-disk pool (see [Session disk](#session-disk)) onto any `SandboxBackend` (FC / VZ / process). Each session-create resolves the image's rootfs through the chunk store before delegating to the underlying backend. A chunk comes from the local NVMe cache, a peer host, or the object store; the host's fill engine (`engram-fill`) admits and schedules the object-store fetches. The OCI registry is not a chunk tier: no session read goes to it. The `PooledBackend` is what the host-agent's `LocalHostClient` wraps as its `SandboxBackend` inner; `LocalHostClient` itself adds harness routing (`bind_session`/`unbind_session`/`send_prompt`) by referencing a shared `HarnessHub` (ADR 0011).
 - Drive sandbox lifecycle through `SandboxBackend` (`create`/`destroy`/`exec_stream`/`snapshot`/`restore`/`start_agent`/`set_harness_sink`); harness routing through `HarnessHub` (`bind_session`/`unbind_session`/`send_prompt`/`accept_via_session_lookup`). The hub's `EventSink` ships every per-session event over the WS as `NotifyKind::HarnessEvent`; the coord's read loop re-emits those into its in-proc hub so SSE subscribers see the same stream as mode=all.
 - Run snapshot manager (host-local; see below).
 - Run the `HarnessHub` TCP listener: in-VM harness adapters dial back via `engram-transport` (vsock or virtio-console) → host-side TCP forwarding → `session_events` ingestion.
@@ -197,6 +197,149 @@ Git is **not** in this table. Agents that want their work to land in a remote do
 - `engram-sandbox-vz`: Apple's Virtualization.framework via `objc2-virtualization` bindings; APFS `clonefile(2)` for snapshots; multi-port virtio-console for the host↔guest control plane (ADR 0003).
 - `engram-sandbox-process`: `tokio::process::Command` + per-sandbox cwds; tar+gzip for the dev "snapshot" path.
 - bincode-over-WebSocket `Frame` protocol (`engram-protocol`) to the coordinator.
+
+### Session disk
+
+A session's disk is a volume the kernel owns. On Linux it is a thin volume in a
+device-mapper pool that node-prep builds (`thinPool` in the host-fleet chart; a Firecracker
+host agent refuses to start without one); on macOS
+it is a sparse file under the work dir. Both sit behind `engram_host_core::SessionDisk`
+and the two flows in `engram_host_core::disk_flows`: `stage` turns a chunk-store manifest
+into a volume, and `checkpoint` turns a volume into a manifest. The guard for each fact is
+the test named beside it.
+
+- No userspace process is in the data path. The host agent holds a volume only while it
+  stages or checkpoints it; a volume outlives every handle to it and reopens by name
+  (`a_volume_survives_a_dropped_handle_and_opens_by_name`). An acknowledged guest write
+  is in the host page cache or the pool, never in host-agent memory. A host-agent restart
+  reattaches a running guest with no change to the disk and loses none of its writes
+  (`a_host_agent_restart_keeps_the_guest_and_every_write`).
+- Reattach holds only between builds with the same `engram_protocol::REATTACH_GENERATION`
+  (ADR 0126). An upgrade to a higher generation first drains every host on a lower one:
+  the chart's pre-upgrade hook cordons it, checkpoints each active session that has no
+  checkpoint, and evicts every session, and fails the upgrade before any change when a
+  session cannot be evicted
+  (`an_old_host_is_cordoned_and_each_session_state_gets_its_action`). A host that
+  registers with a higher generation has the drain's cordon lifted
+  (`only_a_higher_reattach_generation_lifts_a_cordon`).
+- A checkpoint pauses the guest only for the page-cache sync and the volume snapshot; the
+  upload runs after the guest resumes
+  (`a_checkpoint_split_across_the_pause_publishes_the_paused_state`) and carries only the
+  blocks that changed since the previous checkpoint
+  (`checkpoints_upload_only_what_changed_and_rotate_the_volume`,
+  `thin_delta_reports_exactly_what_the_full_compare_reports`). Under a guest writing at
+  full rate the sync and snapshot stay under two seconds however much it wrote
+  (`the_disk_pause_is_bounded_while_the_guest_writes_at_full_rate`).
+- A resume boots before its disk is copied in. The live volume is a dm-clone device over
+  a snapshot of the nearest base the host holds: the kept checkpoint volume or staged image
+  version that shares the most chunks with the session's manifest at the same offset, so an
+  image whose tag moved still supplies the blocks it shares
+  (`a_resume_starts_from_the_staged_volume_that_shares_the_most`), or an empty volume when
+  none shares any; regions the base holds in final form are marked copied by
+  a discard, and the kernel copies the rest in behind the running guest from a ublk source
+  the host agent serves out of the fill engine. A guest read of a region the copy has not
+  reached goes through the source at `Demand`; the chunks the guest read first on the
+  session's last window are fetched at `Prefix` ahead of the copy. When every region is
+  copied the device is reloaded as a thin snapshot of its destination and the source
+  stops; the path Firecracker opened never changes
+  (`a_hydrating_device_copies_only_the_delta_and_settles_onto_its_destination`,
+  `a_lazy_resume_reads_cold_chunks_through_the_source_and_settles`). A checkpoint in the
+  window reads nothing through the source and loses no write: a block whose mapping
+  changed since the base is the snapshot's, any other is the manifest's
+  (`a_checkpoint_of_a_hydrating_volume_lays_the_changed_blocks_over_the_wanted_disk`,
+  `a_checkpoint_during_hydration_publishes_the_disk_and_keeps_the_names_honest`). Only a
+  snapshot taken after the settle becomes a checkpoint volume
+  (`a_snapshot_taken_while_hydrating_never_becomes_the_checkpoint_volume`). The periodic
+  checkpoint waits for the settle, for at most 10 minutes
+  (`a_running_settle_holds_the_periodic_checkpoint_for_a_bounded_time`); an eviction or
+  a snapshot does not wait. A whole chunk read for a volume is not hashed
+  (`read_does_not_hash_what_the_store_returns`). A
+  host-agent restart serves every hydrating volume again from the pool's names, and never
+  deletes one it does not serve (`a_killed_process_leaves_a_volume_the_next_one_serves_again`).
+  A store error that can pass stalls a read of the source; it does not fail it.
+  A node needs `ublk_drv`; node-prep loads it beside `dm_thin_pool`. Without the ublk
+  control device a host writes each volume in full before its guest starts.
+- A live move carries the disk in 64 KiB blocks in three tiers: the checkpoint the source
+  advertises, the blocks a snapshot taken while the guest runs changed since it, and the
+  blocks the snapshot under the pause changed since that one. A source with no checkpoint
+  volume (hydrating, or settled before its first checkpoint) moves by snapshot
+  (`a_role_without_a_checkpoint_volume_refuses_a_live_move`). The pause carries only what
+  the guest wrote during the precopy
+  (`two_host_teleport_seals_only_the_residual_under_steady_writes`,
+  `a_precopy_snapshot_lives_beside_the_one_the_capture_takes`), and the destination's
+  disk holds every byte once the source is destroyed
+  (`two_host_teleport_rootfs_survives_source_destroy`).
+- A live move pauses the source only after the destination has provisioned its disks
+  and landed the precopy, or after a bound when it does not ask
+  (`a_presetup_learns_when_the_destination_is_ready_for_the_pause`).
+- A live move's destination asks the source for each sealed memory chunk once: the drain
+  skips a chunk that a fault already requested, and a fault waits for a request that is
+  already on the wire (`drain_skips_a_requested_chunk_and_records_the_sealed_output`).
+  The destination records every chunk the source supplied. After the drain it publishes
+  the source's chain manifest with those chunks over it as its own lineage, so its first
+  checkpoint is a diff (`post_copy_seed_publishes_the_peer_chunks_over_the_source_manifest`).
+  No capture runs on the destination before that seed
+  (`migration_drain_wait_reports_a_finished_drain_and_leaves_the_role`).
+- While the destination drains, the move's op holds the session lane only for one-second
+  drain waits, so the moved session's other ops run between them
+  (`release_gives_the_lane_back_while_the_drain_runs`).
+- A host binds its gRPC listener before it registers, so the capability vector the
+  register carries passes the self-connect probe
+  (`grpc_self_connect_ok_once_bound_before_the_server_runs`). A refused move names the
+  reason: the missing capability and its probe result, or why the target is not a
+  candidate (`a_capability_refusal_carries_the_probe_result`).
+- A live move whose destination fails before it fetches the paused state aborts on the
+  source, and the session stays active there
+  (`dest_failure_before_the_state_is_served_resumes_the_source`). The source checks and
+  aborts in one step and refuses once a destination fetched the state
+  (`migration_abort_unserved_refuses_after_the_state_is_fetched`). When the state was
+  served, or the source cannot answer, the destination can be running the guest: the move
+  retries the destination and then settles the session Dead
+  (`served_state_dest_failure_is_dead`, `source_without_the_served_answer_is_dead`).
+- A base image is staged into a volume on a node before the image is ready there
+  (`only_images_with_a_volume_on_disk_stay_ready`). A session volume is a snapshot of
+  that image volume (`a_fork_of_a_published_manifest_starts_its_own_lineage`), so a create
+  writes nothing.
+- A released sandbox keeps its newest checkpoint volume per role
+  (`release_keeps_the_newest_checkpoint_volume_of_each_role`). A resume on the same host
+  is a snapshot of it and fetches no chunk
+  (`a_resume_on_the_same_host_snapshots_the_kept_checkpoint`); a resume of a newer
+  manifest fetches only the delta
+  (`a_resume_of_a_newer_manifest_stages_the_delta_onto_the_kept_checkpoint`). The host
+  purges kept checkpoints, oldest release first, when the pool's free space falls under
+  twice the placement floor (`reap_purges_kept_sandboxes_oldest_first_until_the_floor_holds`).
+  A resume takes the sandbox out of that queue
+  (`a_resume_takes_the_sandbox_out_of_the_reap_queue`).
+- An eviction finalize records, for each pending checkpoint, the checkpoint it was taken
+  over. A redrive whose pending checkpoint is gone answers with the disk's checkpoint only
+  when that one is newer
+  (`a_redrive_after_the_publish_answers_with_the_published_checkpoint`); a pending
+  checkpoint lost without a publish fails the finalize, which quarantines, rather than
+  answer with the older checkpoint and drop the writes since it
+  (`a_lost_pending_checkpoint_fails_the_disk_leg`,
+  `quarantined_finalize_releases_the_capture_lock`).
+- Node prep builds the pool on a node's first boot and re-activates it after `thin_check` on
+  every later one. On a used disk it clears the chunk cache when the pool's data file needs
+  the room; a disk too small even then fails node prep with a clear message and leaves no
+  partial file. A metadata file a crash left before the first activation is formatted, not
+  rejected (`scripts/thin-pool-states-test.sh`).
+- A stage reads the node's chunk cache before blob storage
+  (`read_serves_a_resident_chunk_without_the_store`), so the chunks the image
+  prefetch pulled are not fetched a second time.
+- The host reports the pool's data and metadata free space every heartbeat
+  (`capacity_falls_by_the_blocks_written`, `pool_capacity_round_trips_through_heartbeat`).
+  Placement never chooses a node whose pool is below the floor
+  (`scheduler_rejects_hosts_below_pool_floor`). A full data pool queues guest I/O
+  instead of failing it, so a session stalls rather than corrupts.
+- The chunk-store manifest is the only cross-host representation of a disk; any host
+  stages any manifest (`a_first_checkpoint_uploads_every_nonzero_chunk_and_stage_reproduces_it`,
+  `a_checkpoint_over_the_pool_reproduces_through_stage`,
+  `a_checkpoint_reproduces_the_guest_disk_on_another_disk`).
+- The heartbeat carries observed facts only; no field asks the coordinator to act.
+- The session's disk lineage is the latest recoverable snapshot. A session with no
+  recoverable snapshot whose host is lost is dead.
+
+ADR 0125 records the decision and what it replaced.
 
 ### Snapshot manager (lives inside host agent)
 
@@ -352,7 +495,7 @@ pub trait SandboxBackend: Send + Sync {
 
 **v1 implementations**:
 
-- **`engram-sandbox-firecracker` (production, Linux)** — drives Firecracker over its HTTP-over-Unix-socket API. Each sandbox owns a Firecracker process, a per-VM vsock UDS, and (forthcoming) a TAP device. Snapshot via `PATCH /vm Paused` + `PUT /snapshot/create`. Restore via `PUT /snapshot/load` with either `backend_type=File` or `backend_type=Uffd` (lazy paging via the `engram-uffd-handler` companion process — sub-100ms resume regardless of guest RAM size). All `SandboxBackend` methods exercised by integration tests against real microVMs. Production hardening (jailer, TAP networking, broker-mode HTTPS proxy, `SendCtrlAltDel` graceful shutdown) lands in Phase 6.
+- **`engram-sandbox-firecracker` (production, Linux)** — drives Firecracker over its HTTP-over-Unix-socket API. Each sandbox owns a Firecracker process, a per-VM vsock UDS, and (forthcoming) a TAP device. Snapshot via `PATCH /vm Paused` + `PUT /snapshot/create`. Restore via `PUT /snapshot/load` with either `backend_type=File` or `backend_type=Uffd` (lazy paging via the `engram-uffd-handler` companion process — sub-100ms resume regardless of guest RAM size). All `SandboxBackend` methods exercised by integration tests against real microVMs. Production hardening (jailer, TAP networking, broker-mode HTTPS proxy) lands in Phase 6.
 - **`engram-sandbox-vz` (Mac dev, macOS Apple Silicon)** — drives Apple Virtualization.framework via `objc2-virtualization` bindings. Multi-port virtio-console for the host↔guest control plane (universal kernel support, no `CONFIG_VIRTIO_VSOCKETS=y` requirement). Snapshots are APFS rootfs clones (`clonefile(2)` ~50 ms even at 1.7 GB), since VZ's native `saveMachineStateToURL`/`restoreMachineStateFromURL` is broken upstream for arm64 Linux guests. Cold boot 562 ms; cold resume 746 ms. Same `engram-agentd` + harness binaries that run on FC. ADR 0003.
 - **`engram-sandbox-process` (dev, anywhere)** — runs commands as plain host subprocesses, each rooted in a per-sandbox working directory. No isolation, no resource enforcement. Fastest-possible iteration loop for orchestration-layer work that doesn't need to exercise the in-VM code paths. `snapshot()` is a tarball of the workdir. **Never use in deployment.**
 
@@ -542,7 +685,7 @@ Production hardening will add a first-frame token handshake. Token injection opt
 1. **Init** — kernel boots, exec's `init=/sbin/engram-init`. The shim mounts /proc, /sys, /dev, then exec's `engram-agentd --vsock-port 1024`.
 2. **Host connects** — `FirecrackerBackend::exec_stream` opens the FC vsock UDS, writes `CONNECT 1024\n`, reads back `OK <peer_port>\n`.
 3. **Per-exec** — host writes a `WireExecRequest`; agent spawns the child, streams events back, sends `Exit`, closes the connection.
-4. **Shutdown** — host sends SIGKILL to the firecracker process (today). A graceful path via `SendCtrlAltDel` + agent-side handler lands when the in-guest agent supports more than just exec.
+4. **Shutdown** — host sends SIGKILL to the firecracker process. The guest gets no clean shutdown: a snapshot is durable before any destroy that keeps state, and destroy deletes the live disk volume, so nothing reads what the guest did not flush.
 
 ### Distribution
 
@@ -890,7 +1033,7 @@ For Phase 2 the equivalent end-to-end is the FC integration suite (each test is 
 
 ```bash
 bash crates/engram-sandbox-firecracker/scripts/run-boot-test.sh all
-# boot, lifecycle, snapshot (file-backed), snapshot_uffd (lazy paging),
+# boot, lifecycle, snapshot (lazy-paging resume),
 # exec_real_vm (busybox-fixture rootfs → boot → vsock CONNECT → exec → assert stdout)
 ```
 

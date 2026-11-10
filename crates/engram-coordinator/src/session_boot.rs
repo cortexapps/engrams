@@ -142,7 +142,6 @@ pub(crate) struct BootInputs {
 /// its response). Built by `sessions::prepare_from_request` (from a live
 /// request) or `sessions::prepare_from_row` (from a durable queued row).
 pub(crate) struct PreparedBoot {
-    pub nbd_slot_need: u32,
     pub inputs: BootInputs,
     pub memory_mib: u32,
     pub cpu_budget_vcpus: u32,
@@ -248,6 +247,7 @@ pub(crate) async fn boot_on_reserved_host(
     // shape.
     let metadata = engram_core::types::snapshot::SnapshotMetadata {
         base_memory_manifest: None,
+        base_disk_manifest: None,
         migration_source: None,
         id: base_snapshot_id,
         size_bytes: record.size_bytes,

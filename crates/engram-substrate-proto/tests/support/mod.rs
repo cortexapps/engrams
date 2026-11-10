@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 use engram_core::types::manifest::ManifestRef;
-use engram_substrate_proto::{FromWriter, ToWriter};
+use engram_substrate_proto::{ByteRange, FromWriter, Requester, ToWriter};
 use proptest::prelude::*;
 
 pub fn manifest_ref() -> impl Strategy<Value = ManifestRef> {
@@ -35,7 +35,21 @@ pub fn to_writer() -> impl Strategy<Value = ToWriter> {
                 }
             }),
         any::<[u8; 32]>().prop_map(|hash| ToWriter::Populate { hash }),
+        (
+            any::<[u8; 32]>(),
+            requester(),
+            proptest::option::of((any::<u64>(), any::<u64>())),
+        )
+            .prop_map(|(hash, requester, range)| ToWriter::Read {
+                hash,
+                requester,
+                range: range.map(|(offset, len)| ByteRange { offset, len }),
+            }),
     ]
+}
+
+pub fn requester() -> impl Strategy<Value = Requester> {
+    prop_oneof![Just(Requester::Memory), Just(Requester::Disk)]
 }
 
 pub fn from_writer() -> impl Strategy<Value = FromWriter> {
@@ -46,8 +60,8 @@ pub fn from_writer() -> impl Strategy<Value = FromWriter> {
                 cache_writable,
             }
         }),
-        any::<u64>().prop_map(|len| FromWriter::Populated { len }),
         "[ -~]{0,16}".prop_map(|msg| FromWriter::PopulateErr { msg }),
+        any::<u64>().prop_map(|len| FromWriter::Filled { len }),
     ]
 }
 
@@ -61,13 +75,21 @@ fn _exhaustiveness_to_writer(m: &ToWriter) {
     match m {
         ToWriter::Hello { .. } => {}
         ToWriter::Populate { .. } => {}
+        ToWriter::Read { .. } => {}
+    }
+}
+
+fn _exhaustiveness_requester(r: &Requester) {
+    match r {
+        Requester::Memory => {}
+        Requester::Disk => {}
     }
 }
 
 fn _exhaustiveness_from_writer(m: &FromWriter) {
     match m {
         FromWriter::HelloAck { .. } => {}
-        FromWriter::Populated { .. } => {}
         FromWriter::PopulateErr { .. } => {}
+        FromWriter::Filled { .. } => {}
     }
 }

@@ -7,7 +7,9 @@
 //! 1. [`pull`] — resolve the manifest for a platform (manifest lists /
 //!    OCI indexes handled), extract the config blob's `ENV`/`WORKDIR`
 //!    as [`OciRuntimeDefaults`], stream layer blobs to scratch. Fails
-//!    loud on unknown layer mediaTypes before downloading bytes.
+//!    loud on unknown layer mediaTypes before downloading bytes. When
+//!    the [`memo`] holds the output of the same layers, shim and size
+//!    floor, the materialize returns it here and downloads nothing.
 //! 2. [`stream_pack`] declare — whiteout-aware layer semantics
 //!    (`.wh.`, opaque dirs, hardlinks, symlinks, setuid, xattrs,
 //!    zip-slip rejection) applied to an in-memory namespace, pipelined
@@ -32,6 +34,7 @@
 
 pub mod ext4;
 pub mod inject;
+pub mod memo;
 pub mod pull;
 pub mod stream_pack;
 
@@ -40,7 +43,7 @@ use std::path::{Path, PathBuf};
 use engram_chunk_store::{ChunkStore, ManifestKind, ManifestRef};
 use engram_core::types::image::OciRuntimeDefaults;
 
-pub use ext4::{inode_count_for, recommended_size, DETERMINISTIC_EPOCH_SECS};
+pub use ext4::{recommended_inodes, recommended_size, DETERMINISTIC_EPOCH_SECS};
 pub use inject::{inject_init, rendered_init_shim, InitInjection, Transport, DEFAULT_INIT_SHIM};
 pub use pull::{
     download_layer, layer_compression, pull_image, resolve_image, LayerCompression, LayerPlan,
@@ -242,6 +245,39 @@ impl Materializer {
         report(MaterializeStage::Pull, Some(format!("{platform}")));
         let pipeline_started = std::time::Instant::now();
         let resolved = pull::resolve_image(&self.oci, image_uri, platform).await?;
+        let shim = inject::rendered_init_shim(&self.init).await?;
+        let memo_key = memo::MemoKey::new(
+            ManifestKind::Disk.default_chunk_size(),
+            platform,
+            &resolved.layers,
+            &shim,
+            min_fs_size_bytes,
+        );
+        if let Some((disk_manifest, manifest)) = memo::lookup(chunk_store, &memo_key).await {
+            let chunks = manifest.chunks.len() as u64;
+            if let Some(tx) = &progress {
+                let _ = tx.try_send(MaterializeProgress {
+                    stage: MaterializeStage::Chunk,
+                    detail: Some("unchanged layers; reusing the stored disk".into()),
+                    chunks_done: Some(chunks),
+                    chunks_total: Some(chunks),
+                });
+            }
+            tracing::info!(
+                image = %image_uri,
+                platform = %platform,
+                manifest = %disk_manifest,
+                chunks,
+                resolve_ms = pipeline_started.elapsed().as_millis() as u64,
+                "materialize memo hit: layers unchanged, download skipped"
+            );
+            return Ok(Materialized {
+                disk_manifest,
+                oci_defaults: resolved.oci_defaults,
+                manifest_digest: resolved.manifest_digest,
+                ext4_size_bytes: manifest.total_bytes,
+            });
+        }
         let layer_count = resolved.layers.len();
         let compressed_bytes = resolved.compressed_bytes;
         let layers_dir = work.join("layers");
@@ -353,7 +389,7 @@ impl Materializer {
 
         // 3. The stage-1 init shim: declared like any other file (no
         // tree exists to write it into); filled from memory in pass 2.
-        let (shim_rel, shim_mode, shim_body) = inject::rendered_init_shim(&self.init).await?;
+        let (shim_rel, shim_mode, shim_body) = shim;
         ns.declare_synthetic(&shim_rel, shim_mode, shim_body)?;
 
         // 4. Seal: replay survivors into mkext4, freeze the layout.
@@ -454,6 +490,7 @@ impl Materializer {
             }
             Err(_) => chunk_store.put_manifest(disk_manifest, &manifest).await?,
         }
+        memo::record(chunk_store, &memo_key, disk_manifest).await;
 
         // One-line stage attribution for the whole materialize — the
         // "where did the hours go" answer for a big-image enable, readable

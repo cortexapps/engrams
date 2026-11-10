@@ -387,6 +387,27 @@ impl InMemoryOpLog {
         backoff: std::time::Duration,
         error: &str,
     ) -> bool {
+        self.requeue(op_id, epoch, backoff, error, 0)
+    }
+
+    pub fn requeue_wait(
+        &self,
+        op_id: i64,
+        epoch: i64,
+        delay: std::time::Duration,
+        reason: &str,
+    ) -> bool {
+        self.requeue(op_id, epoch, delay, reason, 1)
+    }
+
+    fn requeue(
+        &self,
+        op_id: i64,
+        epoch: i64,
+        backoff: std::time::Duration,
+        error: &str,
+        refund: i32,
+    ) -> bool {
         let mut inner = self.inner.lock().unwrap();
         match inner
             .ops
@@ -395,6 +416,7 @@ impl InMemoryOpLog {
         {
             Some(op) => {
                 op.state = OpState::Queued;
+                op.attempts = (op.attempts - refund).max(0);
                 op.not_before =
                     Some(Utc::now() + chrono::Duration::milliseconds(backoff.as_millis() as i64));
                 op.error = Some(error.to_string());

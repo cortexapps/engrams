@@ -36,6 +36,7 @@ use axum::routing::get;
 use axum::Router;
 use bytes::Bytes;
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{
     AuxRoDrive, CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec,
 };
@@ -374,7 +375,7 @@ async fn materialize_and_boot() {
     let work = tempfile::tempdir().expect("work dir");
     let rootfs = work.path().join("rootfs.ext4");
     chunk_store
-        .materialize_to_file(&disk_manifest, &rootfs)
+        .materialize_to_file_from(&disk_manifest, &rootfs, &chunk_store)
         .await
         .expect("reassemble ext4 from chunks");
 
@@ -408,7 +409,8 @@ async fn materialize_and_boot() {
         swap_source: None,
         swap_manifest: None,
     };
-    let id = backend.create(spec).await.expect("create");
+    let id = SandboxId::new();
+    backend.create(id, spec).await.expect("create");
 
     // The deliverable's property: the materialized image boots to a
     // serving agentd and can exec.

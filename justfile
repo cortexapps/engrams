@@ -32,9 +32,13 @@ check:
     cargo hakari generate --diff
     cargo nextest run --workspace
 
-# Auto-format the workspace.
+# Auto-format the Rust workspace.
 fmt:
     cargo fmt --all
+
+# Auto-format web/ (needs `pnpm install` in web/ first). CI checks it.
+fmt-web:
+    pnpm --dir web run format
 
 # Regenerate `workspace-hack/Cargo.toml` from the current dep
 # graph. Run after adding or removing a workspace dep so
@@ -386,10 +390,11 @@ dev-fc profile='fc-dev' mac_docker_context='colima':
     ENGRAM_FC_COLIMA_PROFILE={{profile}} DOCKER_HOST="$mac_host" tilt up
 
 # ADR 0082: create/update the named Colima VM (aarch64 Ubuntu, nested
-# virt, /dev/kvm, Firecracker + the aarch64 guest kernel, NBD/UFFD host
-# prep, the localhost→Mac DNAT unit engram-dev-fwd) — everything `dev-fc` needs
-# before its first run. Idempotent; safe to re-run after a Colima
-# upgrade or a provisioning-script change.
+# virt, /dev/kvm, the forked Firecracker and the aarch64 guest kernel (both
+# built in the VM), NBD/UFFD host prep, the localhost→Mac DNAT unit
+# engram-dev-fwd) — everything `dev-fc` needs before its first run.
+# Idempotent; safe to re-run after a Colima upgrade, a provisioning-script
+# change, or a third_party/firecracker bump.
 fc-colima-provision profile='fc-dev':
     bash deploy/dev/fc-colima-provision.sh {{profile}}
 
@@ -1127,15 +1132,6 @@ sim SEED STEPS='1500' PROFILE='chaos':
 # Seeded swarm over a range (`just sim-swarm 0..500`).
 sim-swarm SEEDS='0..200' STEPS='1500' PROFILE='chaos':
     cargo run -p engram-dst --release --bin sim -- --seeds {{SEEDS}} --steps {{STEPS}} --profile {{PROFILE}}
-
-# Host-internal simulator (ADR 0098 Phase 2): replay a single seed against
-# the acked-write durability oracle over the portable disk/spool machinery.
-sim-host SEED STEPS='400' PROFILE='chaos':
-    cargo run -p engram-dst-host --release --bin sim-host -- --seed {{SEED}} --steps {{STEPS}} --profile {{PROFILE}}
-
-# Host-internal seeded swarm over a range (`just sim-host-swarm 0..50`).
-sim-host-swarm SEEDS='0..50' STEPS='400' PROFILE='chaos':
-    cargo run -p engram-dst-host --release --bin sim-host -- --seeds {{SEEDS}} --steps {{STEPS}} --profile {{PROFILE}}
 
 # ------------------------------------------------------------------
 # Web dashboard — read-only live view of the running coordinator.

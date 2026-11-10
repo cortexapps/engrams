@@ -18,7 +18,6 @@ pub mod bundle_gc;
 pub mod checkpoint_retention;
 pub mod chunk_gc;
 pub mod config;
-pub mod cow_state;
 pub mod dead_host;
 pub mod enable_scanner;
 pub mod error;
@@ -199,6 +198,7 @@ pub async fn run_with_registry_and_local(
         queue_wake.clone(),
         state.outbox_wake.clone(),
         state.session_ops_wake.clone(),
+        state.op_finished.clone(),
     );
 
     // Phase 3d follow-up: dead-host auto-detector. Fully trait-driven
@@ -310,11 +310,8 @@ pub async fn run_with_registry_and_local(
         None
     };
 
-    // ADR 0016 Phase C: chunk-store GC, redesigned. Pin-set unions
-    // enabled_images + sessions.live_disk_manifest_* + recoverable
-    // snapshots (disk + memory); `chunk_generation` barrier catches
-    // mid-sweep flush races; 24h grace period in
-    // `chunk_gc_candidates` absorbs straggling races. Gated by
+    // Chunk-store GC: the pin set is `engram_chunk_store::gc`'s; the 24h
+    // grace period in `chunk_gc_candidates` absorbs straggling races. Gated by
     // `ENGRAM_CHUNK_GC_ENABLED` (default ON; the grace window is
     // the real safety net in active-development posture).
     let _gc_sweeps = {
@@ -597,6 +594,7 @@ async fn shutdown_signal() {
 pub enum CoordinatorError {
     Config(String),
     Io(std::io::Error),
+    UpgradeDrain(engram_upgrade_drain::DrainError),
 }
 
 impl std::fmt::Display for CoordinatorError {
@@ -604,6 +602,7 @@ impl std::fmt::Display for CoordinatorError {
         match self {
             Self::Config(msg) => write!(f, "coordinator config error: {msg}"),
             Self::Io(e) => write!(f, "coordinator io error: {e}"),
+            Self::UpgradeDrain(e) => write!(f, "{e}"),
         }
     }
 }
@@ -612,7 +611,14 @@ impl std::error::Error for CoordinatorError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
+            Self::UpgradeDrain(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+impl From<engram_upgrade_drain::DrainError> for CoordinatorError {
+    fn from(e: engram_upgrade_drain::DrainError) -> Self {
+        Self::UpgradeDrain(e)
     }
 }

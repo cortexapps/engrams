@@ -13,7 +13,7 @@
 //! | `PUT`   | `/drives/{id}`             | attach rootfs / scratch disks     |
 //! | `PUT`   | `/network-interfaces/{id}` | attach TAP                        |
 //! | `PUT`   | `/vsock`                   | attach virtio-vsock               |
-//! | `PUT`   | `/actions`                 | `InstanceStart`, `SendCtrlAltDel` |
+//! | `PUT`   | `/actions`                 | `InstanceStart`                   |
 //! | `PATCH` | `/vm`                      | `Paused` / `Resumed` (snapshots)  |
 //! | `PUT`   | `/snapshot/create`         | take a Full or Diff snapshot      |
 //! | `PUT`   | `/snapshot/load`           | resume from snapshot (with UFFD)  |
@@ -50,6 +50,7 @@ use engram_core::SandboxError;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tracing::Instrument as _;
 
 /// Client bound to one Firecracker control socket. Cheap to clone —
 /// the actual HTTP connection is established per-request.
@@ -181,7 +182,7 @@ impl FirecrackerClient {
         self.put(&path, iface).await
     }
 
-    /// `PUT /actions` — `InstanceStart`, `SendCtrlAltDel`, etc.
+    /// `PUT /actions` — `InstanceStart`.
     pub async fn put_action(&self, action: ActionType) -> Result<(), SandboxError> {
         let body = ActionBody {
             action_type: action,
@@ -215,6 +216,7 @@ impl FirecrackerClient {
             dir.join("state.bin"),
             dir.join("memory.bin"),
             SnapshotType::Full,
+            false,
         )
         .await
     }
@@ -226,11 +228,16 @@ impl FirecrackerClient {
     /// cold boot, or `enable_diff_snapshots` at `snapshot/load`).
     /// Same pause/resume + cancellation-guard contract as
     /// [`Self::create_snapshot`].
+    ///
+    /// With `defer_sync`, Firecracker does not fsync the two files inside
+    /// the pause and the caller must sync them before it relies on them
+    /// across a host crash.
     pub async fn create_snapshot_at(
         &self,
         state_path: PathBuf,
         mem_path: PathBuf,
         snapshot_type: SnapshotType,
+        defer_sync: bool,
     ) -> Result<SnapshotPaths, SandboxError> {
         self.pause().await?;
 
@@ -249,13 +256,20 @@ impl FirecrackerClient {
             mem_file_path: mem_path.to_string_lossy().into_owned(),
             snapshot_type,
             vmstate_only: false,
+            defer_sync,
         };
-        let create_res = self.put("/snapshot/create", &body).await;
+        let create_res = self
+            .put("/snapshot/create", &body)
+            .instrument(tracing::info_span!("fc.snapshot_create", defer_sync))
+            .await;
 
         // Always try to resume, regardless of whether the create
         // succeeded — leaving the VM paused on error is worse than
         // doubling up on the failure path.
-        let resume_res = self.resume().await;
+        let resume_res = self
+            .resume()
+            .instrument(tracing::info_span!("fc.snapshot_resume"))
+            .await;
         guard.disarm();
 
         create_res?;
@@ -281,8 +295,10 @@ impl FirecrackerClient {
                 mem_file_path: mem_path.to_string_lossy().into_owned(),
                 snapshot_type,
                 vmstate_only: false,
+                defer_sync: false,
             },
         )
+        .instrument(tracing::info_span!("fc.snapshot_create"))
         .await?;
         Ok(SnapshotPaths {
             state_path,
@@ -319,6 +335,7 @@ impl FirecrackerClient {
                 .into_owned(),
             snapshot_type: SnapshotType::Full,
             vmstate_only: true,
+            defer_sync: false,
         };
         self.put("/snapshot/create", &body).await
     }
@@ -777,8 +794,6 @@ struct VmStatePatch {
 #[derive(Debug, Clone, Copy, Serialize)]
 pub enum ActionType {
     InstanceStart,
-    FlushMetrics,
-    SendCtrlAltDel,
 }
 
 #[derive(Debug, Serialize)]
@@ -810,6 +825,10 @@ struct SnapshotCreateBody {
     /// the fork-v3 capability gate.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     vmstate_only: bool,
+    /// Fork only: write both files without an fsync; the caller syncs them
+    /// after the resume. Left off the wire when false, like `vmstate_only`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    defer_sync: bool,
 }
 
 /// PascalCase variant names match Firecracker's expected JSON values
@@ -895,13 +914,9 @@ struct FaultMessage {
 // VM will be unpaused on the next runtime tick, regardless of what
 // happened to the original future. On the happy path the guard's
 // `disarm` is called after the inline resume so we don't
-// double-resume.
-//
-// Surfaced on 2026-05-23 during the COW diagnostic spot-check on
-// session 96392fd3: 3 successful flushes on the host with 0 PG
-// snapshot rows, then a follow-up prompt that the harness never
-// processed — consistent with a partially-completed snapshot
-// pipeline leaving the VM stuck Paused.
+// double-resume. Without the guard, a partially-completed snapshot
+// pipeline leaves the VM Paused and the harness never processes
+// the next prompt.
 
 /// Defuse-on-success guard: if dropped while armed, spawns a
 /// detached `resume` so the VM doesn't stay paused on cancellation.
@@ -1165,14 +1180,10 @@ mod tests {
 
     #[test]
     fn action_type_serializes_pascal_case() {
-        // Firecracker expects exactly these strings.
+        // Firecracker expects exactly this string.
         assert_eq!(
             serde_json::to_string(&ActionType::InstanceStart).unwrap(),
             "\"InstanceStart\""
-        );
-        assert_eq!(
-            serde_json::to_string(&ActionType::SendCtrlAltDel).unwrap(),
-            "\"SendCtrlAltDel\""
         );
     }
 
@@ -1288,6 +1299,7 @@ mod tests {
             mem_file_path: "/snap/memory.bin".into(),
             snapshot_type: SnapshotType::Full,
             vmstate_only: false,
+            defer_sync: false,
         };
         let v: serde_json::Value = serde_json::to_value(&body).unwrap();
         assert_eq!(v["snapshot_path"], "/snap/state.bin");
@@ -1297,15 +1309,18 @@ mod tests {
         // byte-identical to stock so non-migration captures keep working
         // against any FC binary (R2 posture).
         assert!(v.get("vmstate_only").is_none());
+        assert!(v.get("defer_sync").is_none());
 
         let body = SnapshotCreateBody {
             snapshot_path: "/snap/state.bin".into(),
             mem_file_path: "/snap/ignored".into(),
             snapshot_type: SnapshotType::Full,
             vmstate_only: true,
+            defer_sync: true,
         };
         let v: serde_json::Value = serde_json::to_value(&body).unwrap();
         assert_eq!(v["vmstate_only"], true);
+        assert_eq!(v["defer_sync"], true);
     }
 
     #[test]

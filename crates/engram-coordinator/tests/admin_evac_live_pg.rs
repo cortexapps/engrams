@@ -104,6 +104,7 @@ impl HostClient for FakeBackend {
             disk_manifest: None,
             memory_manifest: None,
             base_memory_manifest: None,
+            base_disk_manifest: None,
             migration_source: None,
             source_sandbox_id: None,
             state_blob_key: None,
@@ -422,7 +423,6 @@ async fn durable_cordon_excludes_host_from_placement_on_every_replica() {
 
     // Both hosts available → either can be picked.
     let ctx = ScheduleContext {
-        nbd_slot_need: 1,
         repo: "test/img",
         image_version: "v1",
         snapshot_host: None,
@@ -498,7 +498,6 @@ async fn durable_cordon_excludes_host_from_placement_on_every_replica() {
         .await
         .expect("uncordon");
     let exclude_healthy_ctx = ScheduleContext {
-        nbd_slot_need: 1,
         exclude_host: Some(healthy),
         ..ctx.clone()
     };

@@ -167,7 +167,6 @@ impl NetworkAllocator {
     /// the VM's eth0. Kernel sees `10.200.0.2` as locally hosted
     /// and short-circuits host-agent dials to ttyd through
     /// loopback → SHELL tab fails with EHOSTUNREACH/ECONNREFUSED.
-    /// Observed in prod on session d20c4715 (2026-05-20).
     ///
     /// Reserving slot 0 at construction sidesteps the collision —
     /// SNAT slots start at slot 1 (`10.200.0.4/30`), guaranteed
@@ -377,7 +376,7 @@ pub fn host_startup_lines(
     //    traffic for flows the host initiated — it does NOT widen
     //    the VM→host attack surface (new VM-initiated flows still
     //    hit the DROP). Required for ProxyShell to actually reach
-    //    ttyd; observed in prod (session 379abfec) post-M1.16.
+    //    ttyd.
     out.push(format!(
         "-A INPUT -s {pool} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT \
          -m comment --comment engram-host-input-established",
@@ -1626,7 +1625,7 @@ mod tests {
     /// is permanently reserved by [`NetworkAllocator::new`]. Both
     /// `alloc` and `reserve` must refuse to hand it out — otherwise
     /// a netns SNAT slot collides with the bake's eth0 IP and the
-    /// SHELL tab fails (observed in prod on session d20c4715).
+    /// SHELL tab fails.
     #[test]
     fn bake_cidr_slot_0_is_permanently_reserved() {
         let mut a = NetworkAllocator::new(Ipv4Addr::from_str("10.200.0.0").unwrap());
@@ -2029,8 +2028,7 @@ mod tests {
     /// ProxyShell dials the in-guest ttyd from host root (cold path)
     /// and the guest's SYN+ACK return packet hits the INPUT chain.
     /// Without an ESTABLISHED,RELATED ACCEPT *before* the blanket
-    /// engram-host-input DROP, every host→VM TCP dial times out
-    /// (observed in prod against session 379abfec on 2026-05-20).
+    /// engram-host-input DROP, every host→VM TCP dial times out.
     /// This test pins the rule's presence and ordering.
     #[test]
     fn host_startup_accepts_established_input_before_drop() {

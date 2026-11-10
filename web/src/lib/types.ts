@@ -254,58 +254,12 @@ export interface ListHostsResponse {
   hosts: HostView[];
 }
 
-// ---- ADR 0016 Phase A: COW state diagnostic ---------------------------
+// ---- Storage surface summary ------------------------------------------
 //
-// Mirrors `engram_coordinator::cow_state::CowStateView` (Rust). One row
-// per chunk-tracked sandbox; rendered by `components/CowState.tsx` in
-// the host card and session detail page.
-
-export interface CowStateView {
-  sandbox_id: string;
-  session_id: string | null;
-  /** Current disk manifest version. Ticks on every `flush()`. */
-  disk_manifest_id: string;
-  disk_manifest_version: number;
-  /** Dirty chunks resident in host RAM (not yet flushed to BlobStorage). */
-  dirty_chunks: number;
-  dirty_bytes: number;
-  /** ISO-8601 timestamp of the last successful `flush()`. `null` =
-   * never flushed since the backend was constructed. */
-  last_flush_at: string | null;
-  /** Total chunks the disk manifest references. */
-  base_chunks: number;
-  /** Of `base_chunks`, how many are resident on this host's local
-   * NVMe cache vs. fetched on-demand from BlobStorage. */
-  base_chunks_local: number;
-  /** Most recent memory manifest captured in a snapshot. `null` if
-   * the session has never been snapshotted. */
-  memory_manifest_id: string | null;
-  memory_manifest_version: number | null;
-  /** ISO-8601 timestamp of the last successful snapshot. `null` =
-   * never snapshotted. */
-  last_snapshot_at: string | null;
-}
-
-// ---- ADR 0029: Storage surface summary --------------------------------
-//
-// Mirrors `engram_coordinator::api::storage::StorageSummaryResponse`.
-// Fleet-wide COW/chunk rollups + a per-sandbox durability ledger,
-// aggregated server-side from the per-host cow-state plus cheap
-// Postgres counts (snapshots, gc-candidates). "chunks stored" and
-// "dedup ratio" are intentionally absent — they'd need an O(objects)
-// blob-store walk, which we don't run on a polled endpoint.
-
-export interface DurabilityRow {
-  sandbox_id: string;
-  session_id: string | null;
-  host_id: string;
-  dirty_chunks: number;
-  dirty_bytes: number;
-  base_chunks: number;
-  base_chunks_local: number;
-  /** ISO-8601 of the last successful flush; `null` = never flushed. */
-  last_flush_at: string | null;
-}
+// Mirrors `engram_coordinator::api::storage::StorageSummaryResponse`:
+// snapshot totals and the chunk-GC backlog. "chunks stored" and "dedup
+// ratio" are intentionally absent — they'd need an O(objects) blob-store
+// walk, which we don't run on a polled endpoint.
 
 export interface StorageSummaryResponse {
   snapshots: number;
@@ -313,21 +267,6 @@ export interface StorageSummaryResponse {
   gc_pending: number;
   /** False when `gc_pending` is an estimate (the table passed the exact-count cap). */
   gc_pending_exact: boolean;
-  tracked_sandboxes: number;
-  dirty_chunks: number;
-  unflushed_bytes: number;
-  avg_locality_pct: number;
-  rows: DurabilityRow[];
-}
-
-export interface SessionCowStateResponse {
-  session_id: string;
-  /** `null` when the session has no live sandbox (Idle, HostLost,
-   * Pending, terminal) — the disk-tier numbers don't exist. The
-   * memory-tier fields would still be projectable from PG but
-   * we don't surface them here; consumers can read the
-   * snapshot-row endpoint instead. */
-  state: CowStateView | null;
 }
 
 // ADR 0021 P1.5a retired the `HarnessDescriptor` / `/api/harnesses`

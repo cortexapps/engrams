@@ -53,24 +53,18 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 /// Protocol version carried in `Hello`/`HelloAck`. Bump on any
 /// wire-incompatible change; the server rejects mismatches loudly.
 ///
-/// v2: `Page.lz4` — payloads ship lz4-block-compressed when that is
-/// smaller, and `sha256` covers the WIRE bytes. The measured per-fault
-/// cost on the no-SHA-NI fleet was ~6.7 ms, dominated by the 512 KiB
-/// transfer + double sha256 — compression cuts all three.
+/// v2: `Page.lz4` — a payload may ship lz4-block-compressed, and the
+/// integrity hash covers the WIRE bytes.
 ///
 /// v3: `Hello.purpose` — connections identify as Fault or Drain. The
 /// source skips the AltSource classify hash on fault connections: a
 /// demote there ADDS a dest-side cache/GCS fetch (strictly worse
-/// latency than shipping the resident bytes), and the classify sha256
-/// of the raw 512 KiB was ~1 ms of the per-fault constant on the
-/// no-SHA-NI fleet. Drain connections keep the demote (it saves wire
-/// and the drain is latency-insensitive).
+/// latency than shipping the resident bytes). Drain connections keep
+/// the demote (it saves wire and the drain is latency-insensitive).
 ///
-/// v4: `Page.hash` is blake3 (was sha256) — measured 1.63 ms/serve in
-/// the encode leg, ~1.2 ms of it soft sha256 of the compressed wire
-/// bytes (no SHA-NI on the fleet); blake3 is cryptographic at
-/// ~1–2 GB/s in software. `AltSource.durable_sha256` STAYS sha256 —
-/// that is the chunk-store's content address, not wire integrity.
+/// v4: `Page.hash` is blake3 (was sha256). `AltSource.durable_sha256`
+/// STAYS sha256 — that is the chunk-store's content address, not wire
+/// integrity.
 ///
 /// v5: remove the unused by-hash request and reply.
 /// v6: ordered fault windows and fault-around installation accounting.
@@ -232,8 +226,10 @@ pub enum FromSource {
         req_id: u64,
         chunk_offset: u64,
         /// WIRE bytes: lz4-block-compressed (size-prepended) when
-        /// `lz4`, raw otherwise (the source ships whichever is
-        /// smaller — incompressible chunks go raw).
+        /// `lz4`, raw otherwise. `serde_bytes` encodes the same bincode
+        /// bytes as a plain `Vec<u8>` (u64 length, then the bytes) in one
+        /// copy instead of one call per byte.
+        #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
         /// [`wire_hash`] over the WIRE bytes — verify BEFORE
         /// decompressing.
@@ -298,9 +294,7 @@ pub enum HandlerControl {
     /// here on. `faults`/`fault_us` are the FAULT-path totals (guest
     /// faults that round-tripped the peer + their cumulative wall) —
     /// the serial P2P cost inside the FC load + early execution, the
-    /// restore-tail attribution the drain numbers can't show. Control
-    /// sock is same-host (handler ↔ its own host-agent, one image), so
-    /// extending the variant is bincode-safe.
+    /// restore-tail attribution the drain numbers can't show.
     DrainDone {
         pulled: u64,
         alt_sourced: u64,
@@ -310,6 +304,10 @@ pub enum HandlerControl {
         fault_us: u64,
         fault_max_us: u64,
         fault_around_chunks_installed: u64,
+        /// Sealed chunks the hot-set hint placed first.
+        hot_leading: u64,
+        /// A nonempty hot-set hint arrived while requests remained.
+        hot_hint_received: bool,
     },
     /// The peer is gone (dial/reconnect exhausted, frame error, or sha
     /// mismatch) with sealed chunks still uninstalled. FATAL by design:
@@ -325,6 +323,14 @@ where
     R: Read,
     T: DeserializeOwned,
 {
+    bincode::deserialize(&read_body(r)?).map_err(invalid)
+}
+
+fn invalid(e: bincode::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bincode: {e}"))
+}
+
+fn read_body<R: Read>(r: &mut R) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -336,8 +342,7 @@ where
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body)?;
-    bincode::deserialize(&body)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bincode: {e}")))
+    Ok(body)
 }
 
 /// Bincode-encode `msg` and write it as a length-prefixed frame.
@@ -470,6 +475,8 @@ mod tests {
             fault_us: 55_000,
             fault_max_us: 9_000,
             fault_around_chunks_installed: 0,
+            hot_leading: 3,
+            hot_hint_received: true,
         });
         round_trip(&HandlerControl::PeerLost {
             remaining: 3,

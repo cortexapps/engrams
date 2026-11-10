@@ -26,84 +26,63 @@ pub(crate) const DETERMINISTIC_HASH_SEED: &str = "00000000-5eed-4a11-8036-000000
 /// stamps superblock times from this same epoch.
 pub const DETERMINISTIC_EPOCH_SECS: u64 = 1_704_067_200;
 
-/// Pick a sensible image size for `dir_size_bytes` of source data:
-/// ext4 metadata (~3-5%), inode table, journal (~64 MiB by default),
-/// plus headroom for the booted VM to write to /tmp etc.
-///
-/// Formula: `max(dir_size * 2, dir_size + 128 MiB)`, rounded up to
-/// a 4 KiB boundary. The doubling catches small images (a 50 MiB
-/// rootfs gets 178 MiB, plenty for the journal); the +128 MiB
-/// minimum catches tiny test images where 2× doesn't even cover
-/// ext4's overhead. The 4 KiB rounding is required by macOS Tahoe's
-/// VZ disk-image attachment, which rejects files that aren't a
-/// multiple of the 512-byte sector size with `VZErrorDomain code=5
-/// "Invalid disk image"`. We pick 4 KiB instead of 512 to match
-/// ext4's default block size — same alignment as a real block
-/// device.
-pub fn recommended_size(dir_size_bytes: u64) -> u64 {
-    let twice = dir_size_bytes.saturating_mul(2);
-    let plus_128 = dir_size_bytes.saturating_add(128 * 1024 * 1024);
-    let raw = twice.max(plus_128);
-    // ADR 0036: quantize COARSELY so the filesystem geometry is
-    // stable under small source-tree drift. mke2fs derives block
-    // groups, bitmaps, and inode-table placement from the total
-    // block count — with fine-grained (4 KiB) rounding, an 8 KB
-    // change in a multi-GB tree changes the fs size, which shifts
-    // every structure on the disk and re-rolls ~100% of the 16 MiB
-    // chunk hashes (observed in prod: two bakes of the same source
-    // deduped 1% purely from apt-index churn). Snapping to 256 MiB
-    // bands keeps geometry identical until the tree grows past a
-    // band edge; the padding is zero-filled and zero chunks are
-    // elided from manifests, so the cost is a few extra inode-table
-    // chunks, not storage. Small images (< 1 GiB raw) keep 4 KiB
-    // alignment — dev/test fixtures stay tight, and VZ's
-    // sector-alignment requirement is satisfied by both branches.
-    const FINE: u64 = 4096;
-    const COARSE: u64 = 256 * 1024 * 1024;
-    let align = if raw > 1024 * 1024 * 1024 {
-        COARSE
-    } else {
-        FINE
-    };
-    raw.saturating_add(align - 1) & !(align - 1)
-}
+const GROUP_BYTES: u64 = 128 * 1024 * 1024;
+const BLOCKS_PER_GROUP: u64 = 32_768;
+/// The stable layout's window in 4 KiB blocks: one disk chunk.
+const WINDOW_BLOCKS: u64 = engram_chunk_store::DEFAULT_DISK_CHUNK_SIZE / 4096;
+/// The inode numbers in one stable-layout window (256 B per inode).
+const INODES_PER_WINDOW: u64 = WINDOW_BLOCKS * 16;
+/// The most inodes a block group can have under the stable layout. A
+/// flex span's inode tables (16 groups of `inodes_per_group / 16` blocks,
+/// so `inodes_per_group` blocks) sit in the span's first group behind one
+/// window of superblock, descriptors and bitmaps.
+const MAX_INODES_PER_GROUP: u64 = BLOCKS_PER_GROUP - WINDOW_BLOCKS;
 
-/// Inodes to provision for a tree of `entry_count` entries. mke2fs's
-/// default inode count is `fs_size / 16 KiB`, which a tree of many tiny
-/// files (node_modules, gradle/pnpm caches) blows past — it runs out of
-/// inodes long before blocks. Size from the real entry count instead:
-/// the entries + 50% headroom (root-fs writes at runtime — /tmp, logs,
-/// the warm gradle daemon's scratch) + a floor, then quantized to a
-/// coarse band so small source-tree drift doesn't re-roll the fs geometry
-/// (same determinism rationale as [`recommended_size`]'s COARSE banding).
-pub fn recommended_inodes(entry_count: u64) -> u64 {
-    let raw = entry_count.saturating_mul(3) / 2 + 100_000;
-    // 128 Ki bands. An inode is 256 B, so a band is ~32 MiB of inode
-    // table — negligible against the multi-GiB images this matters for,
-    // and it keeps `-N` stable until the entry count crosses a band edge.
-    const BAND: u64 = 128 * 1024;
+/// The image size for `dir_size_bytes` of data in `entry_count` entries:
+/// the larger of 4 × the data and the block groups that
+/// [`recommended_inodes`] needs, rounded up to 256 MiB.
+///
+/// - The stable layout pads segments with zero windows and can need up
+///   to twice the used bytes of logical size. The padding stays free, so
+///   the guest also gets at least the data's size as working room.
+/// - A group holds at most [`MAX_INODES_PER_GROUP`] inodes, so a tree of
+///   many small or empty files is sized by its entries, not its bytes.
+/// - The 256 MiB bands keep the block-group geometry the same while the
+///   tree drifts by less than a band. A geometry change moves every
+///   inode table and so rewrites every chunk. Whole bands are also whole
+///   512-byte sectors, which VZ requires of a disk image.
+///
+/// The size beyond the data is zero windows, which manifests elide and
+/// sparse files do not store.
+pub fn recommended_size(dir_size_bytes: u64, entry_count: u64) -> u64 {
+    const BAND: u64 = 256 * 1024 * 1024;
+    let for_inodes = recommended_inodes(entry_count)
+        .div_ceil(MAX_INODES_PER_GROUP)
+        .saturating_mul(GROUP_BYTES);
+    let raw = dir_size_bytes.saturating_mul(4).max(for_inodes);
     raw.saturating_add(BAND - 1) & !(BAND - 1)
 }
 
-/// The mke2fs `-N` inode count for an ext4 of `fs_size_bytes` holding
-/// `entry_count` files: the entry-driven [`recommended_inodes`] target,
-/// CAPPED to what the filesystem can physically hold.
+/// The inode count for a tree of `entry_count` entries, in 128 Ki bands.
 ///
-/// `recommended_inodes` floors at ~131072 (the 128 Ki band) for the
-/// multi-GiB image case, where a 32 MiB inode table is noise. A small fs
-/// can't hold that: an inode is 256 B, and mke2fs's hard ceiling is
-/// `fs_size / inode_size` (all blocks as inode table) — e.g. the 16 MiB
-/// host stub harness tops out at 65536 inodes and mke2fs rejects the
-/// 131072 floor outright. We reserve ≤ 1/4 of the fs for inodes so blocks
-/// + journal + metadata still fit, never dropping below a small floor.
-pub fn inode_count_for(entry_count: u64, fs_size_bytes: u64) -> u64 {
-    const INODE_SIZE_B: u64 = 256;
-    let recommended = recommended_inodes(entry_count);
-    if fs_size_bytes == 0 {
-        return recommended; // size unknown — leave the recommendation as-is.
-    }
-    let cap = (fs_size_bytes / (INODE_SIZE_B * 4)).max(16);
-    recommended.min(cap)
+/// The stable layout numbers inodes in window-aligned bands from the
+/// second window (inode 65537) up, and pads each band to a power of two
+/// of windows, so a band of `u` inodes spans at most `2·u` plus two
+/// windows. Band boundaries come from path hashes and average one per
+/// 524288 inodes. Allowing four times that many bands, plus two, the
+/// highest number is at most `65536 + 2·E + 2 windows · (E/131072 + 2)`,
+/// which is `3·E + 5 windows`. A count that covers the highest number
+/// means mkext4 never grows the inode tables: growing moves every table,
+/// rewrites every chunk, and can overflow the groups that
+/// [`recommended_size`] sized. The unused numbers stay free for the
+/// guest. The 128 Ki bands keep the count the same while the entry count
+/// drifts.
+pub fn recommended_inodes(entry_count: u64) -> u64 {
+    const BAND: u64 = 128 * 1024;
+    let raw = entry_count
+        .saturating_mul(3)
+        .saturating_add(5 * INODES_PER_WINDOW);
+    raw.saturating_add(BAND - 1) & !(BAND - 1)
 }
 
 #[cfg(test)]
@@ -111,90 +90,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recommended_size_uses_2x_for_large_images() {
-        // 500 MiB dir → 1 GiB image (2x dominates over +128 MiB).
-        let s = 500 * 1024 * 1024;
-        assert_eq!(recommended_size(s), 2 * s);
+    fn recommended_size_is_four_times_the_data_in_256_mib_bands() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(recommended_size(512 * MIB, 0), 2048 * MIB);
+        assert_eq!(recommended_size(513 * MIB, 0), 2048 * MIB + 256 * MIB);
+    }
+
+    /// A tree of empty files has no bytes; its entries size the image,
+    /// so every inode the stable layout can number fits its groups.
+    #[test]
+    fn recommended_size_holds_the_inodes_of_a_tree_of_empty_files() {
+        for entries in [0u64, 1, 170_000, 1_000_000] {
+            let groups = recommended_size(0, entries) / GROUP_BYTES;
+            assert!(
+                groups * MAX_INODES_PER_GROUP >= recommended_inodes(entries),
+                "{entries} entries need {} inodes, {groups} groups hold fewer",
+                recommended_inodes(entries)
+            );
+        }
     }
 
     #[test]
-    fn recommended_size_uses_plus_128mib_for_small_images() {
-        // 10 MiB dir → 138 MiB image (+128 MiB dominates over 2x = 20 MiB).
-        let s = 10 * 1024 * 1024;
-        assert_eq!(recommended_size(s), s + 128 * 1024 * 1024);
-    }
-
-    #[test]
-    fn recommended_size_handles_zero() {
-        // Empty dir still gets a 128 MiB image rather than 0.
-        assert_eq!(recommended_size(0), 128 * 1024 * 1024);
-    }
-
-    #[test]
-    fn recommended_inodes_covers_count_plus_headroom_and_quantizes() {
+    fn recommended_inodes_covers_stable_numbering_and_quantizes() {
         const BAND: u64 = 128 * 1024;
-        // Always a multiple of the band, and strictly above the entry
-        // count (so every entry gets an inode, with headroom to spare).
         for count in [0u64, 1, 50_000, 300_000, 1_000_000, 5_000_000] {
             let n = recommended_inodes(count);
             assert_eq!(n % BAND, 0, "must be band-aligned for count {count}");
-            assert!(n > count, "{n} inodes must exceed {count} entries");
-            assert!(n >= count + count / 2, "must include ~50% headroom");
+            assert!(
+                n >= count * 3 + 5 * INODES_PER_WINDOW,
+                "{n} inodes must cover the stable numbering of {count} entries"
+            );
         }
-        // Small trees still get a usable floor (~100k → 128 Ki band).
-        assert_eq!(recommended_inodes(0), BAND);
-        // A high-file-count tree (e.g. ~1M node_modules/gradle entries)
-        // gets ~1.5M inodes — far above mke2fs's default of size/16KiB.
-        assert!(recommended_inodes(1_000_000) >= 1_500_000);
-    }
-
-    #[test]
-    fn inode_count_for_caps_to_filesystem_capacity() {
-        const MIB: u64 = 1024 * 1024;
-        const INODE_SIZE_B: u64 = 256;
-        // The 16 MiB host stub harness: the recommended floor (131072)
-        // overruns mke2fs's fs_size/inode_size ceiling (65536) and is
-        // rejected. inode_count_for must clamp below the floor AND below
-        // the ceiling, leaving room for blocks.
-        let n = inode_count_for(0, 16 * MIB);
-        assert!(
-            n < recommended_inodes(0),
-            "tiny fs must clamp below the floor"
-        );
-        assert!(
-            n <= 16 * MIB / INODE_SIZE_B,
-            "must fit mke2fs's hard ceiling"
-        );
-        assert!(n >= 16, "still a usable minimum");
-        // A multi-GiB image: the cap doesn't bite, the recommendation wins.
-        assert_eq!(
-            inode_count_for(1_000_000, 8192 * MIB),
-            recommended_inodes(1_000_000),
-        );
-        // Unknown size (0) leaves the recommendation untouched.
-        assert_eq!(inode_count_for(50_000, 0), recommended_inodes(50_000));
     }
 
     #[test]
     fn recommended_size_does_not_overflow() {
         // Adversarial input doesn't panic.
-        assert!(recommended_size(u64::MAX) > 0);
+        assert!(recommended_size(u64::MAX, u64::MAX) > 0);
     }
 
-    /// ADR 0036: sizes past 1 GiB snap to 256 MiB bands, so small
-    /// source-tree drift (the apt-churn class) maps to the SAME
-    /// filesystem geometry and cross-bake chunk dedup survives.
+    /// ADR 0036: sizes snap to 256 MiB bands, so small source-tree
+    /// drift maps to the same filesystem geometry and cross-bake chunk
+    /// dedup survives.
     #[test]
     fn recommended_size_quantizes_large_images_to_256mib_bands() {
         const MIB: u64 = 1024 * 1024;
-        let a = recommended_size(4800 * MIB);
-        let b = recommended_size(4800 * MIB + 8 * 1024); // +8 KB tree drift
+        let a = recommended_size(4900 * MIB, 0);
+        let b = recommended_size(4900 * MIB + 8 * 1024, 0); // +8 KB tree drift
         assert_eq!(a, b, "small drift must not change the fs size");
         assert_eq!(a % (256 * MIB), 0, "large sizes snap to 256 MiB");
         // Still never smaller than the raw requirement.
-        assert!(a >= 2 * 4800 * MIB);
+        assert!(a >= 4 * 4900 * MIB);
         // And a genuinely larger tree eventually crosses a band edge.
-        assert!(recommended_size(5200 * MIB) > a);
+        assert!(recommended_size(5200 * MIB, 0) > a);
     }
 
     #[test]
@@ -214,9 +162,9 @@ mod tests {
             (10 * 1024 * 1024) + 7,
         ] {
             assert_eq!(
-                recommended_size(s) % 4096,
+                recommended_size(s, 0) % 4096,
                 0,
-                "recommended_size({s}) must be 4 KiB aligned for VZ"
+                "recommended_size({s}, 0) must be 4 KiB aligned for VZ"
             );
         }
     }

@@ -14,7 +14,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use engram_core::traits::{HostClient, SessionFence};
-use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{
     AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
@@ -93,6 +92,31 @@ impl Interceptor for TraceparentInjector {
     }
 }
 
+/// Parent `span` on the W3C `traceparent` in `req`'s metadata: the
+/// server side of [`TraceparentInjector`]. A no-op when the request has
+/// none (OTLP disabled, or a caller that does not propagate).
+pub fn link_remote_parent<T>(span: &tracing::Span, req: &tonic::Request<T>) {
+    if let Some(tp) = req
+        .metadata()
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+    {
+        engram_telemetry::set_parent_from_traceparent(span, tp);
+    }
+}
+
+/// ADR 0079: build the shared fenced request for the
+/// `SandboxIdMessage`-shaped lifecycle RPCs. `SessionFence::unfenced()`
+/// encodes epoch 0 (interim "verb not yet migrated" — the host allows
+/// without advancing).
+fn fenced_request(id: SandboxId, fence: SessionFence) -> FencedSandboxRequest {
+    FencedSandboxRequest {
+        uuid: id.as_uuid().as_bytes().to_vec(),
+        fencing_epoch: fence.epoch,
+        session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
+    }
+}
+
 /// Deadline applied (via the gRPC `grpc-timeout` header) to the
 /// snapshot-restore RPCs — `restore` (resume),
 /// `restore_base_for_session` (cold-create-via-restore), and
@@ -108,18 +132,6 @@ impl Interceptor for TraceparentInjector {
 /// rides the gRPC deadline header, the *host* side observes it too and
 /// can abort its own work. Override via
 /// `ENGRAM_RESTORE_RPC_TIMEOUT_SECS`.
-/// ADR 0079: build the shared fenced request for the
-/// `SandboxIdMessage`-shaped lifecycle RPCs. `SessionFence::unfenced()`
-/// encodes epoch 0 (interim "verb not yet migrated" — the host allows
-/// without advancing).
-fn fenced_request(id: SandboxId, fence: SessionFence) -> FencedSandboxRequest {
-    FencedSandboxRequest {
-        uuid: id.as_uuid().as_bytes().to_vec(),
-        fencing_epoch: fence.epoch,
-        session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
-    }
-}
-
 fn restore_rpc_timeout() -> Duration {
     let secs = std::env::var("ENGRAM_RESTORE_RPC_TIMEOUT_SECS")
         .ok()
@@ -356,7 +368,8 @@ impl GrpcHostClient {
             disk_drain_ms: resp.disk_drain_ms,
             vmstate_ms: resp.vmstate_ms,
             scan_ms: resp.scan_ms,
-            sealed_disk_chunks: resp.sealed_disk_chunks,
+            sealed_disk_blocks: resp.sealed_disk_blocks,
+            precopy_disk_blocks: resp.precopy_disk_blocks,
             paused_at_unix_ms: resp.paused_at_unix_ms,
         })
     }
@@ -438,44 +451,25 @@ impl GrpcHostClient {
         SandboxError,
     > {
         use crate::grpc::migration_item::Kind;
+        use engram_core::types::snapshot::MigrationItem as Item;
+        let wire_role = |role: engram_core::types::snapshot::DiskRole| match role {
+            engram_core::types::snapshot::DiskRole::Root => crate::grpc::DiskRole::Root as i32,
+            engram_core::types::snapshot::DiskRole::Swap => crate::grpc::DiskRole::Swap as i32,
+        };
         let wire_items = items
             .into_iter()
-            .map(|item| match item {
-                engram_core::types::snapshot::MigrationItem::HotHint => MigrationItem {
-                    kind: Kind::HotHint as i32,
-                    chunk_idx: 0,
-                    role: crate::grpc::DiskRole::Root as i32,
-                },
-                engram_core::types::snapshot::MigrationItem::StateBin => MigrationItem {
-                    kind: Kind::StateBin as i32,
-                    chunk_idx: 0,
-                    role: crate::grpc::DiskRole::Root as i32,
-                },
-                engram_core::types::snapshot::MigrationItem::DiskSealInfo(role) => MigrationItem {
-                    kind: Kind::DiskSealInfo as i32,
-                    chunk_idx: 0,
-                    role: match role {
-                        engram_core::types::snapshot::DiskRole::Root => {
-                            crate::grpc::DiskRole::Root as i32
-                        }
-                        engram_core::types::snapshot::DiskRole::Swap => {
-                            crate::grpc::DiskRole::Swap as i32
-                        }
-                    },
-                },
-                engram_core::types::snapshot::MigrationItem::DiskChunkAt(role, idx) => {
-                    MigrationItem {
-                        kind: Kind::DiskChunkAt as i32,
-                        chunk_idx: idx,
-                        role: match role {
-                            engram_core::types::snapshot::DiskRole::Root => {
-                                crate::grpc::DiskRole::Root as i32
-                            }
-                            engram_core::types::snapshot::DiskRole::Swap => {
-                                crate::grpc::DiskRole::Swap as i32
-                            }
-                        },
-                    }
+            .map(|item| {
+                let (kind, role, index) = match item {
+                    Item::HotHint => (Kind::HotHint, None, 0),
+                    Item::StateBin => (Kind::StateBin, None, 0),
+                    Item::DiskSealInfo(role) => (Kind::DiskSealInfo, Some(role), 0),
+                    Item::DiskPrecopyInfo(role) => (Kind::DiskPrecopyInfo, Some(role), 0),
+                    Item::DiskBlockAt(role, index) => (Kind::DiskBlockAt, Some(role), index),
+                };
+                MigrationItem {
+                    kind: kind as i32,
+                    role: role.map_or(crate::grpc::DiskRole::Root as i32, wire_role),
+                    index,
                 }
             })
             .collect();
@@ -492,14 +486,24 @@ impl GrpcHostClient {
         use futures::StreamExt;
         Ok(resp
             .map(|frame| {
-                frame
-                    .map(|f| engram_core::types::snapshot::MigrationFrame {
-                        item_idx: f.item_idx,
-                        offset: f.offset,
-                        data: bytes::Bytes::from(f.data),
-                        last: f.last,
-                    })
-                    .map_err(grpc_to_sandbox_err)
+                let f = frame.map_err(grpc_to_sandbox_err)?;
+                let item_hash = match f.last {
+                    false => None,
+                    true => Some(f.item_hash.as_slice().try_into().map_err(|_| {
+                        SandboxError::Snapshot(format!(
+                            "migration item {} hash is {} bytes, not 32",
+                            f.item_idx,
+                            f.item_hash.len()
+                        ))
+                    })?),
+                };
+                Ok(engram_core::types::snapshot::MigrationFrame {
+                    item_idx: f.item_idx,
+                    offset: f.offset,
+                    data: bytes::Bytes::from(f.data),
+                    last: f.last,
+                    item_hash,
+                })
             })
             .boxed())
     }
@@ -542,6 +546,26 @@ impl GrpcHostClient {
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
+    }
+
+    pub async fn migration_abort_unserved(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        fence: SessionFence,
+    ) -> Result<bool, SandboxError> {
+        let resp = self
+            .inner
+            .clone()
+            .migration_abort_unserved(MigrationExportRef {
+                sandbox_id: id.as_uuid().as_bytes().to_vec(),
+                export_id: export_id.to_string(),
+                fencing_epoch: fence.epoch,
+                session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
+            })
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(resp.into_inner().aborted)
     }
 
     pub async fn commit_snapshot(
@@ -892,8 +916,7 @@ impl GrpcHostClient {
         // the host-side SpawnHarness round-trip can wedge (guest page-in
         // starvation, a dead rootfs device that never answers agentd), and
         // without a `grpc-timeout` header the coordinator's resume `finish`
-        // step inherits the hang unbounded (prod 2026-07-17 session
-        // 03e6535e: a 34-minute stall ended only by a pod roll). The host
+        // step inherits the hang unbounded. The host
         // reattach is idempotent, so a timed-out attempt that the op
         // executor retries reconciles cleanly rather than double-spawning.
         req.set_timeout(restore_rpc_timeout());
@@ -961,68 +984,6 @@ impl GrpcHostClient {
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
-    }
-
-    /// ADR 0016 Phase A: per-sandbox COW diagnostic snapshot. Empty
-    /// `state_bincode` on the wire encodes `None` (host has no
-    /// chunk-tracked view of this sandbox) so coord can distinguish
-    /// "not chunk-tracked" from "really nothing dirty".
-    pub async fn cow_state(&self, id: SandboxId) -> Result<Option<CowState>, SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: id.as_uuid().as_bytes().to_vec(),
-        };
-        let resp = self
-            .inner
-            .clone()
-            .cow_state(req)
-            .await
-            .map_err(grpc_to_sandbox_err)?
-            .into_inner();
-        if resp.state_bincode.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(decode_bincode(&resp.state_bincode, "CowState")?))
-    }
-
-    /// ADR 0016 Phase A: bulk COW fetch for one host. Returns one
-    /// record per chunk-tracked sandbox; ordering not guaranteed.
-    pub async fn cow_state_all(&self) -> Result<Vec<CowStateRecord>, SandboxError> {
-        let resp = self
-            .inner
-            .clone()
-            .cow_state_all(Empty {})
-            .await
-            .map_err(grpc_to_sandbox_err)?
-            .into_inner();
-        decode_bincode(&resp.records_bincode, "Vec<CowStateRecord>")
-    }
-
-    /// ADR 0016 Phase B commit 4a — admin flush trigger. Coord's
-    /// `POST /api/admin/sessions/:id/flush-now` calls this. Empty
-    /// `manifest_ref_bincode` on the wire encodes `None` (no chunk
-    /// tracking / no dirty chunks); non-empty decodes to the new
-    /// `Some(ManifestRef)`.
-    pub async fn flush_sandbox(
-        &self,
-        id: SandboxId,
-    ) -> Result<Option<engram_core::types::manifest::ManifestRef>, SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: id.as_uuid().as_bytes().to_vec(),
-        };
-        let resp = self
-            .inner
-            .clone()
-            .flush_sandbox(req)
-            .await
-            .map_err(grpc_to_sandbox_err)?
-            .into_inner();
-        if resp.manifest_ref_bincode.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(decode_bincode(
-            &resp.manifest_ref_bincode,
-            "ManifestRef",
-        )?))
     }
 
     /// Server-streaming exec. The first frame is `started` (carries
@@ -1635,6 +1596,15 @@ impl HostClient for GrpcHostClient {
         Self::migration_abort(self, id, export_id, fence).await
     }
 
+    async fn migration_abort_unserved(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        fence: SessionFence,
+    ) -> Result<bool, SandboxError> {
+        Self::migration_abort_unserved(self, id, export_id, fence).await
+    }
+
     async fn commit_snapshot(
         &self,
         id: SandboxId,
@@ -1804,21 +1774,6 @@ impl HostClient for GrpcHostClient {
 
     // harness_dial + set_harness_sink use the trait defaults — gRPC
     // doesn't carry static capability or in-proc sink wiring.
-
-    async fn cow_state(&self, id: SandboxId) -> Result<Option<CowState>, SandboxError> {
-        Self::cow_state(self, id).await
-    }
-
-    async fn cow_state_all(&self) -> Result<Vec<CowStateRecord>, SandboxError> {
-        Self::cow_state_all(self).await
-    }
-
-    async fn flush_sandbox(
-        &self,
-        id: SandboxId,
-    ) -> Result<Option<engram_core::types::manifest::ManifestRef>, SandboxError> {
-        Self::flush_sandbox(self, id).await
-    }
 }
 
 /// Map a tonic Status into the same `SandboxError` shape today's WS

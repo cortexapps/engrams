@@ -27,8 +27,8 @@
 //! cargo test -p engram-migrate-proto --test wire_golden -- --ignored regen_golden
 //! ```
 //!
-//! A change to an EXISTING golden is a red flag unless `PROTO_VERSION` was bumped.
-//! Review every changed fixture with the corresponding version change.
+//! A change to an EXISTING golden is a red flag unless `PROTO_VERSION` was bumped,
+//! or the change appends fields that both builds read.
 
 use std::path::PathBuf;
 
@@ -192,6 +192,69 @@ fn from_source_golden_and_variant_indices() {
     assert_variant_index(&error, 5, "FromSource::Error");
 }
 
+/// `FromSource::Page` before `bytes` took `serde_bytes`: the same fields
+/// in the same order, with `bytes` as a plain `Vec<u8>` (bincode encodes
+/// it as a sequence of `u8`). Leading variants stand in for the real
+/// ones so `Page` keeps variant index 2.
+#[derive(Debug, PartialEq, Serialize, serde::Deserialize)]
+enum SeqBytesFromSource {
+    HelloAck,
+    Seal,
+    Page {
+        req_id: u64,
+        chunk_offset: u64,
+        bytes: Vec<u8>,
+        hash: [u8; 32],
+        lz4: bool,
+    },
+}
+
+/// A build with `serde_bytes` on `Page.bytes` and a build without it
+/// write the same bytes and read each other's frames, so a source and a
+/// destination of different builds need no negotiation.
+#[test]
+fn page_bytes_encoding_matches_the_plain_vec_encoding() {
+    for len in [0usize, 1, 255, 4096, 512 * 1024] {
+        let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let page = FromSource::Page {
+            req_id: 9,
+            chunk_offset: 512 * 1024,
+            bytes: payload.clone(),
+            hash: [0x5A; 32],
+            lz4: len % 2 == 0,
+        };
+        let seq = SeqBytesFromSource::Page {
+            req_id: 9,
+            chunk_offset: 512 * 1024,
+            bytes: payload.clone(),
+            hash: [0x5A; 32],
+            lz4: len % 2 == 0,
+        };
+        let page_wire = bincode::serialize(&page).expect("encode page");
+        let seq_wire = bincode::serialize(&seq).expect("encode seq page");
+        assert_eq!(page_wire, seq_wire, "len {len}: encodings differ");
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&9u64.to_le_bytes());
+        expected.extend_from_slice(&(512u64 * 1024).to_le_bytes());
+        expected.extend_from_slice(&(len as u64).to_le_bytes());
+        expected.extend_from_slice(&payload);
+        expected.extend_from_slice(&[0x5A; 32]);
+        expected.push(u8::from(len % 2 == 0));
+        assert_eq!(
+            page_wire, expected,
+            "len {len}: layout is not u64 length + bytes"
+        );
+
+        let from_seq: FromSource = bincode::deserialize(&seq_wire).expect("decode seq wire");
+        assert_eq!(from_seq, page);
+        let from_page: SeqBytesFromSource =
+            bincode::deserialize(&page_wire).expect("decode page wire");
+        assert_eq!(from_page, seq);
+    }
+}
+
 #[test]
 fn handler_control_golden_and_variant_indices() {
     let sealed = HandlerControl::Sealed {
@@ -212,6 +275,8 @@ fn handler_control_golden_and_variant_indices() {
         fault_us: 55_000,
         fault_max_us: 9_000,
         fault_around_chunks_installed: 0,
+        hot_leading: 3,
+        hot_hint_received: true,
     };
     let peer_lost = HandlerControl::PeerLost {
         remaining: 3,
@@ -229,6 +294,10 @@ fn handler_control_golden_and_variant_indices() {
     assert_variant_index(&peer_lost, 3, "HandlerControl::PeerLost");
 }
 
+/// Both builds of a `DrainDone` during a host-agent roll: the previous
+/// build's frame (pinned bytes, no hot fields) decodes with the hot fields
+/// at zero, and the previous build's reader takes the current frame's
+/// leading fields.
 #[test]
 fn seal_bitmap_payload_golden() {
     // `SealBitmap` is a struct (no variant index) but it rides
@@ -358,6 +427,8 @@ fn regen_golden() {
             fault_us: 55_000,
             fault_max_us: 9_000,
             fault_around_chunks_installed: 0,
+            hot_leading: 3,
+            hot_hint_received: true,
         },
     );
     write(

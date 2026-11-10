@@ -1,15 +1,10 @@
-//! Boot-time block-device tuning for the chunked-NBD rootfs.
+//! Boot-time readahead tuning for the guest's virtio disks.
 //!
-//! The guest's virtio disks are backed by the host disk daemon, where one
-//! read round trip costs ~100–200 µs regardless of size — while bytes
-//! inside an already-served range are nearly free. The kernel default
-//! readahead (128 KiB) is sized for local disks where speculative reads
-//! have real device cost; here a bigger window converts long chains of
-//! small dependent reads (JVM classloading is the measured worst case:
-//! ~47k reads at qd≈1 on a dev-brain first `gradlew help`) into fewer,
-//! larger round trips. Measured on the profiling ladder
-//! (engrams-internal #131): 128 KiB → 4 MiB readahead cut a guest-cold
-//! `gradlew help` from 5.2 s to 1.7 s.
+//! A bigger readahead window than the kernel default (128 KiB) converts
+//! long chains of small dependent reads (JVM classloading is the measured
+//! worst case) into fewer, larger reads. The 4 MiB value was measured
+//! against a network-backed rootfs; it is not re-measured against the
+//! local thin volume.
 //!
 //! Applied once at agentd startup. A fresh boot captures the setting
 //! into the base snapshot, so every session restored from that snapshot
@@ -20,13 +15,11 @@
 
 use std::path::Path;
 
-/// 4 MiB — the measured knee of the readahead sweep. Big enough to
-/// amortize round trips, small enough that speculative readahead stays
-/// well under one 16 MiB chunk and cannot drag in neighbouring chunks.
+/// 4 MiB — the measured knee of the readahead sweep.
 const READ_AHEAD_KB: &str = "4096";
 
 /// ADR 0112: the swap device's readahead. Swap-in is random 4 KiB
-/// against fast host-file backing — the 4 MiB window is sized for the
+/// against a local volume — the 4 MiB window is sized for the
 /// rootfs's serial classloading chains, and #1044's profiling showed
 /// large readahead INVERTS under reclaim pressure, which is the only
 /// regime the swap device ever serves. Kernel default, not zero:

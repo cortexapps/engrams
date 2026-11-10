@@ -12,8 +12,8 @@
 //!   K2: a host-agent restart *detaches* its VMs (leaves them running
 //!   under hostPID) and the successor re-adopts them here.
 //! - Orphan-reap: when the FC process is truly gone (or identity
-//!   fails), delete the manifest and let `orphan_reap.rs` reap the
-//!   jail_dir. Reconcile then transitions the owning session, which
+//!   fails), delete the manifest and let the teardown reconcile reap
+//!   the jail_dir. Reconcile then transitions the owning session, which
 //!   warm-recovers elsewhere from its last periodic checkpoint.
 //!
 //! There is deliberately no "restore from a SIGTERM checkpoint" path:
@@ -492,14 +492,12 @@ mod tests {
             uffd_handler_bin: PathBuf::from("/nonexistent/engram-uffd-handler"),
             uffd_base_dir: None,
             uffd_substrate_sock: None,
-            restore_mode: engram_sandbox_firecracker::RestoreMode::File,
             track_dirty_pages: false,
             balloon: false,
             net_pool: None,
             egress_proxy_port: None,
             egress_dns_port: None,
             guest_gateway_port: None,
-            host_id: None,
             uffd_cache_root: None,
             uffd_blob_root: None,
             cpu_template: None,

@@ -181,8 +181,8 @@ mod adapter {
         // The CLI carries a NATIVE tool also named "Artifact" that is
         // disabled in headless mode, so a bare-name call fails with
         // "exists but is not enabled in this context" — worse than
-        // unknown, because the model keeps retrying the built-in name
-        // (session 2769b9df). Redirect to the injected spelling.
+        // unknown, because the model keeps retrying the built-in name.
+        // Redirect to the injected spelling.
         if injected_tools(manifest).any(|tool| tool.name == "Artifact") {
             lines.push(
                 "The built-in Artifact tool is not available here. To publish, update, \
@@ -1530,10 +1530,9 @@ mod adapter {
         ///
         /// The exact `tool_use_id` is the normal key. But a respawned CLI
         /// mints a NEW id for the same intent, so an id-keyed lookup misses
-        /// and the call parks a second time — session 5661c75f ended up
-        /// with two unresolvable `exit_plan_mode` rows: a duplicate review
-        /// card, an inflated revision count, and `awaiting_review` that can
-        /// never clear.
+        /// and the call parks a second time. That leaves two unresolvable
+        /// `exit_plan_mode` rows: a duplicate review card, an inflated
+        /// revision count, and `awaiting_review` that can never clear.
         ///
         /// So `exit_plan_mode` also matches by TOOL: at most one plan is
         /// ever under review per session, and a plan drafted before the
@@ -1840,7 +1839,7 @@ mod adapter {
         // by the built-in name) is exactly the discovery the model gets
         // wrong: haiku searched `select:ask_user_question` (the bare name,
         // not `mcp__engrams__ask_user_question`), missed, and gave up asking
-        // in plain text (session 03efe4f2). Always-loading restores the
+        // in plain text. Always-loading restores the
         // native binding's always-present property. The injected set is
         // small, so the resident-schema cost is negligible; if it grows,
         // switch to per-tool `_meta["anthropic/alwaysLoad"]` in the bridge's
@@ -2203,8 +2202,8 @@ mod adapter {
 
     /// The single in-flight turn, owned by the session loop. `run_id` is
     /// minted on prompt-accept — BEFORE any claude output — so no event
-    /// can be emitted without a valid `run_id`. The bare-event desync
-    /// that wedged `bf3dbbcb` is therefore impossible by construction.
+    /// can be emitted without a valid `run_id`, and a bare-event desync
+    /// is impossible by construction.
     struct TurnState {
         run_id: String,
         tool_calls: u32,
@@ -2310,8 +2309,7 @@ mod adapter {
         }
     }
 
-    /// The condemned-process contract (prod 2026-08-03, session
-    /// aa0829b0): any child we SIGNAL never receives another turn. A
+    /// The condemned-process contract: any child we SIGNAL never receives another turn. A
     /// SIGINT'd claude may abort the turn, emit the abort `result`, and
     /// exit much later on its own schedule — a turn dispatched into that
     /// window dies mid-flight with exit code 0 and reads as a harness
@@ -3099,7 +3097,7 @@ mod adapter {
                                 // abort in flight (or a condemned child)
                                 // must never receive another message — the
                                 // write would land in a dying process and be
-                                // lost (the 2026-08-03 aa0829b0 contract:
+                                // lost (the condemned-process contract:
                                 // the queue survives to the fresh
                                 // generation); and no stdin means no wire to
                                 // write.
@@ -3294,12 +3292,10 @@ mod adapter {
                                 // and STAYS ALIVE — no SIGINT, no respawn — so
                                 // conversation context is preserved and the
                                 // next queued prompt runs on the SAME warm
-                                // process. (This is the root-cause fix for the
-                                // SIGINT-kills-the-persistent-process bug:
-                                // session ba3ae8d5, where interrupt + a queued
-                                // message respawned `--resume` into a fragile,
-                                // context-less process that the harness then
-                                // misread as a crash.) Mark the run so the
+                                // process. A SIGINT here kills the persistent
+                                // process, and interrupt + a queued message
+                                // then respawns `--resume` into a context-less
+                                // process that reads as a crash. Mark the run so the
                                 // `result` handler reports RunInterrupted, and
                                 // arm a grace deadline: a build that ignores the
                                 // control frame is escalated to SIGINT (the
@@ -3381,9 +3377,8 @@ mod adapter {
                         // anything. claude 2.1.212 can abort the turn, emit
                         // the abort `result`, and exit much later — and the
                         // result handler then dispatched the next queued
-                        // prompt into the dying process (prod 2026-08-03,
-                        // session aa0829b0: "claude exited abnormally
-                        // mid-turn ... code 0"). Break straight to the reap:
+                        // prompt into the dying process ("claude exited
+                        // abnormally mid-turn ... code 0"). Break straight to the reap:
                         // `interrupted_run` is set, so the turn closes as
                         // RunInterrupted and the engine respawns `--resume`
                         // with zero backoff; the queued prompt lands in the
@@ -4723,7 +4718,7 @@ mod adapter {
                             "args": ["mcp-bridge"],
                             // Always-loaded so an injected built-in replacement
                             // (ask_user_question/exit_plan_mode) is resident and
-                            // needs no ToolSearch discovery (session 03efe4f2).
+                            // needs no ToolSearch discovery.
                             "alwaysLoad": true
                         }
                     }
@@ -5056,8 +5051,7 @@ mod adapter {
             let _ = tokio::fs::remove_file(sock).await;
         }
 
-        /// The by-tool retarget on the injected path (session 5661c75f's
-        /// class): a respawned CLI minted a NEW id for the same plan, so the
+        /// The by-tool retarget on the injected path: a respawned CLI minted a NEW id for the same plan, so the
         /// exact-id lookup misses. The serve must consume the old stash, ack
         /// the OLD call id (its outbox row would redeliver forever), and not
         /// park a duplicate.
@@ -6252,7 +6246,7 @@ mod adapter {
             let _ = tokio::fs::remove_file(&pidfile).await;
         }
 
-        /// The incident fake (prod 2026-08-03, session aa0829b0): a claude
+        /// A fake claude
         /// that IGNORES the `control_request` (forcing the grace escalation
         /// to SIGINT), and on SIGINT emits the abort `result` but does NOT
         /// exit — the abort-then-exit-later shape of claude 2.1.212. Every
@@ -6291,8 +6285,7 @@ mod adapter {
             path.to_string_lossy().into_owned()
         }
 
-        /// The condemned-process contract, end to end (prod 2026-08-03,
-        /// session aa0829b0): an interrupt whose `control_request` is not
+        /// The condemned-process contract, end to end: an interrupt whose `control_request` is not
         /// honored escalates to SIGINT — and from that signal on, the
         /// child NEVER receives another turn, even though it emits an
         /// abort `result` and lingers. The run closes as RunInterrupted
@@ -6423,8 +6416,7 @@ mod adapter {
             }
         }
 
-        // Phase 3 regression for session ba3ae8d5, write-through era (ADR
-        // 0052 2026-08-20 revision): a mid-turn prompt is WRITTEN THROUGH
+        // Write-through (ADR 0052): a mid-turn prompt is WRITTEN THROUGH
         // (PromptSteered — the fake consumes it inside the running turn),
         // and a subsequent operator Interrupt aborts the turn cleanly on
         // the SAME warm process — RunInterrupted then Idle, no respawn,
@@ -7788,8 +7780,7 @@ mod adapter {
             assert_eq!(apply_prompt_mode(&cli, Some("default")), "default");
         }
 
-        /// ADR 0107 approve, injected `exit_plan_mode` (PR #981 regression,
-        /// session f9222d41): an idle `plan`-directive prompt respawns into
+        /// ADR 0107 approve, injected `exit_plan_mode`: an idle `plan`-directive prompt respawns into
         /// `--permission-mode plan`; the injected `exit_plan_mode` defers and
         /// parks; the approve result flips the stamp to build and STASHES the
         /// result. On the id-stable re-fire the hook must ALLOW (not defer a
@@ -7972,8 +7963,8 @@ mod adapter {
             assert_eq!(prompt_id, None);
             // A respawned CLI mints a NEW tool_use_id for the re-fire — the
             // production case, because a parked plan gets idle-evicted while
-            // the human reads it. Session 5661c75f parked this a SECOND time
-            // and left an unresolvable row behind. The hook must ALLOW the
+            // the human reads it. Without the retarget the re-fire parks a
+            // second time and leaves an unresolvable row. The hook must ALLOW the
             // re-fire (the by-tool retarget finds the stashed reject), and the
             // bridge serves the REVISE instruction.
             assert!(
@@ -7996,9 +7987,9 @@ mod adapter {
                 served.contains("also add tests"),
                 "feedback rides: {served}"
             );
-            // A verdict alone is not enough: session 93869a67 got "Plan
-            // rejected by the reviewer: …" and re-proposed the byte-identical
-            // plan. The ask has to be explicit.
+            // A verdict alone is not enough: on "Plan rejected by the
+            // reviewer: …" the model re-proposes the byte-identical plan.
+            // The ask has to be explicit.
             assert!(
                 served.contains("call exit_plan_mode again"),
                 "the revision ask rides: {served}"

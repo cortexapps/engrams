@@ -18,13 +18,11 @@ use engram_protocol::app;
 
 use crate::api::exec::ExecRequest as ApiExecRequest;
 use crate::api::sessions::{CreateSessionRequest, ListSessionsResponse, SessionListItem};
-use crate::cow_state::CowStateView;
 use crate::error::ApiError;
 use engram_core::types::session::SessionMode;
 
 /// `engram_core::types::Session` → proto `Session`. Drops `user_id`
-/// (off-contract per ADR 0051 §2.1: attribution leaves the contract) and
-/// `live_disk_manifest` (internal coord state, not on the wire shape).
+/// (off-contract per ADR 0051 §2.1: attribution leaves the contract).
 ///
 /// The exhaustive destructure below is the totality guard — if a field is
 /// added to `engram_core::types::Session` without updating this converter,
@@ -40,9 +38,8 @@ pub(crate) fn session_to_proto(s: &engram_core::types::Session) -> app::Session 
         created_at,
         last_active_at,
         last_event_at,
-        live_disk_manifest: _, // Internal coord state (ADR 0016 Phase B); not on the wire shape.
-        park_rung: _,          // Internal parking-ladder state (ADR 0074); not on the wire shape.
-        parked_at: _,          // Internal parking-ladder state (ADR 0074); not on the wire shape.
+        park_rung: _, // Internal parking-ladder state (ADR 0074); not on the wire shape.
+        parked_at: _, // Internal parking-ladder state (ADR 0074); not on the wire shape.
         suggested_title,
     } = s;
     app::Session {
@@ -287,41 +284,6 @@ pub(crate) fn exec_request_from_proto(r: app::ExecRequest) -> ApiExecRequest {
     }
 }
 
-/// [`CowStateView`] → proto [`CowStateView`] (session.proto).
-///
-/// Exhaustive destructure below is the totality guard — a new field on
-/// `CowStateView` must be handled here or the build fails.
-pub(crate) fn cow_state_to_proto(v: &CowStateView) -> app::CowStateView {
-    let CowStateView {
-        sandbox_id,
-        session_id,
-        disk_manifest_id,
-        disk_manifest_version,
-        dirty_chunks,
-        dirty_bytes,
-        last_flush_at,
-        base_chunks,
-        base_chunks_local,
-        memory_manifest_id,
-        memory_manifest_version,
-        last_snapshot_at,
-    } = v;
-    app::CowStateView {
-        sandbox_id: sandbox_id.to_string(),
-        session_id: session_id.map(|s| s.to_string()),
-        disk_manifest_id: disk_manifest_id.clone(),
-        disk_manifest_version: *disk_manifest_version,
-        dirty_chunks: *dirty_chunks,
-        dirty_bytes: *dirty_bytes,
-        last_flush_at: last_flush_at.map(|t| t.to_rfc3339()),
-        base_chunks: *base_chunks,
-        base_chunks_local: *base_chunks_local,
-        memory_manifest_id: memory_manifest_id.clone(),
-        memory_manifest_version: *memory_manifest_version,
-        last_snapshot_at: last_snapshot_at.map(|t| t.to_rfc3339()),
-    }
-}
-
 /// api `ConversationEntry` → proto `ConversationEntry`.
 ///
 /// The exhaustive destructure below is the totality guard — if a field is
@@ -418,8 +380,10 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         cordoned,
         cordon_owner,
         retirement,
-        nbd_slots_total,
-        nbd_slots_in_use,
+        pool_data_free_mib,
+        pool_data_total_mib,
+        pool_metadata_free_mib,
+        pool_metadata_total_mib,
         allocatable_mib,
         reserved_mib,
         free_mib,
@@ -431,6 +395,7 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         failing_capabilities,
         fc_snapshot_version,
         capabilities_schema,
+        reattach_generation,
         // Issue #540: the RAM ledger's attribution fields.
         util_base_shm_mib,
         util_parked_pss_mib,
@@ -459,8 +424,10 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
             .map(|o| o.as_str().to_owned())
             .unwrap_or_default(),
         retirement: retirement.as_ref().map(retirement_to_proto),
-        nbd_slots_total: *nbd_slots_total,
-        nbd_slots_in_use: *nbd_slots_in_use,
+        pool_data_free_mib: *pool_data_free_mib,
+        pool_data_total_mib: *pool_data_total_mib,
+        pool_metadata_free_mib: *pool_metadata_free_mib,
+        pool_metadata_total_mib: *pool_metadata_total_mib,
         allocatable_mib: *allocatable_mib,
         reserved_mib: *reserved_mib,
         free_mib: *free_mib,
@@ -471,6 +438,7 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         failing_capabilities: failing_capabilities.clone(),
         fc_snapshot_version: fc_snapshot_version.clone().unwrap_or_default(),
         capabilities_schema: *capabilities_schema,
+        reattach_generation: *reattach_generation,
         util_base_shm_mib: *util_base_shm_mib,
         util_parked_pss_mib: *util_parked_pss_mib,
         util_running_pss_mib: *util_running_pss_mib,
@@ -490,65 +458,12 @@ pub(crate) fn storage_summary_to_proto(
         snapshot_bytes,
         gc_pending,
         gc_pending_exact,
-        tracked_sandboxes,
-        dirty_chunks,
-        unflushed_bytes,
-        avg_locality_pct,
-        rows,
     } = r;
     app::GetStorageSummaryResponse {
         snapshots,
         snapshot_bytes,
         gc_pending,
         gc_pending_exact,
-        tracked_sandboxes,
-        dirty_chunks,
-        unflushed_bytes,
-        avg_locality_pct,
-        rows: rows.into_iter().map(durability_row_to_proto).collect(),
-    }
-}
-
-fn durability_row_to_proto(r: crate::api::storage::DurabilityRow) -> app::DurabilityRow {
-    let crate::api::storage::DurabilityRow {
-        sandbox_id,
-        session_id,
-        host_id,
-        dirty_chunks,
-        dirty_bytes,
-        base_chunks,
-        base_chunks_local,
-        last_flush_at,
-    } = r;
-    app::DurabilityRow {
-        sandbox_id: sandbox_id.to_string(),
-        session_id: session_id.map(|s| s.to_string()),
-        host_id: host_id.to_string(),
-        dirty_chunks,
-        dirty_bytes,
-        base_chunks,
-        base_chunks_local,
-        last_flush_at: last_flush_at.map(|t| t.to_rfc3339()),
-    }
-}
-
-/// api `FlushNowResult` → proto `FlushSessionResponse`.
-///
-/// The exhaustive destructure below is the totality guard.
-pub(crate) fn flush_now_result_to_proto(
-    r: crate::api::admin::FlushNowResult,
-) -> app::FlushSessionResponse {
-    let crate::api::admin::FlushNowResult {
-        outcome,
-        manifest_version,
-    } = r;
-    app::FlushSessionResponse {
-        outcome: match outcome {
-            crate::api::admin::FlushNowOutcome::Applied => "applied".to_string(),
-            crate::api::admin::FlushNowOutcome::Idle => "idle".to_string(),
-            crate::api::admin::FlushNowOutcome::Stale => "stale".to_string(),
-        },
-        manifest_version,
     }
 }
 
@@ -1027,7 +942,6 @@ mod tests {
             // crossed the two clocks fails this fixture instead of passing on
             // two identical `Utc::now()` values.
             last_event_at: Some(chrono::Utc::now() + chrono::Duration::seconds(61)),
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,

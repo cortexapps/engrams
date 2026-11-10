@@ -382,6 +382,35 @@ async fn crash_after_presetup_reuses_live_payload(mut rig: Rig) {
 }
 scenario!(crash_after_presetup_reuses_live_payload);
 
+async fn live_payload_names_the_source_as_a_chunk_peer(mut rig: Rig) {
+    let meta = &rig.state.services.meta;
+    let mut source = meta
+        .get_host(rig.row.source_host_id)
+        .await
+        .unwrap()
+        .unwrap();
+    source.wire_version = engram_protocol::WIRE_VERSION;
+    meta.upsert_host(source).await.unwrap();
+    rig.make_live().await;
+    rig.source.block_capture.store(true, Ordering::SeqCst);
+    let task = rig.spawn_drive();
+    rig.source.capture_entered.notified().await;
+    let row = meta
+        .open_teleport_for_session(rig.row.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let metadata: engram_core::types::snapshot::SnapshotMetadata =
+        serde_json::from_value(row.live_payload.unwrap()).unwrap();
+    assert_eq!(metadata.peer_hints, vec!["http://source:8080".to_string()]);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    rig.reclaim().await;
+    rig.source.block_capture.store(false, Ordering::SeqCst);
+    assert!(matches!(rig.drive().await, OpOutcome::Done));
+}
+scenario!(live_payload_names_the_source_as_a_chunk_peer);
+
 async fn live_refusal_downgrades_to_snapshot_in_row(rig: Rig) {
     assert_eq!(
         rig.row.kind,
@@ -469,6 +498,113 @@ async fn refused_memory_image_rolls_back_live_move(rig: Rig) {
 }
 scenario!(refused_memory_image_rolls_back_live_move);
 
+/// A destination that fails before it fetched the paused state cannot run
+/// the guest, so the source aborts its export and keeps the session.
+async fn dest_failure_before_the_state_is_served_resumes_the_source(rig: Rig) {
+    rig.make_live().await;
+    rig.dest.restore_fails.store(true, Ordering::SeqCst);
+    assert!(matches!(rig.drive().await, OpOutcome::Done));
+    assert_eq!(rig.dest.restores.load(Ordering::SeqCst), 1, "no retry");
+    assert_eq!(rig.source.unserved_aborts.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.source.destroys.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.phase().await, None);
+    let session = meta_session(&rig).await;
+    assert_eq!(session.status, SessionState::Active);
+    assert_eq!(session.host_id, Some(rig.row.source_host_id));
+    assert_eq!(session.sandbox_id, Some(rig.source.sandbox));
+    let meta = &rig.state.services.meta;
+    assert!(meta
+        .sandbox_tombstones_for_host(rig.row.source_host_id)
+        .await
+        .unwrap()
+        .is_empty());
+    let events = meta
+        .list_session_events_since(rig.row.session_id, -1, 100)
+        .await
+        .unwrap();
+    let terminal: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == "teleport_finished")
+        .collect();
+    assert_eq!(terminal.len(), 1);
+    assert_eq!(terminal[0].payload["outcome"], "aborted");
+}
+scenario!(dest_failure_before_the_state_is_served_resumes_the_source);
+
+/// After its retries, a destination failure the source cannot rule out
+/// as a running guest settles the session Dead and entombs the source.
+async fn dest_failure_without_unserved_proof_is_dead(mut rig: Rig) {
+    rig.make_live().await;
+    rig.dest.restore_fails.store(true, Ordering::SeqCst);
+    assert!(matches!(rig.drive().await, OpOutcome::Retry(_)));
+    assert_eq!(rig.phase().await, Some(TeleportPhase::Captured));
+    assert_eq!(rig.source.aborts.load(Ordering::SeqCst), 0);
+    rig.op.attempts = 4;
+    assert!(matches!(rig.drive().await, OpOutcome::Done));
+    assert_eq!(rig.source.unserved_aborts.load(Ordering::SeqCst), 2);
+    assert_eq!(rig.source.aborts.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.phase().await, None);
+    let session = meta_session(&rig).await;
+    assert_eq!(session.status, SessionState::Dead);
+    assert_eq!(
+        rig.state
+            .services
+            .meta
+            .sandbox_tombstones_for_host(rig.row.source_host_id)
+            .await
+            .unwrap(),
+        vec![rig.source.sandbox]
+    );
+}
+
+async fn served_state_dest_failure_is_dead(rig: Rig) {
+    rig.source.state_served.store(true, Ordering::SeqCst);
+    dest_failure_without_unserved_proof_is_dead(rig).await;
+}
+scenario!(served_state_dest_failure_is_dead);
+
+/// A source that lost its export (a host-agent restart) cannot prove the
+/// state was never served.
+async fn source_without_the_export_is_dead(rig: Rig) {
+    rig.source
+        .abort_unserved_not_found
+        .store(true, Ordering::SeqCst);
+    dest_failure_without_unserved_proof_is_dead(rig).await;
+}
+scenario!(source_without_the_export_is_dead);
+
+/// The unserved abort removed the export but its in-place resume failed:
+/// the rollback's abort finds no export and finishes with a resume.
+async fn unserved_abort_with_a_failed_resume_completes_in_rollback(rig: Rig) {
+    rig.make_live().await;
+    rig.dest.restore_fails.store(true, Ordering::SeqCst);
+    rig.source.resume_fails.store(true, Ordering::SeqCst);
+    assert!(matches!(rig.drive().await, OpOutcome::RetryAfter(_, _)));
+    assert_eq!(rig.phase().await, Some(TeleportPhase::RollingBack));
+    assert_eq!(rig.source.unserved_aborts.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.source.aborts.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.source.resumes.load(Ordering::SeqCst), 1);
+    assert_eq!(meta_session(&rig).await.status, SessionState::Evacuating);
+    rig.source.resume_fails.store(false, Ordering::SeqCst);
+    assert!(matches!(rig.drive().await, OpOutcome::Done));
+    assert_eq!(rig.dest.restores.load(Ordering::SeqCst), 1, "no retry");
+    assert_eq!(rig.source.resumes.load(Ordering::SeqCst), 2);
+    assert_eq!(rig.source.destroys.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.phase().await, None);
+    let session = meta_session(&rig).await;
+    assert_eq!(session.status, SessionState::Active);
+    assert_eq!(session.sandbox_id, Some(rig.source.sandbox));
+}
+scenario!(unserved_abort_with_a_failed_resume_completes_in_rollback);
+
+async fn source_without_the_served_answer_is_dead(rig: Rig) {
+    rig.source
+        .abort_unserved_unsupported
+        .store(true, Ordering::SeqCst);
+    dest_failure_without_unserved_proof_is_dead(rig).await;
+}
+scenario!(source_without_the_served_answer_is_dead);
+
 /// A consumed export (an earlier abort passed its point of no return) is
 /// not a resumed guest: the rollback still needs the resume ack before it
 /// declares Active.
@@ -524,28 +660,6 @@ async fn rollback_with_a_destroyed_source_fails_the_move(rig: Rig) {
     );
 }
 scenario!(rollback_with_a_destroyed_source_fails_the_move);
-
-/// A disk-only session (live disk manifest, no memory snapshot) is still
-/// recoverable through the cold boot: a lost source settles it Idle, not
-/// Dead, and keeps the manifest.
-async fn rollback_with_a_destroyed_source_keeps_a_disk_only_session_idle(rig: Rig) {
-    let manifest = engram_core::types::manifest::ManifestRef::new();
-    rig.state
-        .services
-        .meta
-        .update_live_disk_manifest(rig.row.session_id, rig.row.source_sandbox_id, manifest)
-        .await
-        .unwrap();
-    rig.source.capture_fails.store(true, Ordering::SeqCst);
-    rig.source.resume_not_found.store(true, Ordering::SeqCst);
-    assert!(matches!(rig.drive().await, OpOutcome::Done));
-    assert_eq!(rig.phase().await, None);
-    let session = meta_session(&rig).await;
-    assert_eq!(session.status, engram_core::types::SessionState::Idle);
-    assert_eq!(session.sandbox_id, None);
-    assert_eq!(session.live_disk_manifest, Some(manifest));
-}
-scenario!(rollback_with_a_destroyed_source_keeps_a_disk_only_session_idle);
 
 async fn another_admission(rig: &Rig) -> engram_core::types::teleport::TeleportAdmitRequest {
     use engram_core::types::teleport::*;
@@ -755,3 +869,130 @@ async fn live_peer_lost_fails_to_idle_with_durable_row(rig: Rig) {
     assert_eq!(terminal[0].payload["error"], "peer_lost");
 }
 scenario!(live_peer_lost_fails_to_idle_with_durable_row);
+
+/// Park the move at `Attached` with the post-copy drain still running and
+/// give the lane back, as the executor does between drain slices.
+async fn attached_mid_drain(rig: &Rig) {
+    rig.make_live().await;
+    rig.dest.drain_pending.store(true, Ordering::SeqCst);
+    let out = rig.drive().await;
+    assert!(matches!(out, OpOutcome::RetryAfter(..)), "{out:?}");
+    assert_eq!(rig.phase().await, Some(TeleportPhase::Attached));
+    assert!(rig
+        .state
+        .services
+        .meta
+        .op_requeue_wait(
+            rig.op.id,
+            rig.op.epoch.unwrap(),
+            std::time::Duration::from_secs(60),
+            "waiting for the post-copy drain",
+        )
+        .await
+        .unwrap());
+}
+
+/// Enqueue `kind` behind the waiting teleport op and claim it.
+async fn claim_next(
+    rig: &Rig,
+    kind: engram_core::types::session_op::OpKind,
+    payload: serde_json::Value,
+) -> engram_core::types::session_op::SessionOp {
+    let meta = &rig.state.services.meta;
+    meta.op_enqueue_and_claim(rig.row.session_id, kind, payload, None, "test")
+        .await
+        .unwrap();
+    let op = meta
+        .op_claim_head(rig.row.session_id, "test")
+        .await
+        .unwrap()
+        .expect("the new op is due");
+    assert_eq!(op.kind, kind);
+    op
+}
+
+async fn dispatch(rig: &Rig, op: &engram_core::types::session_op::SessionOp) -> OpOutcome {
+    coordinator::session_verbs::dispatch(&coordinator::session_ops::OpCtx {
+        state: &rig.state,
+        op,
+        epoch: op.epoch.unwrap(),
+    })
+    .await
+}
+
+async fn destroy_mid_drain_settles_the_move(rig: Rig) {
+    use engram_core::types::session_op::{OpKind, OpState};
+    attached_mid_drain(&rig).await;
+    let meta = &rig.state.services.meta;
+    let destroy = claim_next(&rig, OpKind::Destroy, serde_json::json!({})).await;
+    assert!(matches!(dispatch(&rig, &destroy).await, OpOutcome::Done));
+    assert!(meta
+        .op_finish(destroy.id, destroy.epoch.unwrap(), OpState::Done, None)
+        .await
+        .unwrap());
+    assert_eq!(
+        meta.get_session(rig.row.session_id).await.unwrap().status,
+        SessionState::Completed
+    );
+
+    rig.clock.advance(std::time::Duration::from_secs(61));
+    let teleport = meta
+        .op_claim_head(rig.row.session_id, "test")
+        .await
+        .unwrap()
+        .expect("the teleport op is due");
+    assert_eq!(teleport.kind, OpKind::Teleport);
+    assert_eq!(
+        teleport.attempts, rig.op.attempts,
+        "a wait spends no attempt"
+    );
+    assert!(matches!(dispatch(&rig, &teleport).await, OpOutcome::Done));
+    assert_eq!(rig.phase().await, None);
+    assert_eq!(
+        meta.get_session(rig.row.session_id).await.unwrap().status,
+        SessionState::Completed
+    );
+    assert_eq!(
+        meta.sandbox_tombstones_for_host(rig.row.source_host_id)
+            .await
+            .unwrap(),
+        vec![rig.source.sandbox]
+    );
+    let events = meta
+        .list_session_events_since(rig.row.session_id, -1, 100)
+        .await
+        .unwrap();
+    let finished: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == "teleport_finished")
+        .collect();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].payload["error"], "session_ended");
+}
+scenario!(destroy_mid_drain_settles_the_move);
+
+async fn evict_mid_drain_waits_for_the_move(rig: Rig) {
+    use engram_core::types::session_op::OpKind;
+    attached_mid_drain(&rig).await;
+    let evict = claim_next(
+        &rig,
+        OpKind::Evict,
+        serde_json::json!({ "target": "idle", "allow_park": false, "nominated": false }),
+    )
+    .await;
+    assert!(matches!(
+        dispatch(&rig, &evict).await,
+        OpOutcome::RetryAfter(..)
+    ));
+    assert_eq!(rig.dest.captures.load(Ordering::SeqCst), 0);
+    let s = rig
+        .state
+        .services
+        .meta
+        .get_session(rig.row.session_id)
+        .await
+        .unwrap();
+    assert_eq!(s.status, SessionState::Active);
+    assert_eq!(s.sandbox_id, Some(rig.dest.sandbox));
+}
+scenario!(evict_mid_drain_waits_for_the_move);

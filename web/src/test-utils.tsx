@@ -69,7 +69,6 @@ export const testTransport: Transport = createRouterTransport((router) => {
   router.service(FleetService, {
     listHosts: () => ({ hosts: [] }),
     getHost: () => ({ host: undefined }),
-    getHostCowState: () => ({ hostId: "", sessions: [] }),
     drainHost: () => ({}),
     adminDrainHost: () => ({ hostId: "", planned: [], descended: [], skipped: 0 }),
     cordonHost: () => ({ hostId: "", status: "" }),
@@ -78,13 +77,8 @@ export const testTransport: Transport = createRouterTransport((router) => {
       snapshots: 0n,
       snapshotBytes: 0n,
       gcPending: 0n,
-      trackedSandboxes: 0n,
-      dirtyChunks: 0n,
-      unflushedBytes: 0n,
-      avgLocalityPct: 0,
-      rows: [],
+      gcPendingExact: true,
     }),
-    flushSession: () => ({ outcome: "", manifestVersion: undefined }),
     teleportSession: () => ({ teleportId: "", kind: "snapshot", destHostId: "" }),
     chunkGc: () => ({
       listedChunks: 0n,
@@ -116,7 +110,7 @@ export const testTransport: Transport = createRouterTransport((router) => {
     }),
   });
   // ADR 0051 Task 24: stub SessionService so components that call
-  // getSession / getCowState / listCheckpoints / sendPrompt / interrupt
+  // getSession / listCheckpoints / sendPrompt / interrupt
   // (including SessionThread's useMutation initialisation) don't error in tests.
   router.service(SessionService, {
     listSessions: () => ({ sessions: [] }),
@@ -134,7 +128,6 @@ export const testTransport: Transport = createRouterTransport((router) => {
     snapshot: () => ({ sessionId: "", snapshotId: undefined, sizeBytes: undefined, note: "" }),
     resume: () => ({ sessionId: "", snapshotId: undefined, sizeBytes: undefined, note: "" }),
     evictLocal: () => ({}),
-    getCowState: () => ({ sessionId: "", state: undefined }),
     listCheckpoints: () => ({ sessionId: "", checkpoints: [] }),
     createArtifactFromPath: () => ({ artifactId: "", mediaType: "", sizeBytes: BigInt(0) }),
   });

@@ -104,6 +104,8 @@ pub enum InjectedError {
     Sdk(String),
     /// `BlobError::Protocol(_)` — an unexpected response shape.
     Protocol(String),
+    /// `BlobError::Throttled(_)` — the store refused the request for load.
+    Throttled(String),
 }
 
 impl InjectedError {
@@ -117,6 +119,7 @@ impl InjectedError {
                 msg.clone(),
             )),
             Self::Protocol(msg) => BlobError::Protocol(msg.clone()),
+            Self::Throttled(msg) => BlobError::Throttled(msg.clone().into()),
         }
     }
 }
@@ -571,6 +574,31 @@ impl BlobStorage for FaultyBlobStorage {
         Ok(buf.freeze())
     }
 
+    /// Passes the range to the inner store. A get fault on `key` applies
+    /// as it does to `get`: the faulted body, then the range cut from it.
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes, BlobError> {
+        self.counters.gets_attempted.fetch_add(1, Ordering::Relaxed);
+        let (after_bytes, error) = match self.get_fault_for(key) {
+            None => return self.inner.get_range(key, offset, len).await,
+            Some(GetFaultKind::NotFound(err)) => {
+                self.counters.gets_faulted.fetch_add(1, Ordering::Relaxed);
+                return Err(err.to_blob_error());
+            }
+            Some(GetFaultKind::TruncateThenError { after_bytes, error }) => {
+                (after_bytes, Some(error))
+            }
+            Some(GetFaultKind::TruncateCleanEof { after_bytes }) => (after_bytes, None),
+        };
+        self.counters.gets_truncated.fetch_add(1, Ordering::Relaxed);
+        let mut stream =
+            truncating_stream(self.inner.get_streaming(key).await?, after_bytes, error);
+        let mut buf = BytesMut::new();
+        while let Some(chunk) = stream.next().await {
+            buf.extend_from_slice(&chunk?);
+        }
+        engram_core::traits::storage::cut_range(&buf.freeze(), offset, len)
+    }
+
     async fn head(&self, key: &str) -> Result<BlobObjectMeta, BlobError> {
         self.counters
             .heads_attempted
@@ -737,6 +765,31 @@ mod tests {
         let bytes = f.get("k").await.unwrap();
         assert_eq!(&bytes[..], b"0123");
         assert_eq!(f.counters().gets_truncated(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_range_passes_through_and_a_truncated_body_cuts_it_short() {
+        let inner: Arc<dyn BlobStorage> = Arc::new(MemBlob::default());
+        inner
+            .put("k", Bytes::from_static(b"0123456789"))
+            .await
+            .unwrap();
+        let plain = FaultyBlobStorage::new(inner.clone(), FaultPlan::new());
+        assert_eq!(&plain.get_range("k", 7, 3).await.unwrap()[..], b"789");
+        assert_eq!(plain.counters().gets_attempted(), 1);
+
+        let plan = FaultPlan::new().with_get(GetFault {
+            key: KeyMatch::Exact("k".into()),
+            when: When::Always,
+            kind: GetFaultKind::TruncateCleanEof { after_bytes: 4 },
+        });
+        let f = FaultyBlobStorage::new(inner, plan);
+        assert_eq!(&f.get_range("k", 2, 2).await.unwrap()[..], b"23");
+        assert!(matches!(
+            f.get_range("k", 3, 3).await,
+            Err(BlobError::RangeOutOfBounds { .. })
+        ));
+        assert_eq!(f.counters().gets_truncated(), 2);
     }
 
     #[tokio::test]

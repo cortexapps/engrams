@@ -105,6 +105,7 @@ toml_datetime = { version = "1", features = ["serde"] }
 toml_parser = { version = "1" }
 tonic = { version = "0.14" }
 tower = { version = "0.5", default-features = false, features = ["balance", "buffer", "filter", "limit", "load-shed", "log", "retry"] }
+tower-http = { version = "0.7", features = ["auth", "cors", "map-response-body", "trace", "util"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
 tungstenite = { version = "0.30", default-features = false, features = ["__rustls-tls", "handshake"] }
@@ -164,7 +165,7 @@ smallvec = { version = "1", default-features = false, features = ["const_new", "
 sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "chrono", "json", "migrate", "offline", "uuid"] }
 sqlx-postgres = { version = "0.8", default-features = false, features = ["chrono", "json", "migrate", "offline", "uuid"] }
 subtle = { version = "2", default-features = false, features = ["i128"] }
-syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "full", "visit-mut"] }
+syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "full", "visit", "visit-mut"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 tempfile = { version = "3" }
 thiserror = { version = "2" }
@@ -182,46 +183,62 @@ winnow = { version = "1" }
 zeroize = { version = "1", features = ["derive"] }
 
 [target.x86_64-unknown-linux-gnu.dependencies]
+concurrent-queue = { version = "2" }
+event-listener-strategy = { version = "0.5" }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 libc = { version = "0.2", default-features = false, features = ["use_std"] }
+linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 nix = { version = "0.31", features = ["hostname", "ioctl", "mount", "socket"] }
 nom = { version = "7" }
 num-iter = { version = "0.1", default-features = false, features = ["i128", "std"] }
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
-rustix = { version = "1", features = ["event", "fs", "stdio", "termios"] }
+rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "stdio", "termios", "time"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
-tower-http = { version = "0.6", features = ["auth", "follow-redirect", "map-response-body", "trace", "util"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 
 [target.x86_64-unknown-linux-gnu.build-dependencies]
+bindgen = { version = "0.69" }
+concurrent-queue = { version = "2" }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 libc = { version = "0.2", features = ["extra_traits", "use_std"] }
+linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 nom = { version = "7" }
+prettyplease = { version = "0.2", default-features = false, features = ["verbatim"] }
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
-rustix = { version = "1", features = ["event", "fs", "stdio", "termios"] }
+rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "stdio", "termios", "time"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 
 [target.x86_64-unknown-linux-musl.dependencies]
+concurrent-queue = { version = "2" }
+event-listener-strategy = { version = "0.5" }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 libc = { version = "0.2", default-features = false, features = ["use_std"] }
+linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 nix = { version = "0.31", features = ["hostname", "ioctl", "mount", "socket"] }
 nom = { version = "7" }
 num-iter = { version = "0.1", default-features = false, features = ["i128", "std"] }
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
-rustix = { version = "1", features = ["event", "fs", "stdio", "termios"] }
+rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "stdio", "termios", "time"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
-tower-http = { version = "0.6", features = ["auth", "follow-redirect", "map-response-body", "trace", "util"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 
 [target.x86_64-unknown-linux-musl.build-dependencies]
+bindgen = { version = "0.69" }
+concurrent-queue = { version = "2" }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 libc = { version = "0.2", features = ["extra_traits", "use_std"] }
+linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 nom = { version = "7" }
+prettyplease = { version = "0.2", default-features = false, features = ["verbatim"] }
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
-rustix = { version = "1", features = ["event", "fs", "stdio", "termios"] }
+rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "stdio", "termios", "time"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 
 [target.x86_64-apple-darwin.dependencies]
 errno = { version = "0.3" }
@@ -230,7 +247,6 @@ mio = { version = "1", features = ["net", "os-ext"] }
 nix = { version = "0.31", default-features = false, features = ["hostname", "socket"] }
 rustix = { version = "1", features = ["event", "fs", "stdio", "termios"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
-tower-http = { version = "0.6", features = ["auth", "follow-redirect", "map-response-body", "trace", "util"] }
 
 [target.x86_64-apple-darwin.build-dependencies]
 errno = { version = "0.3" }
@@ -246,7 +262,6 @@ mio = { version = "1", features = ["net", "os-ext"] }
 nix = { version = "0.31", default-features = false, features = ["hostname", "socket"] }
 rustix = { version = "1", features = ["event", "fs", "stdio", "termios"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
-tower-http = { version = "0.6", features = ["auth", "follow-redirect", "map-response-body", "trace", "util"] }
 
 [target.aarch64-apple-darwin.build-dependencies]
 errno = { version = "0.3" }

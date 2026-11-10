@@ -14,7 +14,7 @@
 //! ```
 //!
 //! Coverage:
-//! - `pin_set_covers_all_three_sources_and_dry_run_is_pure` —
+//! - `pin_set_covers_every_source_and_dry_run_is_pure` —
 //!   enabled image (rootfs + base-snapshot disk/memory, ADR 0022
 //!   sources #5/#6) + live session manifest + recoverable snapshot
 //!   all pin their chunks; a planted orphan ends up in the
@@ -114,6 +114,33 @@ async fn seed_manifest(
     r
 }
 
+/// Pin `disk` through a recoverable disk-only snapshot of `session_id`.
+async fn record_disk_snapshot(
+    rig: &TestRig,
+    session_id: engram_core::SessionId,
+    disk: ManifestRef,
+) {
+    rig.meta
+        .record_snapshot(SnapshotRecord {
+            id: SnapshotId::new(),
+            session_id: Some(session_id),
+            host_id: None,
+            image_version: "disk-only".into(),
+            size_bytes: 0,
+            created_at: Utc::now(),
+            last_accessed_at: Utc::now(),
+            swap_manifest: None,
+            disk_manifest: Some(disk),
+            memory_manifest: None,
+            recoverable: true,
+            aux_bundles: vec![],
+            events_cursor: None,
+            fc_snapshot_version: None,
+        })
+        .await
+        .expect("record disk-only snapshot");
+}
+
 /// Plant an orphan chunk under `chunks/sha256/<2>/<62>` with
 /// content unique to this test invocation. Returns its hash so
 /// assertions can compare against the swept candidate set.
@@ -128,7 +155,7 @@ async fn plant_orphan(blob: &dyn BlobStorage) -> ChunkHash {
 
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
-async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
+async fn pin_set_covers_every_source_and_dry_run_is_pure() {
     let Some(rig) = rig().await else { return };
 
     // ---- enabled image with chunked-disk manifest ----
@@ -184,7 +211,7 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
         .await
         .expect("upsert enabled image");
 
-    // ---- session with live_disk_manifest ----
+    // ---- session with an earlier disk-only recoverable snapshot ----
     let session_disk = seed_manifest(
         &rig.chunk_store,
         &[b"sess-a", b"sess-b"],
@@ -205,10 +232,7 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
         .transition_session_created(session_id, sandbox_id)
         .await
         .expect("assign sandbox (fused Pending → Created)");
-    rig.meta
-        .update_live_disk_manifest(session_id, sandbox_id, session_disk)
-        .await
-        .expect("update live manifest");
+    record_disk_snapshot(&rig, session_id, session_disk).await;
 
     // ---- recoverable snapshot with disk + memory manifests ----
     let snap_disk = seed_manifest(&rig.chunk_store, &[b"snap-d-a"], ManifestKind::Disk).await;
@@ -256,10 +280,11 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
     )
     .await;
 
-    // Assertions: pin set covers all six sources' chunks: image disk (2)
-    // + base-snapshot disk #6 (1) + base-snapshot memory #5 (1) + session
-    // live (2) + recoverable snapshot disk (1) + memory (1) = 8 distinct
-    // ChunkHashes. The orphan is the lone candidate. Dry-run promotes nothing.
+    // Assertions: pin set covers every source's chunks: image disk (2)
+    // + base-snapshot disk (1) + base-snapshot memory (1) + the earlier
+    // snapshot's disk (2) + the latest snapshot's disk (1) + memory (1) =
+    // 8 distinct ChunkHashes. The orphan is the lone candidate. Dry-run
+    // promotes nothing.
     assert_eq!(
         report.pin_set_size, 8,
         "pin set should cover all 6 manifests' chunks"
@@ -1202,37 +1227,38 @@ async fn mark_pass_walks_every_page_of_the_chunk_space() {
 async fn promote_failure_preserves_mark_cursor_progress() {
     let Some(rig) = rig().await else { return };
 
-    // One pinned manifest, so each pin-set collect is exactly one
-    // manifest GET: the mark pass takes the first, the promote pass the
-    // second.
-    let session_disk = seed_manifest(&rig.chunk_store, &[b"keepme"], ManifestKind::Disk).await;
-    let session_id = rig
-        .meta
-        .create_session(SessionSpec {
-            image: format!("promote-fault:{}", Uuid::new_v4()),
-            mode: SessionMode::Agent,
-        })
-        .await
-        .expect("create session");
-    let sandbox_id = SandboxId::new();
-    rig.meta
-        .transition_session_created(session_id, sandbox_id)
-        .await
-        .expect("assign sandbox");
-    rig.meta
-        .update_live_disk_manifest(session_id, sandbox_id, session_disk)
-        .await
-        .expect("update live manifest");
+    // A ChunkStore keeps its last 16 manifests. With 32 pinned, the mark
+    // pass makes 32 manifest GETs, and the promote pass must read at
+    // least 16 of them from the store again.
+    const PINNED: u64 = 32;
+    for i in 0..PINNED {
+        let content = format!("keepme-{i}");
+        let session_disk =
+            seed_manifest(&rig.chunk_store, &[content.as_bytes()], ManifestKind::Disk).await;
+        let session_id = rig
+            .meta
+            .create_session(SessionSpec {
+                image: format!("promote-fault:{}", Uuid::new_v4()),
+                mode: SessionMode::Agent,
+            })
+            .await
+            .expect("create session");
+        rig.meta
+            .transition_session_created(session_id, SandboxId::new())
+            .await
+            .expect("assign sandbox");
+        record_disk_snapshot(&rig, session_id, session_disk).await;
+    }
 
     let orphan = plant_orphan(rig.blob.as_ref()).await;
 
-    // Fail manifest GETs from the SECOND one on: the mark pass's collect
-    // succeeds, the promote pass's collect does not.
+    // Fail manifest GETs after the mark pass's: its collect succeeds, the
+    // promote pass's collect does not.
     let (faulty, _counters) = engram_testkit::storage::FaultyBlobStorage::arc(
         rig.blob.clone(),
         engram_testkit::storage::FaultPlan::new().with_get(engram_testkit::storage::GetFault {
             key: engram_testkit::storage::KeyMatch::Contains("manifests/".to_string()),
-            when: engram_testkit::storage::When::FromNth(2),
+            when: engram_testkit::storage::When::FromNth(PINNED + 1),
             kind: engram_testkit::storage::GetFaultKind::NotFound(
                 engram_testkit::storage::InjectedError::Sdk("injected promote fault".into()),
             ),
@@ -1329,10 +1355,7 @@ async fn pin_set_is_filtered_to_the_tick_shards() {
         .transition_session_created(session_id, sandbox_id)
         .await
         .expect("assign sandbox");
-    rig.meta
-        .update_live_disk_manifest(session_id, sandbox_id, pinned_mref)
-        .await
-        .expect("update live manifest");
+    record_disk_snapshot(&rig, session_id, pinned_mref).await;
 
     // Whole space in one tick: every pinned chunk is resident.
     let wide = ChunkGcConfig {

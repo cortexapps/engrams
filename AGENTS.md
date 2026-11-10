@@ -13,7 +13,8 @@ and snapshots/evicts/resumes the VM for density. Production isolation is
 against the same code paths.
 
 The deep architecture lives in `README.md` and `DESIGN.md`; design decisions live in
-`docs/adr/` (the source of truth — see [ADRs](#adrs)). This file is the operational
+`docs/adr/` (the record of each decision and its history; `DESIGN.md` states the current
+facts — see [ADRs](#adrs)). This file is the operational
 layer: how to build, test, and the conventions we hold.
 
 ## Daily commands (justfile)
@@ -80,7 +81,7 @@ Firecracker path; VZ exists to exercise that path on macOS, not to fork it.
   if the states aren't externally constructible, the format is the problem.
   Scripted `engram_testkit::storage::FaultyBlobStorage` covers the blob tier.
 - **Firecracker integration** (`crates/engram-sandbox-firecracker/tests/`): `#[ignore]`'d,
-  Linux+KVM only; run in CI on KVM runners. New FC/NBD regression tests **must** be wired
+  Linux+KVM only; run in CI on KVM runners. New FC regression tests **must** be wired
   into `ci.yml`'s `--test` list (not gated as local-only) or they never run. **Size a test
   to the property it asserts, not to realism — minimize CI time.** Prove a
   correctness/isolation/head-of-line-freedom property with the least data, iterations, and
@@ -217,10 +218,55 @@ and the site's CLI reference describe the user side.
   between phases with divergences/pitfalls, flip to `Accepted` at the end with the commit
   chain. ADRs are numbered sequentially and are the record for non-obvious decisions.
 
+**Comments**
+- **A comment states a fact a reader needs that the code does not show**: a non-obvious
+  invariant, a kernel or protocol rule the code relies on, a `SAFETY:` argument, the
+  one-line purpose of a module or a public item. Keep each one short and in the present
+  tense. Do not write how the code got here, what it replaced, what a line plainly does,
+  or which campaign or incident produced it. When a change makes a nearby comment, doc
+  comment, or clap help string inaccurate or longer than it needs to be, fix it in the
+  same change, without asking. The aim is clarity, not a smaller line count.
+- **Clean up what you pass.** Touching a struct, a function, or a file means reading its
+  neighbours too. A stale or padded comment, a mutable flag that a `match` expresses
+  better, a bug, or a poor abstraction seen on the way gets fixed in the same change,
+  not noted for later. Keep the fix in its own commit when it is not part of the
+  logical change.
+- **The pre-commit review pass is a separate step, not a side effect.** After the code
+  works and before every commit, read each touched file top to bottom as a reviewer,
+  not as the author. Look for, and fix in the same change (own commit when it is not
+  the logical change):
+  - **Comments** longer than the fact they state, or about history instead of the code.
+  - **Structure**: a function that branches on flags, repeats a neighbour, or holds more
+    than one job; a `mut` plus a flag where a `match` or an early return says it.
+  - **Abstractions**: a type or helper that exists only to shim an older shape; a seam
+    that does not match who owns the data; the same fact computed two ways in two
+    places (two definitions of "alive", two readers of one config). These are where
+    the bugs live, so treat a duplicated definition as a defect, not a style point.
+  - **Correctness**: a silent default where the input was a contract (a spec that asks
+    for swap and gets none must be an error, not `None`); a fallback that hides a
+    failure instead of returning it; an error path that releases less than the success
+    path; a state read from one source and acted on against another; an invariant the
+    code assumes and never checks.
+  Noticing these while writing is not the pass. The pass is a deliberate read with those
+  four lists in hand, and the commit message says what it turned up.
+
 **Code philosophy**
-- **Clean breaks over compat shims.** Favor simple one-path code; backwards-incompatible
-  changes (image re-bakes, schema changes) are acceptable. No "deprecated" stubs, no dangling
-  references to old versions.
+- **Live users: every change is safe to deploy and to roll back.** The service has real
+  users, so a change must keep their sessions and data through a rolling deploy:
+  - **Expand, then contract.** A schema change that removes or reshapes data lands in two
+    steps. First add and backfill, so the old build still runs on the new schema during the
+    roll and after a rollback. Drop the old shape in a later change, after no deployed build
+    reads it.
+  - **Formats stay readable across one release.** A new build reads what the previous build
+    wrote: durable records on a node, chunk-store manifests, and the coordinator↔host wire.
+    Both builds run at once during a roll.
+  - **Ending sessions or deleting user data is an explicit decision.** A change that does
+    either says so in its PR description, and the owner approves it after reviewing the
+    count from production. The count and any production detail stay out of this public
+    repository.
+  - **Transitional code has an end.** Compatibility code lands with the follow-up that
+    removes it, so the code returns to one path. No permanent shims, no "deprecated" stubs,
+    no dangling references to old versions.
 - **Simplify via abstractions** — a refactor should *retire* code; a new trait should subsume
   existing surfaces, not sit alongside them.
 - **New crate over stuffing** — shared logic that deserves its own crate gets one (workspace
@@ -312,5 +358,7 @@ and the site's CLI reference describe the user side.
 - **0051** the TypeScript orchestration tier · **0003** the VZ backend · **0006** the egress proxy
 - **0066** the vsock port relay · **0118** session apps (named ports, reserved hostnames,
   and the orchestrator-enforced login wall that replaces IAP on preview hosts)
+- **0125** the kernel-owned session disk (dm-thin volumes, `SessionDisk`, the pool
+  capacity gate)
 
 When in doubt about *why* something is shaped the way it is, grep `docs/adr/` before assuming.

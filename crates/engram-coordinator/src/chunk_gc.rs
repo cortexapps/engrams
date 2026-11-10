@@ -997,7 +997,7 @@ async fn chunk_gc_loop(state: SharedState, cfg: ChunkGcConfig) {
         shard_concurrency = cfg.shard_concurrency,
         "chunk-gc sweep loop starting"
     );
-    let mut ticker = tokio::time::interval(cfg.interval);
+    let mut ticker = engram_core::periodic(cfg.interval);
     // Skip the immediate tick — let coord finish boot before the first
     // sweep fires.
     ticker.tick().await;
@@ -1108,7 +1108,7 @@ async fn record_backlog_gauge(state: &SharedState) {
 /// ADR 0035 §5: bundle generations. A few hundred keys, ~2s a sweep — its
 /// own task so the chunk sweep can never starve it.
 async fn bundle_gc_loop(state: SharedState, cfg: ChunkGcConfig) {
-    let mut ticker = tokio::time::interval(cfg.interval);
+    let mut ticker = engram_core::periodic(cfg.interval);
     ticker.tick().await;
     loop {
         ticker.tick().await;
@@ -1157,7 +1157,7 @@ async fn bundle_gc_loop(state: SharedState, cfg: ChunkGcConfig) {
 /// ADR 0028 addendum: portable snapshot blobs (`snapshots/<id>/`), pinned
 /// by a live `snapshots` row. Own task, same reason as bundle-gc.
 async fn snapshot_blob_gc_loop(state: SharedState, cfg: ChunkGcConfig) {
-    let mut ticker = tokio::time::interval(cfg.interval);
+    let mut ticker = engram_core::periodic(cfg.interval);
     ticker.tick().await;
     loop {
         ticker.tick().await;

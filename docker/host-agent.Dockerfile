@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM rust:1.98-slim AS builder
+FROM rust:1.99-slim AS builder
 WORKDIR /src
 # protobuf-compiler: ADR 0013 added a build.rs in engram-protocol that
 # invokes `protoc` to compile `proto/host_service.proto`. The Debian
@@ -51,9 +51,11 @@ FROM debian:trixie-slim
 #     bump that regresses it fails the image build loudly.
 #   - iproute2:  ip, for the tap device + guest netns
 #   - iptables:  egress NAT / firewall rules for guest networking
+#   - thin-provisioning-tools: thin_dump + thin_delta, which read the
+#     session-disk pool's metadata (device-mapper itself is an ioctl)
 # (ca-certificates: TLS to the blob backend — GCS/S3.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates e2fsprogs iproute2 iptables \
+    ca-certificates e2fsprogs iproute2 iptables thin-provisioning-tools \
     && rm -rf /var/lib/apt/lists/*
 # ADR 0080/0036: fail the build if the base's mke2fs predates the
 # SOURCE_DATE_EPOCH support that deterministic packing relies on.

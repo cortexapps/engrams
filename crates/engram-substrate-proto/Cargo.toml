@@ -18,7 +18,7 @@ bincode.workspace = true
 serde.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["socket", "uio"] }
 
 [dev-dependencies]

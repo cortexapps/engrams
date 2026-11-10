@@ -10,7 +10,7 @@ nothing at all. The rest of engrams does not know which one is in use. Three shi
 
 | Backend | Isolation | Snapshots | Runs on | Use it for |
 |---|---|---|---|---|
-| Firecracker | microVM on KVM | memory snapshot with lazy paging, chunked disk over NBD | Linux with `/dev/kvm` | production |
+| Firecracker | microVM on KVM | memory snapshot with lazy paging, disk on a kernel thin volume | Linux with `/dev/kvm` | production |
 | Apple Virtualization | microVM on Apple's Hypervisor framework | clone of the root filesystem | macOS 12 or later on Apple Silicon | development on a Mac with real isolation |
 | Process | none; a host subprocess | tarball of the working directory | macOS or Linux | iterating on the orchestration layer without a VM |
 
@@ -39,10 +39,11 @@ Kubernetes.
 **Lazy memory paging.** The host agent needs `/dev/userfaultfd` with mode `0666` (a udev
 rule) and the sysctl `vm.unprivileged_userfaultfd = 1`.
 
-**Chunked disks.** The kernel needs the NBD block driver (`CONFIG_BLK_DEV_NBD`, built in on
-Ubuntu cloud images) loaded with enough devices, `modprobe nbd nbds_max=<N>`. The host
-agent uses all of them; `ENGRAM_NBD_MAX_SLOTS` sets a lower limit. A running VM uses one
-device for its disk, and one more when it has swap.
+**Session disks.** The kernel needs device-mapper thin provisioning (the `dm_thin_pool`
+module, shipped with the Ubuntu cloud image kernel) and the node needs `thin-provisioning-tools`. The node-prep step
+builds a pool from two files on the host's working filesystem and checks it on every boot;
+`ENGRAM_THIN_POOL` gives the host agent the pool's name. A Firecracker host agent refuses to
+start without one.
 
 **The guest kernel and the bundles.** Each host stages a guest kernel and the read-only
 bundles for the in-guest daemon, the harnesses, and the skills. The VM boots with

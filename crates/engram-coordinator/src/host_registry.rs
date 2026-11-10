@@ -26,6 +26,7 @@ use engram_core::types::sandbox::{
 use engram_core::types::session::SessionState;
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{HostId, SandboxError, SandboxId, SessionId};
+use tracing::Instrument as _;
 
 /// Per-host record kept in-memory. ADR 0047 demoted this to a pure
 /// CONNECTION record: the heartbeat-derived scheduling state that used
@@ -110,9 +111,8 @@ pub struct HostRegistry {
     /// the dead-host detector's 30s threshold, so the TTL only fires
     /// when *detection itself* is broken or paused.
     ttl: Duration,
-    /// ADR 0098 D1: wall clock for heartbeat-freshness decisions.
-    /// Defaults to `SystemClock` at construction; the simulation
-    /// harness swaps it when it builds the registry.
+    /// ADR 0098 D1: wall clock for the PG row's freshness. Always
+    /// `SystemClock`; the entry stamps also read wall time.
     clock: Arc<dyn engram_core::traits::Clock>,
 }
 
@@ -253,27 +253,32 @@ impl HostRegistry {
     }
 
     /// ADR 0047: resolve a (placement-picked) host to its dialable
-    /// backend. Fast path: registered on this replica. Read-through:
-    /// the host's heartbeats land on a sibling pod — fetch its
-    /// `host_addr` from the (fresh) PG row, warm the gRPC pool, and
-    /// register the entry so subsequent calls take the fast path.
+    /// backend. A registered host is served from this replica, but a
+    /// dialed host only while this replica saw it within the TTL: its
+    /// heartbeats may land on a sibling pod, and its address may have
+    /// changed, so past the TTL the PG row decides ([`Self::dial_through`]).
+    /// Without a dialer (mode=all, the simulator) no address can change.
     pub async fn backend_for(&self, host_id: HostId) -> Result<Arc<dyn HostClient>, SandboxError> {
-        if let Some(entry) = self.hosts.get(&host_id) {
-            return Ok(entry.value().backend.clone());
+        let dialed = self.dialer.read().is_some();
+        let cached = self
+            .hosts
+            .get(&host_id)
+            .filter(|entry| !dialed || self.entry_is_fresh(entry))
+            .map(|entry| entry.value().backend.clone());
+        match cached {
+            Some(backend) => Ok(backend),
+            None => self.dial_through(host_id).await,
         }
-        self.dial_through(host_id).await
     }
 
-    /// The slow half of [`Self::backend_for`]: PG row → freshness check
-    /// → warm + register. `HostLost` when the row is missing, stale, or
-    /// has no dial address.
+    /// The PG read-through: `HostLost` when the host's row is missing or
+    /// stale. Otherwise dial the row's `host_addr`, which every replica's
+    /// heartbeat handler writes: a host keeps its id across a node
+    /// replacement but not its IP, and only the replica that receives its
+    /// heartbeats sees the change. Without a dialer, or for a row without
+    /// an address (the in-process host of mode=all), the registered entry
+    /// is served.
     async fn dial_through(&self, host_id: HostId) -> Result<Arc<dyn HostClient>, SandboxError> {
-        let pool = self.dialer.read().clone();
-        let Some(pool) = pool else {
-            // No dialer (mode=all / tests): an unregistered host is
-            // simply unreachable from this process.
-            return Err(SandboxError::HostLost);
-        };
         let rows = self.meta.list_active_hosts().await.map_err(|e| {
             SandboxError::Vm(format!("list_active_hosts during dial-through: {e}").into())
         })?;
@@ -289,14 +294,24 @@ impl HostRegistry {
         if !fresh {
             return Err(SandboxError::HostLost);
         }
-        let Some(addr) = row.host_addr else {
-            return Err(SandboxError::HostLost);
-        };
-        pool.warm(host_id, addr).await?;
-        let client = pool.get(host_id)?;
-        let backend: Arc<dyn HostClient> = Arc::new(client);
-        self.register(host_id, backend.clone());
-        Ok(backend)
+        let pool = self.dialer.read().clone();
+        match (pool, row.host_addr) {
+            (Some(pool), Some(addr)) => {
+                pool.warm(host_id, addr).await?;
+                let backend: Arc<dyn HostClient> = Arc::new(pool.get(host_id)?);
+                self.register(host_id, backend.clone());
+                Ok(backend)
+            }
+            _ => {
+                let backend = self
+                    .hosts
+                    .get(&host_id)
+                    .map(|e| e.value().backend.clone())
+                    .ok_or(SandboxError::HostLost)?;
+                self.touch_seen(host_id);
+                Ok(backend)
+            }
+        }
     }
 
     /// ADR 0046: restore the base snapshot onto an ALREADY-CHOSEN host (picked
@@ -391,7 +406,12 @@ impl HostRegistry {
         }
 
         // Read-through to PG.
-        let pg = match self.meta.host_for_sandbox(sandbox_id).await {
+        let pg = match self
+            .meta
+            .host_for_sandbox(sandbox_id)
+            .instrument(tracing::info_span!("coord.host_registry.host_for_sandbox"))
+            .await
+        {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
@@ -413,47 +433,17 @@ impl HostRegistry {
         // 0047) dialable through its fresh PG row — the host's
         // heartbeats may be landing on a sibling pod, which must not
         // read as HostLost here.
-        let backend = match self.hosts.get(&host_id) {
-            Some(entry) if self.entry_is_fresh(&entry) => entry.value().backend.clone(),
-            Some(entry) => {
-                // Registered but past the local TTL. PG decides: a
-                // fresh row means the host is alive (its heartbeats
-                // land on a sibling pod) — refresh our stamp and
-                // serve; a stale row means genuinely silent → HostLost.
-                drop(entry);
-                let backend = self.pg_fresh_backend(host_id).await?;
-                self.touch_seen(host_id);
-                backend
-            }
+        let cached = self
+            .hosts
+            .get(&host_id)
+            .filter(|entry| self.entry_is_fresh(entry))
+            .map(|entry| entry.value().backend.clone());
+        let backend = match cached {
+            Some(backend) => backend,
             None => self.dial_through(host_id).await?,
         };
         self.sandbox_owner.insert(sandbox_id, host_id);
         Ok((host_id, backend))
-    }
-
-    /// Confirm via the PG row that `host_id` is heartbeat-fresh, then
-    /// return its (already-registered) backend. `HostLost` when the
-    /// row is missing or stale.
-    async fn pg_fresh_backend(&self, host_id: HostId) -> Result<Arc<dyn HostClient>, SandboxError> {
-        let rows = self.meta.list_active_hosts().await.map_err(|e| {
-            SandboxError::Vm(format!("list_active_hosts during freshness check: {e}").into())
-        })?;
-        let Some(row) = rows.into_iter().find(|r| r.id == host_id) else {
-            return Err(SandboxError::HostLost);
-        };
-        let fresh = self
-            .clock
-            .now_utc()
-            .signed_duration_since(row.last_heartbeat_at)
-            .to_std()
-            .map_or(true, |age| age <= self.ttl);
-        if !fresh {
-            return Err(SandboxError::HostLost);
-        }
-        self.hosts
-            .get(&host_id)
-            .map(|e| e.value().backend.clone())
-            .ok_or(SandboxError::HostLost)
     }
 
     fn entry_is_fresh(&self, entry: &dashmap::mapref::one::Ref<'_, HostId, HostEntry>) -> bool {
@@ -645,6 +635,16 @@ impl HostClient for HostRegistry {
     ) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(id).await?;
         backend.migration_abort(id, export_id, fence).await
+    }
+
+    async fn migration_abort_unserved(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        fence: SessionFence,
+    ) -> Result<bool, SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.migration_abort_unserved(id, export_id, fence).await
     }
 
     async fn commit_snapshot(
@@ -932,6 +932,7 @@ mod tests {
     #[derive(Default)]
     struct StubMeta {
         sandbox_to_session: PlMutex<std::collections::HashMap<SandboxId, (HostId, SessionState)>>,
+        hosts: PlMutex<Vec<engram_core::types::host::HostRecord>>,
     }
     #[allow(dead_code)]
     impl StubMeta {
@@ -1003,7 +1004,7 @@ mod tests {
         async fn list_active_hosts(
             &self,
         ) -> Result<Vec<engram_core::types::host::HostRecord>, engram_core::MetaError> {
-            Ok(Vec::new())
+            Ok(self.hosts.lock().clone())
         }
         async fn set_host_status(
             &self,
@@ -1491,5 +1492,104 @@ mod tests {
             Err(e) => panic!("expected SandboxError::HostLost from TTL fallback, got Err({e:?})"),
             Ok(_) => panic!("expected SandboxError::HostLost from TTL fallback, got Ok"),
         }
+    }
+
+    /// A fresh `hosts` row for `id` that advertises `host_addr`.
+    fn fresh_host_row(id: HostId, host_addr: &str) -> engram_core::types::host::HostRecord {
+        use engram_core::traits::Clock;
+        use engram_core::types::host::{
+            HostCapacity, HostMetadata, HostRecord, HostStatus, HostUtilization,
+        };
+        HostRecord {
+            id,
+            hostname: "h1".into(),
+            cloud_metadata: HostMetadata::default(),
+            capacity: HostCapacity {
+                total_gb: 0,
+                used_gb: 0,
+                total_mib: 0,
+                used_mib: 0,
+                running_sandboxes: 0,
+            },
+            utilization: HostUtilization::default(),
+            status: HostStatus::Ready,
+            last_heartbeat_at: engram_core::traits::SystemClock::new().now_utc(),
+            host_addr: Some(host_addr.into()),
+            ready_images: Vec::new(),
+            current_bundles: Vec::new(),
+            sandbox_bundles: Vec::new(),
+            cordoned: false,
+            cordon_owner: None,
+            cordon_reason: None,
+            retire_requested_at: None,
+            retired_at: None,
+            total_vcpus: 0,
+            wire_version: 0,
+            stages_images: true,
+            capabilities: Default::default(),
+            lease_expires_at: None,
+            lease_state: Default::default(),
+            lease_epoch: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_host_whose_heartbeats_go_elsewhere_is_dialed_at_its_pg_address() {
+        // The host registered here at its old address; its heartbeats now
+        // land on a sibling replica, which wrote its new address to PG.
+        let stub = Arc::new(StubMeta::default());
+        let host = HostId::new();
+        let new_addr = "http://127.0.0.1:9";
+        let reg = HostRegistry::new_with_ttl(
+            stub.clone() as Arc<dyn engram_core::traits::MetadataStore>,
+            Duration::from_millis(50),
+        );
+        let pool = Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new());
+        reg.set_dialer(pool.clone());
+        pool.warm(host, "http://127.0.0.1:8".into()).await.unwrap();
+        reg.register(host, Arc::new(pool.get(host).unwrap()));
+        // This replica's entry ages past the TTL; the sibling's heartbeat
+        // keeps the PG row fresh.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stub.hosts.lock().push(fresh_host_row(host, new_addr));
+
+        reg.backend_for(host).await.unwrap();
+        assert_eq!(pool.current_addr(host).as_deref(), Some(new_addr));
+    }
+
+    #[tokio::test]
+    async fn without_a_dialer_a_registered_host_is_served_past_ttl() {
+        // mode=all and the simulator register in-process clients whose
+        // address cannot change; their entries never age out.
+        let stub = Arc::new(StubMeta::default());
+        let host = HostId::new();
+        let reg = HostRegistry::new_with_ttl(
+            stub.clone() as Arc<dyn engram_core::traits::MetadataStore>,
+            Duration::from_millis(50),
+        );
+        let (b, _d) = dummy_backend();
+        reg.register(host, b);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(reg.backend_for(host).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_in_process_host_without_an_address_is_served_past_ttl() {
+        // mode=all: a dialer is wired, but the in-process host's row has
+        // no address, and its heartbeats reach PG, not this registry.
+        let stub = Arc::new(StubMeta::default());
+        let host = HostId::new();
+        let reg = HostRegistry::new_with_ttl(
+            stub.clone() as Arc<dyn engram_core::traits::MetadataStore>,
+            Duration::from_millis(50),
+        );
+        reg.set_dialer(Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()));
+        let (b, _d) = dummy_backend();
+        reg.register(host, b);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut row = fresh_host_row(host, "unused");
+        row.host_addr = None;
+        stub.hosts.lock().push(row);
+        assert!(reg.backend_for(host).await.is_ok());
     }
 }

@@ -11,7 +11,6 @@
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
 
-use engram_core::types::BindingDisposition;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -19,8 +18,8 @@ use axum::http::{Method, Request, StatusCode};
 use chrono::Utc;
 use engram_coordinator::{api, AppState, CoordinatorConfig, Services};
 use engram_core::traits::MetadataStore;
-use engram_core::types::{HostRecord, HostStatus, SessionSpec, SessionState};
-use engram_core::{HostId, SandboxId, SessionId};
+use engram_core::types::{HostRecord, HostStatus};
+use engram_core::{HostId, SessionId};
 use engram_sandbox_process::ProcessBackend;
 use engram_secrets_dev::InMemorySecretStore;
 use engram_sim::{SimEntropy, SimMetadataStore};
@@ -28,42 +27,14 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-// ADR 0098 D4: the hand-rolled `MockMetadataStore` is retired onto the
-// conformance-tested `SimMetadataStore`. Sessions are staged through REAL
-// store calls; live-manifest publish outcomes are read back through the
-// session row + `chunk_generation()` (the retired mock exposed raw
-// HashMaps + an atomic).
+// Sessions are staged through real `SimMetadataStore` calls, never a
+// hand-rolled mock.
 
 fn sim_meta() -> Arc<SimMetadataStore> {
     SimMetadataStore::new(
         Arc::new(engram_core::traits::SystemClock::new()),
         Arc::new(SimEntropy::seeded(0xA912)),
     )
-}
-
-/// Stage an Active session bound to `sandbox` (host left unbound, as the
-/// FlushScheduler's live-manifest publisher sees the row) through legal
-/// FSM edges: create (Pending) → `transition_session_created` (Created +
-/// sandbox) → Active.
-async fn stage_active_bound(
-    meta: &Arc<SimMetadataStore>,
-    image: &str,
-    sandbox: SandboxId,
-) -> SessionId {
-    let id = meta
-        .create_session(SessionSpec {
-            image: image.into(),
-            mode: Default::default(),
-        })
-        .await
-        .expect("create");
-    meta.transition_session_created(id, sandbox)
-        .await
-        .expect("created");
-    meta.transition_session(id, SessionState::Active, BindingDisposition::Retain)
-        .await
-        .expect("active");
-    id
 }
 
 // ---------------------------------------------------------------------
@@ -510,24 +481,6 @@ async fn healthz_returns_ok_status_and_version() {
     assert!(v["version"].is_string());
 }
 
-// ADR 0021 P1.3 deleted `create_session_unknown_harness_name_is_400`:
-// the session no longer selects which harness to attach (that's an
-// image-manifest property baked at image-bake time). The equivalent
-// post-0021 failure mode is "the image has no [harness] block, so
-// even with mode=Agent the session runs as a dev VM" — which is *not*
-// an error condition, it's the harness-less template case. There's no
-// per-session "unknown harness" path anymore.
-
-async fn post(app: axum::Router, uri: &str, body: Value) -> axum::http::Response<Body> {
-    app.oneshot(json_request(Method::POST, uri, body))
-        .await
-        .unwrap()
-}
-
-// ---------------------------------------------------------------------
-// /sessions/:id/events bus
-// ---------------------------------------------------------------------
-
 // ---------------------------------------------------------------------
 // End-to-end exec wiring (POST /sessions → registry → sandbox.exec)
 //
@@ -545,171 +498,6 @@ async fn unknown_route_returns_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-}
-
-// ---------------------------------------------------------------------
-// Image manifest + secret resolution + rootfs materialization
-// ---------------------------------------------------------------------
-
-// Phase 2 removed the "no image / empty workdir" fallback path. The
-// `session_with_no_image_falls_through_to_empty_workdir` test that
-// exercised it lived here; it was deleted alongside the fallback
-// because every session now declares an explicit image (verified by
-// `create_session_with_unknown_image_returns_400`).
-
-// ---------------------------------------------------------------------
-// Session-id injection
-// ---------------------------------------------------------------------
-
-// ---------------------------------------------------------------------
-// Persistent event log + late-join via ?since=N / Last-Event-ID
-// ---------------------------------------------------------------------
-
-// ---------------------------------------------------------------------
-// ADR 0005 retired the checkpoint / fork / diff / log?kind=workspace
-// endpoints along with the platform's git surface. The deleted routes
-// now return 404 because they're no longer registered.
-// ---------------------------------------------------------------------
-
-// ---------------------------------------------------------------------
-// ADR 0007 — POST /api/admin/reap-materialize-dir
-// ---------------------------------------------------------------------
-
-// ---------------------------------------------------------------------
-// ADR 0016 Phase B: live-manifest publish HTTP round-trip
-//
-// Exercises the full host→coord boundary for the FlushScheduler's
-// outcome: POST /api/hosts/:id/live-manifest with a JSON body
-// matching the host-side serialization, decoded by the coord
-// handler, dispatched into MetadataStore::update_live_disk_manifest,
-// returning the Applied/Stale envelope. Wire format and routing
-// regress here if anything diverges. Lives under the same axum
-// router production uses (auth, JSON codecs, route table) so a
-// missing route or shape mismatch fails loud.
-// ---------------------------------------------------------------------
-
-#[tokio::test]
-async fn live_manifest_publish_round_trip_applied_and_stale() {
-    let meta = sim_meta();
-    // Stage an Active session with a bound sandbox through real store calls.
-    let sandbox_id = SandboxId::new();
-    let session_id = stage_active_bound(&meta, "test/repo:live-manifest", sandbox_id).await;
-    let app = build_app(meta.clone()).await;
-    let host_id = engram_core::HostId::new();
-    let manifest_id = uuid::Uuid::new_v4();
-
-    // -- Applied path: matching sandbox_id, version=7 --
-    let resp = post(
-        app.clone(),
-        &format!("/api/v1/hosts/{host_id}/live-manifest"),
-        json!({
-            "session_id": session_id,
-            "sandbox_id": sandbox_id,
-            "manifest_id": manifest_id,
-            "manifest_version": 7u64,
-        }),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp.into_body()).await;
-    assert_eq!(body["outcome"], "applied");
-    // The store recorded the published ref on the session row + bumped
-    // the chunk generation in the same logical TX as the row update.
-    let stored = meta
-        .get_session(session_id)
-        .await
-        .expect("session")
-        .live_disk_manifest
-        .expect("live manifest stored");
-    assert_eq!(stored.manifest_id, manifest_id);
-    assert_eq!(stored.version, 7);
-    assert_eq!(meta.chunk_generation().await.unwrap(), 1);
-
-    // -- Stale path: wrong sandbox_id (simulates publish-after-rebind) --
-    let stale_sandbox = SandboxId::new();
-    let resp = post(
-        app.clone(),
-        &format!("/api/v1/hosts/{host_id}/live-manifest"),
-        json!({
-            "session_id": session_id,
-            "sandbox_id": stale_sandbox,
-            "manifest_id": manifest_id,
-            "manifest_version": 8u64,
-        }),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp.into_body()).await;
-    assert_eq!(body["outcome"], "stale");
-    // Generation does NOT advance on stale; the prior Applied
-    // value (version=7) is untouched.
-    assert_eq!(meta.chunk_generation().await.unwrap(), 1);
-    let still_stored = meta
-        .get_session(session_id)
-        .await
-        .expect("session")
-        .live_disk_manifest
-        .expect("prior manifest still present");
-    assert_eq!(still_stored.version, 7);
-}
-
-// ---------------------------------------------------------------------
-// ADR 0016 Phase B commit 4a: admin flush-now endpoint
-//
-// 404, 409, and "idle" paths are reachable against the existing
-// ProcessBackend wiring (whose flush_sandbox default returns None).
-// The "applied" + "stale" outcomes exercise the full FC chunked-disk
-// pipeline and live in commit 4b's e2e test.
-// ---------------------------------------------------------------------
-
-#[tokio::test]
-async fn live_manifest_publish_unbind_clears_and_bumps_generation() {
-    let meta = sim_meta();
-    let sandbox_id = SandboxId::new();
-    let session_id = stage_active_bound(&meta, "test/repo:unbind", sandbox_id).await;
-    let app = build_app(meta.clone()).await;
-    let host_id = engram_core::HostId::new();
-    let manifest_id = uuid::Uuid::new_v4();
-
-    // Publish first, so unbinding has something to clear.
-    let resp = post(
-        app.clone(),
-        &format!("/api/v1/hosts/{host_id}/live-manifest"),
-        json!({
-            "session_id": session_id,
-            "sandbox_id": sandbox_id,
-            "manifest_id": manifest_id,
-            "manifest_version": 3u64,
-        }),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let gen_after_publish = meta.chunk_generation().await.unwrap();
-
-    // Direct trait call (no API endpoint for fenced_assign_sandbox).
-    // ADR 0016 Phase B: this is the load-bearing eviction-race
-    // mitigation — fenced_assign_sandbox(None) clears the live
-    // manifest + bumps chunk_generation in the same logical step
-    // the sandbox_id NULLs out.
-    engram_core::traits::MetadataStore::fenced_assign_sandbox(
-        meta.as_ref(),
-        session_id,
-        0,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    assert!(meta
-        .get_session(session_id)
-        .await
-        .expect("session")
-        .live_disk_manifest
-        .is_none());
-    assert_eq!(
-        meta.chunk_generation().await.unwrap(),
-        gen_after_publish + 1
-    );
 }
 
 /// Issue #231 regression: the heartbeat handler must NOT swallow a

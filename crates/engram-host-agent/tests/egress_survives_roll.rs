@@ -1,6 +1,5 @@
 //! ADR 0111 + ADR 0121: a surviving VM keeps its egress across a
-//! host-agent roll, against a REAL Firecracker microVM (2026-08-03
-//! incident, session 51fc6af7).
+//! host-agent roll, against a REAL Firecracker microVM.
 //!
 //! What this pins, post-ADR-0121: the egress registry lives in the
 //! node-local daemon and OUTLIVES the host-agent generations. Across
@@ -36,15 +35,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_host_agent::bindings::BindingStore;
 use engram_host_agent::egress::HostEgress;
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_host_agent::proxyd_client::ProxydHandle;
 use engram_rootfs_materializer::{InitInjection, Transport};
-use engram_sandbox_firecracker::{
-    FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
-};
+use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 
 /// The node-local daemon (ADR 0121), run as an in-process task over a
 /// real control UDS. It deliberately OUTLIVES both host-agent
@@ -153,7 +151,6 @@ async fn survivor_keeps_egress_across_a_host_agent_roll() {
     let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agent);
     cfg.bundle_dir = staged.bundle_dir.clone();
     cfg.net_pool = None;
-    cfg.restore_mode = RestoreMode::File;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
 
     let egress_a = Arc::new(HostEgress::new(handle.clone(), String::new(), None));
@@ -182,7 +179,8 @@ async fn survivor_keeps_egress_across_a_host_agent_roll() {
         swap_source: None,
         swap_manifest: None,
     };
-    let sandbox = pooled_a.create(spec).await.expect("create");
+    let sandbox = SandboxId::new();
+    pooled_a.create(sandbox, spec).await.expect("create");
 
     let session_id = engram_core::SessionId::new();
     let guest_ip = std::net::Ipv4Addr::new(10, 200, 0, 2);

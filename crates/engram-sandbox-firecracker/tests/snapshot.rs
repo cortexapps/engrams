@@ -1,6 +1,9 @@
 //! End-to-end snapshot/restore round-trip test against a real Firecracker.
 //! Drives the SandboxBackend trait through `create` → `snapshot` →
-//! `destroy` → `restore` → `destroy`. Same gating as the other ignored
+//! `destroy` → `restore` → `destroy`. The resume serves memory through
+//! `engram-uffd-handler` from the chunked memory manifest, which
+//! `PooledBackend::snapshot` writes in production and
+//! `common::chunk_memory` writes here. Same gating as the other ignored
 //! integration tests (Linux + KVM + firecracker on PATH + cached test
 //! artifacts).
 //!
@@ -8,6 +11,7 @@
 //!
 //! ```sh
 //! eval "$(bash crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh)"
+//! cargo build -p engram-uffd-handler
 //! cargo test -p engram-sandbox-firecracker --test snapshot -- --ignored --nocapture
 //! ```
 
@@ -19,6 +23,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
 
@@ -51,6 +56,7 @@ async fn snapshot_then_restore_round_trips_microvm() {
     // Unprivileged test — see lifecycle.rs comment.
     cfg.net_pool = None;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
+    common::resume_through_uffd(&mut cfg, work.path());
     let backend = FirecrackerBackend::new(work.path(), cfg);
 
     let spec = SandboxSpec {
@@ -72,7 +78,8 @@ async fn snapshot_then_restore_round_trips_microvm() {
     };
 
     // Step 1: create
-    let original_id = backend.create(spec).await.expect("create");
+    let original_id = SandboxId::new();
+    backend.create(original_id, spec).await.expect("create");
 
     // Step 2: let the kernel reach early-boot before snapshotting —
     // snapshotting a half-initialised VM can hang on resume. Poll the serial
@@ -119,8 +126,15 @@ async fn snapshot_then_restore_round_trips_microvm() {
         "list should be empty after destroying the original",
     );
 
-    // Step 6: restore from the snapshot — gets a *new* sandbox id
-    let restored_id = backend.restore(metadata.clone()).await.expect("restore");
+    // Step 6: chunk the memory and drop memory.bin, as a cross-host
+    // receiver has it, then resume — gets a *new* sandbox id
+    common::chunk_memory(&snap_dir, work.path()).await;
+    std::fs::remove_file(snap_dir.join("memory.bin")).expect("remove memory.bin");
+    let restored_id = SandboxId::new();
+    backend
+        .restore(restored_id, metadata.clone(), common::disks(&local_rootfs))
+        .await
+        .expect("restore");
     assert_ne!(
         restored_id, original_id,
         "restore must allocate a fresh sandbox id"
@@ -143,6 +157,10 @@ async fn snapshot_then_restore_round_trips_microvm() {
         "manifest's spec.image carried through restore"
     );
     assert_eq!(st.rootfs_path, local_rootfs, "rootfs path preserved");
+    assert!(
+        restored_jail.join("uffd-handler.log").exists(),
+        "the resume must serve memory through the UFFD handler"
+    );
 
     // Step 8: cleanup
     backend
@@ -193,7 +211,8 @@ async fn balloon_inflate_shrinks_full_memory_dump() {
         swap_source: None,
         swap_manifest: None,
     };
-    let id = backend.create(spec).await.expect("create");
+    let id = SandboxId::new();
+    backend.create(id, spec).await.expect("create");
     let _ = common::wait_for_log_contains(
         &work.path().join(id.to_string()).join("firecracker.log"),
         &["Linux version"],

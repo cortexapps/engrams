@@ -16,13 +16,9 @@
 //! - On every fault we install a **full chunk** in one `UFFDIO_COPY`,
 //!   not just the faulting page. This amortises the syscall + fault-
 //!   handler cost across the chunk's pages and gets us cleanly under
-//!   100 ms for typical Python workloads after the working-set trace
-//!   warms.
-//! - On restore, if a [`WorkingSetTrace`] is supplied we prefault
-//!   every chunk in the trace (REAP-style) **before** vCPUs run.
-//! - As faults are served we record observed chunk hashes into a
-//!   [`WorkingSetRecorder`] so the next restore on this host can
-//!   prefault them.
+//!   100 ms for typical Python workloads.
+//! - As faults are served we record each chunk's position in the
+//!   first-touch record, which the next restore fetches first.
 //!
 //! Dropping the canonical mmap is what removes the `materialize`
 //! pass + the `MAP_POPULATE` eager read from the restore critical
@@ -46,166 +42,15 @@ use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use engram_chunk_store::working_set::WorkingSetTrace;
+use engram_chunk_store::manifest::ChunkHash;
+use engram_chunk_store::FirstTouch;
 use sendfd::RecvWithFd;
 use tokio::runtime::Handle as TokioHandle;
 use userfaultfd::{Event, Uffd};
 
 use crate::chunked::{ChunkedBackendError, ChunkedMemoryBackend, ResolvedPage};
+use crate::fault_stats::{self, Source};
 use crate::proto::{GuestRegionUffdMapping, HANDSHAKE_BUF_BYTES};
-use crate::working_set::WorkingSetRecorder;
-
-/// ADR 0019 / telemetry restoration (#526): per-jail prefault
-/// effectiveness snapshot, written next to `working-set-trace.json` in
-/// the same jail dir (same per-jail-file pattern). The host-agent reads
-/// it after a restore completes (`pooled_backend.rs`, next to its
-/// `working_set_trace_path` accessor) and emits the
-/// `engram_resume_prefault_*` counters from it.
-///
-/// This is the standing detector for "prefault shipped but silently
-/// stopped firing" — it went inert three separate, undetected ways
-/// (`d0e5ecf3` dead canonical-trace path removed, `cf6e4d32`
-/// per-checkpoint manifest key = guaranteed miss, `7c2a7226` publish
-/// killed by eviction SIGKILL), each caught only by manual archaeology
-/// weeks later. A missing file where a trace was requested (host-agent
-/// side: `outcome="stats_missing"`) is now itself the alarm.
-///
-/// Convergence note: `prefault-admission-control` (landing in the same
-/// overhaul) ships a superset gate file (`prefault-gate.json`, same
-/// fields + `trace_source`) that reuses this struct's counter
-/// namespace. Whichever issue lands second drops its own file in favor
-/// of the other's — see #526's guardrails. Do not fork a second
-/// jail-dir file or a parallel `engram_prefault_*` namespace.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct PrefaultStats {
-    /// Whether a working-set trace was requested AND successfully
-    /// loaded for this restore. `false` means there was nothing to
-    /// replay (base image, migration dest with no prior life, or the
-    /// prior life's publish never landed) — expected, not an error.
-    pub trace_loaded: bool,
-    /// `trace.chunks.len()` — the size of the trace that was loaded.
-    /// `0` when `trace_loaded` is `false`.
-    pub chunks_in_trace: usize,
-    /// Chunks the prefault actually installed (a position the session
-    /// manifest still needs, not already installed by a racing fault).
-    pub installed: usize,
-    /// Trace entries that were skipped (the session manifest no longer
-    /// references that hash — rewritten or GC'd since the trace was
-    /// recorded).
-    pub skipped: usize,
-    /// Wall-clock duration of the prefault pass.
-    pub duration_ms: u64,
-    /// Review finding 6: issue step (d)3's "uffd-handler live peer
-    /// page-serves are recorded in the same per-jail stats file" — the
-    /// post-copy migration destination's peer-fill counterpart to
-    /// `installed`/`skipped`. `#[serde(default)]` so a reader built
-    /// against the pre-finding-6 schema (or a file this process never
-    /// patches, e.g. `main.rs`'s early `trace_loaded: false` write on a
-    /// non-peer resume) still parses as all-zero, not an error.
-    ///
-    /// Populated once, as a read-modify-write patch applied at the very
-    /// end of `run_listener`'s background thread (strictly after
-    /// `prefault_from_trace`/`sweep_all`, so it can never be clobbered
-    /// by their own writes) — see `run_listener`. A **snapshot as of
-    /// that patch**, not a full-VM-lifetime total: `serve_pagefault`
-    /// can still route later on-demand faults to the peer after this
-    /// point. Span attributes only for now (`resume.prefault_stats` on
-    /// the host-agent side) — `epic-gcs-free-resume` owns promoting
-    /// these to their own Prometheus counters.
-    #[serde(default)]
-    pub peer_pulled: u64,
-    /// Chunks the drain sourced from somewhere other than the direct
-    /// peer pull (e.g. already-local via a racing fault/prefault) —
-    /// `engram_uffd_handler::peer::DrainStats::alt_sourced`.
-    #[serde(default)]
-    pub peer_alt_sourced: u64,
-    /// Zero-filled chunks the drain skipped installing (no bytes to
-    /// pull) — `engram_uffd_handler::peer::DrainStats::zero_chunks`.
-    #[serde(default)]
-    pub peer_zero_chunks: u64,
-    /// Live page faults served directly from the peer during the
-    /// fault loop, as of the patch point (`Peer::fault_stats().0`) —
-    /// distinct from `peer_pulled` (the eager drain), this is the
-    /// on-demand path a guest's own touch takes before the drain
-    /// reaches that chunk.
-    #[serde(default)]
-    pub peer_live_faults: u64,
-    /// Chunks installed by demand windows, including the faulting chunk.
-    #[serde(default)]
-    pub fault_around_chunks_installed: u64,
-    /// Sealed chunks placed first by the final migration trace.
-    #[serde(default)]
-    pub hot_leading: u64,
-    /// Set after drain completion: a nonempty hint arrived while requests remained.
-    #[serde(default)]
-    pub hot_hint_received: Option<bool>,
-}
-
-/// Filename for [`PrefaultStats`], colocated with
-/// [`crate::runtime`]'s per-jail `working-set-trace.json`
-/// (`WORKING_SET_TRACE_FILE` in `engram-sandbox-firecracker`).
-pub const PREFAULT_STATS_FILE: &str = "prefault-stats.json";
-
-/// Where `PrefaultStats` lands for a jail whose per-jail trace file is
-/// `trace_output` — the sibling `<jail_dir>/prefault-stats.json`.
-/// `None` only if `trace_output` has no parent directory (never true
-/// for a real jail path; guards a degenerate relative path in tests).
-pub fn prefault_stats_path(trace_output: &std::path::Path) -> Option<PathBuf> {
-    trace_output
-        .parent()
-        .map(|dir| dir.join(PREFAULT_STATS_FILE))
-}
-
-/// Best-effort, atomic (temp+rename) write — same pattern as
-/// [`Runtime::dump_trace_output`]. Failures are logged, never
-/// propagated: the stats file is a diagnostic surface, not load-bearing
-/// for the restore itself (a write failure here must never fail or
-/// slow down the guest's boot).
-pub fn write_prefault_stats(path: &std::path::Path, stats: &PrefaultStats) {
-    match serde_json::to_vec(stats) {
-        Ok(bytes) => {
-            let tmp = path.with_extension("json.tmp");
-            if let Err(e) = std::fs::write(&tmp, &bytes) {
-                tracing::warn!(error = %e, path = %tmp.display(), "prefault_stats tmp write");
-                return;
-            }
-            if let Err(e) = std::fs::rename(&tmp, path) {
-                tracing::warn!(error = %e, path = %path.display(), "prefault_stats rename");
-            }
-        }
-        Err(e) => tracing::warn!(error = %e, "prefault_stats serialize"),
-    }
-}
-
-/// Review finding 6: the pure read-modify-write half of patching the
-/// peer-drain snapshot onto whatever `prefault-stats.json` bytes already
-/// exist (written by `prefault_from_trace` or `main.rs`'s early
-/// `trace_loaded: false` case). `existing_bytes` is `None`/unparseable
-/// exactly when the handler never wrote a stats file at all (crashed
-/// before either writer ran) — deliberately returns `None` in that case
-/// rather than fabricating a file, so a genuinely dead handler still
-/// alarms as `stats_missing` instead of surfacing a peer-only stub that
-/// would mask it.
-fn patch_peer_fields(
-    existing_bytes: Option<&[u8]>,
-    (
-        peer_pulled,
-        peer_alt_sourced,
-        peer_zero_chunks,
-        peer_live_faults,
-        hot_leading,
-        hot_hint_received,
-    ): (u64, u64, u64, u64, u64, bool),
-) -> Option<PrefaultStats> {
-    let mut stats: PrefaultStats = serde_json::from_slice(existing_bytes?).ok()?;
-    stats.peer_pulled = peer_pulled;
-    stats.peer_alt_sourced = peer_alt_sourced;
-    stats.peer_zero_chunks = peer_zero_chunks;
-    stats.peer_live_faults = peer_live_faults;
-    stats.hot_leading = hot_leading;
-    stats.hot_hint_received = Some(hot_hint_received);
-    Some(stats)
-}
 
 /// Strip `O_NONBLOCK` from `fd` so blocking reads on it actually
 /// block. Firecracker creates the UFFD as `O_NONBLOCK`; the
@@ -350,8 +195,7 @@ pub fn recv_handshake(
 /// `host_va` are still inside this mapping. Returns `None` when the
 /// offset isn't covered by any mapping.
 ///
-/// Used by both per-fault serving and prefault: every byte-offset
-/// translation funnels through here.
+/// Every byte-offset translation funnels through here.
 fn locate_offset(
     mappings: &[GuestRegionUffdMapping],
     byte_offset: u64,
@@ -407,6 +251,171 @@ enum Claim {
     InFlight,
     /// Already fully `Installed` — the caller short-circuits to a wake.
     Done,
+}
+
+/// Drain connections for a large drain.
+const DRAIN_CONNS: usize = 3;
+/// A drain of this many chunks or fewer uses one connection.
+const DRAIN_SPLIT_MIN_CHUNKS: usize = 64;
+/// Requests each drain connection keeps on the wire.
+const PIPELINE_DEPTH: usize = 8;
+/// Requests each drain connection keeps on the wire while a guest fault
+/// is in flight or finished within [`FAULT_RECENT`].
+const FAULT_SHARE_DEPTH: usize = 2;
+const FAULT_RECENT: Duration = Duration::from_millis(2);
+/// How long a fault (or the drain) waits for another request's install
+/// of the same chunk before it asks for the chunk itself.
+const PEER_REQUESTED_WAIT: Duration = Duration::from_millis(50);
+
+/// The most time the eager sweep runs. Each install is whole, so the sweep
+/// can stop between chunks; the rest serve on demand. This bound keeps a
+/// slow sweep from holding the I/O long after it helps.
+const SWEEP_BUDGET: Duration = Duration::from_secs(60);
+
+/// How long the eager sweep waits before it goes over the chunks it could
+/// not install yet.
+const SWEEP_RETRY: Duration = Duration::from_millis(250);
+
+/// Passes over the waiting chunks in which none lands before the sweep
+/// stops (5 s). A running prefetch lands hundreds of chunks a second.
+const SWEEP_STALL_PASSES: usize = 20;
+
+/// How a chunk installs. [`Runtime::fill_for`] takes this decision for an
+/// offset from the manifests; a peer response gives it directly.
+enum Fill {
+    /// Bytes private to this session: copied in (`UFFDIO_COPY`).
+    Private(Payload),
+    /// The base image's chunk: mapped from the shared base file
+    /// (`UFFDIO_CONTINUE`) when there is one, else copied in.
+    Canonical(Payload),
+    /// A zero chunk (`UFFDIO_ZEROPAGE`).
+    Zero,
+}
+
+/// A chunk's bytes, or the store chunk that holds them.
+enum Payload {
+    Hash(ChunkHash),
+    Bytes(Bytes),
+}
+
+impl Payload {
+    fn bytes(
+        self,
+        backend: &ChunkedMemoryBackend,
+        handle: &TokioHandle,
+    ) -> Result<Bytes, HandlerError> {
+        match self {
+            Payload::Hash(hash) => Ok(backend.fetch_chunk(handle, hash)?),
+            Payload::Bytes(bytes) => Ok(bytes),
+        }
+    }
+
+    /// Whether the bytes are at hand: given, or in the local cache.
+    fn is_resident(&self, backend: &ChunkedMemoryBackend) -> bool {
+        match self {
+            Payload::Hash(hash) => backend.is_resident(*hash),
+            Payload::Bytes(_) => true,
+        }
+    }
+}
+
+impl Fill {
+    /// The same fill, with its bytes fetched now.
+    fn fetched(
+        self,
+        backend: &ChunkedMemoryBackend,
+        handle: &TokioHandle,
+    ) -> Result<Self, HandlerError> {
+        Ok(match self {
+            Fill::Private(p) => Fill::Private(Payload::Bytes(p.bytes(backend, handle)?)),
+            Fill::Canonical(p) => Fill::Canonical(Payload::Bytes(p.bytes(backend, handle)?)),
+            Fill::Zero => Fill::Zero,
+        })
+    }
+}
+
+/// Who installs a chunk. A fault wakes the vCPUs that wait on it; a peer
+/// install is recorded in the sealed output.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Installer {
+    Fault,
+    Sweep,
+    Peer,
+}
+
+/// What [`Runtime::sweep_step`] did with one chunk.
+enum SweepStep {
+    Installed,
+    /// Its bytes are not at hand yet.
+    Wait,
+    /// A zero chunk, or a canonical one with no hash: faults serve it.
+    Zero,
+    /// Installed already, sealed, left to the guest, or past the end.
+    Skip,
+}
+
+/// The work list the drain connections share.
+struct DrainShared {
+    /// `(offset, forced)`: a forced chunk is requested even when another
+    /// request holds it.
+    todo: Mutex<std::collections::VecDeque<(u64, bool)>>,
+    /// Chunks skipped because another request held them.
+    deferred: Mutex<Vec<u64>>,
+    failed: AtomicBool,
+    /// Distinct from fault-connection request ids in logs.
+    next_req: std::sync::atomic::AtomicU64,
+    resolved: std::sync::atomic::AtomicUsize,
+    total: usize,
+    pulled: std::sync::atomic::AtomicU64,
+    alt_sourced: std::sync::atomic::AtomicU64,
+    zero_chunks: std::sync::atomic::AtomicU64,
+}
+
+impl DrainShared {
+    fn new(todo: Vec<u64>) -> Self {
+        Self {
+            total: todo.len(),
+            todo: Mutex::new(todo.into_iter().map(|o| (o, false)).collect()),
+            deferred: Mutex::new(Vec::new()),
+            failed: AtomicBool::new(false),
+            next_req: std::sync::atomic::AtomicU64::new(1_000_000),
+            resolved: std::sync::atomic::AtomicUsize::new(0),
+            pulled: std::sync::atomic::AtomicU64::new(0),
+            alt_sourced: std::sync::atomic::AtomicU64::new(0),
+            zero_chunks: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn pop(&self) -> Option<(u64, bool)> {
+        self.todo.lock().expect("drain queue poisoned").pop_front()
+    }
+
+    fn defer(&self, offset: u64) {
+        self.deferred
+            .lock()
+            .expect("drain queue poisoned")
+            .push(offset);
+    }
+
+    fn force(&self, offset: u64) {
+        self.todo
+            .lock()
+            .expect("drain queue poisoned")
+            .push_front((offset, true));
+    }
+
+    /// Count one chunk as installed, and report progress every 256.
+    fn resolved(&self, rt: &Runtime) {
+        let n = self.resolved.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_multiple_of(256) {
+            if let Some(control) = rt.control.as_ref() {
+                control.report(engram_migrate_proto::HandlerControl::DrainProgress {
+                    pulled: self.pulled.load(Ordering::Relaxed),
+                    remaining: self.total.saturating_sub(n) as u64,
+                });
+            }
+        }
+    }
 }
 
 /// One bounded prefetch slot. Requests are never queued behind a window.
@@ -479,10 +488,6 @@ pub struct Runtime {
     /// runs on a `spawn_blocking` thread which is safe to call
     /// `block_on` from.
     handle: TokioHandle,
-    /// Working-set recorder shared with whoever publishes the trace
-    /// on shutdown. `Mutex` is here for correctness, not contention:
-    /// the fault loop is single-threaded today.
-    recorder: Arc<Mutex<WorkingSetRecorder>>,
     /// Per-chunk installation lifecycle (see [`ChunkState`]). Lets the
     /// fault loop skip duplicate `UFFDIO_COPY` attempts for chunks
     /// already installed (`EEXIST` would otherwise force a retry), and
@@ -491,17 +496,13 @@ pub struct Runtime {
     /// A failed install rolls the chunk back to `Empty` so it is retried
     /// rather than permanently poisoned (issue #206).
     installed: Mutex<Vec<ChunkState>>,
+    /// The chunks the guest needs first, by position, for the next restore's prefix.
+    first_touch: crate::first_touch::FirstTouchRecorder,
     /// Notified whenever a chunk leaves `Installing` (→ `Installed` on
     /// success, → `Empty` on rollback). A fault that found the chunk
     /// `Installing` waits on this until the in-flight install settles.
     install_cv: Condvar,
     page_size: u64,
-    /// ADR 0014 M1.14: when set, the fault loop periodically writes
-    /// the current recorder snapshot to this path. Belt-and-
-    /// suspenders: the bake's profile pass can read the trace
-    /// even if the run loop hangs on a stale userfaultfd that the
-    /// kernel never closes after FC dies.
-    trace_output: Option<PathBuf>,
     /// ADR 0045 unified memory substrate (v2b). When set, guest memory
     /// is `MAP_PRIVATE` of this per-template base shm file (registered
     /// `MISSING|MINOR` by the forked FC) and canonical chunks install
@@ -510,10 +511,10 @@ pub struct Runtime {
     /// private `UFFDIO_COPY`. Session-divergent chunks keep COPY.
     /// `None` ⇒ stock Route-B behavior, byte-identical.
     base_shm: Option<crate::base_shm::BaseShm>,
-    /// Whether `UFFDIO_ZEROPAGE` works on the substrate's MAP_PRIVATE
-    /// file-backed mapping (kernel-version dependent). Starts `true`;
-    /// flips to `false` on the first EINVAL and zero chunks fall back
-    /// to a private COPY of a zeroed buffer.
+    /// Whether `UFFDIO_ZEROPAGE` works on the guest mapping (the
+    /// substrate's MAP_PRIVATE file mapping depends on the kernel).
+    /// Starts `true`; the first EINVAL flips it, and zero chunks then
+    /// install copies of a zeroed buffer.
     zeropage_ok: std::sync::atomic::AtomicBool,
     /// ADR 0045 C2: post-copy migration mode. Sealed (dirtied-since-
     /// checkpoint) chunks are peer-authoritative: the fault path asks
@@ -521,6 +522,16 @@ pub struct Runtime {
     /// task pulls the rest in the background. `None` ⇒ everything
     /// above is independent of the source.
     peer: Option<std::sync::Arc<crate::peer::PeerSession>>,
+    /// Peer mode: one flag per chunk, set while a request for the chunk
+    /// is on the wire (drain, fault window, or direct demand). The drain
+    /// skips a requested chunk and a fault waits for its install, so a
+    /// chunk is asked for once. Empty outside peer mode.
+    peer_requested: Vec<AtomicBool>,
+    /// How long a fault or the drain waits for another request's install
+    /// of a chunk before it asks for the chunk itself.
+    peer_requested_wait: Duration,
+    /// Peer mode: where every peer-supplied chunk is recorded.
+    sealed_out: Option<crate::peer::SealedOutput>,
     fault_window: Mutex<Option<FaultWindow>>,
     fault_around_chunks: usize,
     fault_around_chunks_installed: std::sync::atomic::AtomicU64,
@@ -536,27 +547,17 @@ pub struct Runtime {
     /// rather than fatally escalating PeerLost on a healthy, fully-drained
     /// destination (issue #227 scenario (a)).
     drain_done: std::sync::atomic::AtomicBool,
-    /// ADR 0045 C2 (E2B fold): one-shot trace dump when the recorder
-    /// window closes — the migration capture reads the per-jail trace
-    /// file LIVE, so waiting for handler exit (the publish channel) is
-    /// too late. Set once the close-dump has fired.
-    window_dump_done: std::sync::atomic::AtomicBool,
 }
 
 impl Runtime {
     /// Pair the chunked backend with the UFFD the handshake gave us.
     /// No `memory.bin` file is opened — every page is served from
     /// chunks (ADR 0020 Route B).
-    ///
-    /// `recorder_window` controls how long the trace recorder stays
-    /// open after construction. Pass `Duration::ZERO` to disable
-    /// recording (useful for unit tests / one-shot replays).
     pub fn new(
         mappings: Vec<GuestRegionUffdMapping>,
         uffd: Uffd,
         backend: Arc<ChunkedMemoryBackend>,
         handle: TokioHandle,
-        recorder_window: Duration,
         base_shm: Option<crate::base_shm::BaseShm>,
     ) -> Result<Self, HandlerError> {
         let mappings_total: u64 = mappings.iter().map(|m| m.size as u64).sum();
@@ -592,31 +593,27 @@ impl Runtime {
                 );
             }
         }
-        let vcpu_count = u32::try_from(mappings.len()).unwrap_or(u32::MAX);
-        let recorder = Arc::new(Mutex::new(WorkingSetRecorder::new(
-            vcpu_count,
-            recorder_window,
-        )));
 
         Ok(Self {
             mappings,
             uffd,
             backend,
             handle,
-            recorder,
             installed: Mutex::new(vec![ChunkState::Empty; chunk_count]),
+            first_touch: crate::first_touch::FirstTouchRecorder::new(chunk_count),
             install_cv: Condvar::new(),
             page_size,
-            trace_output: None,
             base_shm,
             zeropage_ok: std::sync::atomic::AtomicBool::new(true),
             peer: None,
+            peer_requested: Vec::new(),
+            peer_requested_wait: PEER_REQUESTED_WAIT,
+            sealed_out: None,
             fault_window: Mutex::new(None),
             fault_around_chunks: crate::peer::DEFAULT_FAULT_AROUND_CHUNKS,
             fault_around_chunks_installed: std::sync::atomic::AtomicU64::new(0),
             control: None,
             drain_done: std::sync::atomic::AtomicBool::new(false),
-            window_dump_done: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -628,262 +625,194 @@ impl Runtime {
         peer: std::sync::Arc<crate::peer::PeerSession>,
         control: Option<std::sync::Arc<crate::peer::ControlTx>>,
     ) {
+        let chunk_count = self
+            .installed
+            .lock()
+            .expect("installed bitmap poisoned")
+            .len();
+        self.peer_requested = (0..chunk_count).map(|_| AtomicBool::new(false)).collect();
         self.peer = Some(peer);
         self.control = control;
     }
 
-    /// ADR 0014 M1.14: configure periodic trace_output dumping. The
-    /// fault loop snapshots the recorder into the path every N
-    /// faults (and once after the recorder window closes) so the
-    /// trace lands on disk even if the loop doesn't unwind cleanly.
-    pub fn set_trace_output(&mut self, path: PathBuf) {
-        self.trace_output = Some(path);
+    /// Peer mode: record every peer-supplied chunk in `out`.
+    pub fn set_sealed_output(&mut self, out: crate::peer::SealedOutput) {
+        self.sealed_out = Some(out);
     }
 
-    /// The per-jail `prefault-stats.json` sibling of this run's
-    /// `--trace-output` path, or `None` when no `--trace-output` was
-    /// given (VZ/Process backends never spawn this binary; a test
-    /// harness that omits it just gets no stats file — best-effort
-    /// diagnostics, never load-bearing).
-    fn prefault_stats_path(&self) -> Option<PathBuf> {
-        self.trace_output
-            .as_ref()
-            .and_then(|p| prefault_stats_path(p))
+    /// Mark `chunk_idx` requested. `false` when a request is already out.
+    fn try_request(&self, chunk_idx: usize) -> bool {
+        self.peer_requested
+            .get(chunk_idx)
+            .is_some_and(|f| !f.swap(true, Ordering::AcqRel))
     }
 
-    /// Snapshot the current recorder state and write it to
-    /// `trace_output` if configured. Best-effort; failures are
-    /// logged but don't propagate (the path matters more than
-    /// our error reporting).
-    fn dump_trace_output(&self) {
-        let Some(path) = self.trace_output.as_ref() else {
-            return;
-        };
-        let r = self.recorder.lock().expect("recorder poisoned");
-        let mut trace = WorkingSetTrace::new(
-            r.vcpu_count_snapshot(),
-            r.window_ms_snapshot(),
-            chrono::Utc::now(),
-        );
-        trace.chunks = r.chunks_snapshot();
-        drop(r);
-        match serde_json::to_vec(&trace) {
-            Ok(bytes) => {
-                let tmp = path.with_extension("json.tmp");
-                if let Err(e) = std::fs::write(&tmp, &bytes) {
-                    tracing::warn!(error = %e, path = %tmp.display(), "trace_output tmp write");
-                    return;
-                }
-                if let Err(e) = std::fs::rename(&tmp, path) {
-                    tracing::warn!(error = %e, path = %path.display(), "trace_output rename");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "trace_output serialize");
+    fn is_requested(&self, chunk_idx: usize) -> bool {
+        self.peer_requested
+            .get(chunk_idx)
+            .is_some_and(|f| f.load(Ordering::Acquire))
+    }
+
+    /// Clear the request flag and wake faults that wait on the chunk.
+    fn clear_request(&self, chunk_idx: usize) {
+        if let Some(flag) = self.peer_requested.get(chunk_idx) {
+            if flag.swap(false, Ordering::AcqRel) {
+                let _installed = self.installed.lock().expect("installed bitmap poisoned");
+                self.install_cv.notify_all();
             }
         }
     }
 
-    /// Pre-install every chunk listed in `trace` into the guest
-    /// before vCPUs run. Idempotent against partial overlap with a
-    /// later fault-served install (per-chunk bitmap guards the
-    /// double-install case).
-    ///
-    /// Drops the trace lock between chunks so a follow-up
-    /// pre-fault from a fresh trace can interleave with the fault
-    /// loop — useful only in testing; production always pre-faults
-    /// once at startup.
-    pub fn prefault_from_trace(&self, trace: &WorkingSetTrace) -> Result<(), HandlerError> {
-        let started = std::time::Instant::now();
-        let mut installed = 0usize;
-        let mut skipped = 0usize;
-        // Run the body in a closure so a `?`-propagated error still falls
-        // through to the stats write below (#526: a handler that dies
-        // partway through must leave a stats file recording what it DID
-        // manage before failing — not the total absence that would
-        // masquerade as `outcome="stats_missing"`, the "handler never even
-        // started" alarm).
-        let result: Result<(), HandlerError> = (|| {
-            for hash in &trace.chunks {
-                // Fetch once per hash; install at every position the
-                // session manifest places the chunk at.
-                let positions = self.backend.session_positions_of(*hash);
-                if positions.is_empty() {
-                    // Trace mentions a hash the session no longer needs
-                    // (rewritten / GC'd). Cheap to skip.
-                    skipped += 1;
-                    continue;
-                }
-                // ADR 0045 substrate: canonical positions must install via the
-                // shared base + CONTINUE — a prefault COPY here would privately
-                // duplicate exactly the hot pages the substrate exists to share.
-                if let Some(base) = self.base_shm.as_ref() {
-                    for byte_offset in positions {
-                        let shared = matches!(
-                            self.backend.resolve(byte_offset),
-                            Some(ResolvedPage::Canonical { canonical_offset })
-                                if self.backend.canonical_chunk_hash(canonical_offset)
-                                    == Some(*hash)
-                        );
-                        let did = if shared {
-                            self.install_canonical_shared(base, byte_offset, *hash, false)?
-                        } else {
-                            let bytes = self.handle.block_on(self.backend.fetch_chunk(*hash))?;
-                            self.install_chunk_at(byte_offset, bytes, false)?
-                        };
-                        if did {
-                            installed += 1;
-                        }
-                    }
-                    continue;
-                }
-                let bytes = self.handle.block_on(self.backend.fetch_chunk(*hash))?;
-                for byte_offset in positions {
-                    if self.install_chunk_at(byte_offset, bytes.clone(), false)? {
-                        installed += 1;
-                    }
-                }
+    /// Wait up to `peer_requested_wait` for a requested chunk to install.
+    /// `true` when it is installed; `false` when the request ended
+    /// without an install, or the bound passed.
+    fn await_requested(&self, chunk_idx: usize) -> bool {
+        let deadline = std::time::Instant::now() + self.peer_requested_wait;
+        let mut installed = self.installed.lock().expect("installed bitmap poisoned");
+        loop {
+            if installed.get(chunk_idx) == Some(&ChunkState::Installed) {
+                return true;
             }
-            Ok(())
-        })();
+            if !self.is_requested(chunk_idx) {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            installed = self
+                .install_cv
+                .wait_timeout(installed, remaining)
+                .expect("installed bitmap poisoned")
+                .0;
+        }
+    }
+
+    /// Write the first-touch record to `dir`, each entry as it is recorded.
+    pub fn set_report_dir(&mut self, dir: &std::path::Path) {
+        self.first_touch.set_output(&dir.join(FirstTouch::FILE));
+    }
+
+    /// Log the memory manifest's composition once.
+    fn log_composition(&self) {
+        let c = self.backend.composition();
+        let canonical_in_shm = self.base_shm.as_ref().map(|base| {
+            let chunk_size = self.backend.chunk_size();
+            let total = self.backend.total_bytes();
+            (0..total.div_ceil(chunk_size))
+                .map(|i| i * chunk_size)
+                .filter(|&off| {
+                    matches!(
+                        self.backend.resolve(off),
+                        Some(ResolvedPage::Canonical { .. })
+                    ) && base.is_populated(off, chunk_size.min(total - off))
+                })
+                .count()
+        });
         tracing::info!(
-            installed,
-            skipped,
-            trace_len = trace.chunks.len(),
-            ok = result.is_ok(),
-            "prefault from working-set trace complete"
+            canonical = c.canonical,
+            canonical_in_shm,
+            divergent = c.divergent,
+            divergent_local = c.divergent_local,
+            zero = c.zero,
+            chunk_size = self.backend.chunk_size(),
+            "memory manifest composition"
         );
-        if let Some(path) = self.prefault_stats_path() {
-            write_prefault_stats(
-                &path,
-                &PrefaultStats {
-                    trace_loaded: true,
-                    chunks_in_trace: trace.chunks.len(),
-                    installed,
-                    skipped,
-                    duration_ms: started.elapsed().as_millis() as u64,
-                    ..Default::default()
-                },
-            );
-        }
-        result
     }
 
     /// ADR 0045 tail latency: eagerly install EVERY chunk of the
     /// session — canonical via the shared base (CONTINUE), divergent
     /// via fetch + COPY — as a background producer racing the fault
-    /// loop, exactly like `prefault_from_trace` but with total
-    /// coverage instead of a recorded working set. A migration restore
-    /// has no host trace, so before this sweep its divergent chunks
+    /// loop. Before this sweep a migration restore's divergent chunks
     /// (the checkpoint chain's accumulated diff — hundreds of 512 KiB
     /// chunks, all prestaged on local NVMe) faulted in one at a time
     /// through the single-threaded fault loop: the residual ~27 s
-    /// post-teleport guest crawl (prod canary 51d51740). Idempotent
+    /// post-teleport guest crawl. Idempotent
     /// against the fault loop via the `installed` bitmap; `wake=false`
     /// (no vCPU waits on a page it hasn't faulted).
+    ///
+    /// With a writer, the sweep never fetches: it installs only chunks
+    /// the cache (or the base shm) already holds. It keeps the chunks it
+    /// could not install yet and goes over only those every
+    /// [`SWEEP_RETRY`] as the writer's prefetch lands them. After
+    /// [`SWEEP_STALL_PASSES`] passes in which none landed (the prefetch
+    /// ended or the writer restarted), it stops and leaves them to the
+    /// faults. A fetch here would be a `Demand` request, made one at a
+    /// time on this thread, for a chunk the prefetch has not reached yet.
+    /// Without a writer nothing else fills the cache, so the sweep
+    /// fetches.
     pub fn sweep_all(&self) -> Result<(), HandlerError> {
-        if std::env::var("ENGRAM_UFFD_EAGER_SWEEP")
-            .map(|v| v == "0")
-            .unwrap_or(false)
-        {
-            tracing::info!("eager sweep disabled via ENGRAM_UFFD_EAGER_SWEEP=0");
-            return Ok(());
-        }
-        // Time-box: each per-chunk install completes atomically (the
-        // `installed` bit and the bytes land together), so stopping
-        // BETWEEN chunks is always safe — the rest serve on-demand. A
-        // stuck origin fetch inside one chunk is the dangerous case
-        // (its bit is set; a faulting vCPU would wake onto a missing
-        // page), which is why fetches go through the cache's bounded
-        // path — the budget here is the backstop that keeps a slow
-        // sweep from monopolizing I/O long past its usefulness.
-        let budget = std::time::Duration::from_secs(
-            std::env::var("ENGRAM_UFFD_EAGER_SWEEP_BUDGET_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(60),
-        );
         let started = std::time::Instant::now();
         let chunk_size = self.backend.chunk_size();
         let total = self.backend.total_bytes();
+        let follow = self.backend.has_writer();
         let mut installed = 0usize;
-        let mut deferred = 0usize;
-        // Two passes, divergent first: those are the chunks an
-        // on-demand fault pays a fetch for (the post-teleport crawl);
-        // canonical pages CONTINUE from the (pre-warmed) base for
-        // near-free, and ZERO chunks are skipped entirely — eagerly
-        // installing them would privately materialize every untouched
-        // page of guest RAM (UFFDIO_ZEROPAGE is rejected on the
-        // substrate's MAP_PRIVATE file mapping, so each would COPY a
-        // zeroed buffer), defeating the density the substrate exists
-        // for. A zero fault is already served with no fetch.
-        for pass in ["divergent", "canonical"] {
-            let mut offset: u64 = 0;
-            while offset < total {
-                if started.elapsed() > budget {
-                    tracing::warn!(
-                        pass,
-                        installed,
-                        deferred,
-                        "eager sweep budget exhausted; remaining chunks serve on-demand"
-                    );
-                    return Ok(());
-                }
-                // ADR 0045 C2: a sealed-but-undrained chunk's truth is the
-                // PEER, not the manifest — installing resolve()'s stale
-                // view here would be silent corruption. The drain runs
-                // before this on the producer thread, so normally every
-                // sealed chunk is already installed; this guard is the
-                // belt-and-braces for any other interleaving.
-                if let Some(peer) = self.peer.as_ref() {
-                    let idx = offset / chunk_size;
-                    if peer.seal().get(idx) && !self.chunk_installed(idx as usize) {
-                        offset += chunk_size;
-                        continue;
-                    }
-                }
-                let did = match (pass, self.backend.resolve(offset)) {
-                    ("divergent", Some(ResolvedPage::Chunk { hash })) => {
-                        let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
-                        self.install_chunk_at(offset, bytes, false)?
-                    }
-                    ("canonical", Some(ResolvedPage::Canonical { canonical_offset })) => {
-                        match self.backend.canonical_chunk_hash(canonical_offset) {
-                            Some(hash) => match self.base_shm.as_ref() {
-                                Some(base) => {
-                                    self.install_canonical_shared(base, offset, hash, false)?
-                                }
-                                None => {
-                                    let bytes =
-                                        self.handle.block_on(self.backend.fetch_chunk(hash))?;
-                                    self.install_chunk_at(offset, bytes, false)?
-                                }
-                            },
-                            None => {
-                                deferred += 1;
-                                false
-                            }
-                        }
-                    }
-                    ("canonical", Some(ResolvedPage::Zero { .. })) => {
-                        // Zero chunks are skipped — installing them would
-                        // privately materialize untouched guest RAM (see
-                        // the pass comment above). Counted once, in the
-                        // canonical pass, as zero_skipped.
-                        deferred += 1;
-                        false
-                    }
-                    _ => false,
-                };
-                if did {
-                    installed += 1;
-                }
-                offset += chunk_size;
+        let mut zero_skipped = 0usize;
+        // Divergent first: those are the chunks an on-demand fault pays a
+        // fetch for (the post-teleport crawl); canonical pages CONTINUE
+        // from the (pre-warmed) base for near-free, and ZERO chunks are
+        // skipped entirely — eagerly installing them would privately
+        // materialize every untouched page of guest RAM
+        // (UFFDIO_ZEROPAGE is rejected on the substrate's MAP_PRIVATE
+        // file mapping, so each would COPY a zeroed buffer), defeating
+        // the density the substrate exists for. A zero fault is already
+        // served with no fetch.
+        // The carried first-touch prefix goes before both: it is what the
+        // guest reads first, and the host-agent fills it first.
+        let (mut order, rest): (Vec<u64>, Vec<u64>) = (0..total)
+            .step_by(chunk_size as usize)
+            .partition(|&offset| self.first_touch.is_carried(self.chunk_idx(offset)));
+        let (divergent, canonical): (Vec<u64>, Vec<u64>) = rest.into_iter().partition(|&offset| {
+            matches!(
+                Self::fill_for(&self.backend, offset),
+                Some(Fill::Private(_))
+            )
+        });
+        let carried = order.len();
+        order.extend(divergent);
+        order.extend(canonical);
+        let mut pending = Vec::new();
+        for offset in order {
+            match self.sweep_step(offset, follow)? {
+                SweepStep::Installed => installed += 1,
+                SweepStep::Zero => zero_skipped += 1,
+                SweepStep::Wait => pending.push(offset),
+                SweepStep::Skip => {}
             }
         }
+        let mut passes = 1usize;
+        let mut stalled = 0usize;
+        let end = loop {
+            if pending.is_empty() {
+                break "complete";
+            }
+            if started.elapsed() > SWEEP_BUDGET {
+                break "budget";
+            }
+            if stalled >= SWEEP_STALL_PASSES {
+                break "stalled";
+            }
+            std::thread::sleep(SWEEP_RETRY);
+            let before = installed;
+            let mut still = Vec::with_capacity(pending.len());
+            for offset in pending {
+                match self.sweep_step(offset, follow)? {
+                    SweepStep::Installed => installed += 1,
+                    SweepStep::Wait => still.push(offset),
+                    SweepStep::Zero | SweepStep::Skip => {}
+                }
+            }
+            pending = still;
+            passes += 1;
+            stalled = if installed > before { 0 } else { stalled + 1 };
+        };
         tracing::info!(
+            end,
             installed,
-            zero_skipped = deferred,
+            carried,
+            passes,
+            left_to_faults = pending.len(),
+            zero_skipped,
             elapsed_ms = started.elapsed().as_millis() as u64,
             total_chunks = total.div_ceil(chunk_size),
             "eager sweep complete (ADR 0045)"
@@ -891,8 +820,54 @@ impl Runtime {
         Ok(())
     }
 
+    /// One chunk of the eager sweep: install it when its bytes are at
+    /// hand (with a writer, `follow`: when the cache or the base shm
+    /// holds them).
+    fn sweep_step(&self, offset: u64, follow: bool) -> Result<SweepStep, HandlerError> {
+        let idx = self.chunk_idx(offset);
+        // ADR 0045 C2: a sealed-but-undrained chunk's truth is the PEER,
+        // not the manifest — installing resolve()'s stale view here would
+        // be silent corruption. The drain runs before this on the
+        // producer thread, so normally every sealed chunk is already
+        // installed; this guard is the belt-and-braces for any other
+        // interleaving.
+        let sealed = self
+            .peer
+            .as_ref()
+            .is_some_and(|peer| peer.seal().get(idx as u64));
+        if self.chunk_installed(idx) || sealed {
+            return Ok(SweepStep::Skip);
+        }
+        let Some(fill) = Self::fill_for(&self.backend, offset) else {
+            return Ok(SweepStep::Skip);
+        };
+        let held = match &fill {
+            Fill::Zero => return Ok(SweepStep::Zero),
+            Fill::Private(payload) => payload.is_resident(&self.backend),
+            Fill::Canonical(payload) => {
+                payload.is_resident(&self.backend)
+                    || self
+                        .base_shm
+                        .as_ref()
+                        .is_some_and(|base| base.is_populated(offset, self.chunk_len(offset)))
+            }
+        };
+        if follow && !held {
+            return Ok(SweepStep::Wait);
+        }
+        if !self.install(offset, fill, Installer::Sweep)? {
+            return Ok(SweepStep::Skip);
+        }
+        // An install hides the guest's fault on this chunk, so a carried
+        // chunk is recorded here, or it would leave the next prefix.
+        if self.first_touch.is_carried(idx) {
+            self.first_touch.touch(idx);
+        }
+        Ok(SweepStep::Installed)
+    }
+
     /// Atomically claim a chunk for installation (CAS `Empty →
-    /// Installing` under the lock). Concurrent prefault / fault / drain
+    /// Installing` under the lock). Concurrent sweep / fault / drain
     /// installs serialise to exactly one installer per chunk.
     ///
     /// - [`Claim::Claimed`]  — WE own the install; on success call
@@ -1085,55 +1060,89 @@ impl Runtime {
         Ok(())
     }
 
-    /// Install `bytes` (a full chunk) at the given session byte
-    /// offset, copying into the guest's UFFD-registered region via
-    /// `UFFDIO_COPY`. `wake` controls whether vCPUs blocked on
-    /// pages in this range are woken (`true` during the fault loop,
-    /// `false` during prefault when no vCPU is blocked yet).
-    ///
-    /// Walks every region the chunk touches (see `install_spanning`):
-    /// a chunk straddling an FC region boundary is installed in full,
-    /// not clamped to the first region.
-    ///
-    /// Returns `Ok(true)` if we installed; `Ok(false)` if the chunk
-    /// was already installed (idempotent path).
-    fn install_chunk_at(
-        &self,
-        byte_offset: u64,
-        bytes: Bytes,
-        wake: bool,
-    ) -> Result<bool, HandlerError> {
-        let chunk_size = self.backend.chunk_size();
-        let chunk_idx = (byte_offset / chunk_size) as usize;
-
-        // Claim the chunk (Empty → Installing). If another installer is
-        // mid-flight or already done, short-circuit to a wake (false);
-        // a failed in-flight install rolls back to Empty and we retry.
-        match self.claim_for_install(chunk_idx) {
-            Claim::Claimed => {}
-            _ => return Ok(false),
-        }
-        self.install_claimed_chunk_at(byte_offset, bytes, wake)
+    fn chunk_idx(&self, offset: u64) -> usize {
+        (offset / self.backend.chunk_size()) as usize
     }
 
-    fn install_claimed_chunk_at(
-        &self,
-        byte_offset: u64,
-        bytes: Bytes,
-        wake: bool,
-    ) -> Result<bool, HandlerError> {
-        let chunk_size = self.backend.chunk_size();
-        let chunk_idx = (byte_offset / chunk_size) as usize;
+    /// The length of the chunk at `offset`: the last chunk can be short.
+    fn chunk_len(&self, offset: u64) -> u64 {
+        self.backend
+            .chunk_size()
+            .min(self.backend.total_bytes().saturating_sub(offset))
+    }
 
-        // The chunk's bytes occupy file offsets
-        // [byte_offset, byte_offset + total_len). Walk every region the
-        // range touches so a boundary-spanning chunk installs in FULL,
-        // copying the matching slice of `bytes` into each segment.
-        let total_len = std::cmp::min(chunk_size, bytes.len() as u64);
-        let result = self.install_spanning(byte_offset, total_len, |host_va, seg_len, pos| {
+    /// How the chunk at `offset` installs, from the manifests: the one
+    /// source decision every installer takes. `None` past the end.
+    fn fill_for(backend: &ChunkedMemoryBackend, offset: u64) -> Option<Fill> {
+        Some(match backend.resolve(offset)? {
+            ResolvedPage::Chunk { hash } => Fill::Private(Payload::Hash(hash)),
+            ResolvedPage::Canonical { hash } => Fill::Canonical(Payload::Hash(hash)),
+            ResolvedPage::Zero => Fill::Zero,
+        })
+    }
+
+    /// Install the chunk at `offset` from `fill`. `Ok(false)` when another
+    /// installer had it. The claim is held across the fetch, so a chunk is
+    /// fetched once however many installers race for it.
+    fn install(&self, offset: u64, fill: Fill, by: Installer) -> Result<bool, HandlerError> {
+        if self.claim_for_install(self.chunk_idx(offset)) != Claim::Claimed {
+            return Ok(false);
+        }
+        self.install_claimed(offset, fill, by)
+    }
+
+    /// Install a chunk the caller claimed, then settle the claim:
+    /// `Installed` on success, back to `Empty` on any error, so a failed
+    /// fetch or copy leaves the chunk retryable (#206). A peer install is
+    /// recorded before it is marked installed, so once every sealed chunk
+    /// is installed the sealed output is complete.
+    fn install_claimed(
+        &self,
+        offset: u64,
+        fill: Fill,
+        by: Installer,
+    ) -> Result<bool, HandlerError> {
+        let len = self.chunk_len(offset);
+        let record = self.sealed_out.as_ref().filter(|_| by == Installer::Peer);
+        let wake = by == Installer::Fault;
+        let result = (|| {
+            let base = match fill {
+                Fill::Canonical(_) => self.base_shm.as_ref(),
+                _ => None,
+            };
+            // A base that holds the chunk needs no bytes, unless they are recorded.
+            let bytes = match fill {
+                Fill::Zero => None,
+                Fill::Canonical(_)
+                    if record.is_none() && base.is_some_and(|b| b.is_populated(offset, len)) =>
+                {
+                    None
+                }
+                Fill::Private(payload) | Fill::Canonical(payload) => {
+                    Some(payload.bytes(&self.backend, &self.handle)?)
+                }
+            };
+            if let Some(out) = record {
+                out.record(offset, bytes.as_deref(), len);
+            }
+            match (base, bytes) {
+                (Some(base), bytes) => self.continue_from_base(base, offset, len, bytes, wake),
+                (None, Some(bytes)) => self.copy_in(offset, &bytes, wake),
+                (None, None) => self.zero_in(offset, len, wake),
+            }
+        })();
+        self.settle_install(self.chunk_idx(offset), &result);
+        result.map(|()| true)
+    }
+
+    /// `UFFDIO_COPY` `bytes` (a full chunk, or the short last one) into
+    /// every region the chunk spans (see `install_spanning`).
+    fn copy_in(&self, offset: u64, bytes: &[u8], wake: bool) -> Result<(), HandlerError> {
+        let len = self.backend.chunk_size().min(bytes.len() as u64);
+        self.install_spanning(offset, len, |host_va, seg_len, pos| {
             // SAFETY: `bytes[pos..pos+seg_len]` is in bounds
-            // (`install_spanning` never advances past `total_len`, which
-            // is clamped to `bytes.len()`). `host_va` is a guest-visible
+            // (`install_spanning` never advances past `len`, which is
+            // clamped to `bytes.len()`). `host_va` is a guest-visible
             // address in a UFFD-registered region we hold copy access
             // to. UFFDIO_COPY installs the PTE + wakes per page atomically.
             unsafe {
@@ -1145,114 +1154,76 @@ impl Runtime {
                 )?;
             }
             Ok(())
-        });
-        self.settle_install(chunk_idx, &result);
-        result.map(|()| true)
+        })
     }
 
-    /// Install a zero-filled chunk: `UFFDIO_ZEROPAGE` over the
-    /// chunk-aligned range. Used for canonical chunks the manifest
-    /// omits (implicit zero pages). No copy — the kernel maps its
-    /// shared zero page, COW on the guest's first write. Same
-    /// idempotency + clamping discipline as `install_chunk_at`.
-    fn install_zero_at(&self, byte_offset: u64, wake: bool) -> Result<bool, HandlerError> {
-        let chunk_size = self.backend.chunk_size();
-        let chunk_idx = (byte_offset / chunk_size) as usize;
-
-        match self.claim_for_install(chunk_idx) {
-            Claim::Claimed => {}
-            _ => return Ok(false),
-        }
-        self.install_claimed_zero_at(byte_offset, wake)
-    }
-
-    fn install_claimed_zero_at(&self, byte_offset: u64, wake: bool) -> Result<bool, HandlerError> {
-        let chunk_size = self.backend.chunk_size();
-        let chunk_idx = (byte_offset / chunk_size) as usize;
-
-        // Zero the chunk's whole [byte_offset, +total_len) range,
-        // walking every region it spans (clamped to the manifest's
-        // total so the final partial chunk doesn't overrun).
-        let total_len = std::cmp::min(
-            chunk_size,
-            self.backend.total_bytes().saturating_sub(byte_offset),
-        );
-        let result = self.install_spanning(byte_offset, total_len, |host_va, seg_len, _pos| {
-            // SAFETY: `host_va` is a guest-visible address in a UFFD-
-            // registered region we hold zeropage access to. ZEROPAGE
-            // installs zero pages over the range + wakes blocked vCPUs
-            // atomically per page when `wake`.
+    /// Zero `len` bytes from `offset`: `UFFDIO_ZEROPAGE`, so the kernel
+    /// maps its shared zero page and the guest's first write copies it.
+    /// Some kernels reject ZEROPAGE on the substrate's MAP_PRIVATE file
+    /// mapping; then this and every later zero install copies a zeroed
+    /// buffer (one private page per touched page).
+    fn zero_in(&self, offset: u64, len: u64, wake: bool) -> Result<(), HandlerError> {
+        self.install_spanning(offset, len, |host_va, seg_len, _pos| {
+            if self.zeropage_ok.load(Ordering::Relaxed) {
+                // SAFETY: `host_va` is a guest-visible address in a UFFD-
+                // registered region we hold zeropage access to. ZEROPAGE
+                // installs zero pages over the range and wakes blocked
+                // vCPUs atomically per page when `wake`.
+                match unsafe {
+                    self.uffd
+                        .zeropage(host_va as *mut std::ffi::c_void, seg_len, wake)
+                } {
+                    Ok(_) => return Ok(()),
+                    Err(userfaultfd::Error::ZeropageFailed(errno))
+                        if errno as i32 == libc::EINVAL || errno as i32 == libc::EOPNOTSUPP =>
+                    {
+                        self.zeropage_ok.store(false, Ordering::Relaxed);
+                        tracing::info!(
+                            "UFFDIO_ZEROPAGE unsupported on this mapping; installing copies of zeros"
+                        );
+                    }
+                    Err(e) => return Err(HandlerError::Uffd(e)),
+                }
+            }
+            let zeros = vec![0u8; seg_len];
+            // SAFETY: a zeroed buffer of `seg_len`; same contract as
+            // `copy_in`'s copy.
             unsafe {
-                self.uffd
-                    .zeropage(host_va as *mut std::ffi::c_void, seg_len, wake)?;
+                self.uffd.copy(
+                    zeros.as_ptr() as *const _,
+                    host_va as *mut std::ffi::c_void,
+                    seg_len,
+                    wake,
+                )?;
             }
             Ok(())
-        });
-        self.settle_install(chunk_idx, &result);
-        result.map(|()| true)
+        })
     }
 
-    /// ADR 0045 substrate (v2b): install a canonical chunk by ensuring the
-    /// base shm file holds its bytes, then `UFFDIO_CONTINUE`-ing the range —
-    /// the kernel maps the base file's page-cache pages (write-protected
-    /// MAP_PRIVATE; guest writes COW), so every same-template VM on the host
-    /// shares one physical copy. The fetch is skipped entirely when a
-    /// sibling already populated the range (`SEEK_HOLE` probe).
-    fn install_canonical_shared(
+    /// ADR 0045 substrate (v2b): map a canonical chunk from the base shm
+    /// file with `UFFDIO_CONTINUE` — the kernel maps the base file's
+    /// page-cache pages (write-protected MAP_PRIVATE; guest writes COW),
+    /// so every same-template VM on the host shares one physical copy.
+    /// `bytes` are written to the base first when it does not hold them;
+    /// they are `None` only when it does.
+    fn continue_from_base(
         &self,
         base: &crate::base_shm::BaseShm,
-        byte_offset: u64,
-        hash: engram_chunk_store::ChunkHash,
-        wake: bool,
-    ) -> Result<bool, HandlerError> {
-        let chunk_size = self.backend.chunk_size();
-        let chunk_idx = (byte_offset / chunk_size) as usize;
-        match self.claim_for_install(chunk_idx) {
-            Claim::Claimed => {}
-            _ => return Ok(false),
-        }
-
-        let populate_len = std::cmp::min(
-            chunk_size,
-            self.backend.total_bytes().saturating_sub(byte_offset),
-        );
-        // All fallible work — the (multi-second, network-bound)
-        // `fetch_chunk`, the base write, and the CONTINUE walk — runs in
-        // `populate_and_continue` so a single `settle_install` publishes
-        // `Installed` only on full success and rolls the claim back to
-        // `Empty` on ANY error. The chunk is never left `Installing`
-        // across `?`, and a transient fetch failure is retried by the
-        // next fault rather than permanently poisoning the chunk (#206).
-        let result = self.populate_and_continue(base, byte_offset, populate_len, hash, wake);
-        self.settle_install(chunk_idx, &result);
-        result.map(|()| true)
-    }
-
-    /// The fallible body of `install_canonical_shared`: ensure the base
-    /// shm holds the chunk's bytes (fetch + write, skipped when a sibling
-    /// already populated the range), then `UFFDIO_CONTINUE` every region
-    /// segment the chunk spans. Split out so the claim is settled in one
-    /// place on the combined `Result`.
-    fn populate_and_continue(
-        &self,
-        base: &crate::base_shm::BaseShm,
-        byte_offset: u64,
-        populate_len: u64,
-        hash: engram_chunk_store::ChunkHash,
+        offset: u64,
+        len: u64,
+        bytes: Option<Bytes>,
         wake: bool,
     ) -> Result<(), HandlerError> {
-        // Ensure the base shm holds this chunk's bytes (file-offset keyed
-        // — independent of the region layout) before we map them.
-        if !base.is_populated(byte_offset, populate_len) {
-            let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
-            base.write_chunk(byte_offset, &bytes)
-                .map_err(HandlerError::BaseShm)?;
+        if let Some(bytes) = bytes {
+            if !base.is_populated(offset, len) {
+                base.write_chunk(offset, &bytes)
+                    .map_err(HandlerError::BaseShm)?;
+            }
         }
-
         // CONTINUE each region segment the chunk spans. Per segment the
         // kernel may map a prefix and return progress (looped) and may
         // EEXIST on a page a racing fault already mapped.
-        self.install_spanning(byte_offset, populate_len, |host_va, seg_len, _pos| {
+        self.install_spanning(offset, len, |host_va, seg_len, _pos| {
             let mut done: u64 = 0;
             while (done as usize) < seg_len {
                 let start = host_va + done;
@@ -1279,106 +1250,46 @@ impl Runtime {
         })
     }
 
-    /// ADR 0045 substrate (v2b): zero canonical chunks. Try
-    /// `UFFDIO_ZEROPAGE` (maps the kernel zero page — zero RAM until the
-    /// guest writes); some kernels reject it on MAP_PRIVATE file-backed
-    /// mappings, in which case fall back to a private COPY of a zeroed
-    /// buffer (correct, costs one private page per touched page).
-    fn install_zero_substrate(&self, byte_offset: u64, wake: bool) -> Result<bool, HandlerError> {
-        let chunk_size = self.backend.chunk_size();
-        let chunk_idx = (byte_offset / chunk_size) as usize;
-        match self.claim_for_install(chunk_idx) {
-            Claim::Claimed => {}
-            _ => return Ok(false),
-        }
-        self.install_claimed_zero_substrate(byte_offset, wake)
-    }
-
-    fn install_claimed_zero_substrate(
-        &self,
-        byte_offset: u64,
-        wake: bool,
-    ) -> Result<bool, HandlerError> {
-        let chunk_size = self.backend.chunk_size();
-        let chunk_idx = (byte_offset / chunk_size) as usize;
-
-        // Walk every region the chunk spans (clamped to the manifest's
-        // total). Per segment try ZEROPAGE; on a kernel that rejects it
-        // for this MAP_PRIVATE file mapping, fall back to a COPY of a
-        // zeroed buffer for that segment and every later one.
-        let total_len = std::cmp::min(
-            chunk_size,
-            self.backend.total_bytes().saturating_sub(byte_offset),
-        );
-        let result = self.install_spanning(byte_offset, total_len, |host_va, seg_len, _pos| {
-            if self.zeropage_ok.load(Ordering::Relaxed) {
-                // SAFETY: range is inside a registered region.
-                match unsafe {
-                    self.uffd
-                        .zeropage(host_va as *mut std::ffi::c_void, seg_len, wake)
-                } {
-                    Ok(_) => return Ok(()),
-                    Err(userfaultfd::Error::ZeropageFailed(errno))
-                        if errno as i32 == libc::EINVAL || errno as i32 == libc::EOPNOTSUPP =>
-                    {
-                        self.zeropage_ok.store(false, Ordering::Relaxed);
-                        tracing::info!(
-                            "UFFDIO_ZEROPAGE unsupported on the substrate mapping;                          falling back to COPY-of-zeros"
-                        );
-                    }
-                    Err(e) => return Err(HandlerError::Uffd(e)),
-                }
-            }
-            let zeros = bytes::Bytes::from(vec![0u8; seg_len]);
-            // SAFETY: zeroed buffer of seg_len; same contract as
-            // install_chunk_at's copy.
-            unsafe {
-                self.uffd.copy(
-                    zeros.as_ptr() as *const _,
-                    host_va as *mut std::ffi::c_void,
-                    seg_len,
-                    wake,
-                )?;
-            }
-            Ok(())
-        });
-        self.settle_install(chunk_idx, &result);
-        result.map(|()| true)
-    }
-
     /// Run forever, draining events from the UFFD and serving each
     /// page fault. Returns `Ok(())` cleanly when the UFFD is closed
     /// (Firecracker exited / sandbox destroyed).
+    ///
+    /// [`crate::FAULT_THREADS`] threads read the userfaultfd. The kernel
+    /// gives each fault message to exactly one reader, and the claim table
+    /// makes two installs of one chunk safe: one thread installs, the
+    /// others wait for it and wake. The first thread to end (end of file
+    /// or an error) ends the handler; the others end with the process.
     pub fn run(self: &Arc<Self>) -> Result<(), HandlerError> {
-        let mut faults_served: u64 = 0;
+        let threads = crate::FAULT_THREADS;
+        let (done, ended) = std::sync::mpsc::channel();
+        for i in 0..threads {
+            let rt = Arc::clone(self);
+            let done = done.clone();
+            std::thread::Builder::new()
+                .name(format!("engram-uffd-fault-{i}"))
+                .spawn(move || {
+                    let _ = done.send(rt.serve_faults());
+                })?;
+        }
+        drop(done);
+        tracing::info!(threads, "serving faults");
+        ended.recv().unwrap_or(Ok(()))
+    }
+
+    fn serve_faults(self: &Arc<Self>) -> Result<(), HandlerError> {
         loop {
             match self.uffd.read_event() {
                 Ok(Some(Event::Pagefault { addr, .. })) => {
-                    self.serve_pagefault(addr as u64)?;
-                    faults_served += 1;
-                    if faults_served.is_power_of_two() {
-                        tracing::info!(faults_served, "served page fault");
-                        // ADR 0014 M1.14: dump trace_output on the
-                        // same log-cadence so a hung run loop still
-                        // produces a usable file. Cheap (~1 KiB
-                        // serialize + fs::write).
-                        self.dump_trace_output();
-                    }
-                    // ADR 0045 C2 (E2B fold): one-shot dump on the first
-                    // fault AFTER the recorder window closes, so the
-                    // complete hot set is on disk ~window-length after
-                    // restore — a live migration capture reads it from
-                    // the jail. (The power-of-two cadence alone can
-                    // leave the file stale mid-window.)
-                    if !self
-                        .window_dump_done
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        && !self.recorder.lock().expect("recorder poisoned").is_open()
-                        && !self
-                            .window_dump_done
-                            .swap(true, std::sync::atomic::Ordering::Relaxed)
-                    {
-                        self.dump_trace_output();
+                    let started = std::time::Instant::now();
+                    fault_stats::take_fetch_source();
+                    let arm = self.serve_pagefault_classified(addr as u64)?;
+                    let source = match arm {
+                        Source::Peer => Source::Peer,
+                        arm => fault_stats::take_fetch_source().unwrap_or(arm),
+                    };
+                    let served = fault_stats::STATS.record_fault(source, started.elapsed());
+                    if served.is_power_of_two() {
+                        fault_stats::STATS.log("pow2");
                     }
                 }
                 Ok(Some(other)) => {
@@ -1388,14 +1299,33 @@ impl Runtime {
                     return Ok(());
                 }
                 Err(userfaultfd::Error::ReadEof) => {
-                    tracing::info!(
-                        faults_served,
-                        "uffd closed by firecracker; handler exiting cleanly"
-                    );
+                    tracing::info!("uffd closed by firecracker; handler exiting cleanly");
                     return Ok(());
                 }
                 Err(e) => return Err(HandlerError::Uffd(e)),
             }
+        }
+    }
+
+    /// The fill for a verified peer response, its bytes fetched now: the
+    /// sealed output records them, and the fault window must not fetch
+    /// under its cancellation lock. `AltSource` (live content equals the
+    /// durable chunk) takes the manifest's fill.
+    fn peer_fill(
+        backend: &ChunkedMemoryBackend,
+        handle: &TokioHandle,
+        offset: u64,
+        page: crate::peer::PeerPage,
+    ) -> Result<Fill, HandlerError> {
+        use crate::peer::PeerPage;
+        match page {
+            PeerPage::Bytes(bytes) => Ok(Fill::Private(Payload::Bytes(Bytes::from(bytes)))),
+            PeerPage::Zero => Ok(Fill::Zero),
+            PeerPage::AltSource(_) => Self::fill_for(backend, offset)
+                .ok_or_else(|| {
+                    HandlerError::PeerLost(format!("AltSource for unresolvable offset {offset:#x}"))
+                })?
+                .fetched(backend, handle),
         }
     }
 
@@ -1405,65 +1335,22 @@ impl Runtime {
         offset: u64,
         page: crate::peer::PeerPage,
     ) -> Result<bool, HandlerError> {
-        let bytes = Self::prepare_peer_page(&self.backend, &self.handle, offset, page)?;
-        self.install_prepared_peer_page(offset, bytes)
+        let fill = Self::peer_fill(&self.backend, &self.handle, offset, page)?;
+        self.install(offset, fill, Installer::Peer)
     }
 
-    /// Resolve durable bytes without a runtime reference or the install lock.
-    fn prepare_peer_page(
-        backend: &ChunkedMemoryBackend,
-        handle: &TokioHandle,
-        offset: u64,
-        page: crate::peer::PeerPage,
-    ) -> Result<Option<Bytes>, HandlerError> {
-        use crate::peer::PeerPage;
-        Ok(match page {
-            PeerPage::Bytes(bytes) => Some(Bytes::from(bytes)),
-            PeerPage::Zero => None,
-            PeerPage::AltSource(_) => {
-                let hash = match backend.resolve(offset) {
-                    Some(ResolvedPage::Chunk { hash }) => Some(hash),
-                    Some(ResolvedPage::Canonical { canonical_offset }) => {
-                        backend.canonical_chunk_hash(canonical_offset)
-                    }
-                    Some(ResolvedPage::Zero { .. }) => None,
-                    None => {
-                        return Err(HandlerError::PeerLost(format!(
-                            "AltSource for unresolvable offset {offset:#x}"
-                        )))
-                    }
-                };
-                hash.map(|hash| handle.block_on(backend.fetch_chunk(hash)))
-                    .transpose()?
-            }
-        })
-    }
-
-    fn install_prepared_peer_page(
-        &self,
-        offset: u64,
-        bytes: Option<Bytes>,
-    ) -> Result<bool, HandlerError> {
-        let chunk_idx = (offset / self.backend.chunk_size()) as usize;
-        if self.claim_for_install(chunk_idx) != Claim::Claimed {
-            return Ok(false);
-        }
-        self.install_claimed_peer_page(offset, bytes)
-    }
-
-    fn install_claimed_peer_page(
-        &self,
-        offset: u64,
-        bytes: Option<Bytes>,
-    ) -> Result<bool, HandlerError> {
-        match bytes {
-            Some(bytes) => self.install_claimed_chunk_at(offset, bytes, false),
-            None if self.base_shm.is_some() => self.install_claimed_zero_substrate(offset, false),
-            None => self.install_claimed_zero_at(offset, false),
-        }
-    }
-
+    #[cfg(test)]
     fn serve_pagefault(self: &Arc<Self>, fault_addr: u64) -> Result<(), HandlerError> {
+        self.serve_pagefault_classified(fault_addr).map(|_| ())
+    }
+
+    /// Serve one fault and return where its bytes came from. A chunk
+    /// fetch overrides the returned source through
+    /// [`fault_stats::set_fetch_source`].
+    fn serve_pagefault_classified(
+        self: &Arc<Self>,
+        fault_addr: u64,
+    ) -> Result<Source, HandlerError> {
         // Locate the region this fault came from to translate
         // host_va → byte_offset (the inverse of `locate_offset`).
         let region = self
@@ -1480,19 +1367,20 @@ impl Runtime {
         // lands consistently across faults in the same chunk.
         let chunk_size = self.backend.chunk_size();
         let chunk_byte_offset = byte_offset - (byte_offset % chunk_size);
+        let chunk_idx = self.chunk_idx(chunk_byte_offset);
+        self.first_touch.touch(chunk_idx);
 
         // ADR 0045 C2: sealed chunks are peer-authoritative — their truth
         // lives only in the paused source's address space, so they MUST
         // resolve via the peer, never via `resolve()` (whose manifest view
         // predates the dirtying). Ahead of everything else by design.
         if let Some(peer) = self.peer.as_ref() {
-            let chunk_idx = (chunk_byte_offset / chunk_size) as usize;
             if peer.seal().get(chunk_idx as u64) {
                 if self.chunk_installed(chunk_idx) {
                     // Drain (or an earlier fault) already landed it; the
                     // vCPU queued before the install — wake it.
                     self.wake_page(page_aligned, page_size)?;
-                    return Ok(());
+                    return Ok(Source::Wake);
                 }
                 // ADR 0045 C2 / issue #227 (a): once the drain has pulled
                 // every sealed chunk, the source's export may be torn down
@@ -1517,17 +1405,17 @@ impl Runtime {
                     );
                     if offsets.is_empty() {
                         self.wake_page(page_aligned, page_size)?;
-                        return Ok(());
+                        return Ok(Source::Wake);
                     }
                     match self.serve_fault_window(peer, offsets, chunk_byte_offset) {
                         Ok(()) => {
                             self.wake_page(page_aligned, page_size)?;
-                            return Ok(());
+                            return Ok(Source::Peer);
                         }
                         Err(e) => {
                             if self.chunk_installed(chunk_idx) {
                                 self.wake_page(page_aligned, page_size)?;
-                                return Ok(());
+                                return Ok(Source::Wake);
                             }
                             self.report_window_failure(peer, &e.to_string());
                             return Err(e);
@@ -1537,94 +1425,16 @@ impl Runtime {
             }
         }
 
-        match self
-            .backend
-            .resolve(chunk_byte_offset)
-            .ok_or(HandlerError::AddressOutsideRegions(fault_addr))?
-        {
-            ResolvedPage::Canonical { canonical_offset } => {
-                // Route B: "canonical" means "fetch the canonical chunk
-                // hash from the store" (shared via base-shm CONTINUE
-                // when present). Reaching this arm means the session
-                // agrees with the base here, so a hash is expected; the
-                // `None` branch is a defensive zero-fill for a malformed
-                // manifest — session omissions resolve to `Zero` below.
-                match self.backend.canonical_chunk_hash(canonical_offset) {
-                    Some(hash) => {
-                        // ADR 0014 M1.14: record the canonical chunk
-                        // hash. Without this, a fully-canonical snapshot
-                        // (base snapshot, pre-divergence) produces an
-                        // empty working-set trace and the next restore's
-                        // prefetch can't narrow at all.
-                        {
-                            let mut r = self.recorder.lock().expect("recorder poisoned");
-                            if r.is_open() {
-                                r.observe(hash);
-                            }
-                        }
-                        let installed = match self.base_shm.as_ref() {
-                            // ADR 0045 substrate: shared install via the
-                            // base shm + CONTINUE (one physical copy per
-                            // host); guest writes COW privately.
-                            Some(base) => {
-                                self.install_canonical_shared(base, chunk_byte_offset, hash, true)?
-                            }
-                            None => {
-                                let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
-                                self.install_chunk_at(chunk_byte_offset, bytes, true)?
-                            }
-                        };
-                        if !installed {
-                            // Already installed: wake the vCPU since the
-                            // kernel may have queued the fault before our
-                            // earlier prefault landed.
-                            self.wake_page(page_aligned, page_size)?;
-                        }
-                    }
-                    None => {
-                        let installed = if self.base_shm.is_some() {
-                            self.install_zero_substrate(chunk_byte_offset, true)?
-                        } else {
-                            self.install_zero_at(chunk_byte_offset, true)?
-                        };
-                        if !installed {
-                            self.wake_page(page_aligned, page_size)?;
-                        }
-                    }
-                }
-            }
-            ResolvedPage::Chunk { hash } => {
-                // Track in the working-set recorder regardless of
-                // whether the install fires — the hash is what the
-                // *next* restore wants to prefault.
-                {
-                    let mut r = self.recorder.lock().expect("recorder poisoned");
-                    if r.is_open() {
-                        r.observe(hash);
-                    }
-                }
-                let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
-                let installed = self.install_chunk_at(chunk_byte_offset, bytes, true)?;
-                if !installed {
-                    self.wake_page(page_aligned, page_size)?;
-                }
-            }
-            ResolvedPage::Zero { offset } => {
-                // Session omits this offset → authoritative zero page,
-                // regardless of what the base holds there (the session
-                // capture is full + zero-omitted). No chunk to record.
-                let installed = if self.base_shm.is_some() {
-                    self.install_zero_substrate(offset, true)?
-                } else {
-                    self.install_zero_at(offset, true)?
-                };
-                if !installed {
-                    self.wake_page(page_aligned, page_size)?;
-                }
-            }
+        let fill = Self::fill_for(&self.backend, chunk_byte_offset)
+            .ok_or(HandlerError::AddressOutsideRegions(fault_addr))?;
+        let zero = matches!(fill, Fill::Zero);
+        if !self.install(chunk_byte_offset, fill, Installer::Fault)? {
+            // Another installer had it: the kernel may have queued this
+            // fault before that install landed, so wake the vCPU.
+            self.wake_page(page_aligned, page_size)?;
+            return Ok(Source::Wake);
         }
-
-        Ok(())
+        Ok(if zero { Source::Zero } else { Source::Shm })
     }
 
     /// Cheap read of whether a chunk is fully `Installed` (a chunk that
@@ -1664,8 +1474,10 @@ impl Runtime {
         Ok(())
     }
 
-    /// Only the requested chunk holds fault priority. A busy prefetch slot
-    /// drops new speculative work; every demand uses the fault connection.
+    /// Only the requested chunk holds fault priority. A chunk already on
+    /// the wire (drain or window) is awaited, not asked for again. A busy
+    /// prefetch slot drops new speculative work; every other demand uses
+    /// the fault connection.
     fn serve_fault_window(
         self: &Arc<Self>,
         peer: &Arc<crate::peer::PeerSession>,
@@ -1673,28 +1485,55 @@ impl Runtime {
         fault_offset: u64,
     ) -> Result<(), HandlerError> {
         use crate::peer::PEER_READ_TIMEOUT;
+        let chunk_size = self.backend.chunk_size();
+        let fault_idx = (fault_offset / chunk_size) as usize;
         let mut slot = self.fault_window.lock().expect("window slot poisoned");
         if slot.as_ref().is_some_and(|job| job.thread.is_finished()) {
             slot.take().unwrap().stop();
         }
-        if self.is_drain_done()
-            || self.chunk_installed((fault_offset / self.backend.chunk_size()) as usize)
-        {
+        if self.is_drain_done() || self.chunk_installed(fault_idx) {
             return Ok(());
+        }
+        if self.is_requested(fault_idx) {
+            drop(slot);
+            let _fault = peer.begin_fault();
+            if self.await_requested(fault_idx) {
+                return Ok(());
+            }
+            slot = self.fault_window.lock().expect("window slot poisoned");
         }
         if slot.is_some() {
             drop(slot);
             // Overlapping demands also bypass the worker. Install claims
             // deduplicate its later response without waiting for the suffix.
-            let page = peer
-                .need_at(fault_offset)
-                .map_err(|e| HandlerError::PeerLost(e.to_string()))?;
-            return self.install_window_page(fault_offset, page);
+            let owned = self.try_request(fault_idx);
+            let page = peer.need_at(fault_offset);
+            let installed = page
+                .map_err(|e| HandlerError::PeerLost(e.to_string()))
+                .and_then(|page| self.install_window_page(fault_offset, page));
+            if owned {
+                self.clear_request(fault_idx);
+            }
+            return installed;
         }
         if peer.is_lost() {
             return Err(HandlerError::PeerLost("peer already marked lost".into()));
         }
         let _fault = peer.begin_fault();
+        // The window asks only for chunks no other request holds; the
+        // faulting chunk is always asked for.
+        let mut owned = Vec::with_capacity(offsets.len());
+        let offsets: Vec<u64> = offsets
+            .into_iter()
+            .filter(|offset| {
+                let idx = (offset / chunk_size) as usize;
+                let mine = self.try_request(idx);
+                if mine {
+                    owned.push(idx);
+                }
+                mine || *offset == fault_offset
+            })
+            .collect();
         let progress = Arc::new(WindowProgress::new());
         let worker_progress = progress.clone();
         let runtime = Arc::downgrade(self);
@@ -1736,9 +1575,8 @@ impl Runtime {
                                 } else {
                                     // Fetches may outlive stop(). They own only the backend,
                                     // never the runtime or its mappings.
-                                    let bytes =
-                                        Self::prepare_peer_page(&backend, &handle, offset, page)
-                                            .map_err(|e| e.to_string())?;
+                                    let fill = Self::peer_fill(&backend, &handle, offset, page)
+                                        .map_err(|e| e.to_string())?;
                                     if worker_progress.stopped() {
                                         return Ok(());
                                     }
@@ -1758,7 +1596,7 @@ impl Runtime {
                                         return Ok(());
                                     }
                                     if rt
-                                        .install_claimed_peer_page(offset, bytes)
+                                        .install_claimed(offset, fill, Installer::Peer)
                                         .map_err(|e| e.to_string())?
                                     {
                                         rt.fault_around_chunks_installed
@@ -1771,8 +1609,22 @@ impl Runtime {
                             connected,
                         )
                         .map_err(|e| e.to_string())??;
+                    // Every response was read: the connection is idle and
+                    // can serve the next window. Unregister it first, so a
+                    // later stop() of this window cannot shut it down.
+                    let mut socket = worker_progress.socket.lock().expect("window poisoned");
+                    if !worker_progress.stopped() {
+                        *socket = None;
+                        drop(socket);
+                        worker_peer.return_prefetch_conn(conn);
+                    }
                     Ok(())
                 })();
+                if let Some(rt) = runtime.upgrade() {
+                    for idx in owned {
+                        rt.clear_request(idx);
+                    }
+                }
                 if let Err(error) = result {
                     if let Some(rt) = runtime.upgrade() {
                         let message = engram_migrate_proto::HandlerControl::PeerLost {
@@ -1853,13 +1705,19 @@ impl Runtime {
 
     /// ADR 0045 C2: the background drain — pull every sealed chunk the
     /// fault path hasn't already served, over the drain's OWN
-    /// connection, pipelined. Runs FIRST on the producer thread (before
-    /// the trace prefault and the eager sweep): sealed content exists
-    /// only in the paused source, so draining it is what releases the
-    /// source — and it makes the later sweep/prefault trivially safe
-    /// (by the time they run, every sealed chunk is installed, so their
-    /// stale `resolve()` view can never be installed over divergence).
+    /// connections, pipelined. Runs FIRST on the producer thread (before
+    /// the eager sweep): sealed content exists only in the paused source,
+    /// so draining it is what releases the source — and it makes the
+    /// later sweep trivially safe (by the time it runs, every sealed chunk
+    /// is installed, so its stale `resolve()` view can never be installed
+    /// over divergence).
     ///
+    /// A large drain runs on [`DRAIN_CONNS`] connections; the source
+    /// serves each connection on its own thread. A chunk that a fault
+    /// already requested is skipped until that request ends; it is asked
+    /// for again only if it is still not installed then.
+    ///
+    /// `hot` (the source's hot chunks, hottest first) leads the drain.
     /// `AltSource` responses demote inline to the class-2 path (fetch
     /// via cache/store + private install). Install errors are real
     /// errors; peer errors return `Err` and the caller reports
@@ -1867,24 +1725,20 @@ impl Runtime {
     pub fn drain_from_peer(
         &self,
         peer: &crate::peer::PeerSession,
-        hot: Option<&engram_chunk_store::working_set::WorkingSetTrace>,
+        hot: &[ChunkHash],
     ) -> Result<crate::peer::DrainStats, HandlerError> {
-        self.drain_with_hint(peer, &mut hot.cloned(), &mut || None)
+        self.drain_with_hint(peer, hot, &mut || None)
     }
 
+    /// [`Self::drain_from_peer`], with `hint` polled once per response:
+    /// the first hot set it returns reorders the chunks still queued.
     fn drain_with_hint(
         &self,
         peer: &crate::peer::PeerSession,
-        hot: &mut Option<WorkingSetTrace>,
-        hint: &mut impl FnMut() -> Option<WorkingSetTrace>,
+        hot: &[ChunkHash],
+        hint: &mut impl FnMut() -> Option<Vec<ChunkHash>>,
     ) -> Result<crate::peer::DrainStats, HandlerError> {
-        use crate::peer::{DrainStats, PeerPage};
-
-        const PIPELINE_DEPTH: usize = 8;
-        // Per-request (retryable, `Error{req_id: Some}`) drain failures get
-        // a bounded same-conn retry before the drain gives up (issue #227 b).
-        const DRAIN_REQUEST_RETRIES: u32 = 3;
-        const DRAIN_REQUEST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+        use crate::peer::DrainStats;
 
         let chunk_size = self.backend.chunk_size();
         let seal = peer.seal();
@@ -1892,7 +1746,6 @@ impl Runtime {
         let mut conn = peer
             .open_extra_conn()
             .map_err(|e| HandlerError::PeerLost(format!("drain conn: {e}")))?;
-        let next_req = std::sync::atomic::AtomicU64::new(1_000_000); // distinct from fault-conn ids in logs
 
         // Pending sealed chunk offsets, skipping anything already
         // installed by a racing fault. HOT-FIRST: the source's
@@ -1903,19 +1756,17 @@ impl Runtime {
         // cold remainder keeps offset order.
         let mut todo: Vec<u64> = Vec::with_capacity(seal.count_ones() as usize);
         let mut queued = std::collections::HashSet::new();
-        if let Some(trace) = hot.as_ref() {
-            for hash in &trace.chunks {
-                for offset in self.backend.session_positions_of(*hash) {
-                    let idx = offset / chunk_size;
-                    if seal.get(idx) && queued.insert(idx) {
-                        todo.push(idx * chunk_size);
-                    }
+        for hash in hot {
+            for offset in self.backend.session_positions_of(*hash) {
+                let idx = offset / chunk_size;
+                if seal.get(idx) && queued.insert(idx) {
+                    todo.push(idx * chunk_size);
                 }
             }
         }
         let hot_leading = todo.len();
         stats.hot_leading = hot_leading as u64;
-        stats.hot_hint_received = hot.as_ref().is_some_and(|trace| !trace.chunks.is_empty());
+        stats.hot_hint_received = !hot.is_empty();
         for i in (0..seal.chunk_count).filter(|i| seal.get(*i)) {
             if !queued.contains(&i) {
                 todo.push(i * chunk_size);
@@ -1924,83 +1775,176 @@ impl Runtime {
         if hot_leading > 0 {
             tracing::info!(hot_leading, total = todo.len(), "drain ordered hot-first");
         }
-        let total_sealed = todo.len();
+        let extra_conns = if todo.len() > DRAIN_SPLIT_MIN_CHUNKS {
+            DRAIN_CONNS - 1
+        } else {
+            0
+        };
+        let shared = DrainShared::new(todo);
 
+        let mut apply_hint = || {
+            let Some(hot) = hint() else { return };
+            let mut todo = shared.todo.lock().expect("drain queue poisoned");
+            stats.hot_hint_received |= !hot.is_empty() && !todo.is_empty();
+            let mut rank = std::collections::HashMap::new();
+            for hash in &hot {
+                for offset in self.backend.session_positions_of(*hash) {
+                    let next = rank.len();
+                    rank.entry(offset).or_insert(next);
+                }
+            }
+            stats.hot_leading += todo
+                .iter()
+                .filter(|(o, _)| {
+                    rank.contains_key(o) && !self.chunk_installed((*o / chunk_size) as usize)
+                })
+                .count() as u64;
+            todo.make_contiguous()
+                .sort_by_key(|(o, _)| rank.get(o).copied().unwrap_or(usize::MAX));
+        };
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..extra_conns)
+                .map(|_| {
+                    scope.spawn(|| -> Result<(), HandlerError> {
+                        // An extra connection only adds throughput: the
+                        // first connection drains alone without it.
+                        let mut conn = match peer.open_extra_conn() {
+                            Ok(conn) => conn,
+                            Err(error) => {
+                                tracing::warn!(%error, "extra drain connection failed");
+                                return Ok(());
+                            }
+                        };
+                        self.drain_conn(peer, &shared, &mut conn, &mut || {})
+                    })
+                })
+                .collect();
+            let mut result = self.drain_conn(peer, &shared, &mut conn, &mut apply_hint);
+            for worker in workers {
+                let joined = worker.join().unwrap_or_else(|_| {
+                    Err(HandlerError::PeerLost("drain worker panicked".into()))
+                });
+                if result.is_ok() {
+                    result = joined;
+                }
+            }
+            result
+        })?;
+
+        stats.pulled = shared.pulled.load(Ordering::Relaxed);
+        stats.alt_sourced = shared.alt_sourced.load(Ordering::Relaxed);
+        stats.zero_chunks = shared.zero_chunks.load(Ordering::Relaxed);
+        let _ = crate::peer::send_drain_done(&mut conn, stats);
+        Ok(stats)
+    }
+
+    /// One drain connection: pipeline requests from the shared queue and
+    /// install the responses, until the queue and the deferred set are
+    /// empty or another connection failed. `tick` runs once per response.
+    fn drain_conn(
+        &self,
+        peer: &crate::peer::PeerSession,
+        shared: &DrainShared,
+        conn: &mut std::net::TcpStream,
+        tick: &mut dyn FnMut(),
+    ) -> Result<(), HandlerError> {
+        let result = self.drain_conn_inner(peer, shared, conn, tick);
+        if result.is_err() {
+            shared.failed.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    fn drain_conn_inner(
+        &self,
+        peer: &crate::peer::PeerSession,
+        shared: &DrainShared,
+        conn: &mut std::net::TcpStream,
+        tick: &mut dyn FnMut(),
+    ) -> Result<(), HandlerError> {
+        use crate::peer::PeerPage;
+        // Per-request (retryable, `Error{req_id: Some}`) drain failures get
+        // a bounded same-conn retry before the drain gives up (issue #227 b).
+        const DRAIN_REQUEST_RETRIES: u32 = 3;
+        const DRAIN_REQUEST_BACKOFF: Duration = Duration::from_millis(50);
+
+        let chunk_size = self.backend.chunk_size();
         let mut in_flight: std::collections::VecDeque<(u64, u64)> = Default::default(); // (req_id, offset)
-        let mut todo: std::collections::VecDeque<_> = todo.into();
-        // Issue #227 (b): offsets the source answered with a per-request
-        // error (`Error{req_id: Some}`, e.g. a transient process_vm_readv
-        // EAGAIN/ENOMEM). Re-queued for a bounded re-request through the
-        // SAME pipeline (preserving strict request/response FIFO order on
-        // the wire — never a side-band read) rather than rewinding the
-        // whole drain. `attempts[offset]` bounds the retries.
+                                                                                        // Issue #227 (b): offsets the source answered with a per-request
+                                                                                        // error (`Error{req_id: Some}`, e.g. a transient process_vm_readv
+                                                                                        // EAGAIN/ENOMEM). Re-queued for a bounded re-request through the
+                                                                                        // SAME pipeline (preserving strict request/response FIFO order on
+                                                                                        // the wire — never a side-band read) rather than rewinding the
+                                                                                        // whole drain. `attempts[offset]` bounds the retries. Their
+                                                                                        // request flags stay set until the chunk is installed.
         let mut retry: std::collections::VecDeque<u64> = Default::default();
         let mut attempts: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
-        let mut processed = 0usize;
+        let abandon = |in_flight: &std::collections::VecDeque<(u64, u64)>,
+                       retry: &std::collections::VecDeque<u64>| {
+            for offset in in_flight.iter().map(|(_, o)| o).chain(retry.iter()) {
+                self.clear_request((offset / chunk_size) as usize);
+            }
+        };
         loop {
-            if let Some(trace) = hint() {
-                stats.hot_hint_received |= !trace.chunks.is_empty() && !todo.is_empty();
-                let mut rank = std::collections::HashMap::new();
-                for hash in &trace.chunks {
-                    for offset in self.backend.session_positions_of(*hash) {
-                        let next = rank.len();
-                        rank.entry(offset).or_insert(next);
-                    }
-                }
-                stats.hot_leading += todo
-                    .iter()
-                    .filter(|o| {
-                        rank.contains_key(o) && !self.chunk_installed((**o / chunk_size) as usize)
-                    })
-                    .count() as u64;
-                todo.make_contiguous()
-                    .sort_by_key(|o| rank.get(o).copied().unwrap_or(usize::MAX));
-                // The source already merged handler and idle hints in priority
-                // order. Keep all hashes, including unsealed chunks, for the
-                // post-drain prefault. Never wait for another hint.
-                *hot = Some(trace);
+            if shared.failed.load(Ordering::SeqCst) {
+                abandon(&in_flight, &retry);
+                return Ok(());
             }
-            // Fill the pipeline — but YIELD to guest faults. A fault
-            // request queuing behind the drain's in-flight bulk bytes
-            // was the measured ~7 ms/fault (vs ~1 ms on a quiet wire);
-            // during a post-resume fault storm the guest's stall
-            // matters and the drain's finish time does not (it only
-            // delays the source release). Parking REFILLS only: the
-            // up-to-8 outstanding responses flush in a few ms, then
-            // the wire belongs to the fault path until it goes quiet.
-            while peer.fault_active_within(std::time::Duration::from_millis(2)) {
-                std::thread::sleep(std::time::Duration::from_micros(200));
-            }
-            while in_flight.len() < PIPELINE_DEPTH {
-                // Drain re-queued (per-request-failed) offsets first, then
-                // the fresh todo list.
-                let offset = match retry.pop_front() {
-                    Some(o) => o,
-                    None => match todo.pop_front() {
-                        Some(o) => o,
+            tick();
+            // Yield most of the wire to guest faults: a fault request
+            // that queues behind bulk drain bytes stalls a vCPU, while
+            // the drain's finish time only delays the source release.
+            let depth = if peer.fault_active_within(FAULT_RECENT) {
+                FAULT_SHARE_DEPTH
+            } else {
+                PIPELINE_DEPTH
+            };
+            while in_flight.len() < depth {
+                let (offset, forced) = match retry.pop_front() {
+                    Some(o) => (o, true),
+                    None => match shared.pop() {
+                        Some(next) => next,
                         None => break,
                     },
                 };
-                if self.chunk_installed((offset / chunk_size) as usize) {
-                    processed += 1;
+                let idx = (offset / chunk_size) as usize;
+                if self.chunk_installed(idx) {
+                    shared.resolved(self);
                     continue;
                 }
-                let req_id = next_req.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                engram_migrate_proto::write_frame(
-                    &mut conn,
+                if !self.try_request(idx) && !forced {
+                    shared.defer(offset);
+                    continue;
+                }
+                let req_id = shared.next_req.fetch_add(1, Ordering::Relaxed);
+                if let Err(e) = engram_migrate_proto::write_frame(
+                    &mut *conn,
                     &engram_migrate_proto::ToSource::NeedAt {
                         req_id,
                         chunk_offset: offset,
                     },
-                )
-                .map_err(|e| HandlerError::PeerLost(format!("drain write: {e}")))?;
+                ) {
+                    self.clear_request(idx);
+                    abandon(&in_flight, &retry);
+                    return Err(HandlerError::PeerLost(format!("drain write: {e}")));
+                }
                 in_flight.push_back((req_id, offset));
             }
             let Some((req_id, offset)) = in_flight.pop_front() else {
-                break; // pipeline empty and iterator exhausted
+                if retry.is_empty() && !self.settle_deferred(shared) {
+                    return Ok(());
+                }
+                continue;
             };
-            let resp = engram_migrate_proto::read_frame(&mut conn)
-                .map_err(|e| HandlerError::PeerLost(format!("drain read: {e}")))?;
+            let idx = (offset / chunk_size) as usize;
+            let resp = match engram_migrate_proto::read_frame(&mut *conn) {
+                Ok(resp) => resp,
+                Err(e) => {
+                    self.clear_request(idx);
+                    abandon(&in_flight, &retry);
+                    return Err(HandlerError::PeerLost(format!("drain read: {e}")));
+                }
+            };
             // Issue #227 (b): a per-request server error (`Error{req_id:
             // Some}`) is NOT migration-fatal — the conn keeps serving. Bound-
             // retry THAT chunk via the re-queue (FIFO-safe) instead of
@@ -2012,6 +1956,8 @@ impl Runtime {
                     let n = attempts.entry(offset).or_insert(0);
                     *n += 1;
                     if *n > DRAIN_REQUEST_RETRIES {
+                        self.clear_request(idx);
+                        abandon(&in_flight, &retry);
                         return Err(HandlerError::PeerLost(format!(
                             "drain per-request retries exhausted at offset {offset:#x}: {msg}"
                         )));
@@ -2026,100 +1972,57 @@ impl Runtime {
                     retry.push_back(offset);
                     continue;
                 }
-                Err(e) => return Err(HandlerError::PeerLost(format!("drain decode: {e}"))),
+                Err(e) => {
+                    self.clear_request(idx);
+                    abandon(&in_flight, &retry);
+                    return Err(HandlerError::PeerLost(format!("drain decode: {e}")));
+                }
             };
-            match page {
-                PeerPage::Bytes(bytes) => {
-                    self.install_chunk_at(offset, bytes.into(), false)?;
-                    stats.pulled += 1;
-                }
-                PeerPage::Zero => {
-                    if self.base_shm.is_some() {
-                        self.install_zero_substrate(offset, false)?;
-                    } else {
-                        self.install_zero_at(offset, false)?;
-                    }
-                    stats.zero_chunks += 1;
-                }
-                PeerPage::AltSource(_durable) => {
-                    // Class-2 demote: serve through the normal resolve
-                    // arms (private install; the shared base is never
-                    // written with session-addressed content here).
-                    match self.backend.resolve(offset) {
-                        Some(ResolvedPage::Chunk { hash }) => {
-                            let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
-                            self.install_chunk_at(offset, bytes, false)?;
-                        }
-                        Some(ResolvedPage::Canonical { canonical_offset }) => {
-                            match self.backend.canonical_chunk_hash(canonical_offset) {
-                                Some(hash) => {
-                                    let bytes =
-                                        self.handle.block_on(self.backend.fetch_chunk(hash))?;
-                                    self.install_chunk_at(offset, bytes, false)?;
-                                }
-                                None => {
-                                    if self.base_shm.is_some() {
-                                        self.install_zero_substrate(offset, false)?;
-                                    } else {
-                                        self.install_zero_at(offset, false)?;
-                                    }
-                                }
-                            }
-                        }
-                        Some(ResolvedPage::Zero { .. }) => {
-                            // Session omits this offset → private zero
-                            // page (the shared base is never written
-                            // with session-addressed content here).
-                            if self.base_shm.is_some() {
-                                self.install_zero_substrate(offset, false)?;
-                            } else {
-                                self.install_zero_at(offset, false)?;
-                            }
-                        }
-                        None => {
-                            return Err(HandlerError::PeerLost(format!(
-                                "AltSource demote for unresolvable offset {offset:#x}"
-                            )));
-                        }
-                    }
-                    stats.alt_sourced += 1;
-                }
+            let counter = match &page {
+                PeerPage::Bytes(_) => &shared.pulled,
+                PeerPage::Zero => &shared.zero_chunks,
+                PeerPage::AltSource(_) => &shared.alt_sourced,
+            };
+            let installed = self.install_peer_page(offset, page);
+            self.clear_request(idx);
+            if let Err(e) = installed {
+                abandon(&in_flight, &retry);
+                return Err(e);
             }
-            processed += 1;
-            if processed.is_multiple_of(256) {
-                if let Some(control) = self.control.as_ref() {
-                    control.report(engram_migrate_proto::HandlerControl::DrainProgress {
-                        pulled: stats.pulled,
-                        remaining: (total_sealed - processed) as u64,
-                    });
-                }
+            counter.fetch_add(1, Ordering::Relaxed);
+            shared.resolved(self);
+        }
+    }
+
+    /// Wait for the chunks other requests held, and queue the ones still
+    /// not installed for a request of their own. `false` when nothing
+    /// was deferred.
+    fn settle_deferred(&self, shared: &DrainShared) -> bool {
+        let deferred = std::mem::take(&mut *shared.deferred.lock().expect("drain queue poisoned"));
+        if deferred.is_empty() {
+            return false;
+        }
+        let chunk_size = self.backend.chunk_size();
+        for offset in deferred {
+            let idx = (offset / chunk_size) as usize;
+            if self.chunk_installed(idx) || self.await_requested(idx) {
+                shared.resolved(self);
+            } else {
+                shared.force(offset);
             }
         }
-
-        let _ = crate::peer::send_drain_done(&mut conn, stats);
-        Ok(stats)
+        true
     }
 
     /// `UFFDIO_WAKE` the specified page. Used when the chunk this
-    /// fault belongs to was already installed (by an earlier
-    /// prefault or sibling-fault install): the page is no longer
+    /// fault belongs to was already installed (by the sweep, the
+    /// drain, or a sibling fault): the page is no longer
     /// missing but the vCPU was still queued, so we have to tell
     /// the kernel explicitly.
     fn wake_page(&self, page_aligned: u64, page_size: u64) -> Result<(), HandlerError> {
         self.uffd
             .wake(page_aligned as *mut std::ffi::c_void, page_size as usize)?;
         Ok(())
-    }
-
-    /// Consume the runtime, freezing the working-set recorder into a
-    /// publishable trace. Caller uploads it to
-    /// `traces/<manifest_id>/<host_id>.json` for the next restore.
-    pub fn finish_recorder(&self) -> WorkingSetTrace {
-        let recorder = std::mem::replace(
-            &mut *self.recorder.lock().expect("recorder poisoned"),
-            WorkingSetRecorder::new(0, Duration::ZERO),
-        );
-        recorder.finish()
     }
 
     /// Test/debug accessor.
@@ -2130,9 +2033,7 @@ impl Runtime {
 }
 
 /// One-shot run: bind the listener, accept Firecracker, handshake,
-/// optionally pre-fault from a trace, then loop until the UFFD
-/// closes. On clean exit, returns the recorded working-set trace
-/// (which the caller publishes back to the chunk store).
+/// then serve faults until the UFFD closes.
 ///
 /// `stream` is held alive for the lifetime of the run — matches the
 /// upstream `on_demand_handler.rs` which polls both the stream and
@@ -2140,12 +2041,12 @@ impl Runtime {
 /// Firecracker to hang on `PUT /snapshot/load` (it keeps its side
 /// open and treats our close as a protocol error).
 pub struct RunListenerOpts {
-    pub prefault_trace: Option<WorkingSetTrace>,
     pub fault_around_chunks: usize,
-    /// Advisory capture-time trace, delivered concurrently with the drain.
-    pub migration_trace: Option<PathBuf>,
-    pub recorder_window: Duration,
-    pub trace_output: Option<PathBuf>,
+    /// Peer mode: the advisory hot-set hint, read concurrently with the
+    /// drain (see [`crate::hot_hint`]).
+    pub migration_hint: Option<PathBuf>,
+    /// Where the first-touch record goes.
+    pub report_dir: Option<PathBuf>,
     pub base_shm: Option<crate::base_shm::BaseShm>,
     /// ADR 0045 C2: post-copy peer mode (session already sealed) +
     /// the optional control-sock reporter.
@@ -2153,6 +2054,12 @@ pub struct RunListenerOpts {
         std::sync::Arc<crate::peer::PeerSession>,
         Option<std::sync::Arc<crate::peer::ControlTx>>,
     )>,
+    /// Peer mode: record every peer-supplied chunk here (see
+    /// [`crate::peer::SealedOutput`]).
+    pub sealed_output: Option<PathBuf>,
+    /// The session's published first-touch prefix, as it loads; the
+    /// first-touch recorder carries it forward.
+    pub previous_prefix: Option<tokio::task::JoinHandle<Option<Vec<u32>>>>,
 }
 
 pub fn run_listener(
@@ -2160,15 +2067,15 @@ pub fn run_listener(
     backend: Arc<ChunkedMemoryBackend>,
     handle: TokioHandle,
     opts: RunListenerOpts,
-) -> Result<WorkingSetTrace, HandlerError> {
+) -> Result<(), HandlerError> {
     let RunListenerOpts {
-        mut prefault_trace,
         fault_around_chunks,
-        migration_trace,
-        recorder_window,
-        trace_output,
+        migration_hint,
+        report_dir,
         base_shm,
         peer,
+        sealed_output,
+        previous_prefix,
     } = opts;
     let pid = std::process::id();
     let _ = std::fs::remove_file(&listen);
@@ -2187,56 +2094,65 @@ pub fn run_listener(
         total_bytes = total,
         "handshake complete",
     );
-    let mut rt = Runtime::new(mappings, uffd, backend, handle, recorder_window, base_shm)?;
+    let mut rt = Runtime::new(mappings, uffd, backend, handle, base_shm)?;
     rt.fault_around_chunks = fault_around_chunks;
-    if let Some(path) = trace_output {
-        rt.set_trace_output(path);
+    if let Some(dir) = report_dir {
+        rt.set_report_dir(&dir);
     }
     if let Some((session, control)) = peer {
         rt.set_peer(session, control);
+        if let Some(path) = sealed_output {
+            match crate::peer::SealedOutput::create(path) {
+                Ok(out) => rt.set_sealed_output(out),
+                Err(error) => {
+                    tracing::warn!(%error, "sealed output unavailable; the first checkpoint is Full")
+                }
+            }
+        }
     }
-    // ADR 0043 P1: run the working-set prefault as a BACKGROUND producer
-    // concurrent with the fault loop, instead of blocking resume on it.
-    // vCPUs run the instant Firecracker resumes; any page the guest touches
-    // before the prefault reaches it is served on-demand by the fault loop.
-    // This is safe to run in parallel: `install_chunk_at` is idempotent via
-    // the per-chunk `installed` bitmap (whichever of prefault/fault installs
-    // first wins, the other skips), and `serve_pagefault` explicitly wakes a
-    // vCPU whose fault raced ahead of a prefault install (the `wake_page`
-    // path). `Uffd` is `Send + Sync` (a `RawFd`) and every install path is
-    // mutex-guarded, so sharing the `Runtime` across the two threads is
-    // sound. Previously prefault ran to completion before `run()`, which put
-    // the entire working-set fetch on the resume critical path.
+    // ADR 0043 P1: the drain and the sweep run on a BACKGROUND producer
+    // concurrent with the fault loop; vCPUs run the instant Firecracker
+    // resumes. The claim table makes each install exactly-once, and a fault
+    // that finds its chunk installed by the producer wakes its vCPU.
     let rt = Arc::new(rt);
-    let prefault_thread = {
+    if let Some(prefix) = previous_prefix {
+        let rt = Arc::clone(&rt);
+        rt.handle.clone().spawn(async move {
+            if let Ok(Some(indices)) = prefix.await {
+                rt.first_touch.carry(&indices);
+            }
+        });
+    }
+    {
+        // Off the fault path: the composition stats every divergent chunk.
+        let composition = Arc::clone(&rt);
+        let _ = std::thread::Builder::new()
+            .name("engram-uffd-composition".to_string())
+            .spawn(move || composition.log_composition());
+        fault_stats::spawn_periodic_log();
+    }
+    let producer = {
         let rt = Arc::clone(&rt);
         std::thread::Builder::new()
-            .name("engram-uffd-prefault".to_string())
+            .name("engram-uffd-producer".to_string())
             .spawn(move || {
                 let (hint_tx, mut hint_rx) = tokio::sync::oneshot::channel();
-                let hint_task = migration_trace.map(|path| rt.handle.spawn(async move {
-                    match crate::working_set::load_migration_trace(&path).await {
-                        Ok(trace) => { let _ = hint_tx.send(trace); }
+                let hint_task = migration_hint.map(|path| rt.handle.spawn(async move {
+                    match crate::hot_hint::load(&path).await {
+                        Ok(hot) => { let _ = hint_tx.send(hot); }
                         Err(error) => tracing::info!(%error, "migration hint unavailable; drain continues"),
                     }
                 }));
-                // Review finding 6: (pulled, alt_sourced, zero_chunks, live
-                // faults) from the peer drain, captured below if this
-                // restore is peer mode — `None` otherwise (base/resume
-                // restores never set `rt.peer`). Patched onto
-                // `prefault-stats.json` at the end of this closure.
-                let mut peer_drain_stats: Option<(u64, u64, u64, u64, u64, bool)> = None;
                 // ADR 0045 C2: in peer mode the sealed drain runs FIRST —
                 // sealed content exists only in the paused source, so
                 // draining it is what releases the source, and it makes
-                // the trace prefault + sweep below trivially safe (every
-                // sealed chunk is installed before their stale resolve()
-                // view could touch it). A drain failure is PeerLost:
+                // the sweep below trivially safe (every sealed chunk is
+                // installed before its stale resolve() view could touch it). A drain failure is PeerLost:
                 // report and stop producing — the host-agent rewinds the
                 // whole VM; warming a doomed guest is wasted I/O.
                 if let Some(peer) = rt.peer.clone() {
                     let started = std::time::Instant::now();
-                    let outcome = rt.drain_with_hint(&peer, &mut prefault_trace, &mut || hint_rx.try_recv().ok());
+                    let outcome = rt.drain_with_hint(&peer, &[], &mut || hint_rx.try_recv().ok());
                     if let Some(task) = hint_task { task.abort(); }
                     match outcome {
                         Ok(stats) => {
@@ -2247,23 +2163,15 @@ pub fn run_listener(
                             // path must already know not to dial the peer by
                             // the time that frame is observed.
                             rt.mark_drain_done();
+                            // Every sealed chunk is installed, so the
+                            // sealed output is complete.
+                            if let Some(out) = rt.sealed_out.as_ref() {
+                                out.finish();
+                            }
                             let fault_around_chunks_installed = rt
                                 .fault_around_chunks_installed
                                 .load(std::sync::atomic::Ordering::Relaxed);
                             let (faults, fault_us, fault_max_us) = peer.fault_stats();
-                            // Review finding 6: stash the drain + live-fault
-                            // snapshot so it can be patched onto
-                            // `prefault-stats.json` once every other writer
-                            // in this closure has had its turn (see the
-                            // read-modify-write patch below `sweep_all`).
-                            peer_drain_stats = Some((
-                                stats.pulled,
-                                stats.alt_sourced,
-                                stats.zero_chunks,
-                                faults,
-                                stats.hot_leading,
-                                stats.hot_hint_received,
-                            ));
                             tracing::info!(
                                 pulled = stats.pulled,
                                 alt_sourced = stats.alt_sourced,
@@ -2274,6 +2182,7 @@ pub fn run_listener(
                                 fault_max_us,
                                 "post-copy drain complete"
                             );
+                            fault_stats::STATS.log("drain");
                             if let Some(control) = rt.control.as_ref() {
                                 control.report(engram_migrate_proto::HandlerControl::DrainDone {
                                     pulled: stats.pulled,
@@ -2284,6 +2193,8 @@ pub fn run_listener(
                                     fault_us,
                                     fault_max_us,
                                     fault_around_chunks_installed,
+                                    hot_leading: stats.hot_leading,
+                                    hot_hint_received: stats.hot_hint_received,
                                 });
                             }
                         }
@@ -2300,50 +2211,14 @@ pub fn run_listener(
                         }
                     }
                 }
-                // Hot set first (when a trace exists), then the eager
-                // full sweep covers everything else — so by the time
-                // the guest touches ANY page, the odds it must round-
-                // trip the fault loop shrink to the race window. The
-                // sweep is what kills the migration-restore crawl: no
-                // host trace exists on a fresh dest, and the divergent
-                // chunk set otherwise faults in serially (ADR 0045).
-                if let Some(trace) = prefault_trace {
-                    if let Err(e) = rt.prefault_from_trace(&trace) {
-                        tracing::warn!(
-                            error = %e,
-                            "background prefault failed; remaining pages serve on-demand",
-                        );
-                    }
-                }
+                // The eager sweep installs what the cache holds, so by
+                // the time the guest touches a page, the odds it must
+                // round-trip the fault loop shrink to the race window.
                 if let Err(e) = rt.sweep_all() {
                     tracing::warn!(
                         error = %e,
                         "eager full sweep failed; remaining pages serve on-demand",
                     );
-                }
-                // Review finding 6: patch the peer-drain snapshot onto
-                // `prefault-stats.json`, read-modify-write. Runs strictly
-                // after `prefault_from_trace`'s own internal write (just
-                // above) and after `main.rs`'s early `trace_loaded: false`
-                // write (which happens before this thread even starts) —
-                // sequential code on this one background thread, so this is
-                // always the LAST writer and can never be clobbered by an
-                // earlier one. A missing/corrupt file at this point (the
-                // handler died before either wrote) is left alone: patching
-                // a stats-missing state into a fabricated file would defeat
-                // the alarm finding 1 exists to protect.
-                if let Some(peer_drain_stats) = peer_drain_stats {
-                    if let Some(path) = rt.prefault_stats_path() {
-                        let existing = std::fs::read(&path).ok();
-                        if let Some(mut patched) =
-                            patch_peer_fields(existing.as_deref(), peer_drain_stats)
-                        {
-                            patched.fault_around_chunks_installed = rt
-                                .fault_around_chunks_installed
-                                .load(std::sync::atomic::Ordering::Relaxed);
-                            write_prefault_stats(&path, &patched);
-                        }
-                    }
                 }
             })
     };
@@ -2351,15 +2226,14 @@ pub fn run_listener(
     tracing::info!(pid, "starting fault loop");
     let result = rt.run();
     tracing::info!(pid, ?result, "fault loop returned");
+    fault_stats::STATS.log("exit");
     rt.stop_fault_window();
-    // Join the prefault producer before freezing the recorder so it's
-    // quiesced. Once the uffd closes (FC exited) the prefault's next install
-    // errors out, so this returns promptly rather than blocking teardown.
-    if let Ok(handle) = prefault_thread {
+    // Once the uffd closes (FC exited) the producer's next install errors
+    // out, so this join returns promptly rather than blocking teardown.
+    if let Ok(handle) = producer {
         let _ = handle.join();
     }
-    result?;
-    Ok(rt.finish_recorder())
+    result
 }
 
 #[cfg(test)]
@@ -2375,125 +2249,15 @@ mod tests {
     use engram_storage_local::LocalBlobStorage;
     use userfaultfd::UffdBuilder;
 
-    /// ADR 0019 / telemetry restoration (#526): `PrefaultStats` is the
-    /// per-jail file the host-agent reads post-restore to derive the
-    /// `engram_resume_prefault_*` counters — a pure serialize/write/read
-    /// round-trip, no uffd/kernel surface involved.
-    #[test]
-    fn prefault_stats_serialize_write_read_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let trace_output = dir.path().join("working-set-trace.json");
-        let stats_path = prefault_stats_path(&trace_output).expect("sibling path resolves");
-        assert_eq!(stats_path, dir.path().join(PREFAULT_STATS_FILE));
-
-        let stats = PrefaultStats {
-            trace_loaded: true,
-            chunks_in_trace: 42,
-            installed: 40,
-            skipped: 2,
-            duration_ms: 1234,
-            peer_pulled: 0,
-            peer_alt_sourced: 0,
-            peer_zero_chunks: 0,
-            peer_live_faults: 0,
-            fault_around_chunks_installed: 0,
-            hot_leading: 0,
-            hot_hint_received: None,
-        };
-        write_prefault_stats(&stats_path, &stats);
-
-        let bytes = std::fs::read(&stats_path).expect("stats file must exist after write");
-        let read_back: PrefaultStats =
-            serde_json::from_slice(&bytes).expect("stats file must be valid JSON");
-        assert_eq!(read_back, stats);
-
-        // The temp file from the atomic write must not linger.
-        assert!(
-            !stats_path.with_extension("json.tmp").exists(),
-            "temp file must be renamed away, not left behind"
-        );
-    }
-
-    /// The `trace_loaded: false` shape main.rs writes for the no-trace
-    /// case (either no trace was requested, or the requested one failed
-    /// to load) — distinguishable from a `stats_missing` (file absent
-    /// entirely) read on the host-agent side.
-    #[test]
-    fn prefault_stats_no_trace_shape_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let trace_output = dir.path().join("working-set-trace.json");
-        let stats_path = prefault_stats_path(&trace_output).unwrap();
-
-        let stats = PrefaultStats {
-            trace_loaded: false,
-            ..Default::default()
-        };
-        write_prefault_stats(&stats_path, &stats);
-
-        let read_back: PrefaultStats =
-            serde_json::from_slice(&std::fs::read(&stats_path).unwrap()).unwrap();
-        assert!(!read_back.trace_loaded);
-        assert_eq!(read_back.chunks_in_trace, 0);
-        assert_eq!(read_back.installed, 0);
-        assert_eq!(read_back.skipped, 0);
-    }
-
-    /// Review finding 6 regression test: the peer-drain snapshot patches
-    /// onto an EXISTING stats file (either shape `prefault_from_trace` or
-    /// `main.rs`'s no-trace path could have written) without disturbing
-    /// the fields that writer already set.
-    #[test]
-    fn patch_peer_fields_preserves_existing_trace_fields() {
-        let base = PrefaultStats {
-            trace_loaded: true,
-            chunks_in_trace: 10,
-            installed: 8,
-            skipped: 2,
-            duration_ms: 55,
-            ..Default::default()
-        };
-        let bytes = serde_json::to_vec(&base).unwrap();
-        let patched =
-            patch_peer_fields(Some(&bytes), (3, 1, 4, 7, 2, true)).expect("existing file parses");
-        assert_eq!(
-            patched,
-            PrefaultStats {
-                trace_loaded: true,
-                chunks_in_trace: 10,
-                installed: 8,
-                skipped: 2,
-                duration_ms: 55,
-                peer_pulled: 3,
-                peer_alt_sourced: 1,
-                peer_zero_chunks: 4,
-                peer_live_faults: 7,
-                fault_around_chunks_installed: 0,
-                hot_leading: 2,
-                hot_hint_received: Some(true),
-            },
-        );
-    }
-
-    /// A handler that died before either writer ran (no stats file at
-    /// all) must NOT get a fabricated peer-only file — that would mask
-    /// the `stats_missing` alarm finding 1 exists to protect.
-    #[test]
-    fn patch_peer_fields_none_when_no_prior_writer_ran() {
-        assert!(patch_peer_fields(None, (1, 2, 3, 4, 0, false)).is_none());
-        assert!(patch_peer_fields(Some(b"not json"), (1, 2, 3, 4, 0, false)).is_none());
-    }
-
-    /// ADR 0043 P1: the prefault now runs on a background thread CONCURRENT
-    /// with the fault loop instead of fully ahead of it. Prove the two install
-    /// paths race safely: a `prefault_from_trace` thread and a `serve_pagefault`
-    /// thread, with an overlapping chunk range, must between them install every
-    /// chunk EXACTLY once (the `installed` bitmap serialises the check-and-set)
+    /// ADR 0043 P1: the sweep runs on a background thread CONCURRENT with
+    /// the fault loop. A sweep thread and a `serve_pagefault` thread, with an
+    /// overlapping chunk range, must between them install every chunk
+    /// EXACTLY once (the `installed` bitmap serialises the check-and-set)
     /// and leave the guest region byte-correct — no double-`UFFDIO_COPY`
-    /// (`EEXIST`), no corruption, no panic. This is the core safety property the
-    /// concurrent restructure relies on (the wake-a-blocked-vCPU half is
-    /// `wake_page`, unchanged + covered by the FC UFFD integration tests).
+    /// (`EEXIST`), no corruption, no panic. (The wake-a-blocked-vCPU half is
+    /// `wake_page`, covered by the FC UFFD integration tests.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn concurrent_prefault_and_faults_install_every_chunk_once_and_correctly() {
+    async fn concurrent_sweep_and_faults_install_every_chunk_once_and_correctly() {
         let page_size = 4096u64;
         let chunk_size = page_size; // one page per chunk keeps the math simple
         let n_chunks = 16usize;
@@ -2505,7 +2269,6 @@ mod tests {
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
         let store = ChunkStore::new(blob);
         let mut entries = Vec::with_capacity(n_chunks);
-        let mut hashes = Vec::with_capacity(n_chunks);
         for i in 0..n_chunks {
             let tag = (i as u8).wrapping_add(1);
             let hash = store
@@ -2516,7 +2279,6 @@ mod tests {
                 offset: i as u64 * chunk_size,
                 hash,
             });
-            hashes.push(hash);
         }
         let manifest = Manifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
@@ -2525,7 +2287,6 @@ mod tests {
             total_bytes: total,
             chunks: entries,
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
@@ -2585,29 +2346,19 @@ mod tests {
                 uffd,
                 backend,
                 tokio::runtime::Handle::current(),
-                Duration::ZERO,
                 None,
             )
             .unwrap(),
         );
 
-        // Two install paths race with an OVERLAP in the middle quarter
-        // [n/4, 3n/4): the prefault thread covers chunks [0, 3n/4); the
-        // "fault server" thread serves chunks [n/4, n). Every chunk is covered
-        // by at least one path; the overlap forces the bitmap to arbitrate.
-        // Both call `handle.block_on`, so they MUST run on plain threads (not
-        // tokio workers) — exactly as the handler runs on a spawn_blocking thread.
+        // Two install paths race: the sweep covers every chunk; the "fault
+        // server" thread serves chunks [n/4, n). Both call
+        // `handle.block_on`, so they MUST run on plain threads (not tokio
+        // workers) — exactly as the handler runs on a spawn_blocking thread.
         let base = ptr as u64;
-        // Build the trace the way production does — observe the first 3/4 of
-        // the chunks into a recorder, then freeze it.
-        let mut recorder = WorkingSetRecorder::new(1, Duration::from_secs(60));
-        for h in hashes.iter().take(3 * n_chunks / 4) {
-            recorder.observe(*h);
-        }
-        let trace = recorder.finish();
         let rt_pf = Arc::clone(&rt);
         let prefault = std::thread::spawn(move || {
-            rt_pf.prefault_from_trace(&trace).expect("prefault");
+            rt_pf.sweep_all().expect("sweep");
         });
         let rt_sf = Arc::clone(&rt);
         let server = std::thread::spawn(move || {
@@ -2744,7 +2495,6 @@ mod tests {
             total_bytes: total,
             chunks: entries,
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
@@ -2884,7 +2634,6 @@ mod tests {
             uffd,
             backend,
             tokio::runtime::Handle::current(),
-            Duration::ZERO,
             None,
         )
         .unwrap();
@@ -2892,12 +2641,11 @@ mod tests {
         let rt = Arc::new(rt);
 
         // Producer order, exactly as run_listener does it: drain, then
-        // prefault, then sweep. Off the tokio workers (block_on inside).
+        // sweep. Off the tokio workers (block_on inside).
         let rt_drain = Arc::clone(&rt);
         let sess = Arc::clone(&session);
         let kind = hint_kind.to_owned();
-        let mut trace = WorkingSetTrace::new(0, 0, chrono::DateTime::UNIX_EPOCH);
-        trace.chunks = match hint_kind {
+        let hot = match hint_kind {
             "installed" => vec![manifest.chunks[1].hash],
             "in-flight" => vec![manifest.chunks[3].hash],
             "unsealed" | "late-unsealed" => {
@@ -2907,16 +2655,15 @@ mod tests {
         };
         let stats = std::thread::spawn(move || {
             let mut delivered = false;
-            let (tx, mut rx) = tokio::sync::oneshot::channel::<WorkingSetTrace>();
+            let (tx, mut rx) = tokio::sync::oneshot::channel::<Vec<ChunkHash>>();
             let _pending = if kind == "failed" {
                 drop(tx);
                 None
             } else {
                 Some(tx)
             };
-            let mut hot = None;
             let stats = rt_drain
-                .drain_with_hint(&sess, &mut hot, &mut || {
+                .drain_with_hint(&sess, &[], &mut || {
                     // An unresolved or failed delivery must not gate the first request.
                     if kind == "unavailable" || kind == "failed" {
                         return rx.try_recv().ok();
@@ -2931,16 +2678,13 @@ mod tests {
                     }
                     delivered = true;
                     Some(if kind == "empty" {
-                        WorkingSetTrace::new(0, 0, chrono::DateTime::UNIX_EPOCH)
+                        Vec::new()
                     } else {
-                        trace.clone()
+                        hot.clone()
                     })
                 })
                 .expect("advisory hints cannot fail the drain");
             rt_drain.mark_drain_done();
-            if let Some(trace) = hot {
-                rt_drain.prefault_from_trace(&trace).expect("prefault");
-            }
             rt_drain.sweep_all().expect("sweep");
             stats
         })
@@ -2975,8 +2719,8 @@ mod tests {
         drop(requests);
 
         // Only unsealed durable reads matter here: sealed AltSource reads
-        // happen during the drain. The hint must move late unsealed chunks
-        // ahead of offset zero, preserving the source's merged trace order.
+        // happen during the drain. The hint orders only the drain: the
+        // sweep reads the unsealed chunks in offset order.
         let unsealed = [0, 2, 4, 6, 7];
         let fetched: Vec<_> = durable
             .fetched
@@ -2992,13 +2736,7 @@ mod tests {
             .collect();
         assert_eq!(
             fetched,
-            if matches!(hint_kind, "unsealed" | "late-unsealed") {
-                // The uncached sweep fetches hot chunks again; installation
-                // remains idempotent. Their first fetch must precede the sweep.
-                vec![7, 6, 0, 2, 4, 6, 7]
-            } else {
-                vec![0, 2, 4, 6, 7]
-            },
+            vec![0, 2, 4, 6, 7],
             "unsealed durable fetch order ({hint_kind})"
         );
 
@@ -3075,7 +2813,6 @@ mod tests {
             total_bytes: total,
             chunks: entries,
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
@@ -3199,7 +2936,6 @@ mod tests {
             uffd,
             backend,
             tokio::runtime::Handle::current(),
-            Duration::ZERO,
             None,
         )
         .unwrap();
@@ -3208,7 +2944,7 @@ mod tests {
 
         let rt_drain = Arc::clone(&rt);
         let sess = Arc::clone(&session);
-        let stats = std::thread::spawn(move || rt_drain.drain_from_peer(&sess, None))
+        let stats = std::thread::spawn(move || rt_drain.drain_from_peer(&sess, &[]))
             .join()
             .unwrap()
             .expect("drain must SUCCEED through the per-request error, not rewind");
@@ -3276,7 +3012,6 @@ mod tests {
             total_bytes: total,
             chunks: entries,
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
@@ -3409,7 +3144,6 @@ mod tests {
             uffd,
             backend,
             tokio::runtime::Handle::current(),
-            Duration::ZERO,
             None,
         )
         .unwrap();
@@ -3511,7 +3245,6 @@ mod tests {
             total_bytes: total,
             chunks: entries,
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
@@ -3588,7 +3321,6 @@ mod tests {
                 uffd,
                 backend,
                 tokio::runtime::Handle::current(),
-                Duration::ZERO,
                 None,
             )
             .unwrap(),
@@ -3674,6 +3406,45 @@ mod tests {
     // (no privileged userfaultfd required); the end-to-end retry through
     // a real UFFD is covered by `fetch_failure_rolls_back_then_retries`.
 
+    /// Several fault threads serving faults on the same chunks: each chunk
+    /// is installed by exactly one of them, and the rest only wake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fault_threads_on_overlapping_faults_install_each_chunk_once() {
+        let n_chunks = 8usize;
+        let chunk_size = 4 * 4096u64;
+        let Some(rt) = test_runtime_with_chunk_size(n_chunks, chunk_size) else {
+            return;
+        };
+        let base = rt.mappings()[0].base_host_virt_addr;
+        let pages = n_chunks as u64 * chunk_size / 4096;
+        let threads: Vec<_> = (0..4u64)
+            .map(|t| {
+                let rt = Arc::clone(&rt);
+                std::thread::spawn(move || {
+                    (0..pages)
+                        .map(|p| {
+                            // Each thread walks the pages from its own start.
+                            let page = (p + t * 3) % pages;
+                            let source = rt
+                                .serve_pagefault_classified(base + page * 4096)
+                                .expect("serve fault");
+                            ((page * 4096 / chunk_size) as usize, source)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut installs = vec![0usize; n_chunks];
+        for t in threads {
+            for (idx, source) in t.join().unwrap() {
+                if source != Source::Wake {
+                    installs[idx] += 1;
+                }
+            }
+        }
+        assert_eq!(installs, vec![1; n_chunks]);
+    }
+
     /// Build a small runtime with a real anonymous UFFD mapping, for
     /// install-state tests and demand-window tests. Returns None when
     /// the kernel forbids userfaultfd. Tests that use the mapping must
@@ -3699,7 +3470,6 @@ mod tests {
             total_bytes: total,
             chunks: Vec::new(),
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
@@ -3753,7 +3523,6 @@ mod tests {
                 uffd,
                 backend,
                 tokio::runtime::Handle::current(),
-                Duration::ZERO,
                 None,
             )
             .unwrap(),
@@ -3826,7 +3595,7 @@ mod tests {
         let drain_rt = rt.clone();
         let drain_peer = peer.clone();
         let drain = std::thread::spawn(move || {
-            let result = drain_rt.drain_from_peer(&drain_peer, None);
+            let result = drain_rt.drain_from_peer(&drain_peer, &[]);
             drain_rt.mark_drain_done();
             done_tx.send(result).unwrap();
         });
@@ -3911,7 +3680,7 @@ mod tests {
         let drain_peer = peer.clone();
         let drain = std::thread::spawn(move || {
             done_tx
-                .send(drain_rt.drain_from_peer(&drain_peer, None))
+                .send(drain_rt.drain_from_peer(&drain_peer, &[]))
                 .unwrap();
         });
         let stats = done_rx
@@ -4025,17 +3794,28 @@ mod tests {
                 total_bytes: 8192,
                 chunks: vec![ChunkRef { offset: 4096, hash }],
                 parent: None,
-                working_set_trace: None,
                 annotations: serde_json::Value::Null,
             };
             let path = dir.path().join("populate.sock");
             let listener = UnixListener::bind(&path).unwrap();
-            let file_path = dir.path().join("chunk");
-            std::fs::write(&file_path, bytes).unwrap();
+            let slot = tempfile::tempfile().unwrap();
+            slot.set_len(engram_substrate_proto::SLOT_BYTES).unwrap();
+            std::os::unix::fs::FileExt::write_all_at(&slot, &bytes, 0).unwrap();
             let (fetch_tx, fetch_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let durable = std::thread::spawn(move || {
                 let (mut socket, _) = listener.accept().unwrap();
+                let hello: ToWriter = read_frame(&mut socket).unwrap();
+                assert!(matches!(hello, ToWriter::Hello { .. }));
+                write_frame(
+                    &mut socket,
+                    &FromWriter::HelloAck {
+                        tmpfs_ok: true,
+                        cache_writable: true,
+                    },
+                )
+                .unwrap();
+                engram_substrate_proto::send_fd(socket.as_fd(), slot.as_fd()).unwrap();
                 let request: ToWriter = read_frame(&mut socket).unwrap();
                 assert!(matches!(request, ToWriter::Populate { .. }));
                 fetch_tx.send(()).unwrap();
@@ -4051,9 +3831,7 @@ mod tests {
                     )
                     .unwrap();
                 } else {
-                    write_frame(&mut socket, &FromWriter::Populated { len: 4096 }).unwrap();
-                    let file = std::fs::File::open(file_path).unwrap();
-                    engram_substrate_proto::send_fd(&socket, file.as_fd()).unwrap();
+                    write_frame(&mut socket, &FromWriter::Filled { len: 4096 }).unwrap();
                 }
             });
             Arc::get_mut(&mut rt).unwrap().backend = Arc::new(
@@ -4255,7 +4033,11 @@ mod tests {
         let fault = std::thread::spawn(move || fault_rt.serve_pagefault(base));
         barrier.wait();
         assert!(rt
-            .install_chunk_at(4096, Bytes::from(vec![0xCD; 4096]), false)
+            .install(
+                4096,
+                Fill::Private(Payload::Bytes(Bytes::from(vec![0xCD; 4096]))),
+                Installer::Sweep,
+            )
             .unwrap());
         barrier.wait();
         fault.join().unwrap().unwrap();
@@ -4267,6 +4049,84 @@ mod tests {
         );
         // SAFETY: all chunks are installed, and the fault worker has joined.
         assert_eq!(unsafe { std::ptr::read((base + 4096) as *const u8) }, 0xCD);
+        unsafe {
+            libc::munmap(base as *mut _, 16384);
+        }
+    }
+
+    /// A chunk another request holds is not asked for again by the drain,
+    /// and every peer install lands in the sealed output, which gets its
+    /// final name only when the caller finishes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_skips_a_requested_chunk_and_records_the_sealed_output() {
+        use crate::peer::{
+            tests::{fake_source, page_resp},
+            PeerSession, SealedOutput,
+        };
+        let Some(mut rt) = bookkeeping_runtime(4) else {
+            return;
+        };
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let log = asked.clone();
+        let addr = fake_source(vec![0, 1, 2, 3], move |req, offset| {
+            log.lock().unwrap().push(offset);
+            page_resp(req, offset)
+        });
+        let peer = tokio::task::spawn_blocking(move || {
+            PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), 4096, 16384)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let peer = Arc::new(peer);
+        let out_dir = tempfile::tempdir().unwrap();
+        let out_path = out_dir.path().join("sealed.bin");
+        {
+            let rt = Arc::get_mut(&mut rt).unwrap();
+            rt.set_peer(peer.clone(), None);
+            rt.set_sealed_output(SealedOutput::create(out_path.clone()).unwrap());
+            // Long enough that the drain waits for this test's install.
+            rt.peer_requested_wait = Duration::from_secs(10);
+        }
+        // A fault window holds chunk 1.
+        assert!(rt.try_request(1));
+        let drain_rt = rt.clone();
+        let drain_peer = peer.clone();
+        let drain = std::thread::spawn(move || drain_rt.drain_from_peer(&drain_peer, &[]));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while ![0, 2, 3].iter().all(|i| rt.chunk_installed(*i)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drain did not install"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(rt
+            .install(
+                4096,
+                Fill::Private(Payload::Bytes(Bytes::from(vec![0x5A; 4096]))),
+                Installer::Peer,
+            )
+            .unwrap());
+        rt.clear_request(1);
+        let stats = drain.join().unwrap().unwrap();
+        assert_eq!(stats.pulled, 3);
+        let mut asked = asked.lock().unwrap().clone();
+        asked.sort_unstable();
+        assert_eq!(
+            asked,
+            vec![0, 8192, 12288],
+            "the held chunk was asked for again"
+        );
+        assert!(!out_path.exists(), "an unfinished set has no final name");
+        rt.sealed_out.as_ref().unwrap().finish();
+        let sealed = std::fs::read(&out_path).unwrap();
+        assert_eq!(sealed.len(), 16384);
+        assert!(sealed[..4096].iter().all(|b| *b == 0xAB));
+        assert!(sealed[4096..8192].iter().all(|b| *b == 0x5A));
+        assert!(sealed[8192..].iter().all(|b| *b == 0xAB));
+        let base = rt.mappings[0].base_host_virt_addr;
+        // SAFETY: the drain has joined and no fault is in flight.
         unsafe {
             libc::munmap(base as *mut _, 16384);
         }
@@ -4297,7 +4157,11 @@ mod tests {
             .unwrap()
             .set_peer(Arc::new(peer), None);
         assert!(rt
-            .install_chunk_at(4096, Bytes::from(vec![0xCD; 4096]), false)
+            .install(
+                4096,
+                Fill::Private(Payload::Bytes(Bytes::from(vec![0xCD; 4096]))),
+                Installer::Sweep,
+            )
             .unwrap());
         let base = rt.mappings[0].base_host_virt_addr;
         let fault_rt = rt.clone();
@@ -4331,6 +4195,8 @@ mod tests {
                 fault_us: 0,
                 fault_max_us: 0,
                 fault_around_chunks_installed: 0,
+                hot_leading: 0,
+                hot_hint_received: false,
             });
         let mut subscriber = std::os::unix::net::UnixStream::connect(control_path).unwrap();
         subscriber
@@ -4435,7 +4301,11 @@ mod tests {
             .unwrap();
         pending_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(rt
-            .install_chunk_at(4096, Bytes::from(vec![0xCD; 4096]), false)
+            .install(
+                4096,
+                Fill::Private(Payload::Bytes(Bytes::from(vec![0xCD; 4096]))),
+                Installer::Sweep,
+            )
             .unwrap());
         assert_eq!(rt.sealed_uninstalled_count(&peer), 0);
         assert!(!rt.is_drain_done());
@@ -4662,7 +4532,6 @@ mod tests {
             total_bytes: total,
             chunks: vec![ChunkRef { offset: 0, hash }],
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
@@ -4720,7 +4589,6 @@ mod tests {
                 uffd,
                 backend,
                 tokio::runtime::Handle::current(),
-                Duration::ZERO,
                 None,
             )
             .unwrap(),

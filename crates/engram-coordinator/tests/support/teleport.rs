@@ -28,12 +28,22 @@ pub struct ScriptedHost {
     pub resume_not_found: AtomicBool,
     /// `migration_abort` answers NotFound: the export is already consumed.
     pub abort_not_found: AtomicBool,
+    /// A destination fetched the paused state from this source.
+    pub state_served: AtomicBool,
+    /// The host predates `migration_abort_unserved`.
+    pub abort_unserved_unsupported: AtomicBool,
+    /// `migration_abort_unserved` finds no export (a host-agent restart
+    /// loses the in-memory export registry).
+    pub abort_unserved_not_found: AtomicBool,
+    /// An abort removed the export: later aborts answer NotFound.
+    pub export_consumed: AtomicBool,
     pub destroy_fails: AtomicBool,
     pub spawn_fails: AtomicBool,
     pub captures: AtomicUsize,
     pub restores: AtomicUsize,
     pub resumes: AtomicUsize,
     pub aborts: AtomicUsize,
+    pub unserved_aborts: AtomicUsize,
     pub destroys: AtomicUsize,
     pub spawns: AtomicUsize,
     pub binds: AtomicUsize,
@@ -41,6 +51,8 @@ pub struct ScriptedHost {
     pub live_refused: AtomicBool,
     pub live_lost: AtomicBool,
     pub peer_lost: AtomicBool,
+    /// `migration_drain_wait` never answers: the drain is still running.
+    pub drain_pending: AtomicBool,
     pub block_capture: AtomicBool,
     pub capture_entered: tokio::sync::Notify,
 }
@@ -56,12 +68,17 @@ impl ScriptedHost {
             resume_fails: AtomicBool::new(false),
             resume_not_found: AtomicBool::new(false),
             abort_not_found: AtomicBool::new(false),
+            state_served: AtomicBool::new(false),
+            abort_unserved_unsupported: AtomicBool::new(false),
+            abort_unserved_not_found: AtomicBool::new(false),
+            export_consumed: AtomicBool::new(false),
             destroy_fails: AtomicBool::new(false),
             spawn_fails: AtomicBool::new(false),
             captures: AtomicUsize::new(0),
             restores: AtomicUsize::new(0),
             resumes: AtomicUsize::new(0),
             aborts: AtomicUsize::new(0),
+            unserved_aborts: AtomicUsize::new(0),
             destroys: AtomicUsize::new(0),
             spawns: AtomicUsize::new(0),
             binds: AtomicUsize::new(0),
@@ -69,6 +86,7 @@ impl ScriptedHost {
             live_refused: AtomicBool::new(true),
             live_lost: AtomicBool::new(false),
             peer_lost: AtomicBool::new(false),
+            drain_pending: AtomicBool::new(false),
             block_capture: AtomicBool::new(false),
             capture_entered: tokio::sync::Notify::new(),
         })
@@ -133,6 +151,7 @@ impl HostClient for ScriptedHost {
             disk_manifest: None,
             memory_manifest: None,
             base_memory_manifest: None,
+            base_disk_manifest: None,
             migration_source: None,
             source_sandbox_id: None,
             state_blob_key: None,
@@ -273,7 +292,8 @@ impl HostClient for ScriptedHost {
             disk_drain_ms: 0,
             vmstate_ms: 0,
             scan_ms: 0,
-            sealed_disk_chunks: 1,
+            sealed_disk_blocks: 1,
+            precopy_disk_blocks: 0,
             paused_at_unix_ms: 0,
         })
     }
@@ -281,6 +301,9 @@ impl HostClient for ScriptedHost {
         &self,
         _id: SandboxId,
     ) -> Result<engram_core::types::snapshot::DrainOutcome, SandboxError> {
+        if self.drain_pending.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if self.peer_lost.load(Ordering::SeqCst) {
             Ok(engram_core::types::snapshot::DrainOutcome::PeerLost {
                 remaining: 1,
@@ -312,13 +335,40 @@ impl HostClient for ScriptedHost {
         _fence: SessionFence,
     ) -> Result<(), SandboxError> {
         self.aborts.fetch_add(1, Ordering::SeqCst);
-        if self.abort_not_found.load(Ordering::SeqCst) {
+        if self.abort_not_found.load(Ordering::SeqCst)
+            || self.export_consumed.load(Ordering::SeqCst)
+        {
             Err(SandboxError::NotFound)
         } else if self.resume_fails.load(Ordering::SeqCst) {
             Err(SandboxError::Timeout)
         } else {
             Ok(())
         }
+    }
+    async fn migration_abort_unserved(
+        &self,
+        _id: SandboxId,
+        _export: &str,
+        _fence: SessionFence,
+    ) -> Result<bool, SandboxError> {
+        self.unserved_aborts.fetch_add(1, Ordering::SeqCst);
+        if self.abort_unserved_unsupported.load(Ordering::SeqCst) {
+            return Err(SandboxError::InvalidSpec(
+                "this host doesn't support `migration_abort_unserved`".into(),
+            ));
+        }
+        if self.abort_unserved_not_found.load(Ordering::SeqCst)
+            || self.export_consumed.load(Ordering::SeqCst)
+        {
+            return Err(SandboxError::NotFound);
+        }
+        if self.state_served.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        // Like the real host: once the export is removed the answer is
+        // `true`, even when the in-place resume fails.
+        self.export_consumed.store(true, Ordering::SeqCst);
+        Ok(true)
     }
     fn harness_dial(&self) -> HarnessDial {
         HarnessDial::Vsock

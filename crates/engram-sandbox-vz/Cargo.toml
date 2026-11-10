@@ -23,7 +23,6 @@ unsafe_code = "allow"
 
 [dependencies]
 engram-core.workspace = true
-engram-chunk-store.workspace = true
 engram-agentd.workspace = true
 engram-harness-proto.workspace = true
 async-trait.workspace = true
@@ -53,6 +52,3 @@ libc = "0.2"
 futures.workspace = true
 tempfile = "3"
 tracing-subscriber.workspace = true
-# e2e_vz live lifecycle test: a host-local blob store backs the chunk
-# store the VZ snapshot path chunks into.
-engram-storage-local.workspace = true

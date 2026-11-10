@@ -339,25 +339,18 @@ pub(crate) fn new_enable_row(
     }
 }
 
-/// Verify a reuse-candidate base snapshot's chunks are actually present in
-/// BlobStorage before re-pointing a fresh enable at it. Content-keyed reuse
-/// skips the capture VM entirely — but if the candidate snapshot's chunks
-/// were lost (a GC over-delete, a manual deletion, a partial earlier upload),
-/// reusing it re-points the image at a corrupt base that 404s at restore (the
-/// wedged-session class). The disk materialize re-uploads missing disk chunks
-/// from the OCI source on every refresh, but a base snapshot's MEMORY chunks
-/// have no source other than a fresh capture — so a miss in EITHER of the
-/// candidate's manifests means we must recapture rather than reuse. HEADs
-/// every chunk (short-circuiting on the first miss); any miss — or any error
-/// reading a manifest/probe — is treated as "not reusable" so we fail safe
-/// toward a correct fresh capture.
+/// Whether a reuse candidate's chunks are all in BlobStorage. Reusing a
+/// base snapshot whose chunks were lost (a GC over-delete, a manual
+/// deletion, a partial upload) re-points the image at a base that 404s
+/// at restore. A materialize puts back missing disk chunks, but memory
+/// chunks have no source other than a fresh capture, so a miss in either
+/// manifest means recapture. Any error reading a manifest or probing a
+/// chunk also answers `false`, toward a correct fresh capture.
 pub(crate) async fn reuse_candidate_chunks_present(
     chunk_store: &engram_chunk_store::ChunkStore,
-    blob: std::sync::Arc<dyn engram_core::traits::BlobStorage>,
     disk_manifest: engram_core::types::manifest::ManifestRef,
     memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
 ) -> bool {
-    use futures::stream::{self, StreamExt};
     for mref in std::iter::once(disk_manifest).chain(memory_manifest) {
         let manifest = match chunk_store.get_manifest(mref).await {
             Ok(m) => m,
@@ -371,32 +364,17 @@ pub(crate) async fn reuse_candidate_chunks_present(
                 return false;
             }
         };
-        // Collect owned keys up front: holding a borrow of `manifest` (a
-        // slice Iter) across the buffer_unordered awaits makes this future
-        // non-Send, and it runs inside the spawned enable pipeline.
-        let keys: Vec<String> = manifest
-            .chunks
-            .iter()
-            .map(|c| c.hash.storage_key())
-            .collect();
-        let mut checks = stream::iter(keys.into_iter().map(|key| {
-            let blob = blob.clone();
-            async move { blob.exists(&key).await }
-        }))
-        .buffer_unordered(32);
-        while let Some(res) = checks.next().await {
-            match res {
-                Ok(true) => {}
-                Ok(false) => return false,
-                Err(e) => {
-                    tracing::warn!(
-                        manifest = %mref,
-                        error = %e,
-                        "reuse verify: chunk existence probe failed; \
-                         treating as not reusable (will recapture)",
-                    );
-                    return false;
-                }
+        match chunk_store.all_chunks_stored(&manifest).await {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(e) => {
+                tracing::warn!(
+                    manifest = %mref,
+                    error = %e,
+                    "reuse verify: chunk existence probe failed; \
+                     treating as not reusable (will recapture)",
+                );
+                return false;
             }
         }
     }
@@ -534,7 +512,6 @@ pub(crate) async fn try_reuse_base_snapshot(
                 // source but a fresh capture, so a miss ⇒ recapture.
                 if reuse_candidate_chunks_present(
                     &state.services.chunk_store,
-                    state.services.blob.clone(),
                     disk_manifest,
                     memory_manifest,
                 )
@@ -587,7 +564,6 @@ pub(crate) async fn try_reuse_base_snapshot(
                 // (see the content-keyed branch above).
                 if reuse_candidate_chunks_present(
                     &state.services.chunk_store,
-                    state.services.blob.clone(),
                     disk_manifest,
                     memory_manifest,
                 )
@@ -616,53 +592,38 @@ pub(crate) async fn try_reuse_base_snapshot(
     Ok(None)
 }
 
-/// ADR 0084 P1b: ensure a `capture_jobs` row exists for this enable job
-/// and return the MOST RECENT one (terminal or not) — the scanner's
-/// entire interaction with capture dispatch. Inserts a WAITING row then
-/// runs the reserving pick (`place_capture_job` over
-/// `capture_candidate_hosts`) only when no
-/// row exists yet for this enable job; an existing row (running,
-/// reassigned, or terminal) is returned as-is — the actual `SandboxSpec`/
-/// env/egress assembly is deferred to the CLAIM endpoint
-/// (`host_http::claim_capture_job`), which resolves secrets fresh at
-/// claim time rather than once at job-creation time (ADR 0084 §A).
-///
-/// ADR 0084 §C: the placement pick uses the honest
-/// [`crate::placement::CaptureFootprint`] inputs for a capture job —
-/// `mem_mib` from the image's declared/default resources,
-/// `image_size_mib` read off the ALREADY-materialized disk
-/// manifest's chunk-store `Manifest::total_bytes` (a metadata-only read,
-/// no chunk bytes fetched). Falls back to [`CaptureFootprint::floor_only`]
-/// (LOUDLY logged) if the manifest can't be read — a capture must never
-/// fail to even GET a placement pick over a sizing-metadata hiccup.
+/// ADR 0084 §C: the placement footprint for a capture of `config` from
+/// `disk_manifest`: the memory from the image's resources, the populated
+/// image size from the manifest's listed chunks (a metadata read). An
+/// unreadable manifest falls back to floor-only sizing, loudly: a capture
+/// must still get a placement pick over a sizing hiccup.
 pub(crate) async fn capture_footprint_for(
     state: &SharedState,
     disk_manifest: engram_core::types::manifest::ManifestRef,
     config: &ImageConfig,
 ) -> crate::placement::CaptureFootprint {
-    let mem_mib = config.resolved_memory_mib() as u64;
     match state.services.chunk_store.get_manifest(disk_manifest).await {
         Ok(manifest) => {
-            let image_size_mib = (manifest.total_bytes / (1024 * 1024)).max(1);
-            crate::placement::CaptureFootprint::for_capture(image_size_mib, mem_mib)
+            let populated = manifest.chunks.len() as u64 * manifest.chunk_size.as_u64();
+            crate::placement::CaptureFootprint::for_capture(
+                config.resolved_memory_mib() as u64,
+                populated.div_ceil(1024 * 1024),
+            )
         }
         Err(e) => {
             tracing::warn!(
                 manifest = %disk_manifest,
                 error = %e,
-                "capture footprint: could not read the disk manifest's total_bytes; \
-                 falling back to FLOOR-ONLY sizing (no footprint headroom veto) for this pick",
+                "capture footprint: could not read the disk manifest; \
+                 falling back to floor-only sizing for this pick",
             );
             crate::placement::CaptureFootprint::floor_only()
         }
     }
 }
 
-/// Same as [`capture_footprint_for`] but reads its inputs off an
-/// existing `capture_jobs` row (the deadline-scan reassign pick and the
-/// scanner's retryable-failure reassign pick both already have one) —
-/// parses `row.disk_manifest` and merges `row.image_config` over
-/// `row.oci_defaults` the same way the claim handler does.
+/// [`capture_footprint_for`] over an existing `capture_jobs` row, with its
+/// image config merged over the OCI defaults as the claim handler does.
 pub(crate) async fn capture_footprint_for_job_row(
     state: &SharedState,
     row: &engram_core::types::capture_job::CaptureJobRow,
@@ -679,7 +640,7 @@ pub(crate) async fn capture_footprint_for_job_row(
                 disk_manifest = %row.disk_manifest,
                 error = %e,
                 "capture footprint: capture_jobs.disk_manifest failed to parse; \
-                 falling back to FLOOR-ONLY sizing for this reassign pick",
+                 falling back to floor-only sizing for this pick",
             );
             crate::placement::CaptureFootprint::floor_only()
         }
@@ -819,13 +780,8 @@ pub(crate) async fn resolve_cold_base_plan(
             reason: ColdBaseMissReason::ChunksMissing,
         };
     };
-    let present = reuse_candidate_chunks_present(
-        &state.services.chunk_store,
-        state.services.blob.clone(),
-        disk_ref,
-        mem_ref,
-    )
-    .await;
+    let present =
+        reuse_candidate_chunks_present(&state.services.chunk_store, disk_ref, mem_ref).await;
     if !present {
         tracing::warn!(
             %content_key, snapshot_id = %candidate.snapshot_id,
@@ -859,6 +815,10 @@ pub(crate) async fn resolve_cold_base_plan(
     }
 }
 
+/// The most recent `capture_jobs` row for this enable job, terminal or not.
+/// With no row yet, inserts a waiting one and tries the reserving pick at
+/// once. The sandbox spec, env and egress are built at claim time
+/// (`host_http::claim_capture_job`), so secrets resolve fresh per attempt.
 pub(crate) async fn ensure_capture_job(
     state: &SharedState,
     row: &EnabledImage,
@@ -901,13 +861,10 @@ pub(crate) async fn ensure_capture_job(
         cpu_budget_vcpus: config.resolved_vcpus() as i32,
     };
     let inserted = state.services.meta.insert_capture_job(new_job).await?;
-    // Immediately attempt the reserving 2D pick so a fresh job dispatches
-    // THIS tick rather than idling a full scan interval. No fit ⇒ the row
-    // stays WAITING and the capacity scan (`capture_job_capacity_scan`)
-    // re-offers it every tick, failing it with `CapacityTimeout` past the
-    // queue deadline. `fc_snapshot_version` pin: `None` at job-creation
-    // time (the claim handler resolves the cold-base candidate fresh per
-    // attempt — ADR 0084 §B5 "known gap").
+    // Pick now so a new job dispatches this tick. With no fit the row stays
+    // waiting; `capture_job_capacity_scan` offers it again each tick and
+    // fails it past the queue timeout. No `fc_snapshot_version` pin here:
+    // the claim handler picks the cold base per attempt.
     let footprint = capture_footprint_for(state, disk_manifest_ref, &config).await;
     let candidates = crate::placement::capture_candidate_hosts(
         state.services.meta.as_ref(),
@@ -1718,7 +1675,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            reuse_candidate_chunks_present(&chunk_store, blob.clone(), present_ref, None).await,
+            reuse_candidate_chunks_present(&chunk_store, present_ref, None).await,
             "all chunks present ⇒ reusable",
         );
 
@@ -1736,20 +1693,14 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !reuse_candidate_chunks_present(&chunk_store, blob.clone(), missing_ref, None).await,
+            !reuse_candidate_chunks_present(&chunk_store, missing_ref, None).await,
             "a missing chunk ⇒ not reusable (recapture)",
         );
 
         // The prod shape: intact disk manifest + a missing MEMORY chunk (a
         // reaped base-memfile chunk) ⇒ not reusable.
         assert!(
-            !reuse_candidate_chunks_present(
-                &chunk_store,
-                blob.clone(),
-                present_ref,
-                Some(missing_ref),
-            )
-            .await,
+            !reuse_candidate_chunks_present(&chunk_store, present_ref, Some(missing_ref),).await,
             "present disk + missing memory chunk ⇒ not reusable",
         );
     }

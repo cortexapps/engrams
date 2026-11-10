@@ -4,7 +4,7 @@
 //! produce byte-identical images must derive the *same* `content_ref()`
 //! (ADR 0036), and a manifest that `validate()` accepts must be
 //! internally consistent (offsets aligned, monotonic, in bounds) —
-//! consumers (NBD daemon, UFFD handler, materialize) trust that geometry
+//! consumers (disk stage, UFFD handler, materialize) trust that geometry
 //! without re-checking it. These properties assert those invariants over
 //! arbitrary inputs rather than the handful of hand-picked cases the
 //! `#[cfg(test)]` unit tests cover.
@@ -83,7 +83,6 @@ fn arb_valid_manifest() -> impl Strategy<Value = Manifest> {
                 total_bytes,
                 chunks,
                 parent: None,
-                working_set_trace: None,
                 annotations: serde_json::Value::Null,
             }
         })
@@ -126,7 +125,6 @@ fn arb_valid_manifest_with_chunks(min_chunks: usize) -> impl Strategy<Value = Ma
                 total_bytes,
                 chunks,
                 parent: None,
-                working_set_trace: None,
                 annotations: serde_json::Value::Null,
             }
         })
@@ -174,7 +172,6 @@ proptest! {
             total_bytes,
             chunks,
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
 

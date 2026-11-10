@@ -18,11 +18,9 @@
 //!   --canonical-manifest <uuid>@v<n> \
 //!   --session-manifest   <uuid>@v<n> \
 //!   [--fault-around-chunks N] (env ENGRAM_UFFD_FAULT_AROUND, default 8)
-//!   [--prefault-trace file:<path>|<host-uuid>] \
-//!   [--publish-trace-host <host-uuid>] \
 //!   [--trace-key <session-uuid>] \
-//!   [--cache-root /var/cache/engram/chunks] \
-//!   [--recorder-window-ms 5000]
+//!   [--report-dir <dir>] \
+//!   [--cache-root /var/cache/engram/chunks]
 //! ```
 //!
 //! ADR 0070: this handler is a single-evictor-safe cache citizen — it
@@ -108,66 +106,33 @@ fn main() -> std::process::ExitCode {
 mod linux {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::Duration;
 
-    use engram_chunk_store::working_set::{TraceRef, WorkingSetTrace};
-    use engram_chunk_store::ChunkStore;
     use engram_core::traits::BlobStorage;
     use engram_core::types::manifest::ManifestRef;
     use engram_uffd_handler::ChunkedMemoryBackend;
     use tokio::runtime::Handle as TokioHandle;
+    use tracing::Instrument as _;
     use uuid::Uuid;
-
-    /// Default trace-recorder window. The literature (FaaSnap, REAP)
-    /// converges on ~5 s as the right point: long enough to capture
-    /// the steady-state working set, short enough that publishing
-    /// the trace doesn't measurably delay snapshot finalisation.
-    const DEFAULT_RECORDER_WINDOW_MS: u64 = 5_000;
-
-    /// Which trace to consume on restore.
-    #[derive(Clone, Debug)]
-    pub enum PrefaultTraceSpec {
-        /// `traces/<manifest_id>/<host_id>.json` (this host's prior
-        /// recording for the same manifest).
-        Host(Uuid),
-        /// A local trace JSON staged by the spawn (post-copy: the
-        /// SOURCE's hot set — drives drain ordering + prefault).
-        File(PathBuf),
-    }
 
     pub struct Args {
         pub listen: PathBuf,
         pub canonical_manifest: ManifestRef,
         pub session_manifest: ManifestRef,
-        /// ADR 0045: read the SESSION manifest from this local JSON
-        /// file instead of the blob store — a migration destination
-        /// restores from a not-yet-durable manifest whose chunks the
-        /// host-agent pre-pulled into the NVMe cache.
+        /// Read the CANONICAL manifest from this local JSON file instead
+        /// of the blob store (the host stages a copy beside the snapshot).
+        pub canonical_manifest_json: Option<PathBuf>,
+        /// Read the SESSION manifest from this local JSON file instead of
+        /// the blob store: a migration destination's not-yet-durable
+        /// manifest, or the host's staged copy.
         pub session_manifest_json: Option<PathBuf>,
-        pub prefault_trace: Option<PrefaultTraceSpec>,
-        /// If `Some(host_id)`, publish the recorded trace as
-        /// `traces/<session_manifest.manifest_id>/<host_id>.json` on
-        /// clean shutdown. Omit on bake / unit-test runs where no
-        /// publishing is wanted.
-        pub publish_trace_host: Option<Uuid>,
-        /// Tier 2 (resume-prefault fix): a **session-stable** trace key
-        /// (the session id). When set, both prefault-replay and publish
-        /// key the working-set trace by this id under the *canonical*
-        /// variant (`traces/<trace_key>/canonical.json`) instead of the
-        /// per-checkpoint `session_manifest.manifest_id` — which is minted
-        /// fresh on every snapshot, so a manifest-keyed lookup ALWAYS
-        /// misses on resume (the trace published in life N under M_N is
-        /// never found in life N+1 under M_{N+1}). Keying by the stable
-        /// session id makes life N's recorded hot-set warm life N+1's
-        /// divergent working set. Unset ⇒ base/migration paths keep the
-        /// per-host manifest keying unchanged.
+        /// Peer mode: the hot-set hint the destination stages (see
+        /// [`engram_uffd_handler::hot_hint`]). It orders the drain.
+        pub migration_hint: Option<PathBuf>,
+        /// The session id: the handler reads the session's published
+        /// first-touch prefix under it.
         pub trace_key: Option<Uuid>,
-        /// The per-jail trace file path: write the recorded trace JSON
-        /// here on clean shutdown (in addition to / instead of
-        /// `--publish-trace-host`'s BlobStorage publish). ADR 0045 C2
-        /// reads it back to ship the migration `hot_chunks` rider. Omit
-        /// when the receiver doesn't care.
-        pub trace_output: Option<PathBuf>,
+        /// Where the handler writes its first-touch record (the jail dir).
+        pub report_dir: Option<PathBuf>,
         /// ADR 0014 M1.14: when set, bypass `pick_blob_backend`'s
         /// env-var lookup and `LocalBlobStorage::new(this)` directly.
         /// Used by the bake/materialize profile pass, where the bake
@@ -177,13 +142,16 @@ mod linux {
         /// `<images_dir>/store/` layout (not `<root>/blobs/`).
         pub blob_root: Option<PathBuf>,
         pub cache_root: PathBuf,
-        pub recorder_window: Duration,
         /// ADR 0045 substrate (v2b): the per-template base shm file this
         /// handler creates, sizes, and lazily populates with canonical
         /// chunks. The forked FC maps it MAP_PRIVATE and registers
         /// MISSING|MINOR; canonical faults resolve via UFFDIO_CONTINUE
         /// (shared), divergent via UFFDIO_COPY (private). Off when unset.
         pub base_shm: Option<PathBuf>,
+        /// Where to record the base shm file this handler actually opened
+        /// (empty when it falls back to running without one). The host
+        /// reads it to choose the Firecracker load's base file.
+        pub base_shm_ack: Option<PathBuf>,
         /// ADR 0045 C2 (post-copy destination): `host:port` of the SOURCE
         /// host-agent's page server. With `--peer-export-id`, arms peer
         /// mode: connect + authenticate + block for the `Seal` BEFORE
@@ -199,6 +167,9 @@ mod linux {
         /// `HandlerControl` reports (Sealed/DrainProgress/DrainDone/
         /// PeerLost) to whichever host-agent dials in.
         pub control_sock: Option<PathBuf>,
+        /// Peer mode: write every peer-supplied chunk here, at its
+        /// session offset; the file gets this name once the drain is done.
+        pub sealed_output: Option<PathBuf>,
         /// ADR 0075: the substrate populate socket (the single-writer
         /// host-agent). When set, chunk misses are populated by the
         /// writer (its singleflight / pins / budget govern) and this
@@ -213,21 +184,22 @@ mod linux {
         let mut listen: Option<PathBuf> = None;
         let mut canonical_manifest: Option<ManifestRef> = None;
         let mut session_manifest: Option<ManifestRef> = None;
+        let mut canonical_manifest_json: Option<PathBuf> = None;
         let mut session_manifest_json: Option<PathBuf> = None;
-        let mut prefault_trace: Option<PrefaultTraceSpec> = None;
-        let mut publish_trace_host: Option<Uuid> = None;
+        let mut migration_hint: Option<PathBuf> = None;
         let mut trace_key: Option<Uuid> = None;
-        let mut trace_output: Option<PathBuf> = None;
+        let mut report_dir: Option<PathBuf> = None;
         let mut blob_root: Option<PathBuf> = None;
         let mut cache_root: Option<PathBuf> = None;
-        let mut recorder_window_ms: u64 = DEFAULT_RECORDER_WINDOW_MS;
         let mut base_shm: Option<PathBuf> = None;
+        let mut base_shm_ack: Option<PathBuf> = None;
         let mut fault_around_chunks = std::env::var("ENGRAM_UFFD_FAULT_AROUND")
             .unwrap_or_else(|_| engram_uffd_handler::peer::DEFAULT_FAULT_AROUND_CHUNKS.to_string());
         let mut peer_addr: Option<String> = None;
         let mut peer_export_id: Option<String> = None;
         let mut peer_token: Option<String> = None;
         let mut control_sock: Option<PathBuf> = None;
+        let mut sealed_output: Option<PathBuf> = None;
         let mut substrate_sock: Option<PathBuf> = None;
 
         let mut argv = std::env::args().skip(1);
@@ -256,26 +228,23 @@ mod linux {
                         .ok_or_else(|| "--session-manifest requires a value".to_string())?;
                     session_manifest = Some(parse_manifest_ref(&v)?);
                 }
+                "--canonical-manifest-json" => {
+                    let v = argv
+                        .next()
+                        .ok_or_else(|| "--canonical-manifest-json requires a value".to_string())?;
+                    canonical_manifest_json = Some(PathBuf::from(v));
+                }
                 "--session-manifest-json" => {
                     let v = argv
                         .next()
                         .ok_or_else(|| "--session-manifest-json requires a value".to_string())?;
                     session_manifest_json = Some(PathBuf::from(v));
                 }
-                "--prefault-trace" => {
-                    let v = argv
-                        .next()
-                        .ok_or_else(|| "--prefault-trace requires a value".to_string())?;
-                    prefault_trace = Some(parse_trace_spec(&v)?);
-                }
-                "--publish-trace-host" => {
-                    let v = argv
-                        .next()
-                        .ok_or_else(|| "--publish-trace-host requires a value".to_string())?;
-                    publish_trace_host = Some(
-                        Uuid::parse_str(&v)
-                            .map_err(|e| format!("--publish-trace-host {v:?}: {e}"))?,
-                    );
+                "--migration-hint" => {
+                    migration_hint =
+                        Some(PathBuf::from(argv.next().ok_or_else(|| {
+                            "--migration-hint requires a value".to_string()
+                        })?));
                 }
                 "--trace-key" => {
                     let v = argv
@@ -284,10 +253,10 @@ mod linux {
                     trace_key =
                         Some(Uuid::parse_str(&v).map_err(|e| format!("--trace-key {v:?}: {e}"))?);
                 }
-                "--trace-output" => {
-                    trace_output =
+                "--report-dir" => {
+                    report_dir =
                         Some(PathBuf::from(argv.next().ok_or_else(|| {
-                            "--trace-output requires a value".to_string()
+                            "--report-dir requires a value".to_string()
                         })?));
                 }
                 "--blob-root" => {
@@ -308,13 +277,11 @@ mod linux {
                             .ok_or_else(|| "--base-shm requires a value".to_string())?,
                     ));
                 }
-                "--recorder-window-ms" => {
-                    let v = argv
-                        .next()
-                        .ok_or_else(|| "--recorder-window-ms requires a value".to_string())?;
-                    recorder_window_ms = v
-                        .parse::<u64>()
-                        .map_err(|e| format!("--recorder-window-ms {v:?}: {e}"))?;
+                "--base-shm-ack" => {
+                    base_shm_ack =
+                        Some(PathBuf::from(argv.next().ok_or_else(|| {
+                            "--base-shm-ack requires a value".to_string()
+                        })?));
                 }
                 "--peer-addr" => {
                     peer_addr = Some(
@@ -338,6 +305,12 @@ mod linux {
                     control_sock =
                         Some(PathBuf::from(argv.next().ok_or_else(|| {
                             "--control-sock requires a value".to_string()
+                        })?));
+                }
+                "--sealed-output" => {
+                    sealed_output =
+                        Some(PathBuf::from(argv.next().ok_or_else(|| {
+                            "--sealed-output requires a value".to_string()
                         })?));
                 }
                 "--substrate-sock" => {
@@ -391,19 +364,20 @@ mod linux {
             listen,
             canonical_manifest,
             session_manifest,
+            canonical_manifest_json,
             session_manifest_json,
-            prefault_trace,
-            publish_trace_host,
+            migration_hint,
             trace_key,
-            trace_output,
+            report_dir,
             blob_root,
             cache_root,
-            recorder_window: Duration::from_millis(recorder_window_ms),
             base_shm,
+            base_shm_ack,
             peer_addr,
             peer_export_id,
             peer_token,
             control_sock,
+            sealed_output,
             substrate_sock,
         })
     }
@@ -429,19 +403,32 @@ mod linux {
         })
     }
 
-    /// Accept `file:<path>` (a local trace JSON) or `<uuid>` (a host id).
-    fn parse_trace_spec(s: &str) -> Result<PrefaultTraceSpec, String> {
-        if let Some(path) = s.strip_prefix("file:") {
-            Ok(PrefaultTraceSpec::File(PathBuf::from(path)))
-        } else {
-            let host = Uuid::parse_str(s).map_err(|e| {
-                format!("--prefault-trace {s:?} (expected `file:<path>` or <uuid>): {e}")
-            })?;
-            Ok(PrefaultTraceSpec::Host(host))
-        }
-    }
-
     pub async fn run(args: Args, handle: TokioHandle) -> Result<(), String> {
+        // ADR 0075: dial the single writer and run the readiness Hello
+        // BEFORE any FC-facing surface exists (base-shm creation + the
+        // UDS bind happen downstream of here). A HelloAck with
+        // tmpfs_ok=false exits nonzero with a distinct string the
+        // host-agent surfaces in the spawn failure — the VM fails at
+        // spawn time instead of booting and later dying with
+        // `register memory … userfaultfd … System error`. The Hello runs
+        // beside the blob backend's setup; neither needs the other.
+        let hello = args.substrate_sock.as_ref().map(|sock| {
+            let client = std::sync::Arc::new(
+                engram_uffd_handler::populate_client::PopulateClient::new(sock.clone()),
+            );
+            let span = tracing::info_span!("uffd.substrate_hello");
+            let (canonical, session) = (args.canonical_manifest, args.session_manifest);
+            tokio::task::spawn_blocking(move || {
+                let probes = span.in_scope(|| {
+                    client.hello(
+                        Some(canonical),
+                        Some(session),
+                        engram_uffd_handler::FAULT_THREADS,
+                    )
+                });
+                (client, probes)
+            })
+        });
         let blob = match args.blob_root.as_ref() {
             Some(root) => {
                 tokio::fs::create_dir_all(root)
@@ -452,35 +439,51 @@ mod linux {
                     Arc::new(engram_storage_local::LocalBlobStorage::new(root.clone()));
                 s
             }
-            None => pick_blob_backend(&args.cache_root).await?,
+            None => {
+                pick_blob_backend(&args.cache_root)
+                    .instrument(tracing::info_span!("uffd.blob_backend"))
+                    .await?
+            }
         };
         tokio::fs::create_dir_all(&args.cache_root)
             .await
             .map_err(|e| format!("create cache root {}: {e}", args.cache_root.display()))?;
 
-        // ADR 0075: dial the single writer and run the readiness Hello
-        // BEFORE any FC-facing surface exists (base-shm creation + the
-        // UDS bind happen downstream of here). A HelloAck with
-        // tmpfs_ok=false exits nonzero with a distinct string the
-        // host-agent surfaces in the spawn failure — the VM fails at
-        // spawn time instead of booting and later dying with
-        // `register memory … userfaultfd … System error`.
-        let populate = match &args.substrate_sock {
-            Some(sock) => {
-                let client = std::sync::Arc::new(
-                    engram_uffd_handler::populate_client::PopulateClient::new(sock.clone()),
-                );
-                match client.hello(Some(args.canonical_manifest), Some(args.session_manifest)) {
+        // The session's published first-touch prefix, read beside the
+        // startup work: the first-touch recorder carries it forward.
+        let previous_prefix = args.trace_key.map(|session| {
+            let blob = blob.clone();
+            tokio::spawn(async move {
+                let key = engram_chunk_store::FirstTouch::key(session);
+                match blob.get(&key).await {
+                    Ok(bytes) => engram_chunk_store::FirstTouch::decode_indices(&bytes),
+                    Err(engram_core::BlobError::NotFound) => None,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "first-touch prefix unreadable");
+                        None
+                    }
+                }
+            })
+        });
+
+        let populate = match hello {
+            Some(hello) => {
+                let (client, hello) = hello
+                    .await
+                    .map_err(|e| format!("substrate hello join: {e}"))?;
+                match hello {
                     Ok((tmpfs_ok, cache_writable)) => {
                         if !tmpfs_ok {
                             return Err(
-                                "substrate readiness: uffd base dir is NOT tmpfs — refusing to                                  serve (the guest would die later with `register memory …                                  userfaultfd … System error`)"
+                                "substrate readiness: uffd base dir is NOT tmpfs — refusing to \
+                                 serve (the guest would die later with `register memory … \
+                                 userfaultfd … System error`)"
                                     .to_string(),
                             );
                         }
                         if !cache_writable {
                             tracing::warn!(
-                                "substrate readiness: cache root not writable at the writer;                                  populates will fail to the direct-blob fallback",
+                                "substrate readiness: the writer's cache root is not writable",
                             );
                         }
                         Some(client)
@@ -508,11 +511,15 @@ mod linux {
         let (backend, canonical_fell_back) = ChunkedMemoryBackend::build_with_canonical_fallback(
             args.canonical_manifest,
             args.session_manifest,
-            args.session_manifest_json.as_deref(),
+            engram_uffd_handler::chunked::LocalManifests {
+                canonical: args.canonical_manifest_json.as_deref(),
+                session: args.session_manifest_json.as_deref(),
+            },
             blob.clone(),
             &args.cache_root,
             populate,
         )
+        .instrument(tracing::info_span!("uffd.build_backend"))
         .await
         .map_err(|e| format!("build chunked backend: {e}"))?;
         let backend = Arc::new(backend);
@@ -552,6 +559,7 @@ mod linux {
                         total_bytes,
                     )
                 })
+                .instrument(tracing::info_span!("uffd.peer_connect"))
                 .await
                 .map_err(|e| format!("peer connect join: {e}"))?
                 .map_err(|e| format!("peer connect: {e}"))?;
@@ -571,87 +579,6 @@ mod linux {
             _ => None,
         };
 
-        // Defer file loading to the producer in peer mode. Fault service and
-        // FC resume must not wait for the source's idle scan.
-        let migration_trace = if peer_wiring.is_some() {
-            match args.prefault_trace.as_ref() {
-                Some(PrefaultTraceSpec::File(path)) => Some(path.clone()),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let prefault = if migration_trace.is_some() {
-            None
-        } else if let Some(spec) = args.prefault_trace {
-            let loaded = match &spec {
-                PrefaultTraceSpec::File(path) => tokio::fs::read(path)
-                    .await
-                    .map_err(|e| format!("read {}: {e}", path.display()))
-                    .and_then(|bytes| {
-                        serde_json::from_slice(&bytes).map_err(|e| format!("parse trace: {e}"))
-                    }),
-                PrefaultTraceSpec::Host(host) => {
-                    // Tier 2 (resume-prefault fix): prefer the session-
-                    // stable canonical key when present (the resume path
-                    // threads `--trace-key <session_id>`). The per-
-                    // checkpoint `manifest_id` key below only ever hits for
-                    // base/migration traces — on resume it is a fresh id
-                    // each snapshot, so it would always miss.
-                    let trace_ref =
-                        select_trace_ref(args.trace_key, args.session_manifest.manifest_id, *host);
-                    load_trace_via_blob(blob.clone(), trace_ref)
-                        .await
-                        .map_err(|e| e.to_string())
-                }
-            };
-            match loaded {
-                Ok(t) => {
-                    tracing::info!(chunks = t.chunks.len(), ?spec, "loaded prefault trace");
-                    Some(t)
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        ?spec,
-                        "prefault trace requested but couldn't be loaded; proceeding without"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // ADR 0019 / telemetry restoration (#526): the "no trace" half of
-        // the prefault effectiveness detector. `Runtime::prefault_from_trace`
-        // writes `prefault-stats.json` at the END of a background thread
-        // that only starts once `run_listener` binds — so if no trace was
-        // requested (or the requested one failed to load), NOTHING would
-        // otherwise write the file, and the host-agent's post-restore read
-        // would see the same absence as a crashed handler
-        // (`outcome="stats_missing"`, the alarm condition) even though this
-        // is the ordinary, expected "nothing to replay" case. Write the
-        // `trace_loaded: false` snapshot now, synchronously, before the
-        // listener even binds — the earliest point this process knows the
-        // answer — so `outcome="no_trace"` and `outcome="stats_missing"`
-        // stay distinguishable.
-        if prefault.is_none() {
-            if let Some(stats_path) = args
-                .trace_output
-                .as_ref()
-                .and_then(|p| engram_uffd_handler::runtime::prefault_stats_path(p))
-            {
-                engram_uffd_handler::runtime::write_prefault_stats(
-                    &stats_path,
-                    &engram_uffd_handler::runtime::PrefaultStats {
-                        trace_loaded: false,
-                        ..Default::default()
-                    },
-                );
-            }
-        }
-
         // ADR 0045 substrate (v2b): create + size the base shm file NOW —
         // before run_listener binds the UDS. The host-agent orders FC's
         // load (which open(O_RDONLY)s + mmaps this file) after the socket
@@ -668,7 +595,10 @@ mod linux {
         };
         let base_shm = match base_shm_arg {
             Some(path) => {
-                let b = engram_uffd_handler::base_shm::BaseShm::open(path, backend.total_bytes())
+                let b = tracing::info_span!("uffd.base_shm_open")
+                    .in_scope(|| {
+                        engram_uffd_handler::base_shm::BaseShm::open(path, backend.total_bytes())
+                    })
                     .map_err(|e| format!("base shm: {e}"))?;
                 tracing::info!(
                     path = %path.display(),
@@ -679,75 +609,34 @@ mod linux {
             }
             None => None,
         };
+        if let Some(ack) = args.base_shm_ack.as_ref() {
+            let opened = base_shm.as_ref().and(base_shm_arg);
+            engram_uffd_handler::base_shm::write_ack(ack, opened.map(PathBuf::as_path))
+                .map_err(|e| format!("write base shm ack {}: {e}", ack.display()))?;
+        }
 
-        let result = tokio::task::spawn_blocking({
-            let handle = handle.clone();
+        tokio::task::spawn_blocking({
             let listen = args.listen.clone();
-            let backend = backend.clone();
-            let window = args.recorder_window;
-            let trace_out = args.trace_output.clone();
             move || {
                 engram_uffd_handler::runtime::run_listener(
                     listen,
                     backend,
                     handle,
                     engram_uffd_handler::runtime::RunListenerOpts {
-                        prefault_trace: prefault,
                         fault_around_chunks: args.fault_around_chunks,
-                        migration_trace,
-                        recorder_window: window,
-                        trace_output: trace_out,
+                        migration_hint: args.migration_hint,
+                        report_dir: args.report_dir,
                         base_shm,
                         peer: peer_wiring,
+                        sealed_output: args.sealed_output,
+                        previous_prefix,
                     },
                 )
             }
         })
         .await
-        .map_err(|e| format!("fault-loop join: {e}"))?;
-        let trace = result.map_err(|e| format!("fault loop: {e}"))?;
-
-        // ADR 0014 M1.14: dump the trace to a local file first, so a
-        // later publish_trace failure (e.g., the bake's blob root
-        // has a different layout than runtime's) doesn't lose the
-        // recorded data. The bake/materialize profile pass reads
-        // this file back to stage the trace as an OCI layer.
-        if let Some(path) = args.trace_output.as_ref() {
-            let bytes = serde_json::to_vec(&trace)
-                .map_err(|e| format!("serialize trace for --trace-output: {e}"))?;
-            tokio::fs::write(path, &bytes)
-                .await
-                .map_err(|e| format!("write trace to {}: {e}", path.display()))?;
-            tracing::info!(
-                chunks = trace.chunks.len(),
-                path = %path.display(),
-                "trace written to --trace-output"
-            );
-        }
-
-        if let Some(host) = args.publish_trace_host {
-            // Best-effort publish — log and continue rather than
-            // propagating, so the --trace-output side effect above
-            // sticks even when BlobStorage isn't reachable.
-            //
-            // Tier 2 (resume-prefault fix): publish under the session-
-            // stable canonical key when present, mirroring the replay
-            // lookup so life N's recorded trace lands exactly where life
-            // N+1 looks for it. Base/migration runs (no trace_key) keep
-            // the per-host manifest keying.
-            let trace_ref =
-                select_trace_ref(args.trace_key, args.session_manifest.manifest_id, host);
-            if let Err(e) = publish_trace(blob, trace_ref, &trace).await {
-                tracing::warn!(error = %e, "publish_trace failed; trace_output still written");
-            }
-        } else if args.trace_output.is_none() {
-            tracing::info!(
-                chunks = trace.chunks.len(),
-                "fault loop exited; trace recorded but no publish target set, dropping"
-            );
-        }
-
-        Ok(())
+        .map_err(|e| format!("fault-loop join: {e}"))?
+        .map_err(|e| format!("fault loop: {e}"))
     }
 
     /// `ENGRAM_BLOB_BACKEND` (default `local`) decides backend, via
@@ -762,65 +651,15 @@ mod linux {
         engram_blob_client::from_env().await
     }
 
-    async fn load_trace_via_blob(
-        blob: Arc<dyn BlobStorage>,
-        trace_ref: TraceRef,
-    ) -> Result<WorkingSetTrace, String> {
-        let store = ChunkStore::new(blob);
-        store
-            .get_trace(trace_ref)
-            .await
-            .map_err(|e| format!("get_trace: {e}"))?
-            .ok_or_else(|| format!("trace {trace_ref:?} not found"))
-    }
-
-    /// Tier 2 (resume-prefault fix): choose the working-set trace key.
-    /// A session-stable `trace_key` (the resume path threads `--trace-key
-    /// <session_id>`) selects the canonical variant so publish and replay
-    /// agree across ALL of a session's checkpoints; without one (base image
-    /// / migration) fall back to the per-host, per-checkpoint manifest key —
-    /// today's behavior, which always missed on resume because the manifest
-    /// id is minted fresh each snapshot.
-    fn select_trace_ref(
-        trace_key: Option<Uuid>,
-        manifest_id: Uuid,
-        fallback_host: Uuid,
-    ) -> TraceRef {
-        match trace_key {
-            Some(key) => TraceRef::canonical(key),
-            None => TraceRef::host(manifest_id, fallback_host),
-        }
-    }
-
-    async fn publish_trace(
-        blob: Arc<dyn BlobStorage>,
-        trace_ref: TraceRef,
-        trace: &WorkingSetTrace,
-    ) -> Result<(), String> {
-        let store = ChunkStore::new(blob);
-        store
-            .put_trace(trace_ref, trace)
-            .await
-            .map_err(|e| format!("put_trace {trace_ref:?}: {e}"))?;
-        tracing::info!(
-            chunks = trace.chunks.len(),
-            ?trace_ref,
-            "published working-set trace"
-        );
-        Ok(())
-    }
-
     const HELP: &str = "engram-uffd-handler \\
   --listen <sock> \\
   --canonical-manifest <uuid>@v<num> \\
   --session-manifest <uuid>@v<num> \\
   [--fault-around-chunks N] (env ENGRAM_UFFD_FAULT_AROUND, default 8)
-  [--prefault-trace file:<path>|<host-uuid>] \\
-  [--publish-trace-host <host-uuid>] \\
+  [--trace-key <session-uuid>] [--report-dir <dir>] \\
   [--cache-root <path>] \\
-  [--recorder-window-ms <ms>] \\
   [--peer-addr <host:port> --peer-export-id <id> [--peer-token <tok>]] \\
-  [--control-sock <sock>]
+  [--control-sock <sock>] [--sealed-output <path>] [--migration-hint <path>]
 
 Peer mode (ADR 0045 C2, post-copy destination): with --peer-addr +
 --peer-export-id (token via ENGRAM_PEER_TOKEN), the handler connects
@@ -828,6 +667,8 @@ to the SOURCE host-agent's page server, blocks for the sealed dirty
 bitmap BEFORE binding <sock>, serves sealed faults from the peer
 (sha-verified) and drains the rest in the background. --control-sock
 streams Sealed/DrainProgress/DrainDone/PeerLost to the host-agent.
+--sealed-output records the peer-supplied chunks for the first checkpoint.
+--migration-hint names the source's hot-set hint, which orders the drain.
 
 UFFD page-fault handler (ADR 0020 Route B). Firecracker connects to
 <sock>, hands over the guest's UFFD, and the handler serves every
@@ -837,44 +678,4 @@ chunks via UFFDIO_ZEROPAGE). No memory.bin file is read.
 
 ENGRAM_BLOB_BACKEND={local,gcs} (default local) picks the chunk
 store's blob backend. ENGRAM_GCS_BUCKET is required when gcs.";
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        /// Tier 2 (resume-prefault fix): a session-stable trace key selects
-        /// the CANONICAL variant keyed by the SESSION id (`traces/<session>/
-        /// canonical.json`), so a resume finds the trace its own prior life
-        /// published — instead of looking under the per-checkpoint memory
-        /// manifest id, which is minted fresh each snapshot and never
-        /// matches. Without a key (base image / migration) it falls back to
-        /// the per-host manifest key, unchanged.
-        #[test]
-        fn select_trace_ref_prefers_session_key() {
-            let session = Uuid::from_u128(1);
-            let manifest = Uuid::from_u128(2);
-            let host = Uuid::from_u128(3);
-
-            let with_key = select_trace_ref(Some(session), manifest, host);
-            assert_eq!(
-                with_key.manifest_id, session,
-                "keyed by session, not manifest"
-            );
-            assert_eq!(
-                with_key.host_id, None,
-                "canonical (no host) so publish==replay"
-            );
-
-            let without_key = select_trace_ref(None, manifest, host);
-            assert_eq!(
-                without_key.manifest_id, manifest,
-                "fallback keeps per-checkpoint key"
-            );
-            assert_eq!(
-                without_key.host_id,
-                Some(host),
-                "fallback keeps per-host key"
-            );
-        }
-    }
 }

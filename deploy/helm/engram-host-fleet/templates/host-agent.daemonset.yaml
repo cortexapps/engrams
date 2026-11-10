@@ -80,20 +80,6 @@ spec:
                 echo "[node-prep] FATAL: /dev/kvm is missing — this VM was launched without nested virtualization (vmx flag count: $(grep -c -w vmx /proc/cpuinfo || true)); replace the instance"
                 exit 1
               fi
-              # ADR 0049: nbds_max only takes effect on a fresh module load.
-              # A loaded module can only change after the node is drained.
-              WANT_NBDS_MAX={{ .Values.nbd.nbdsMax }}
-              if [ "$WANT_NBDS_MAX" = "0" ]; then
-                echo "[node-prep] nbd disabled (nbdsMax=0); skipping modprobe"
-              else
-                CUR_NBDS_MAX=$(cat /sys/module/nbd/parameters/nbds_max 2>/dev/null || echo "")
-                if [ -n "$CUR_NBDS_MAX" ] && [ "$CUR_NBDS_MAX" != "$WANT_NBDS_MAX" ]; then
-                  echo "[node-prep] nbd loaded with nbds_max=$CUR_NBDS_MAX, want $WANT_NBDS_MAX; reloading"
-                  rmmod nbd 2>&1 || echo "[node-prep] rmmod nbd failed (devices in use); reboot/drain to change nbds_max"
-                fi
-                echo "[node-prep] modprobe nbd nbds_max=$WANT_NBDS_MAX"
-                modprobe nbd nbds_max=$WANT_NBDS_MAX 2>&1 || echo "[node-prep] nbd modprobe skipped (already loaded or unavailable)"
-              fi
               {{- range $k, $v := .Values.nodePrep.sysctls }}
               # {{ $k }} is a node-wide sysctl when it is not namespaced.
               echo "[node-prep] sysctl {{ $k }}={{ $v }}"
@@ -132,15 +118,40 @@ spec:
                  touch {{ $.Values.storage.workDirHostPath }}/.engram-node-prep-mounted'
               {{- end }}
               {{- end }}
+              {{- with .Values.storage.ioScheduler }}
+              # The block I/O scheduler of the disks under the work dir. It
+              # comes after the dedicated mount, so it finds those devices.
+              nsenter -t 1 -m -- env \
+                IO_SCHEDULER={{ . | quote }} \
+                IO_DIR={{ $.Values.storage.workDirHostPath | quote }} \
+                sh -s < /opt/engram/io-scheduler.sh \
+                || echo "[node-prep] WARNING: the io scheduler step failed; the disk scheduler is not set"
+              {{- end }}
               {{- with .Values.firecracker.uffdBaseDir }}
               # UFFD minor faults require the base files on tmpfs/shmem.
               echo "[node-prep] tmpfs {{ . }} (size={{ $.Values.firecracker.uffdBaseTmpfsSize }})"
               nsenter -t 1 -m -- sh -c \
                 'mkdir -p {{ . }} && { mountpoint -q {{ . }} || mount -t tmpfs -o size={{ $.Values.firecracker.uffdBaseTmpfsSize }} engram-base-shm {{ . }}; }'
               {{- end }}
+              # The node's own dmsetup / thin_check / losetup, in the host
+              # mount namespace; the script arrives on stdin.
+              echo "[node-prep] thin pool {{ .Values.thinPool.name }} in {{ .Values.thinPool.dir }}"
+              nsenter -t 1 -m -- env \
+                POOL_NAME={{ .Values.thinPool.name | quote }} \
+                POOL_DIR={{ .Values.thinPool.dir | quote }} \
+                POOL_DATA_SIZE={{ .Values.thinPool.dataSize | quote }} \
+                POOL_META_SIZE={{ .Values.thinPool.metadataSize | quote }} \
+                POOL_BLOCK_SECTORS={{ .Values.thinPool.blockSizeSectors | quote }} \
+                POOL_LOW_WATER={{ .Values.thinPool.lowWaterMarkBlocks | quote }} \
+                POOL_CACHE_DIR={{ printf "%s/sandboxes/chunk-cache" .Values.storage.workDirHostPath | quote }} \
+                sh -s < /opt/engram/thin-pool.sh
               echo "[node-prep] done"
           volumeMounts:
             - {name: lib-modules, mountPath: /lib/modules, readOnly: true}
+            - {name: thin-pool-script, mountPath: /opt/engram/thin-pool.sh, subPath: thin-pool.sh, readOnly: true}
+            {{- if .Values.storage.ioScheduler }}
+            - {name: io-scheduler-script, mountPath: /opt/engram/io-scheduler.sh, subPath: io-scheduler.sh, readOnly: true}
+            {{- end }}
           resources:
             requests: {cpu: "10m", memory: 32Mi}
             limits: {cpu: "100m", memory: 64Mi}
@@ -261,6 +272,12 @@ spec:
             # in the configmap, and matches the emptyDir layout).
             - name: ENGRAM_FIRECRACKER_BIN
               value: /opt/engram/firecracker
+            - name: ENGRAM_THIN_POOL
+              value: {{ .Values.thinPool.name | quote }}
+            - name: ENGRAM_DISK_HYDRATION_WINDOW_CHUNKS
+              value: {{ .Values.thinPool.hydration.windowChunks | quote }}
+            - name: ENGRAM_DISK_HYDRATION_IN_FLIGHT_REGIONS
+              value: {{ .Values.thinPool.hydration.inFlightRegions | quote }}
             {{- if .Values.coordinator.tokenSecretName }}
             - name: ENGRAM_COORDINATOR_TOKEN
               valueFrom:
@@ -340,6 +357,18 @@ spec:
         - {name: dev, hostPath: {path: /dev, type: Directory}}
         {{- if .Values.nodePrep.enabled }}
         - {name: lib-modules, hostPath: {path: /lib/modules, type: Directory}}
+        {{- end }}
+        {{- if .Values.nodePrep.enabled }}
+        - name: thin-pool-script
+          configMap:
+            name: {{ include "hostfleet.hostAgent.fullname" . }}-thin-pool
+            defaultMode: 0555
+        {{- if .Values.storage.ioScheduler }}
+        - name: io-scheduler-script
+          configMap:
+            name: {{ include "hostfleet.hostAgent.fullname" . }}-io-scheduler
+            defaultMode: 0555
+        {{- end }}
         {{- end }}
         # ADR 0044 K2 / GAP 2: firecracker + the guest kernel land here from
         # the node-assets init container — replaces the hostPath `type: File`

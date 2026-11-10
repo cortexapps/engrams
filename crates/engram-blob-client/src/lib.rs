@@ -38,11 +38,16 @@
 //!   prefixes). A hung TCP connection becomes a retryable error, not
 //!   a wedged capture leg.
 //! - **Bounded retry**: transient failures ([`BlobError::Sdk`] /
-//!   [`BlobError::Protocol`] / a deadline) are retried with
-//!   deterministic exponential backoff. `NotFound`, `Config`, and
+//!   [`BlobError::Protocol`] / [`BlobError::Throttled`] / a deadline)
+//!   are retried with exponential backoff. `NotFound`, `Config`, and
 //!   `Io` (local-fs ENOSPC and friends) surface immediately. Every
 //!   blob op is idempotent (content-addressed chunks, versioned
 //!   manifests), so retry is unconditionally safe.
+//! - **Throttled PUTs**: a PUT the store refused for load waits for
+//!   seconds, with jitter ([`ClientPolicy::put_throttled`]); the store
+//!   adds capacity over minutes, and an upload burst that retries in
+//!   step meets the same limit again. Reads keep the short schedule: a
+//!   guest can wait on a GET.
 //! - **Streaming caveats**: `put_streaming` is forwarded verbatim —
 //!   the inbound stream is consumed by the first attempt and cannot
 //!   be replayed here (streaming callers own their resumability, as
@@ -66,6 +71,7 @@
 //! stack (ADR 0098/0099).
 
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -76,24 +82,29 @@ use engram_core::traits::{BlobObjectMeta, BlobStorage, ByteStream, ListPage};
 
 /// Whether an error is worth another attempt. `Sdk` carries the SDK
 /// backends' transport failures (they fold IO errors into it);
-/// `Protocol` is a garbled response (an LB hiccup). A permanent error
+/// `Protocol` is a garbled response (an LB hiccup); `Throttled` is the
+/// store asking for less load. A permanent error
 /// wearing `Sdk` clothing (403, 412) costs at most `attempts - 1`
 /// extra round-trips before surfacing — cheap next to the Full
 /// snapshot a poisoned chain costs.
 fn is_transient(e: &BlobError) -> bool {
-    matches!(e, BlobError::Sdk(_) | BlobError::Protocol(_))
+    matches!(
+        e,
+        BlobError::Sdk(_) | BlobError::Protocol(_) | BlobError::Throttled(_)
+    )
 }
 
 /// Attempt budget, backoff shape, and per-attempt deadlines.
 /// `attempts` is the TOTAL number of tries (`3` = 1 initial + 2
-/// retries); the delay before retry `n` is `base_backoff * 2^(n-1)`.
-/// Backoff is deterministic (no jitter) so behavior is identical
-/// under simulation; at this fleet's blob-op rate herd effects are
-/// not a factor.
+/// retries); the delay before retry `n` is `base_backoff * 2^(n-1)`,
+/// with no jitter. A throttled PUT uses [`Self::put_throttled`]
+/// instead. One op counts its attempts across both schedules.
 #[derive(Clone, Copy, Debug)]
 pub struct ClientPolicy {
     pub attempts: u32,
     pub base_backoff: Duration,
+    /// The schedule for a PUT that failed with [`BlobError::Throttled`].
+    pub put_throttled: ThrottleBackoff,
     /// Deadline per attempt for unary ops (`get`/`put`/`head`/
     /// `delete` and `get_streaming`'s initial call). Sized for the
     /// worst honest case — a cold 16 MiB chunk on a congested NIC —
@@ -110,6 +121,7 @@ impl Default for ClientPolicy {
         Self {
             attempts: 3,
             base_backoff: Duration::from_millis(100),
+            put_throttled: ThrottleBackoff::default(),
             attempt_timeout: Duration::from_secs(30),
             list_timeout: Duration::from_secs(300),
         }
@@ -123,12 +135,66 @@ impl ClientPolicy {
     }
 }
 
+/// Truncated exponential backoff with jitter. Before retry `n` the
+/// ceiling is `min(base * 2^(n-1), max_delay)`, and the delay is a value
+/// in `[ceiling / 2, ceiling)`: never less than half, so a throttled
+/// store always gets a pause, and spread over the other half, so a burst
+/// of throttled PUTs does not retry at the same instant.
+///
+/// The default (6 tries, 1 s base, 16 s cap) waits 15.5 s to 31 s in all
+/// before it gives up. Google's client libraries start at 1 s and double;
+/// the total stays under a minute because a periodic checkpoint holds
+/// its sandbox's capture lock while it uploads.
+#[derive(Clone, Copy, Debug)]
+pub struct ThrottleBackoff {
+    /// Total tries, the first included.
+    pub attempts: u32,
+    pub base: Duration,
+    pub max_delay: Duration,
+}
+
+impl Default for ThrottleBackoff {
+    fn default() -> Self {
+        Self {
+            attempts: 6,
+            base: Duration::from_secs(1),
+            max_delay: Duration::from_secs(16),
+        }
+    }
+}
+
+impl ThrottleBackoff {
+    /// The delay before retry `retry` (1-based) of the call numbered
+    /// `call`. The jitter is a hash of the two, not a random draw: a run
+    /// replays exactly, and concurrent calls still get different values.
+    fn delay(&self, retry: u32, call: u64) -> Duration {
+        let ceiling = self
+            .base
+            .saturating_mul(1u32 << (retry - 1).min(16))
+            .min(self.max_delay);
+        let half = ceiling / 2;
+        // A fraction of `half` in [0, 1), as 32 bits of the hash.
+        let frac = u128::from(splitmix64(call ^ (u64::from(retry) << 48)) >> 32);
+        half + Duration::from_nanos(((half.as_nanos() * frac) >> 32) as u64)
+    }
+}
+
+/// SplitMix64's output function: a cheap, well-mixed 64-bit hash.
+fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 /// The encapsulated blob-tier client. Construct via [`from_env`] in
 /// binaries, [`BlobClient::wrap`]/[`BlobClient::with_policy`] in
 /// tests and the simulator.
 pub struct BlobClient {
     inner: Arc<dyn BlobStorage>,
     policy: ClientPolicy,
+    /// Numbers each op; the seed of its throttle jitter.
+    calls: AtomicU64,
 }
 
 impl BlobClient {
@@ -140,7 +206,11 @@ impl BlobClient {
     /// Wrap `inner` with an explicit policy (tests use ~0 backoff and
     /// short deadlines).
     pub fn with_policy(inner: Arc<dyn BlobStorage>, policy: ClientPolicy) -> Self {
-        Self { inner, policy }
+        Self {
+            inner,
+            policy,
+            calls: AtomicU64::new(0),
+        }
     }
 
     /// Run one deadline-bounded attempt. `deadline = None` forwards
@@ -167,47 +237,68 @@ impl BlobClient {
         }
     }
 
+    /// The delay before the next try after `attempt` failed with `e`, or
+    /// `None` when `e` is final or the schedule is spent. `throttle` is
+    /// the schedule for a [`BlobError::Throttled`] error, if the op has
+    /// one.
+    fn retry_delay(
+        &self,
+        e: &BlobError,
+        attempt: u32,
+        throttle: Option<&ThrottleBackoff>,
+        call: u64,
+    ) -> Option<Duration> {
+        if !is_transient(e) {
+            return None;
+        }
+        match throttle {
+            Some(t) if matches!(e, BlobError::Throttled(_)) => {
+                (attempt < t.attempts).then(|| t.delay(attempt, call))
+            }
+            _ => (attempt < self.policy.attempts).then(|| self.policy.backoff_for(attempt)),
+        }
+    }
+
     async fn with_retry<T, Fut>(
         &self,
         op: &'static str,
         deadline: Option<Duration>,
+        throttle: Option<&ThrottleBackoff>,
         mut call: impl FnMut() -> Fut,
     ) -> Result<T, BlobError>
     where
         Fut: Future<Output = Result<T, BlobError>>,
     {
         let started = std::time::Instant::now();
+        let call_no = self.calls.fetch_add(1, Ordering::Relaxed);
         let mut attempt = 1u32;
         let result = loop {
-            match Self::attempt(op, deadline, call()).await {
+            let e = match Self::attempt(op, deadline, call()).await {
                 Ok(v) => break Ok(v),
-                Err(e) if is_transient(&e) && attempt < self.policy.attempts.max(1) => {
-                    let delay = self.policy.backoff_for(attempt);
-                    metrics::counter!("engram_blob_retry_total", "op" => op).increment(1);
+                Err(e) => e,
+            };
+            let Some(delay) = self.retry_delay(&e, attempt, throttle, call_no) else {
+                if is_transient(&e) {
+                    metrics::counter!("engram_blob_retry_exhausted_total", "op" => op).increment(1);
                     tracing::warn!(
                         op,
-                        attempt,
-                        delay_ms = delay.as_millis() as u64,
+                        attempts = attempt,
                         error = %e,
-                        "transient blob error; retrying",
+                        "transient blob error persisted through every attempt; giving up",
                     );
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
                 }
-                Err(e) => {
-                    if is_transient(&e) {
-                        metrics::counter!("engram_blob_retry_exhausted_total", "op" => op)
-                            .increment(1);
-                        tracing::warn!(
-                            op,
-                            attempts = attempt,
-                            error = %e,
-                            "transient blob error persisted through every attempt; giving up",
-                        );
-                    }
-                    break Err(e);
-                }
-            }
+                break Err(e);
+            };
+            metrics::counter!("engram_blob_retry_total", "op" => op).increment(1);
+            tracing::warn!(
+                op,
+                attempt,
+                delay_ms = delay.as_millis() as u64,
+                error = %e,
+                "transient blob error; retrying",
+            );
+            tokio::time::sleep(delay).await;
+            attempt += 1;
         };
         let outcome = if result.is_ok() { "ok" } else { "error" };
         metrics::histogram!("engram_blob_op_seconds", "op" => op, "outcome" => outcome)
@@ -226,7 +317,8 @@ impl BlobStorage for BlobClient {
 
     async fn put(&self, key: &str, body: Bytes) -> Result<u64, BlobError> {
         let deadline = Some(self.policy.attempt_timeout);
-        self.with_retry("put", deadline, || {
+        let throttle = Some(&self.policy.put_throttled);
+        self.with_retry("put", deadline, throttle, || {
             let inner = self.inner.clone();
             let key = key.to_owned();
             let body = body.clone();
@@ -239,7 +331,7 @@ impl BlobStorage for BlobClient {
         // Retries + deadline on the initial call only; the returned
         // body is the caller's (see module docs).
         let deadline = Some(self.policy.attempt_timeout);
-        self.with_retry("get_streaming", deadline, || {
+        self.with_retry("get_streaming", deadline, None, || {
             let inner = self.inner.clone();
             let key = key.to_owned();
             async move { inner.get_streaming(&key).await }
@@ -253,7 +345,7 @@ impl BlobStorage for BlobClient {
         // deadline-bounded attempt — a mid-body connection reset
         // re-issues the whole GET. The 2026-07-22 failure shape.
         let deadline = Some(self.policy.attempt_timeout);
-        self.with_retry("get", deadline, || {
+        self.with_retry("get", deadline, None, || {
             let inner = self.inner.clone();
             let key = key.to_owned();
             async move { inner.get(&key).await }
@@ -261,9 +353,19 @@ impl BlobStorage for BlobClient {
         .await
     }
 
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes, BlobError> {
+        let deadline = Some(self.policy.attempt_timeout);
+        self.with_retry("get_range", deadline, None, || {
+            let inner = self.inner.clone();
+            let key = key.to_owned();
+            async move { inner.get_range(&key, offset, len).await }
+        })
+        .await
+    }
+
     async fn head(&self, key: &str) -> Result<BlobObjectMeta, BlobError> {
         let deadline = Some(self.policy.attempt_timeout);
-        self.with_retry("head", deadline, || {
+        self.with_retry("head", deadline, None, || {
             let inner = self.inner.clone();
             let key = key.to_owned();
             async move { inner.head(&key).await }
@@ -273,7 +375,7 @@ impl BlobStorage for BlobClient {
 
     async fn delete(&self, key: &str) -> Result<(), BlobError> {
         let deadline = Some(self.policy.attempt_timeout);
-        self.with_retry("delete", deadline, || {
+        self.with_retry("delete", deadline, None, || {
             let inner = self.inner.clone();
             let key = key.to_owned();
             async move { inner.delete(&key).await }
@@ -283,7 +385,7 @@ impl BlobStorage for BlobClient {
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, BlobError> {
         let deadline = Some(self.policy.list_timeout);
-        self.with_retry("list_prefix", deadline, || {
+        self.with_retry("list_prefix", deadline, None, || {
             let inner = self.inner.clone();
             let prefix = prefix.to_owned();
             async move { inner.list_prefix(&prefix).await }
@@ -303,7 +405,7 @@ impl BlobStorage for BlobClient {
         limit: usize,
     ) -> Result<ListPage, BlobError> {
         let deadline = Some(self.policy.attempt_timeout);
-        self.with_retry("list_prefix_page", deadline, || {
+        self.with_retry("list_prefix_page", deadline, None, || {
             let inner = self.inner.clone();
             let prefix = prefix.to_owned();
             let cursor = cursor.map(str::to_string);
@@ -384,12 +486,175 @@ mod tests {
         FaultPlan, FaultyBlobStorage, GetFault, GetFaultKind, InjectedError, KeyMatch, When,
     };
 
+    /// GCS's ranged GET through the client that wraps every store. The
+    /// emulator closes its connection after a 416 without a
+    /// `Connection: close`, so a request on the pooled connection can fail
+    /// in transport; the client retries it, as it does in production.
+    #[tokio::test(flavor = "current_thread")]
+    async fn gcs_ranged_get_against_emulator() {
+        if std::env::var("STORAGE_EMULATOR_HOST").is_err() {
+            return;
+        }
+        let Ok(bucket) = std::env::var("ENGRAM_TEST_GCS_BUCKET") else {
+            return;
+        };
+        let gcs = engram_storage_gcs::GcsBlobStorage::connect(bucket)
+            .await
+            .expect("connect against emulator");
+        let client = BlobClient::wrap(Arc::new(gcs));
+        engram_testkit::blob_conformance::ranged_get(&client).await;
+    }
+
     fn test_policy() -> ClientPolicy {
         ClientPolicy {
             attempts: 3,
             base_backoff: Duration::from_millis(1),
+            put_throttled: ThrottleBackoff {
+                attempts: 3,
+                base: Duration::from_millis(1),
+                max_delay: Duration::from_millis(4),
+            },
             attempt_timeout: Duration::from_secs(5),
             list_timeout: Duration::from_secs(5),
+        }
+    }
+
+    /// Answers the first `throttles` PUTs and GETs with
+    /// `BlobError::Throttled`, then succeeds. No I/O, so paused tokio time
+    /// advances only through the client's own sleeps.
+    struct ThrottlingStorage {
+        throttles: u32,
+        puts: AtomicU64,
+        gets: AtomicU64,
+    }
+
+    impl ThrottlingStorage {
+        fn new(throttles: u32) -> Arc<Self> {
+            Arc::new(Self {
+                throttles,
+                puts: AtomicU64::new(0),
+                gets: AtomicU64::new(0),
+            })
+        }
+
+        fn answer(&self, calls: &AtomicU64) -> Result<(), BlobError> {
+            if calls.fetch_add(1, Ordering::SeqCst) < u64::from(self.throttles) {
+                return Err(BlobError::Throttled(
+                    "429: request distribution is too uneven".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl BlobStorage for ThrottlingStorage {
+        async fn put_streaming(&self, _key: &str, _body: ByteStream) -> Result<u64, BlobError> {
+            unreachable!("not used by these tests")
+        }
+        async fn put(&self, _key: &str, body: Bytes) -> Result<u64, BlobError> {
+            self.answer(&self.puts).map(|()| body.len() as u64)
+        }
+        async fn get_streaming(&self, _key: &str) -> Result<ByteStream, BlobError> {
+            unreachable!("not used by these tests")
+        }
+        async fn get(&self, _key: &str) -> Result<Bytes, BlobError> {
+            self.answer(&self.gets)
+                .map(|()| Bytes::from_static(b"body"))
+        }
+        async fn head(&self, _key: &str) -> Result<BlobObjectMeta, BlobError> {
+            unreachable!("not used by these tests")
+        }
+        async fn delete(&self, _key: &str) -> Result<(), BlobError> {
+            unreachable!("not used by these tests")
+        }
+        async fn list_prefix(&self, _prefix: &str) -> Result<Vec<String>, BlobError> {
+            unreachable!("not used by these tests")
+        }
+    }
+
+    /// Three throttles, then success: the PUT waits through retries 1-3
+    /// of the default schedule (ceilings 1 s, 2 s, 4 s; each delay at
+    /// least half its ceiling) and lands.
+    #[tokio::test(start_paused = true)]
+    async fn throttled_put_backs_off_for_seconds_then_lands() {
+        let store = ThrottlingStorage::new(3);
+        let client = BlobClient::wrap(store.clone());
+
+        let started = tokio::time::Instant::now();
+        let n = client
+            .put("chunks/sha256/ab/cd", Bytes::from_static(b"chunk"))
+            .await
+            .expect("the PUT lands once the store stops throttling");
+        let waited = started.elapsed();
+
+        assert_eq!(n, 5);
+        assert_eq!(store.puts.load(Ordering::SeqCst), 4);
+        assert!(
+            waited >= Duration::from_millis(3500) && waited < Duration::from_secs(7),
+            "waited {waited:?}"
+        );
+    }
+
+    /// A throttle that never clears ends the PUT after the whole default
+    /// schedule: 6 tries, 15.5 s to 31 s of backoff, and the error is the
+    /// store's throttle.
+    #[tokio::test(start_paused = true)]
+    async fn throttled_put_that_never_clears_gives_up_within_the_budget() {
+        let store = ThrottlingStorage::new(u32::MAX);
+        let client = BlobClient::wrap(store.clone());
+
+        let started = tokio::time::Instant::now();
+        let err = client
+            .put("chunks/sha256/ab/cd", Bytes::from_static(b"chunk"))
+            .await
+            .expect_err("a lasting throttle surfaces");
+        let waited = started.elapsed();
+
+        assert!(matches!(err, BlobError::Throttled(_)), "got {err:?}");
+        assert_eq!(store.puts.load(Ordering::SeqCst), 6);
+        assert!(
+            waited >= Duration::from_millis(15_500) && waited < Duration::from_secs(31),
+            "waited {waited:?}"
+        );
+    }
+
+    /// A GET keeps the short schedule when the store throttles: a guest
+    /// can be waiting on it.
+    #[tokio::test(start_paused = true)]
+    async fn throttled_get_keeps_the_short_schedule() {
+        let store = ThrottlingStorage::new(u32::MAX);
+        let client = BlobClient::wrap(store.clone());
+
+        let started = tokio::time::Instant::now();
+        let err = client
+            .get("chunks/sha256/ab/cd")
+            .await
+            .expect_err("a lasting throttle surfaces");
+
+        assert!(matches!(err, BlobError::Throttled(_)), "got {err:?}");
+        assert_eq!(store.gets.load(Ordering::SeqCst), 3);
+        assert_eq!(started.elapsed(), Duration::from_millis(300));
+    }
+
+    #[test]
+    fn throttle_delays_stay_in_range_and_spread_across_calls() {
+        let t = ThrottleBackoff::default();
+        for retry in 1..t.attempts {
+            let ceiling = t.base.saturating_mul(1 << (retry - 1)).min(t.max_delay);
+            let delays: Vec<Duration> = (0..256).map(|call| t.delay(retry, call)).collect();
+            for d in &delays {
+                assert!(*d >= ceiling / 2 && *d < ceiling, "retry {retry}: {d:?}");
+            }
+            let mut distinct = delays.clone();
+            distinct.sort();
+            distinct.dedup();
+            assert!(distinct.len() > 200, "retry {retry}: delays do not spread");
+            assert_eq!(
+                t.delay(retry, 7),
+                t.delay(retry, 7),
+                "same input, same delay"
+            );
         }
     }
 
@@ -566,10 +831,8 @@ mod tests {
         let client = BlobClient::with_policy(
             hanging,
             ClientPolicy {
-                attempts: 3,
-                base_backoff: Duration::from_millis(1),
                 attempt_timeout: Duration::from_millis(50),
-                list_timeout: Duration::from_secs(5),
+                ..test_policy()
             },
         );
 
@@ -589,9 +852,8 @@ mod tests {
             hanging,
             ClientPolicy {
                 attempts: 2,
-                base_backoff: Duration::from_millis(1),
                 attempt_timeout: Duration::from_millis(20),
-                list_timeout: Duration::from_secs(5),
+                ..test_policy()
             },
         );
 

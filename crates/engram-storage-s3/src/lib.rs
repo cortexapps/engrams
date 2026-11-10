@@ -204,14 +204,20 @@ impl PartAccumulator {
     }
 }
 
-/// Wrap any SDK error as [`BlobError::Sdk`], keeping the full context
-/// chain (`DisplayErrorContext` renders service code + message).
-fn sdk_err<E, R>(err: SdkError<E, R>) -> BlobError
+/// Wrap an SDK error as [`BlobError::Throttled`] when S3 refused it for
+/// load (503 `SlowDown`, or 429), else as [`BlobError::Sdk`], keeping the
+/// full context chain (`DisplayErrorContext` renders service code +
+/// message).
+fn sdk_err<E>(err: SdkError<E>) -> BlobError
 where
     E: std::error::Error + Send + Sync + 'static,
-    R: std::fmt::Debug + Send + Sync + 'static,
 {
-    BlobError::Sdk(err.into_service_error_or_self())
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    let inner = err.into_service_error_or_self();
+    match status {
+        Some(429 | 503) => BlobError::Throttled(inner),
+        _ => BlobError::Sdk(inner),
+    }
 }
 
 /// The SDK's error Display shows only the outermost layer; this
@@ -393,6 +399,37 @@ impl BlobStorage for S3BlobStorage {
             }
         });
         Ok(ByteStream::new(stream))
+    }
+
+    /// One ranged `GetObject` (`206 Partial Content`). S3 answers a
+    /// range that starts past the end with 416 (`InvalidRange`), and one
+    /// that ends past it with the bytes it has; both are out of bounds.
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes, BlobError> {
+        let range = engram_core::traits::storage::range_header(offset, len)?;
+        let out = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .range(range)
+            .send()
+            .await
+            .map_err(|e| match &e {
+                SdkError::ServiceError(ctx) if ctx.err().is_no_such_key() => BlobError::NotFound,
+                SdkError::ServiceError(ctx) => match ctx.raw().status().as_u16() {
+                    404 => BlobError::NotFound,
+                    416 => BlobError::RangeOutOfBounds { offset, len },
+                    _ => sdk_err(e),
+                },
+                _ => sdk_err(e),
+            })?;
+        let body = out
+            .body
+            .collect()
+            .await
+            .map_err(|e| BlobError::Sdk(Box::new(e)))?
+            .into_bytes();
+        engram_core::traits::storage::checked_range(body, offset, len)
     }
 
     async fn head(&self, key: &str) -> Result<BlobObjectMeta, BlobError> {
@@ -649,6 +686,14 @@ mod tests {
             return;
         };
         blob_conformance::streaming_round_trip(&store, 64 * 1024, 1024).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn conformance_ranged_get_against_emulator() {
+        let Some(store) = emulator_store().await else {
+            return;
+        };
+        blob_conformance::ranged_get(&store).await;
     }
 
     #[tokio::test(flavor = "current_thread")]

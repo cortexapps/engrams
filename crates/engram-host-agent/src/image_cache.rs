@@ -88,12 +88,9 @@ impl ImageCache {
         })
     }
 
-    /// Clone of the inner `OciClient`. Useful for callers that need
-    /// to reuse the same auth resolver for additional OCI verbs
-    /// outside the cache's pull surface — e.g. ADR 0008 Phase 5's
-    /// `OciChunkResolver`, which does Range GETs against the
-    /// registry for chunk fetches. The client is cheap to clone
-    /// (its internals are `Arc`s).
+    /// Clone of the inner `OciClient`, for callers that pull with the
+    /// same auth resolver outside the cache (the `MaterializeImage`
+    /// pull). Cheap to clone (its internals are `Arc`s).
     pub fn oci_client(&self) -> OciClient {
         self.inner.oci.clone()
     }
@@ -334,65 +331,6 @@ impl ImageCache {
     }
 }
 
-impl CachedImage {
-    /// Whether this cached image carries a chunked-OCI bootstrap —
-    /// i.e., disk chunks are reachable as individual blobs in the
-    /// OCI registry (ADR 0036), not just via BlobStorage.
-    ///
-    /// Phase 5 of ADR 0008's rollout uses this to dispatch between
-    /// the legacy BlobStorage-only path and the tiered fault path.
-    pub fn is_disk_chunked_oci(&self) -> bool {
-        self.disk_bootstrap_path.is_some()
-    }
-
-    /// Parse the bootstrap sidecar and build an
-    /// [`engram_oci::OciChunkIndex`] suitable for constructing an
-    /// [`engram_oci::OciChunkResolver`].
-    ///
-    /// Returns `Ok(None)` if the image isn't chunked-OCI shaped;
-    /// otherwise reads the bootstrap and populates the index with
-    /// one entry per chunk, addressed by the chunk's own blob
-    /// digest (ADR 0036: digest == chunk hash). A v1 bootstrap
-    /// (monolithic chunk blob, entries without per-chunk digests)
-    /// is rejected — those artifacts must be re-baked.
-    ///
-    /// ADR 0008 Phase 5 wiring: a future `PooledBackend::create`
-    /// pass will call this on a chunked image, wrap the result in a
-    /// `TieredChunkResolver` alongside a `BlobStorageResolver`, and
-    /// install the tiered resolver onto a per-sandbox
-    /// `ChunkStore::with_resolver` for chunk reads. The legacy
-    /// BlobStorage-only path remains for non-chunked images.
-    pub async fn build_oci_chunk_index(
-        &self,
-    ) -> Result<Option<engram_oci::OciChunkIndex>, CacheError> {
-        let Some(bs_path) = self.disk_bootstrap_path.as_ref() else {
-            return Ok(None);
-        };
-        let bytes = fs::read(bs_path).await.map_err(CacheError::Io)?;
-        let bs: engram_chunk_store::Bootstrap = serde_json::from_slice(&bytes).map_err(|e| {
-            CacheError::Bundle(format!("{}: bootstrap parse: {e}", bs_path.display()))
-        })?;
-        if !bs.is_per_chunk() {
-            return Err(CacheError::Bundle(format!(
-                "{}: pre-ADR-0036 monolithic chunk-blob bootstrap; re-bake the image",
-                bs_path.display()
-            )));
-        }
-        let mut index = engram_oci::OciChunkIndex::new();
-        for entry in &bs.entries {
-            let blob_digest = entry.blob_digest.clone().expect("is_per_chunk checked");
-            index.insert(
-                entry.sha256,
-                engram_oci::OciBlobLocator {
-                    blob_digest,
-                    length: entry.length as u64,
-                },
-            );
-        }
-        Ok(Some(index))
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct CachedImage {
     pub manifest_path: PathBuf,
@@ -404,16 +342,14 @@ pub struct CachedImage {
     /// (no bundle present).
     pub rootfs_path: Option<PathBuf>,
     /// ADR 0007: parsed bundle.json content, when the image carries
-    /// one. Phase 4/5 wire this into FC's NBD disk + UFFD memory
-    /// adapters; today it's plumbed through so adopters can find
-    /// the chunk-store reference without re-reading the file.
+    /// one: the chunk-store manifests a session volume and the UFFD
+    /// memory adapter start from.
     pub bundle: Option<ImageBundle>,
-    /// ADR 0008 Phase 3 / ADR 0036: path to the disk-side bootstrap
-    /// layer when the artifact is chunked-OCI shaped. `Some` enables
-    /// the `TieredChunkResolver` (cache → OCI) fault path — each
-    /// bootstrap entry carries its chunk's own blob digest; `None`
-    /// means the artifact predates ADR 0008 and consumers fall back
-    /// to BlobStorage-only resolution via `bundle.disk_manifest`.
+    /// Path to the disk-side bootstrap layer, when the artifact
+    /// carries one. The host synthesizes the disk manifest from it when
+    /// the manifest is not in its object store
+    /// (`ensure_chunked_manifest_in_blob_storage`). Chunks are always
+    /// read from the chunk cache or the object store.
     pub disk_bootstrap_path: Option<PathBuf>,
     pub digest: String,
 }
@@ -746,125 +682,6 @@ mod tests {
         assert_eq!(got.schema_version, 2);
         assert_eq!(got.disk_manifest, manifest_ref);
         assert!(got.bootstrap_disk_available);
-    }
-
-    // ---- ADR 0008 Phase 5: CachedImage chunked-OCI helpers ----
-
-    fn cached_image_skeleton() -> CachedImage {
-        CachedImage {
-            manifest_path: PathBuf::from("/nonexistent/manifest.toml"),
-            rootfs_path: None,
-            bundle: None,
-            disk_bootstrap_path: None,
-            digest: "sha256:test".into(),
-        }
-    }
-
-    #[test]
-    fn is_disk_chunked_oci_requires_bootstrap() {
-        let mut c = cached_image_skeleton();
-        assert!(!c.is_disk_chunked_oci(), "skeleton: no bootstrap");
-
-        c.disk_bootstrap_path = Some(PathBuf::from("/x/bootstrap.disk.json"));
-        assert!(
-            c.is_disk_chunked_oci(),
-            "ADR 0036: the bootstrap alone is the chunked-OCI marker \
-             (every entry carries its own blob digest)"
-        );
-    }
-
-    #[tokio::test]
-    async fn build_oci_chunk_index_returns_none_for_non_chunked_image() {
-        let c = cached_image_skeleton();
-        assert!(c.build_oci_chunk_index().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn build_oci_chunk_index_addresses_each_chunk_by_its_own_digest() {
-        // ADR 0036: every bootstrap entry carries its chunk's own
-        // blob digest; the index maps hash → (that digest, length).
-        let tmp = tempfile::tempdir().unwrap();
-        let bs_path = tmp.path().join("bootstrap.disk.json");
-        let h0 = engram_chunk_store::ChunkHash::of(b"chunk-zero");
-        let h1 = engram_chunk_store::ChunkHash::of(b"chunk-one");
-        let bootstrap = engram_chunk_store::Bootstrap {
-            schema_version: engram_chunk_store::BOOTSTRAP_SCHEMA_VERSION,
-            kind: engram_chunk_store::ManifestKind::Disk,
-            total_bytes: 32,
-            chunk_size: engram_chunk_store::manifest::ChunkSize::bytes(16),
-            entries: vec![
-                engram_chunk_store::BootstrapEntry {
-                    file_offset: 0,
-                    blob_digest: Some(format!("sha256:{}", h0.to_hex())),
-                    blob_offset: 0,
-                    length: 16,
-                    sha256: h0,
-                },
-                engram_chunk_store::BootstrapEntry {
-                    file_offset: 16,
-                    blob_digest: Some(format!("sha256:{}", h1.to_hex())),
-                    blob_offset: 0,
-                    length: 16,
-                    sha256: h1,
-                },
-            ],
-        };
-        fs::write(&bs_path, serde_json::to_vec(&bootstrap).unwrap())
-            .await
-            .unwrap();
-
-        let mut c = cached_image_skeleton();
-        c.disk_bootstrap_path = Some(bs_path);
-
-        let index = c
-            .build_oci_chunk_index()
-            .await
-            .unwrap()
-            .expect("chunked image yields an index");
-        assert_eq!(index.len(), 2);
-
-        for h in [h0, h1] {
-            let loc = index.get(&h).expect("chunk in index");
-            assert_eq!(loc.blob_digest, format!("sha256:{}", h.to_hex()));
-            assert_eq!(loc.length, 16);
-        }
-    }
-
-    #[tokio::test]
-    async fn build_oci_chunk_index_rejects_v1_monolithic_bootstrap() {
-        // Pre-ADR-0036 bootstraps (entries without per-chunk
-        // digests) must be rejected with a "re-bake" error, not
-        // silently mis-indexed.
-        let tmp = tempfile::tempdir().unwrap();
-        let bs_path = tmp.path().join("bootstrap.disk.json");
-        let h = engram_chunk_store::ChunkHash::of(b"legacy");
-        let bootstrap = engram_chunk_store::Bootstrap {
-            schema_version: 1,
-            kind: engram_chunk_store::ManifestKind::Disk,
-            total_bytes: 16,
-            chunk_size: engram_chunk_store::manifest::ChunkSize::bytes(16),
-            entries: vec![engram_chunk_store::BootstrapEntry {
-                file_offset: 0,
-                blob_digest: None,
-                blob_offset: 0,
-                length: 16,
-                sha256: h,
-            }],
-        };
-        fs::write(&bs_path, serde_json::to_vec(&bootstrap).unwrap())
-            .await
-            .unwrap();
-
-        let mut c = cached_image_skeleton();
-        c.disk_bootstrap_path = Some(bs_path);
-
-        let err = c.build_oci_chunk_index().await.unwrap_err();
-        match err {
-            CacheError::Bundle(msg) => {
-                assert!(msg.contains("re-bake"), "got: {msg}");
-            }
-            other => panic!("expected Bundle error, got {other:?}"),
-        }
     }
 
     #[tokio::test]

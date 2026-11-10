@@ -3,7 +3,7 @@ name: engram-host-fleet
 description: |
   Engram Firecracker host fleet for Kubernetes (ADR 0044). Runs the
   engram-host-agent as a privileged DaemonSet — one pod per KVM /
-  nested-virt node — that owns /dev/kvm, /dev/nbdN, taps and iptables
+  nested-virt node — that owns /dev/kvm, the thin pool, taps and iptables
   and fans out N Firecracker microVMs as children (K8s schedules the
   daemon, NOT the sessions; the coordinator schedules sessions itself).
   A node-prep init container handles the host-OS setup (kernel modules,

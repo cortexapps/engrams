@@ -17,9 +17,7 @@ use engram_core::types::sandbox::{
 };
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
-use engram_sandbox_firecracker::{
-    FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
-};
+use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use futures::StreamExt;
 
 mod common;
@@ -39,11 +37,9 @@ struct HostStack {
 fn build_host(
     label: &str,
     kernel: &Path,
-    handler: &Path,
     blob_root: &Path,
     bundle_dir: &Path,
     chunk_store: &engram_chunk_store::ChunkStore,
-    devices: Vec<PathBuf>,
 ) -> (Arc<PooledBackend>, tempfile::TempDir) {
     let work = tempfile::Builder::new()
         .prefix(&format!("drainwave-{label}-"))
@@ -56,9 +52,7 @@ fn build_host(
     cfg.net_pool = None;
     // ADR 0080: both hosts stage the same agentd bundle dir (the fleet mirror).
     cfg.bundle_dir = bundle_dir.to_path_buf();
-    cfg.restore_mode = RestoreMode::File;
-    cfg.uffd_handler_bin = handler.to_path_buf();
-    cfg.uffd_blob_root = Some(blob_root.to_path_buf());
+    common::resume_through_uffd(&mut cfg, blob_root);
     cfg.uffd_cache_root = Some(work.path().join("chunk-cache"));
     cfg.track_dirty_pages = true;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
@@ -67,11 +61,8 @@ fn build_host(
         engram_chunk_store::cache::ChunkCacheConfig::new(work.path().join("chunk-cache"));
     cache_cfg.budget_bytes = 1024 * 1024 * 1024;
     let pooled = PooledBackend::new(inner)
-        .with_nbd_pool(
-            engram_host_agent::disk_daemon::NbdSlotAllocator::from_paths(devices)
-                .expect("nbd slot pool"),
-        )
-        .with_chunk_store(chunk_store.clone(), work.path().join("materialize"))
+        .with_chunk_store(chunk_store.clone())
+        .with_session_volumes(common::session_volumes(work.path(), chunk_store))
         .with_chunk_cache(engram_chunk_store::ChunkCache::new(cache_cfg))
         .with_checkpoint_dir(work.path().join("checkpoints"));
     (Arc::new(pooled), work)
@@ -91,7 +82,6 @@ async fn serve(pooled: Arc<PooledBackend>) -> HostStack {
         let _ = engram_host_agent::grpc_server::boot(
             addr,
             inner,
-            None,
             engram_host_agent::session_epochs::ephemeral(),
             None,
         )
@@ -134,7 +124,7 @@ fn heartbeat_argv() -> Vec<String> {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN + four NBD devices"]
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN"]
 async fn drain_wave_teleports_every_session_off_host_a() {
     if std::env::var("ENGRAM_INTEG_TWO_HOSTS")
         .map(|v| v == "0")
@@ -143,10 +133,10 @@ async fn drain_wave_teleports_every_session_off_host_a() {
         eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
         return;
     }
-    let Some(devices) = common::postcopy::nbd_devices(2 * SESSIONS) else {
+    if common::postcopy::fork_gate().is_none() {
         return;
-    };
-    let Some((kernel, handler, agent, busybox)) = gate() else {
+    }
+    let Some((kernel, agent, busybox)) = gate() else {
         return;
     };
     // Low-disk hosts (the dev VM at >90% used) trip the cache's
@@ -182,24 +172,10 @@ async fn drain_wave_teleports_every_session_off_host_a() {
     // ADR 0080: one staged agentd bundle dir shared by both hosts (the
     // fleet stages identical generations).
     let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
-    let (pooled_a, _work_a) = build_host(
-        "a",
-        &kernel,
-        &handler,
-        &blob_root,
-        &staged.bundle_dir,
-        &chunk_store,
-        devices.iter().step_by(2).cloned().collect(),
-    );
-    let (pooled_b, _work_b) = build_host(
-        "b",
-        &kernel,
-        &handler,
-        &blob_root,
-        &staged.bundle_dir,
-        &chunk_store,
-        devices.iter().skip(1).step_by(2).cloned().collect(),
-    );
+    let (pooled_a, _work_a) =
+        build_host("a", &kernel, &blob_root, &staged.bundle_dir, &chunk_store);
+    let (pooled_b, _work_b) =
+        build_host("b", &kernel, &blob_root, &staged.bundle_dir, &chunk_store);
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
     let client_a = dial(host_a.addr).await;
@@ -220,13 +196,7 @@ async fn drain_wave_teleports_every_session_off_host_a() {
         image: "engram-drain-wave".into(),
         rootfs_source: None,
         image_uri: None,
-        // The chunked disk manifest: an NBD-served root is what presetup
-        // requires (the disk half of post-copy is the NBD seal).
-        rootfs_manifest: Some(
-            outcome
-                .disk_manifest
-                .expect("ext4 bake produces a chunked disk manifest"),
-        ),
+        rootfs_manifest: Some(common::fork_lineage(&chunk_store, outcome.disk_manifest).await),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },
@@ -428,7 +398,7 @@ async fn drain_wave_teleports_every_session_off_host_a() {
     host_b.peer.abort();
 }
 
-fn gate() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
+fn gate() -> Option<(PathBuf, PathBuf, PathBuf)> {
     let kernel = match std::env::var("FC_TEST_KERNEL") {
         Ok(p) => PathBuf::from(p),
         Err(_) => {
@@ -460,12 +430,7 @@ fn gate() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
         eprintln!("SKIP: musl engram-agentd not built at {}", agent.display());
         return None;
     }
-    let handler = Path::new(&manifest_dir).join("../../target/debug/engram-uffd-handler");
-    if !handler.exists() {
-        eprintln!("SKIP: engram-uffd-handler not built");
-        return None;
-    }
-    Some((kernel, handler, agent, busybox))
+    Some((kernel, agent, busybox))
 }
 
 async fn exec(backend: &Arc<PooledBackend>, id: engram_core::SandboxId, cmd: &str) -> String {

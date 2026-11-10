@@ -65,3 +65,22 @@ app.kubernetes.io/name: {{ .Chart.Name }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: operator
 {{- end -}}
+
+{{/*
+ADR 0126: the coordinator's app-gRPC address for the upgrade hooks: the
+explicit value, else the operator's, else the host of coordinator.endpoint
+on the app-gRPC port. Empty when the host-agents register nowhere.
+*/}}
+{{- define "hostfleet.upgrade.coordinatorUrl" -}}
+{{- if .Values.upgradeDrain.coordinatorUrl -}}
+{{ .Values.upgradeDrain.coordinatorUrl }}
+{{- else if .Values.operator.coordinatorUrl -}}
+{{ .Values.operator.coordinatorUrl }}
+{{- else if .Values.coordinator.endpoint -}}
+http://{{ (urlParse .Values.coordinator.endpoint).hostname }}:{{ .Values.upgradeDrain.coordinatorGrpcPort }}
+{{- end -}}
+{{- end -}}
+
+{{- define "hostfleet.upgrade.fullname" -}}
+{{- printf "%s-upgrade" (include "hostfleet.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}

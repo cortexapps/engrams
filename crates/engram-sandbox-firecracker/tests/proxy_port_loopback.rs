@@ -165,7 +165,11 @@ async fn port_relay_reaches_guest_loopback_without_hol_blocking() {
         swap_source: None,
         swap_manifest: None,
     };
-    let sandbox_id = backend.create(spec).await.expect("create sandbox");
+    let sandbox_id = SandboxId::new();
+    backend
+        .create(sandbox_id, spec)
+        .await
+        .expect("create sandbox");
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
 
     // ---- 3. Start two concurrent loopback servers inside the guest. ----

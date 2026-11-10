@@ -1027,7 +1027,6 @@ async fn host_fc_snapshot_version(ctx: &Ctx) {
 async fn queue_fifo(ctx: &Ctx) {
     let meta = &ctx.meta;
     let enqueue = |sid: SessionId| engram_core::traits::metadata::SessionCreateWriteSet {
-        nbd_slot_need: 1,
         session_id: sid,
         spec: spec("conf:q"),
         mem_budget_mib: 1024,
@@ -1509,6 +1508,61 @@ async fn dead_host_lease(ctx: &Ctx) {
         .unwrap());
 }
 
+/// A fixed-cadence wait requeues like a backoff and gives back the
+/// attempt the claim counted; a stale epoch writes nothing.
+async fn op_requeue_wait_refunds_the_attempt(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let sid = meta.create_session(spec("conf:ops-wait")).await.unwrap();
+    let EnqueueOutcome::Claimed(op) = meta
+        .op_enqueue_and_claim(sid, OpKind::Teleport, serde_json::json!({}), None, "pod-a")
+        .await
+        .unwrap()
+    else {
+        panic!("first op must be Claimed")
+    };
+    assert_eq!(op.attempts, 1);
+    let epoch = op.epoch.unwrap();
+    assert!(!meta
+        .op_requeue_wait(op.id, epoch + 99, Duration::from_secs(1), "wait")
+        .await
+        .unwrap());
+    for _ in 0..3 {
+        let claimed = meta.op_get(op.id).await.unwrap().expect("op row");
+        assert_eq!(claimed.state, OpState::Running);
+        assert!(meta
+            .op_requeue_wait(
+                op.id,
+                claimed.epoch.unwrap(),
+                Duration::from_secs(1),
+                "wait"
+            )
+            .await
+            .unwrap());
+        let queued = meta.op_get(op.id).await.unwrap().expect("op row");
+        assert_eq!(queued.state, OpState::Queued);
+        assert_eq!(queued.attempts, 0, "the wait spends no attempt");
+        assert!(meta.op_claim_head(sid, "pod-a").await.unwrap().is_none());
+        ctx.clock.advance(Duration::from_secs(2));
+        let again = meta
+            .op_claim_head(sid, "pod-a")
+            .await
+            .unwrap()
+            .expect("due after the wait");
+        assert_eq!(again.attempts, 1);
+    }
+    let claimed = meta.op_get(op.id).await.unwrap().expect("op row");
+    assert!(meta
+        .op_requeue_with_backoff(op.id, claimed.epoch.unwrap(), Duration::ZERO, "transient")
+        .await
+        .unwrap());
+    let again = meta
+        .op_claim_head(sid, "pod-a")
+        .await
+        .unwrap()
+        .expect("due");
+    assert_eq!(again.attempts, 2, "a failure keeps its attempt");
+}
+
 /// The op pipeline: claim epochs fence writes; requeue backoff gates
 /// due-ness on the clock; reclaim bumps the epoch and fences out the
 /// stalled claimant.
@@ -1602,6 +1656,65 @@ async fn ops_pipeline(ctx: &Ctx) {
         .op_heartbeat(op2.id, op2c.epoch.unwrap())
         .await
         .unwrap());
+}
+
+/// The terminal op writes report whether they ended a row:
+/// `op_cancel_queued` ends every queued op of the kind and no running
+/// one; `op_cancel_by_id` ends only a queued row; `op_finish` ends only
+/// a running row at its epoch.
+async fn op_terminal_writes(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let sid = meta.create_session(spec("conf:op-terminal")).await.unwrap();
+    let EnqueueOutcome::Claimed(running) = meta
+        .op_enqueue_and_claim(sid, OpKind::Evict, serde_json::json!({}), None, "pod-a")
+        .await
+        .unwrap()
+    else {
+        panic!("first op must be Claimed")
+    };
+    let mut queued = Vec::new();
+    for kind in [OpKind::Evict, OpKind::Evict, OpKind::Resume] {
+        match meta
+            .op_enqueue_and_claim(sid, kind, serde_json::json!({}), None, "pod-a")
+            .await
+            .unwrap()
+        {
+            EnqueueOutcome::Queued(op) => queued.push(op),
+            other => panic!("ops behind a running op must queue, got {other:?}"),
+        }
+    }
+
+    assert!(meta.op_cancel_queued(sid, OpKind::Evict).await.unwrap());
+    assert!(
+        !meta.op_cancel_queued(sid, OpKind::Evict).await.unwrap(),
+        "nothing queued of the kind is left to cancel",
+    );
+    for op in &queued[..2] {
+        let row = meta.op_get(op.id).await.unwrap().unwrap();
+        assert_eq!(row.state, OpState::Cancelled);
+    }
+    let row = meta.op_get(running.id).await.unwrap().unwrap();
+    assert_eq!(row.state, OpState::Running, "a running op is not cancelled");
+
+    assert!(!meta.op_cancel_by_id(running.id).await.unwrap());
+    assert!(meta.op_cancel_by_id(queued[2].id).await.unwrap());
+    assert!(!meta.op_cancel_by_id(queued[2].id).await.unwrap());
+
+    let epoch = running.epoch.unwrap();
+    assert!(meta
+        .op_finish(running.id, epoch, OpState::Failed, Some("conf"))
+        .await
+        .unwrap());
+    assert!(
+        !meta
+            .op_finish(running.id, epoch, OpState::Done, None)
+            .await
+            .unwrap(),
+        "a finished op is not finished again",
+    );
+    let row = meta.op_get(running.id).await.unwrap().unwrap();
+    assert_eq!(row.state, OpState::Failed);
+    assert_eq!(row.error.as_deref(), Some("conf"));
 }
 
 /// Issue #1314: `op_resume_failure_streak` counts terminally-failed
@@ -2695,9 +2808,6 @@ async fn host_lifecycle(ctx: &Ctx) {
         .await
         .unwrap();
     let util = engram_core::types::host::HostUtilization {
-        nbd_slots_total: 0,
-        nbd_slots_in_use: 0,
-        nbd_sandboxes: Default::default(),
         disk_total_mib: 400_000,
         disk_used_mib: 100_000,
         ..Default::default()
@@ -2810,7 +2920,7 @@ async fn placement_no_fit(ctx: &Ctx) {
         .await
         .unwrap();
     let unmeasured = meta
-        .placement_no_fit_details(&[ready], 4096, 2, 1)
+        .placement_no_fit_details(&[ready], 4096, 2)
         .await
         .unwrap();
     assert_eq!(unmeasured[0].reason, "unmeasured");
@@ -2831,7 +2941,7 @@ async fn placement_no_fit(ctx: &Ctx) {
     .unwrap();
 
     let details = meta
-        .placement_no_fit_details(&[ready, cordoned, unknown], 4096, 2, 1)
+        .placement_no_fit_details(&[ready, cordoned, unknown], 4096, 2)
         .await
         .unwrap();
     assert_eq!(details.len(), 3);
@@ -2844,7 +2954,7 @@ async fn placement_no_fit(ctx: &Ctx) {
 
     // Over-budget asks classify against the binding dimension.
     let details = meta
-        .placement_no_fit_details(&[ready], 16_384, 2, 1)
+        .placement_no_fit_details(&[ready], 16_384, 2)
         .await
         .unwrap();
     assert_eq!(details[0].reason, "ram_full");
@@ -2853,165 +2963,140 @@ async fn placement_no_fit(ctx: &Ctx) {
     // 8 still fits. Both stores must share the overcommit arithmetic
     // (the conformance suite caught SimMeta using raw vcpus).
     let details = meta
-        .placement_no_fit_details(&[ready], 4096, 8, 1)
+        .placement_no_fit_details(&[ready], 4096, 8)
         .await
         .unwrap();
     assert_eq!(details[0].reason, "fits_now");
     let details = meta
-        .placement_no_fit_details(&[ready], 4096, 17, 1)
+        .placement_no_fit_details(&[ready], 4096, 17)
         .await
         .unwrap();
     assert_eq!(details[0].reason, "cpu_full");
 }
 
-/// Register-time rehydrate list (`list_resident_sandboxes_on_host_
-/// with_disk_manifest`): every VM-resident state with a bound sandbox
-/// is returned — a rung-parked `Evicting` session included (session
-/// 731df805, 2026-07-17: filtering on `status = 'active'` orphaned the
-/// parked survivor's NBD device across a host-agent pod roll) — with
-/// the effective disk manifest resolved as newer-of(live, latest
-/// recoverable snapshot): same manifest_id → max(version), different
-/// id → snapshot wins, non-recoverable snapshots invisible.
-async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
-    use engram_core::types::manifest::ManifestRef;
+/// A host that measures its RAM but reports no cores places a session
+/// that asks for CPU: an unreported core count is no CPU gate.
+async fn a_host_without_reported_cores_has_no_cpu_gate(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let now = ctx.clock.now_utc();
+    let host = HostId::new();
+    meta.upsert_host(host_record(host, "conf-no-cores", now))
+        .await
+        .unwrap();
+    let mut hb = heartbeat_fixture();
+    hb.utilization =
+        serde_json::from_value(serde_json::json!({"allocatable_mib": 8192})).expect("utilization");
+    hb.total_vcpus = 0;
+    meta.touch_host_heartbeat(host, hb).await.unwrap();
 
+    let details = meta
+        .placement_no_fit_details(&[host], 4096, 2)
+        .await
+        .unwrap();
+    assert_eq!(details[0].reason, "fits_now");
+    let placed = meta
+        .reserve_and_persist_create(
+            engram_core::traits::metadata::SessionCreateWriteSet {
+                session_id: SessionId::new(),
+                spec: spec("conf:no-cores"),
+                mem_budget_mib: 4096,
+                cpu_budget_vcpus: 2,
+                sealed_secrets: None,
+                capabilities: Vec::new(),
+                integration_policy_json: None,
+                runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(
+                    Vec::new(),
+                    None,
+                    None,
+                    Vec::new(),
+                ),
+                oauth_binding: None,
+            },
+            &[host],
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        placed,
+        engram_core::traits::metadata::CreateDisposition::Placed(_)
+    ));
+}
+
+/// The register-time rehydrate list and the reconcile assignment list are
+/// one listing: every VM-resident state with a bound sandbox on the host.
+/// A rung-parked `Evicting` survivor and a `Created` survivor are as
+/// resident as an `Active` one; an `Idle` row and a row on another host
+/// are not.
+async fn resident_sandbox_assignments_state_matrix(ctx: &Ctx) {
     let meta = &ctx.meta;
     let now = ctx.clock.now_utc();
     let host = HostId::new();
     let other_host = HostId::new();
-    meta.upsert_host(host_record(host, "conf-rehydrate-h1", now))
+    meta.upsert_host(host_record(host, "conf-resident-h1", now))
         .await
         .unwrap();
-    meta.upsert_host(host_record(other_host, "conf-rehydrate-h2", now))
+    meta.upsert_host(host_record(other_host, "conf-resident-h2", now))
         .await
         .unwrap();
-
-    let mref = |manifest_id: uuid::Uuid, version: u64| ManifestRef {
-        manifest_id,
-        version,
-    };
-    let snap_with = |sid, at, recoverable, manifest: Option<ManifestRef>| {
-        let mut s = snapshot(SnapshotId::new(), sid, at, recoverable);
-        s.disk_manifest = manifest;
-        s
-    };
     let bind = |sid, h| async move {
         meta.assign_session_host(sid, Some(h)).await.unwrap();
         let sb = engram_core::SandboxId::new();
-        // 0108: the production fused Pending→Created bind.
         meta.transition_session_created(sid, sb).await.unwrap();
         sb
     };
+    let activate = |sid| async move {
+        meta.transition_session(sid, SessionState::Active, BindingDisposition::Retain)
+            .await
+            .unwrap();
+    };
 
-    let m_a = uuid::Uuid::from_u128(0xA);
-    let m_b = uuid::Uuid::from_u128(0xB);
-    let m_c = uuid::Uuid::from_u128(0xC);
-    let m_d = uuid::Uuid::from_u128(0xD);
-    let m_e = uuid::Uuid::from_u128(0xE);
-    let m_f = uuid::Uuid::from_u128(0xF);
-    let m_g = uuid::Uuid::from_u128(0x10);
-
-    // Active + sandbox: live A@5 vs recoverable snap A@3 → same id,
-    // live is newer → A@5.
     let s_active = meta
-        .create_session(spec("conf:rehydrate-active"))
+        .create_session(spec("conf:resident-active"))
         .await
         .unwrap();
     let sb_active = bind(s_active, host).await;
-    meta.transition_session(s_active, SessionState::Active, BindingDisposition::Retain)
-        .await
-        .unwrap();
-    meta.update_live_disk_manifest(s_active, sb_active, mref(m_a, 5))
-        .await
-        .unwrap();
-    assert!(meta
-        .record_snapshot(snap_with(s_active, now, true, Some(mref(m_a, 3))))
-        .await
-        .unwrap());
+    activate(s_active).await;
 
-    // THE regression case — rung-parked survivor: Evicting + sandbox
-    // still bound. Live B@2; two recoverable snapshots, the NEWEST
-    // (D@1) must win over both the older snap (C@9) and the live ref
-    // (different manifest_id → snapshot wins).
-    let s_parked = meta
-        .create_session(spec("conf:rehydrate-parked"))
+    let s_evicting = meta
+        .create_session(spec("conf:resident-evicting"))
         .await
         .unwrap();
-    let sb_parked = bind(s_parked, host).await;
-    meta.transition_session(s_parked, SessionState::Active, BindingDisposition::Retain)
-        .await
-        .unwrap();
-    meta.update_live_disk_manifest(s_parked, sb_parked, mref(m_b, 2))
-        .await
-        .unwrap();
-    assert!(meta
-        .record_snapshot(snap_with(s_parked, now, true, Some(mref(m_c, 9))))
-        .await
-        .unwrap());
-    ctx.clock.advance(Duration::from_secs(10));
-    let later = ctx.clock.now_utc();
-    assert!(meta
-        .record_snapshot(snap_with(s_parked, later, true, Some(mref(m_d, 1))))
-        .await
-        .unwrap());
-    meta.transition_session(s_parked, SessionState::Evicting, BindingDisposition::Retain)
-        .await
-        .unwrap();
-
-    // ADR 0101 C — a session at the `parked` STATUS (paused in place,
-    // sandbox bound). THE 2026-07-21 regression (session 61a03b7e): the
-    // hand-rolled SQL status list missed 'parked', the parked survivor
-    // vanished from the register-time rehydrate list after a host-agent
-    // roll, and the quarantine ladder destroyed its healthy paused VM
-    // (93 events rewound). Live G@3, no snapshots → G@3.
-    let s_c_parked = meta
-        .create_session(spec("conf:rehydrate-parked-status"))
-        .await
-        .unwrap();
-    let sb_c_parked = bind(s_c_parked, host).await;
-    meta.transition_session(s_c_parked, SessionState::Active, BindingDisposition::Retain)
-        .await
-        .unwrap();
-    meta.update_live_disk_manifest(s_c_parked, sb_c_parked, mref(m_g, 3))
-        .await
-        .unwrap();
+    let sb_evicting = bind(s_evicting, host).await;
+    activate(s_evicting).await;
     meta.transition_session(
-        s_c_parked,
+        s_evicting,
         SessionState::Evicting,
         BindingDisposition::Retain,
     )
     .await
     .unwrap();
-    meta.transition_session(s_c_parked, SessionState::Parked, BindingDisposition::Retain)
+
+    let s_parked = meta
+        .create_session(spec("conf:resident-parked"))
+        .await
+        .unwrap();
+    let sb_parked = bind(s_parked, host).await;
+    activate(s_parked).await;
+    meta.transition_session(s_parked, SessionState::Evicting, BindingDisposition::Retain)
+        .await
+        .unwrap();
+    meta.transition_session(s_parked, SessionState::Parked, BindingDisposition::Retain)
         .await
         .unwrap();
 
-    // Created + sandbox (VM resident, agent not yet started): no live
-    // manifest; one recoverable snap E@1; a NEWER but non-recoverable
-    // F@7 must be invisible → E@1.
     let s_created = meta
-        .create_session(spec("conf:rehydrate-created"))
+        .create_session(spec("conf:resident-created"))
         .await
         .unwrap();
     let sb_created = bind(s_created, host).await;
-    assert!(meta
-        .record_snapshot(snap_with(s_created, now, true, Some(mref(m_e, 1))))
-        .await
-        .unwrap());
-    assert!(meta
-        .record_snapshot(snap_with(s_created, later, false, Some(mref(m_f, 7))))
-        .await
-        .unwrap());
 
-    // Idle (evicted; sandbox unbound) → excluded.
     let s_idle = meta
-        .create_session(spec("conf:rehydrate-idle"))
+        .create_session(spec("conf:resident-idle"))
         .await
         .unwrap();
     bind(s_idle, host).await;
-    meta.transition_session(s_idle, SessionState::Active, BindingDisposition::Retain)
-        .await
-        .unwrap();
+    activate(s_idle).await;
     meta.transition_session(s_idle, SessionState::Idle, BindingDisposition::Detach)
         .await
         .unwrap();
@@ -3019,30 +3104,23 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
         .await
         .unwrap();
 
-    // Active on ANOTHER host → excluded from this host's list.
     let s_elsewhere = meta
-        .create_session(spec("conf:rehydrate-elsewhere"))
+        .create_session(spec("conf:resident-elsewhere"))
         .await
         .unwrap();
     bind(s_elsewhere, other_host).await;
-    meta.transition_session(
-        s_elsewhere,
-        SessionState::Active,
-        BindingDisposition::Retain,
-    )
-    .await
-    .unwrap();
+    activate(s_elsewhere).await;
 
     let mut rows = meta
-        .list_resident_sandboxes_on_host_with_disk_manifest(host)
+        .list_resident_sandbox_assignments_on_host(host)
         .await
         .unwrap();
     rows.sort_by_key(|(sid, _, _)| *sid);
     let mut expected = vec![
-        (s_active, sb_active, Some(mref(m_a, 5))),
-        (s_parked, sb_parked, Some(mref(m_d, 1))),
-        (s_c_parked, sb_c_parked, Some(mref(m_g, 3))),
-        (s_created, sb_created, Some(mref(m_e, 1))),
+        (s_active, sb_active, SessionState::Active),
+        (s_evicting, sb_evicting, SessionState::Evicting),
+        (s_parked, sb_parked, SessionState::Parked),
+        (s_created, sb_created, SessionState::Created),
     ];
     expected.sort_by_key(|(sid, _, _)| *sid);
     assert_eq!(rows, expected);
@@ -3115,10 +3193,9 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
     );
 
     // A parked VM is RESIDENT: paused in place, sandbox bound, memory
-    // held. Every residency-derived surface must see it (the 2026-07-21
-    // 61a03b7e incident: the PG literal lists missed 'parked', so the
-    // parked survivor was invisible to the register-time rehydrate list
-    // and its paused VM was destroyed after a host-agent roll).
+    // held. Every residency-derived surface must see it. A status list that
+    // misses `parked` hides the VM from the register-time rehydrate list,
+    // and a host-agent roll then destroys the paused VM.
     assert!(
         meta.list_active_sessions()
             .await
@@ -3126,14 +3203,6 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
             .iter()
             .any(|s| s.id == sid),
         "a parked session is in the non-terminal (active) set"
-    );
-    assert!(
-        meta.list_resident_sandboxes_on_host_with_disk_manifest(host)
-            .await
-            .unwrap()
-            .iter()
-            .any(|(s, sb2, _)| *s == sid && *sb2 == sb),
-        "a parked survivor is in the register-time rehydrate list"
     );
     assert!(
         meta.per_host_reserved().await.unwrap().contains_key(&host),
@@ -4065,6 +4134,10 @@ conformance!(
     t_parked_lifecycle_and_eviction_settle,
     super::parked_lifecycle_and_eviction_settle
 );
+conformance!(
+    t_resident_sandbox_assignments_state_matrix,
+    super::resident_sandbox_assignments_state_matrix
+);
 conformance!(t_session_lifecycle, super::session_lifecycle);
 conformance!(
     t_binding_disposition_contract,
@@ -4099,6 +4172,11 @@ conformance!(t_dead_host_lease, super::dead_host_lease);
 conformance!(t_host_binding_lease, super::host_binding_lease);
 conformance!(t_sandbox_tombstones, super::sandbox_tombstones);
 conformance!(t_ops_pipeline, super::ops_pipeline);
+conformance!(
+    t_op_requeue_wait_refunds_the_attempt,
+    super::op_requeue_wait_refunds_the_attempt
+);
+conformance!(t_op_terminal_writes, super::op_terminal_writes);
 conformance!(t_op_resume_failure_streak, super::op_resume_failure_streak);
 conformance!(
     t_op_wake_queued_kind_counts_due_ops,
@@ -4130,10 +4208,6 @@ conformance!(
 conformance!(t_chunk_gc_sweep_lease, super::chunk_gc_sweep_lease);
 conformance!(t_host_lifecycle, super::host_lifecycle);
 conformance!(t_bundle_pin_set_union, super::bundle_pin_set_union);
-conformance!(
-    t_resident_sandboxes_rehydrate_list,
-    super::resident_sandboxes_rehydrate_list
-);
 
 /// Issue #722 (R3): the reservation predicate is UNCONDITIONAL — a
 /// `pending` pinned to a host holds its budget (visible through
@@ -4158,7 +4232,6 @@ async fn stale_pending_reservation(ctx: &Ctx) {
     // A placed pending with a queued create_boot op.
     let with_op = SessionId::new();
     let ws = |sid: SessionId| engram_core::traits::metadata::SessionCreateWriteSet {
-        nbd_slot_need: 1,
         session_id: sid,
         spec: spec("conf:722"),
         mem_budget_mib: 2048,
@@ -4213,10 +4286,7 @@ async fn stale_pending_reservation(ctx: &Ctx) {
     ));
 
     // Both reserve — 8192 - 2*2048 = 4096 free.
-    let details = meta
-        .placement_no_fit_details(&[host], 1, 1, 1)
-        .await
-        .unwrap();
+    let details = meta.placement_no_fit_details(&[host], 1, 1).await.unwrap();
     assert_eq!(details[0].free_mib, 4096);
 
     // R3 (#722): cross the old 10-minute horizon. BOTH pendings STILL
@@ -4228,10 +4298,7 @@ async fn stale_pending_reservation(ctx: &Ctx) {
     // by a real `pending → failed` transition (the sole reclaimer), never
     // a placement-side write-off.
     ctx.clock.advance(Duration::from_secs(11 * 60));
-    let details = meta
-        .placement_no_fit_details(&[host], 1, 1, 1)
-        .await
-        .unwrap();
+    let details = meta.placement_no_fit_details(&[host], 1, 1).await.unwrap();
     assert_eq!(
         details[0].free_mib, 4096,
         "R3 #722: a pending reserves unconditionally — neither the live-op \
@@ -4297,9 +4364,78 @@ async fn enabled_image_config_update(ctx: &Ctx) {
     );
 }
 
+/// `capturing_disk_manifests` is the distinct disk manifests of the
+/// in-flight capture jobs; a finished job leaves the set, and a row that
+/// does not parse fails the read.
+async fn capturing_disk_manifests_in_flight(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let now = ctx.clock.now_utc();
+    let host = HostId::from(uuid::Uuid::from_u128(0xca9));
+    meta.upsert_host(host_record(host, "capturing-host", now))
+        .await
+        .unwrap();
+    let config = ImageConfig::default();
+    let disk = |n: u128, v: u64| engram_core::types::manifest::ManifestRef {
+        manifest_id: uuid::Uuid::from_u128(n),
+        version: v,
+    };
+    let mut jobs = Vec::new();
+    for (name, manifest) in [
+        ("a", disk(2, 1)),
+        ("b", disk(1, 3)),
+        ("c", disk(2, 1)),
+        ("done", disk(9, 9)),
+    ] {
+        let parent = meta
+            .create_or_get_enable_job(&format!("conf:capturing:{name}"), None, &config)
+            .await
+            .unwrap()
+            .id;
+        let mut row = new_capture(parent);
+        row.disk_manifest = manifest.to_string();
+        jobs.push(meta.insert_capture_job(row).await.unwrap());
+    }
+    let done = meta
+        .place_capture_job(jobs[3].id, &[host])
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(meta
+        .record_capture_job_report(&CaptureJobReport {
+            job_id: done.id,
+            epoch: done.epoch,
+            stage: CaptureJobStage::Done,
+            progress: None,
+            fc_snapshot_version: None,
+            terminal: Some(CaptureTerminalReport::Done {
+                result_bincode: bincode::serialize(&capture_result_fixture()).unwrap(),
+            }),
+        })
+        .await
+        .unwrap());
+
+    let mut capturing = meta.capturing_disk_manifests().await.unwrap();
+    capturing.sort_by_key(|r| (r.manifest_id, r.version));
+    assert_eq!(capturing, vec![disk(1, 3), disk(2, 1)]);
+
+    let parent = meta
+        .create_or_get_enable_job("conf:capturing:bad", None, &config)
+        .await
+        .unwrap()
+        .id;
+    let mut bad = new_capture(parent);
+    bad.disk_manifest = "not-a-manifest".into();
+    meta.insert_capture_job(bad).await.unwrap();
+    assert!(matches!(
+        meta.capturing_disk_manifests().await,
+        Err(MetaError::Serialization(_))
+    ));
+}
+
 /// The enable/capture read surface over a store with no such jobs:
-/// `live_enable_work_by_host` is the empty map, while `list_prestaging_refs`
-/// and `capture_assignments_for_host` are empty — and registering or
+/// `live_enable_work_by_host` is the empty map, while
+/// `list_prestaging_refs`, `capturing_disk_manifests` and
+/// `capture_assignments_for_host` are empty — and registering or
 /// heartbeating a host fabricates none of them. (The sim models no
 /// enable_jobs/capture_jobs table; a fresh PG DB has no such rows — both
 /// stores agree on the empty case, the only one conformance exercises.)
@@ -4311,6 +4447,7 @@ async fn live_enable_work_empty(ctx: &Ctx) {
         .unwrap()
         .is_empty());
     assert!(meta.list_prestaging_refs().await.unwrap().is_empty());
+    assert!(meta.capturing_disk_manifests().await.unwrap().is_empty());
     let host = HostId::new();
     let now = ctx.clock.now_utc();
     assert!(meta
@@ -5229,10 +5366,9 @@ async fn artifact_outlives_sessions(ctx: &Ctx) {
     assert_eq!(ctx.meta.artifact_usage(ghost).await.unwrap(), (1, 7));
 }
 
-/// Prod 2026-08-03 (session aa0829b0, 12 sessions/14d): a prompt sent
-/// to an idle session was appended before the un-park resume ran its
-/// rung-1 rewind, and the rewind tombstoned the user's own message —
-/// surfacing as a spurious `recovered_from_checkpoint{checkpoint_lag,
+/// A prompt sent to an idle session can append before the un-park resume
+/// runs its rung-1 rewind. A rewind that tombstones the user's own message
+/// surfaces as a spurious `recovered_from_checkpoint{checkpoint_lag,
 /// rolled_back: 1}`. The positive-provenance predicate makes user
 /// input un-tombstoneable by construction: the race is benign at every
 /// interleaving, and a clean idle resume (nothing but input past the
@@ -5457,10 +5593,18 @@ conformance!(
 );
 conformance!(t_placement_no_fit, super::placement_no_fit);
 conformance!(
+    t_a_host_without_reported_cores_has_no_cpu_gate,
+    super::a_host_without_reported_cores_has_no_cpu_gate
+);
+conformance!(
     t_enabled_image_config_update,
     super::enabled_image_config_update
 );
 conformance!(t_live_enable_work_empty, super::live_enable_work_empty);
+conformance!(
+    t_capturing_disk_manifests_in_flight,
+    super::capturing_disk_manifests_in_flight
+);
 conformance!(t_snapshot_totals, super::snapshot_totals_aggregate);
 conformance!(
     t_stale_pending_reservation,
@@ -5832,7 +5976,6 @@ async fn teleport_reservation_arm_counts_open_rows(ctx: &Ctx) {
     let mut t = teleport_fixture(ctx, source, h).await;
     let pending = SessionId::new();
     let ws = engram_core::traits::metadata::SessionCreateWriteSet {
-        nbd_slot_need: 1,
         session_id: pending,
         spec: spec("conf:placement"),
         mem_budget_mib: 1,
@@ -5860,7 +6003,7 @@ async fn teleport_reservation_arm_counts_open_rows(ctx: &Ctx) {
         let reserved = m.per_host_reserved().await.unwrap();
         assert_eq!(reserved[&h].mem_mib, 4096);
         assert_eq!(reserved[&h].vcpus, 2);
-        let detail = m.placement_no_fit_details(&[h], 1, 1, 1).await.unwrap();
+        let detail = m.placement_no_fit_details(&[h], 1, 1).await.unwrap();
         assert_eq!(detail[0].reason, "ram_full");
         assert!(m
             .place_queued_session(pending, 1, 1, &[h], 0)
@@ -6091,27 +6234,17 @@ async fn fenced_binding_preserves_cleanup_and_strike_reset(ctx: &Ctx) {
         .unwrap();
     let first = engram_core::SandboxId::new();
     meta.transition_session_created(sid, first).await.unwrap();
-    let manifest = engram_core::types::manifest::ManifestRef::new();
-    meta.update_live_disk_manifest(sid, first, manifest)
-        .await
-        .unwrap();
-    let generation = meta.chunk_generation().await.unwrap();
     assert!(meta
         .apply_missing_sandbox_strikes(&[], &[sid], 2)
         .await
         .unwrap()
         .is_empty());
 
-    // A rejected clear must retain both the live pin and the strike streak.
+    // A rejected clear must retain the strike streak.
     assert!(matches!(
         meta.fenced_assign_sandbox(sid, 1, None, None).await,
         Err(MetaError::Conflict(_))
     ));
-    assert_eq!(
-        meta.get_session(sid).await.unwrap().live_disk_manifest,
-        Some(manifest)
-    );
-    assert_eq!(meta.chunk_generation().await.unwrap(), generation);
     assert_eq!(
         meta.apply_missing_sandbox_strikes(&[], &[sid], 2)
             .await
@@ -6119,7 +6252,7 @@ async fn fenced_binding_preserves_cleanup_and_strike_reset(ctx: &Ctx) {
         vec![sid]
     );
 
-    // A bind resets strikes, retains the manifest, and mints one epoch.
+    // A bind resets strikes and mints one epoch.
     assert!(meta
         .apply_missing_sandbox_strikes(&[], &[sid], 2)
         .await
@@ -6137,13 +6270,10 @@ async fn fenced_binding_preserves_cleanup_and_strike_reset(ctx: &Ctx) {
         .await
         .unwrap()
         .is_empty());
-    assert_eq!(
-        meta.get_session(sid).await.unwrap().live_disk_manifest,
-        Some(manifest)
-    );
-    assert_eq!(meta.chunk_generation().await.unwrap(), generation);
 
-    // A clear resets strikes and removes the live pin without minting an epoch.
+    // A clear resets strikes without minting an epoch and without touching
+    // the chunk-GC barrier: a binding is not a pin-set source.
+    let generation = meta.chunk_generation().await.unwrap();
     assert_eq!(
         meta.fenced_assign_sandbox(sid, 0, None, None)
             .await
@@ -6152,8 +6282,7 @@ async fn fenced_binding_preserves_cleanup_and_strike_reset(ctx: &Ctx) {
     );
     let session = meta.get_session(sid).await.unwrap();
     assert_eq!(session.sandbox_id, None);
-    assert_eq!(session.live_disk_manifest, None);
-    assert_eq!(meta.chunk_generation().await.unwrap(), generation + 1);
+    assert_eq!(meta.chunk_generation().await.unwrap(), generation);
     assert_eq!(meta.session_binding_generations(sid).await.unwrap().0, 2);
     assert!(meta
         .apply_missing_sandbox_strikes(&[], &[sid], 2)
@@ -6325,7 +6454,6 @@ async fn teleport_admission_fixture(
     }
     let sid = SessionId::new();
     let ws = engram_core::traits::metadata::SessionCreateWriteSet {
-        nbd_slot_need: 1,
         session_id: sid,
         spec: spec("conf:teleport-machine"),
         mem_budget_mib: 4096,
@@ -7087,225 +7215,59 @@ conformance!(
     super::capture_job_result_json_round_trip
 );
 
-// These scenarios run in the default simulator lane and the ignored PG lane.
-async fn nbd_host_placement(ctx: &Ctx) {
-    use engram_core::traits::{CreateDisposition, SessionCreateWriteSet};
+/// The session-disk pool facts a host reports round-trip through the
+/// heartbeat unchanged; placement reads them from the host row.
+async fn pool_capacity_round_trips_through_heartbeat(ctx: &Ctx) {
     let m = &ctx.meta;
     let h = HostId::new();
-    m.upsert_host(host_record(h, "nbd-host", ctx.clock.now_utc()))
+    m.upsert_host(host_record(h, "conf-pool", ctx.clock.now_utc()))
         .await
         .unwrap();
     let mut hb = heartbeat_fixture();
-    hb.utilization.allocatable_mib = 32768;
-    hb.utilization.nbd_slots_total = 4;
-    hb.utilization.nbd_slots_in_use = 1; // An unrelated quarantined device.
-    m.touch_host_heartbeat(h, hb.clone()).await.unwrap();
-    let read = m.get_host(h).await.unwrap().unwrap();
-    assert_eq!(read.utilization.nbd_slots_total, 4);
-    assert_eq!(read.utilization.nbd_slots_in_use, 1);
-    let ws = |need| SessionCreateWriteSet {
-        nbd_slot_need: need,
-        session_id: SessionId::new(),
-        spec: spec("conf:slots"),
-        mem_budget_mib: 1024,
-        cpu_budget_vcpus: 1,
-        sealed_secrets: None,
-        capabilities: vec![],
-        integration_policy_json: None,
-        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(
-            vec![],
-            None,
-            None,
-            vec![],
-        ),
-        oauth_binding: None,
-    };
-    let first = ws(2);
-    let sid = first.session_id;
-    assert!(matches!(
-        m.reserve_and_persist_create(first, &[h], 0).await.unwrap(),
-        CreateDisposition::Placed(_)
-    ));
-    assert_eq!(m.per_host_reserved().await.unwrap()[&h].nbd_slots, 2);
-    assert_eq!(
-        m.placement_no_fit_details(&[h], 1024, 1, 2).await.unwrap()[0].reason,
-        "nbd_slots"
-    );
-    let queued = ws(2);
-    let qid = queued.session_id;
-    assert!(matches!(
-        m.reserve_and_persist_create(queued, &[h], 0).await.unwrap(),
-        CreateDisposition::Queued
-    ));
-    assert_eq!(
-        m.list_queued_sessions_fifo().await.unwrap()[0].nbd_slot_need,
-        2
-    );
-    assert_eq!(
-        m.place_queued_session(qid, 1024, 1, &[h], 0).await.unwrap(),
-        None
-    );
-
-    let sandbox = engram_core::SandboxId::new();
-    m.transition_session_created(sid, sandbox).await.unwrap();
-    hb.utilization.nbd_slots_in_use = 3;
-    hb.utilization.nbd_sandboxes = [(sandbox, 2)].into();
-    m.touch_host_heartbeat(h, hb.clone()).await.unwrap();
-    assert_eq!(
-        m.get_host(h)
-            .await
-            .unwrap()
-            .unwrap()
-            .utilization
-            .nbd_sandboxes,
-        [(sandbox, 2)].into()
-    );
-    assert_eq!(m.per_host_reserved().await.unwrap()[&h].nbd_slots, 0);
-    // A root-only guest can still use the fourth slot: no double count.
-    let root = ws(1);
-    let root_id = root.session_id;
-    assert!(matches!(
-        m.reserve_and_persist_create(root, &[h], 0).await.unwrap(),
-        CreateDisposition::Placed(_)
-    ));
-    m.delete_pending_session(root_id).await.unwrap();
-    // Release the quarantine and place the queued two-device guest.
-    hb.utilization.nbd_slots_in_use = 2;
-    m.touch_host_heartbeat(h, hb.clone()).await.unwrap();
-    assert_eq!(
-        m.place_queued_session(qid, 1024, 1, &[h], 0).await.unwrap(),
-        Some(h)
-    );
-    assert_eq!(m.per_host_reserved().await.unwrap()[&h].nbd_slots, 2);
-    // NBD-off hosts use the file fallback, even with old counter values.
-    hb.utilization.nbd_slots_total = 0;
+    hb.utilization.pool_data_free_mib = 40_000;
+    hb.utilization.pool_data_total_mib = 400_000;
+    hb.utilization.pool_metadata_free_mib = 7_000;
+    hb.utilization.pool_metadata_total_mib = 8_192;
     m.touch_host_heartbeat(h, hb).await.unwrap();
-    assert!(matches!(
-        m.reserve_and_persist_create(ws(2), &[h], 0).await.unwrap(),
-        CreateDisposition::Placed(_)
-    ));
-    // Removing a full affinity host must not promote a non-affinity host.
-    let candidates = [HostId::new(), HostId::new(), HostId::new()];
-    for (i, host) in candidates.iter().enumerate() {
-        m.upsert_host(host_record(*host, "nbd-affinity", ctx.clock.now_utc()))
-            .await
-            .unwrap();
-        let mut hb = heartbeat_fixture();
-        hb.utilization.allocatable_mib = if i == 2 { 8192 } else { 32768 };
-        hb.utilization.nbd_slots_total = 2;
-        hb.utilization.nbd_slots_in_use = if i == 0 { 2 } else { 0 };
-        m.touch_host_heartbeat(*host, hb).await.unwrap();
-    }
-    assert!(
-        matches!(m.reserve_and_persist_create(ws(2), &candidates, 1).await.unwrap(),
-        CreateDisposition::Placed(host) if host == candidates[2])
-    );
+    let read = m.get_host(h).await.unwrap().unwrap().utilization;
+    assert_eq!(read.pool_data_free_mib, 40_000);
+    assert_eq!(read.pool_data_total_mib, 400_000);
+    assert_eq!(read.pool_metadata_free_mib, 7_000);
+    assert_eq!(read.pool_metadata_total_mib, 8_192);
 }
-conformance!(t_nbd_host_placement, super::nbd_host_placement);
+conformance!(
+    t_pool_capacity_round_trips_through_heartbeat,
+    super::pool_capacity_round_trips_through_heartbeat
+);
 
-async fn nbd_teleport_placement(ctx: &Ctx) {
-    use engram_core::types::teleport::TeleportAdmitOutcome;
-    let req = teleport_admission_fixture(ctx).await;
-    let dest = req.candidates[1];
-    let mut hb = heartbeat_fixture();
-    hb.utilization.allocatable_mib = 32768;
-    hb.utilization.nbd_slots_total = 1;
-    hb.utilization.nbd_slots_in_use = 1;
-    ctx.meta
-        .touch_host_heartbeat(dest, hb.clone())
-        .await
-        .unwrap();
-    assert!(matches!(
-        ctx.meta.teleport_admit(req.clone()).await.unwrap(),
-        TeleportAdmitOutcome::NoFit
-    ));
-    hb.utilization.nbd_slots_in_use = 0;
-    ctx.meta.touch_host_heartbeat(dest, hb).await.unwrap();
-    let row = admit_teleport(ctx, req).await;
-    assert_eq!(
-        ctx.meta.per_host_reserved().await.unwrap()[&row.dest_host_id].nbd_slots,
-        1
-    );
-    assert_eq!(
-        ctx.meta
-            .placement_no_fit_details(&[dest], 1, 1, 1)
-            .await
-            .unwrap()[0]
-            .reason,
-        "nbd_slots"
-    );
-    // At commit the session reserves the destination; the teleport row
-    // keeps the source reserved until release, using the same slot need.
-    let moved = restored_teleport(ctx).await;
-    assert!(ctx
-        .meta
-        .teleport_commit(moved.id, 0)
-        .await
-        .unwrap()
-        .is_some());
-    let reserved = ctx.meta.per_host_reserved().await.unwrap();
-    assert_eq!(reserved[&moved.source_host_id].nbd_slots, 1);
-    assert_eq!(reserved[&moved.dest_host_id].nbd_slots, 1);
-    for (host, sandbox) in [
-        (moved.source_host_id, moved.source_sandbox_id),
-        (moved.dest_host_id, moved.dest_sandbox_id.unwrap()),
-    ] {
-        let mut hb = heartbeat_fixture();
-        hb.utilization.nbd_slots_total = 1;
-        hb.utilization.nbd_slots_in_use = 1;
-        hb.utilization.nbd_sandboxes = [(sandbox, 1)].into();
-        ctx.meta.touch_host_heartbeat(host, hb).await.unwrap();
-        assert_eq!(
-            ctx.meta.per_host_reserved().await.unwrap()[&host].nbd_slots,
-            0
-        );
-        assert_eq!(
-            ctx.meta
-                .placement_no_fit_details(&[host], 1, 1, 1)
-                .await
-                .unwrap()[0]
-                .reason,
-            "nbd_slots"
-        );
-    }
-}
-conformance!(t_nbd_teleport_placement, super::nbd_teleport_placement);
-
-async fn nbd_capture_placement(ctx: &Ctx) {
+/// A capture job's epoch fences stale reports: a reassignment or a
+/// redrive bumps the epoch, and a call that names the old one is a
+/// no-op.
+async fn capture_job_epoch_fences_reassignment_and_redrive(ctx: &Ctx) {
     use engram_core::types::capture_job::CaptureJobProgress;
     let m = &ctx.meta;
     let h = HostId::new();
-    m.upsert_host(host_record(h, "capture-slots", ctx.clock.now_utc()))
+    m.upsert_host(host_record(h, "capture-epoch", ctx.clock.now_utc()))
         .await
         .unwrap();
     let mut hb = heartbeat_fixture();
     hb.utilization.allocatable_mib = 32768;
-    hb.utilization.nbd_slots_total = 2;
-    hb.utilization.nbd_slots_in_use = 1;
-    m.touch_host_heartbeat(h, hb.clone()).await.unwrap();
+    m.touch_host_heartbeat(h, hb).await.unwrap();
     let parent = m
-        .create_or_get_enable_job("conf:nbd-capture", None, &ImageConfig::default())
+        .create_or_get_enable_job("conf:capture-epoch", None, &ImageConfig::default())
         .await
         .unwrap()
         .id;
-    let mut new = new_capture(parent);
-    new.image_config.resources.suggested_swap_mib = Some(128);
-    let job = m.insert_capture_job(new).await.unwrap();
-    let waiting = m.place_capture_job(job.id, &[h]).await.unwrap().unwrap();
-    assert_eq!(waiting.host_id, None);
-    hb.utilization.nbd_slots_in_use = 0;
-    m.touch_host_heartbeat(h, hb.clone()).await.unwrap();
+    let job = m.insert_capture_job(new_capture(parent)).await.unwrap();
     let placed = m.place_capture_job(job.id, &[h]).await.unwrap().unwrap();
     assert_eq!(placed.host_id, Some(h));
-    assert_eq!(m.per_host_reserved().await.unwrap()[&h].nbd_slots, 2);
-    let sandbox = engram_core::SandboxId::new();
     assert!(m
         .record_capture_job_report(&CaptureJobReport {
             job_id: job.id,
             epoch: placed.epoch,
             stage: CaptureJobStage::Booting,
             progress: Some(CaptureJobProgress {
-                sandbox_id: Some(sandbox),
+                sandbox_id: Some(engram_core::SandboxId::new()),
                 ..Default::default()
             }),
             fc_snapshot_version: None,
@@ -7313,36 +7275,35 @@ async fn nbd_capture_placement(ctx: &Ctx) {
         })
         .await
         .unwrap());
-    // Partial attach: the root is claimed, but swap still needs one slot.
-    hb.utilization.nbd_slots_in_use = 1;
-    hb.utilization.nbd_sandboxes = [(sandbox, 1)].into();
-    m.touch_host_heartbeat(h, hb.clone()).await.unwrap();
-    assert_eq!(m.per_host_reserved().await.unwrap()[&h].nbd_slots, 1);
-    assert_eq!(
-        m.placement_no_fit_details(&[h], 1, 1, 1).await.unwrap()[0].reason,
-        "nbd_slots"
-    );
-    hb.utilization.nbd_slots_in_use = 2;
-    hb.utilization.nbd_sandboxes = [(sandbox, 2)].into();
-    m.touch_host_heartbeat(h, hb.clone()).await.unwrap();
-    assert_eq!(m.per_host_reserved().await.unwrap()[&h].nbd_slots, 0);
-    // Reassignment must use the same slot gate, and fence old reports.
-    let waiting = m
+    let reassigned = m
         .reassign_capture_job(job.id, placed.epoch, &[h])
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(waiting.host_id, None);
-    assert_eq!(waiting.epoch, placed.epoch + 1);
+    assert_eq!(reassigned.host_id, Some(h));
+    assert_eq!(reassigned.epoch, placed.epoch + 1);
     assert!(m
         .reassign_capture_job(job.id, placed.epoch, &[h])
         .await
         .unwrap()
         .is_none());
+    assert!(
+        !m.record_capture_job_report(&CaptureJobReport {
+            job_id: job.id,
+            epoch: placed.epoch,
+            stage: CaptureJobStage::Booting,
+            progress: None,
+            fc_snapshot_version: None,
+            terminal: None,
+        })
+        .await
+        .unwrap(),
+        "a report from the fenced epoch is dropped"
+    );
     assert!(m
         .record_capture_job_report(&CaptureJobReport {
             job_id: job.id,
-            epoch: waiting.epoch,
+            epoch: reassigned.epoch,
             stage: CaptureJobStage::Failed,
             progress: None,
             fc_snapshot_version: None,
@@ -7354,22 +7315,35 @@ async fn nbd_capture_placement(ctx: &Ctx) {
         })
         .await
         .unwrap());
+    assert!(
+        m.redrive_failed_capture_job(job.id, placed.epoch, &[h], 10)
+            .await
+            .unwrap()
+            .is_none(),
+        "a redrive that names the fenced epoch is a no-op"
+    );
     let retry = m
-        .redrive_failed_capture_job(job.id, waiting.epoch, &[h], 10)
+        .redrive_failed_capture_job(job.id, reassigned.epoch, &[h], 10)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(retry.host_id, None);
-    hb.utilization.nbd_slots_in_use = 0;
-    hb.utilization.nbd_sandboxes.clear();
-    m.touch_host_heartbeat(h, hb).await.unwrap();
-    assert_eq!(
-        m.place_capture_job(job.id, &[h])
-            .await
-            .unwrap()
-            .unwrap()
-            .host_id,
-        Some(h)
+    assert_eq!(retry.host_id, Some(h));
+    assert_eq!(retry.epoch, reassigned.epoch + 1);
+    assert!(
+        !m.record_capture_job_report(&CaptureJobReport {
+            job_id: job.id,
+            epoch: reassigned.epoch,
+            stage: CaptureJobStage::Booting,
+            progress: None,
+            fc_snapshot_version: None,
+            terminal: None,
+        })
+        .await
+        .unwrap(),
+        "a report from the epoch the redrive replaced is dropped"
     );
 }
-conformance!(t_nbd_capture_placement, super::nbd_capture_placement);
+conformance!(
+    t_capture_job_epoch_fences_reassignment_and_redrive,
+    super::capture_job_epoch_fences_reassignment_and_redrive
+);

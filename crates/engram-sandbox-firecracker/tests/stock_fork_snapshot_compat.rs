@@ -1,16 +1,16 @@
-//! Stock ↔ fork Firecracker snapshot compatibility (ADR 0045 Phase B, R2).
+//! Fork → stock Firecracker snapshot compatibility (ADR 0045 Phase B, R2).
 //!
-//! The engrams fork adds the MAP_SHARED / `Msync` surface but deliberately
-//! never touches `src/vmm/src/snapshot/` and never bumps `SNAPSHOT_VERSION`, so
-//! a snapshot taken by stock FC must restore on the fork and vice-versa. That
-//! byte-compatibility is what makes a mixed fleet safe during a `nodeAssetsImage`
-//! roll (some hosts forked, some not). This test proves it end-to-end: create +
-//! snapshot with one binary, restore with the other, both directions.
+//! The engrams fork adds the MAP_SHARED / `Msync` surface but never touches
+//! `src/vmm/src/snapshot/` and never bumps `SNAPSHOT_VERSION`, so a snapshot
+//! the fork takes restores on stock FC. This test guards that the fork's
+//! snapshot format does not drift from upstream: create + snapshot with the
+//! fork, restore with stock. The other direction is not tested: the backend
+//! sends the fork's snapshot API (`defer_sync`), which stock rejects, and no
+//! deployment restores a snapshot that stock took.
 //!
-//! Drives the high-level `SandboxBackend` trait (create → snapshot → restore),
-//! with File-mode restore (a direct read of `memory.bin` — the most direct
-//! exercise of the on-disk snapshot format). Both backends share one work dir so
-//! the restoring binary resolves the creating binary's snapshot + rootfs.
+//! Drives the high-level `SandboxBackend` trait (create → snapshot → resume).
+//! Both backends share one work dir so the restoring binary resolves the
+//! creating binary's snapshot + rootfs.
 //!
 //! Needs `FC_TEST_KERNEL` / `FC_TEST_ROOTFS` + `/dev/kvm` (like the other FC
 //! tests) plus BOTH binaries via `ENGRAM_FC_STOCK_BIN` / `ENGRAM_FC_FORK_BIN`:
@@ -31,10 +31,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
-use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreMode};
+use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
 
-/// Create + snapshot a microVM with `creator_bin`, then File-restore that exact
+/// Create + snapshot a microVM with `creator_bin`, then resume that exact
 /// snapshot with `restorer_bin`. Both backends share `work` so the restorer
 /// resolves the creator's snapshot dir + rootfs. Panics on any failure.
 async fn round_trip(
@@ -56,7 +57,7 @@ async fn round_trip(
         let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
         cfg.net_pool = None; // unprivileged test — see lifecycle.rs
         cfg.firecracker_bin = bin;
-        cfg.restore_mode = RestoreMode::File;
+        common::resume_through_uffd(&mut cfg, work.path());
         // Public ubuntu rootfs has no /sbin/engram-init; boot to bash so the VM
         // survives the pre-snapshot sleep. See snapshot.rs.
         cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
@@ -68,7 +69,7 @@ async fn round_trip(
 
     let spec = SandboxSpec {
         image: label.into(),
-        rootfs_source: Some(local_rootfs),
+        rootfs_source: Some(local_rootfs.clone()),
         image_uri: None,
         rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
@@ -85,8 +86,9 @@ async fn round_trip(
     };
 
     // Create + snapshot with the first binary.
-    let original_id = creator
-        .create(spec)
+    let original_id = SandboxId::new();
+    creator
+        .create(original_id, spec)
         .await
         .unwrap_or_else(|e| panic!("{label}: create: {e:?}"));
     // Wait for the source VM to reach early boot before snapshotting — poll the
@@ -110,6 +112,7 @@ async fn round_trip(
         snap_dir.join("memory.bin").exists(),
         "{label}: memory.bin missing"
     );
+    common::chunk_memory(&snap_dir, work.path()).await;
     creator
         .destroy(original_id)
         .await
@@ -118,8 +121,12 @@ async fn round_trip(
     // Restore the very same snapshot with the OTHER binary. A wire-format skew
     // (the R2 risk) would surface here as a deserialize/magic/version error.
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
-    let restored_id = match restorer.restore(metadata).await {
-        Ok(id) => id,
+    let restored_id = SandboxId::new();
+    match restorer
+        .restore(restored_id, metadata, common::disks(&local_rootfs))
+        .await
+    {
+        Ok(()) => {}
         Err(e) => {
             // Dump firecracker.log (carries the guest console) for any preserved jail.
             for entry in std::fs::read_dir(work.path())
@@ -154,22 +161,6 @@ async fn round_trip(
         .destroy(restored_id)
         .await
         .unwrap_or_else(|e| panic!("{label}: destroy restored: {e:?}"));
-}
-
-#[tokio::test]
-#[ignore = "requires Linux + KVM + ENGRAM_FC_STOCK_BIN + ENGRAM_FC_FORK_BIN; run with --ignored on the dev VM"]
-async fn stock_created_snapshot_restores_on_fork() {
-    let env = match common::compat_preflight() {
-        Some(e) => e,
-        None => return,
-    };
-    round_trip(
-        env.stock_bin.clone(),
-        env.fork_bin.clone(),
-        &env,
-        "compat-stock-to-fork",
-    )
-    .await;
 }
 
 #[tokio::test]

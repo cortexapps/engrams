@@ -1,5 +1,5 @@
 //! engrams admin … — explicit triggers for primitives whose production driver
-//! is implicit (the idle detector, the flush scanner). Same pipelines, no TTL
+//! is implicit (the idle detector, the GC sweeps). Same pipelines, no TTL
 //! wait.
 
 use serde::Serialize;
@@ -8,33 +8,6 @@ use engram_app_client::proto::*;
 use engram_app_client::Clients;
 
 use crate::output::{fail, print_json, CliResult};
-
-/// FleetService.FlushSession — force a chunked-disk flush of one session.
-pub async fn flush(c: &Clients, id: &str, json: bool) -> CliResult {
-    let resp = c
-        .flush_session(FlushSessionRequest {
-            session_id: id.to_string(),
-        })
-        .await?;
-    if json {
-        #[derive(Serialize)]
-        struct Out {
-            outcome: String,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            manifest_version: Option<u64>,
-        }
-        print_json(&Out {
-            outcome: resp.outcome,
-            manifest_version: resp.manifest_version,
-        });
-        return Ok(());
-    }
-    match resp.manifest_version {
-        Some(v) => println!("{}: manifest_version={v}", resp.outcome),
-        None => println!("{}", resp.outcome),
-    }
-    Ok(())
-}
 
 /// SessionService.EvictIdle — the idle-eviction pipeline, now. Synchronous:
 /// the session is Idle by the time this returns.

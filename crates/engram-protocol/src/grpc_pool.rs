@@ -66,16 +66,11 @@ impl GrpcHostPool {
         }
     }
 
-    /// Idempotent warm-up: ensure a `Channel` exists for `host_id`
-    /// and that the underlying TCP+H2 handshake is in flight or
-    /// complete.
-    ///
-    /// Called from three places:
-    ///   - `POST /api/hosts/register` receive — initial host pickup
-    ///   - `POST /api/hosts/:id/heartbeat` receive — keeps the entry
-    ///     fresh on whatever pod fields the heartbeat (any pod can)
-    ///   - coord-pod startup — preloads pool entries for every
-    ///     `hosts` row with `status IN ('ready','draining')`
+    /// Idempotent warm-up: ensure a `Channel` exists for `host_id` at
+    /// `host_addr` and start the TCP+H2 handshake. A different address
+    /// replaces the entry. Callers: host registration, the heartbeat
+    /// handler, coordinator startup, and the host registry's read-through
+    /// of the `hosts` row.
     ///
     /// `host_addr` example: `http://10.10.0.42:9101`. Plain HTTP/2
     /// (h2c) — TLS off, bearer-token auth happens per-RPC via tonic
@@ -130,9 +125,6 @@ impl GrpcHostPool {
     }
 
     /// The address this pool is currently dialing for `host_id`, if any.
-    /// ADR 0044 K2 (GAP 1): the heartbeat handler compares this against
-    /// the host's advertised addr to detect a restarted pod whose IP
-    /// changed under a stable HostId, and re-`warm`s when they differ.
     pub fn current_addr(&self, host_id: HostId) -> Option<String> {
         self.entries.get(&host_id).map(|e| e.host_addr.clone())
     }

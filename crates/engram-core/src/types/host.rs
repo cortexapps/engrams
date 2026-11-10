@@ -101,19 +101,55 @@ pub struct HostCapacity {
 }
 
 /// The host chunk-cache disk floor (bytes): free work_dir space below
-/// which the host is treated as disk-pressured. Issue #528 / the
-/// `engrams-fc-xngk` post-mortem: 20 GiB is the margin under which the
-/// host-agent's idle-evict stops pushing candidates. The SINGLE owner of
-/// this value — the host-agent's `DEFAULT_DISK_FLOOR_BYTES` aliases it,
-/// and ADR 0078's placement affinity vetoes a snapshot-host whose free
-/// disk is below it (placing a resume on a host about to disk-evict its
-/// cache is pointless). Do not mint a second threshold.
+/// which the host is treated as disk-pressured (issue #528). 20 GiB is the
+/// margin under which the host-agent's idle-evict stops pushing
+/// candidates. The SINGLE owner of this value: the host-agent's
+/// `DEFAULT_DISK_FLOOR_BYTES` aliases it, and ADR 0078's placement
+/// affinity vetoes a snapshot-host whose free disk is below it (placing
+/// a resume on a host about to disk-evict its cache is pointless). Do not
+/// mint a second threshold.
 pub const HOST_DISK_CACHE_FLOOR_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 /// [`HOST_DISK_CACHE_FLOOR_BYTES`] in MiB, for comparison against
 /// [`HostUtilization`]'s MiB disk fields on the coordinator placement
 /// path.
 pub const HOST_DISK_CACHE_FLOOR_MIB: u64 = HOST_DISK_CACHE_FLOOR_BYTES / (1024 * 1024);
+
+/// Placement stops choosing a host whose session-disk pool has less data
+/// space free than this. A full data pool queues guest I/O instead of
+/// failing it, so the floor keeps the resident sessions running.
+pub const HOST_POOL_DATA_FLOOR_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+pub const HOST_POOL_DATA_FLOOR_MIB: u64 = HOST_POOL_DATA_FLOOR_BYTES / (1024 * 1024);
+
+/// The pool data floor in effect: `ENGRAM_PLACEMENT_POOL_FLOOR_BYTES`,
+/// else [`HOST_POOL_DATA_FLOOR_BYTES`]. The coordinator places against
+/// it and a host reaps kept checkpoint volumes to stay above twice it.
+pub fn pool_data_floor_bytes() -> u64 {
+    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        floor_bytes_from_env(
+            "ENGRAM_PLACEMENT_POOL_FLOOR_BYTES",
+            HOST_POOL_DATA_FLOOR_BYTES,
+        )
+    })
+}
+
+/// A byte count from `var`, or `default` when unset. A value that does
+/// not parse is a configuration error, not a default.
+pub fn floor_bytes_from_env(var: &str, default: u64) -> u64 {
+    match std::env::var(var) {
+        Ok(s) => s
+            .parse()
+            .unwrap_or_else(|e| panic!("{var}={s:?} is not a byte count: {e}")),
+        Err(_) => default,
+    }
+}
+
+/// Placement stops choosing a host whose pool metadata has less space
+/// free than this. Metadata is sized so this never trips; the heartbeat
+/// reports it so an alert fires first.
+pub const HOST_POOL_METADATA_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
+pub const HOST_POOL_METADATA_FLOOR_MIB: u64 = HOST_POOL_METADATA_FLOOR_BYTES / (1024 * 1024);
 
 /// Observed host resource utilization, sampled fresh on every
 /// heartbeat. Distinct from [`HostCapacity`], which is the
@@ -128,16 +164,18 @@ pub const HOST_DISK_CACHE_FLOOR_MIB: u64 = HOST_DISK_CACHE_FLOOR_BYTES / (1024 *
 /// UI renders an empty bar rather than failing.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HostUtilization {
-    /// NBD capacity. Zero means the host uses file-backed disks.
+    /// Free / total MiB of the session-disk pool's data device. A zero
+    /// total means the host has no pool (sparse-file volumes) or has not
+    /// reported one; placement treats it as unmeasured.
     #[serde(default)]
-    pub nbd_slots_total: u32,
-    /// Claimed slots, including quarantined devices.
+    pub pool_data_free_mib: u64,
     #[serde(default)]
-    pub nbd_slots_in_use: u32,
-    /// Attached device counts included in the slot sample, by sandbox.
-    /// Placement reserves the remaining need, including a partial attach.
+    pub pool_data_total_mib: u64,
+    /// Free / total MiB of the pool's metadata device.
     #[serde(default)]
-    pub nbd_sandboxes: std::collections::HashMap<super::ids::SandboxId, u32>,
+    pub pool_metadata_free_mib: u64,
+    #[serde(default)]
+    pub pool_metadata_total_mib: u64,
     /// Total / used bytes (MiB) of the host's work_dir filesystem —
     /// the mount that holds the chunk cache, jails, and FC memory
     /// dumps. `statvfs(2)`; available on Linux and macOS.
@@ -212,12 +250,12 @@ pub enum CapStatus {
     #[default]
     Unknown,
     /// The probe ran and passed. `detail` carries free-form context
-    /// (e.g. `nbds_max=128`) for operator display; never load-bearing.
+    /// (e.g. `session volumes`) for operator display; never load-bearing.
     Ok(Option<String>),
     /// The probe ran and failed. `detail` is the errno/message.
     Failed(String),
     /// This backend never has this capability (e.g. VZ has no
-    /// uffd/nbd/base_shm substrate) — distinct from `Failed` so the fleet
+    /// uffd/base_shm substrate) — distinct from `Failed` so the fleet
     /// view doesn't render a VZ host's substrate row as broken.
     NotApplicable,
 }
@@ -265,12 +303,10 @@ pub struct HostCapabilities {
     /// no guest involved). `NotApplicable` off the FC backend.
     #[serde(default)]
     pub uffd_minor_shmem: CapStatus,
-    /// The `nbd` kernel module is loaded (`/sys/module/nbd/parameters/nbds_max`
-    /// readable). `detail` carries `nbds_max=<n>`. `NotApplicable` off the
-    /// FC backend. Does NOT change `build_from_kernel`'s materialize-to-file
-    /// dev fallback — this only makes a prod misconfiguration visible.
+    /// The host owns a session-disk pool. `NotApplicable` off the FC
+    /// backend.
     #[serde(default)]
-    pub nbd: CapStatus,
+    pub session_disk: CapStatus,
     /// Idle-page bitmap access. Informational; never a placement requirement.
     #[serde(default)]
     pub page_idle: CapStatus,
@@ -288,6 +324,10 @@ pub struct HostCapabilities {
     /// `host_wire_version_ok` against `HostRecord::wire_version`.
     #[serde(default)]
     pub wire_version: u32,
+    /// Mirror of `engram_protocol::REATTACH_GENERATION`: which builds can
+    /// adopt this host's running VMs. `0` for a build that predates it.
+    #[serde(default)]
+    pub reattach_generation: u32,
 }
 
 impl HostCapabilities {
@@ -296,7 +336,7 @@ impl HostCapabilities {
     /// the host has reported a real vector (`schema >= 1`), since an
     /// `Unknown` at `schema == 0` just means "hasn't reported yet,"
     /// not "probed and something's wrong." `NotApplicable` never
-    /// counts — it's the correct steady state for e.g. `nbd` on a VZ
+    /// counts — it's the correct steady state for e.g. `session_disk` on a VZ
     /// host, not a failure. Fixed field order (not alphabetical) for
     /// deterministic rendering.
     pub fn failing_capabilities(&self) -> Vec<&'static str> {
@@ -317,8 +357,8 @@ impl HostCapabilities {
         if is_failing(&self.uffd_minor_shmem) {
             out.push("uffd_minor_shmem");
         }
-        if is_failing(&self.nbd) {
-            out.push("nbd");
+        if is_failing(&self.session_disk) {
+            out.push("session_disk");
         }
         if matches!(self.page_idle, CapStatus::Failed(_)) {
             out.push("page_idle");
@@ -429,6 +469,13 @@ pub struct HostRecord {
     pub lease_epoch: u64,
 }
 
+/// Whether a register lifts the host's cordon (ADR 0126). Only an upgrade
+/// across a reattach generation raises the generation a host reports, and
+/// that upgrade's drain placed the cordon.
+pub fn register_lifts_cordon(stored: &HostRecord, reported: &HostCapabilities) -> bool {
+    stored.cordoned && reported.reattach_generation > stored.capabilities.reattach_generation
+}
+
 /// ADR 0116 A-D2: hard ceiling on a declared handoff TTL, shared by the
 /// coordinator's clamp and the operator's own request sizing so the two
 /// can never disagree (#1218 review: a 1 h coordinator clamp silently
@@ -512,16 +559,70 @@ pub struct HostHeartbeat {
     pub lease_renew_until: Option<DateTime<Utc>>,
 }
 
-/// Per-host reserved memory, CPU, and NBD device budgets.
-/// Σ over the memory-reserving session states of `mem_budget_mib` and
-/// `cpu_budget_vcpus`. The read-side twin of `reserve_placement`'s
-/// in-transaction aggregate, for the resume/evac picker and the fleet view.
-/// NBD slots exclude devices already in the heartbeat count.
-#[derive(Clone, Copy, Debug, Default)]
+/// Per-host reserved memory and CPU: Σ of `mem_budget_mib` and
+/// `cpu_budget_vcpus` over the sessions in a memory-reserving state (a
+/// parked VM included), the capturing VMs and the reserving teleport legs
+/// on the host.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReservedBudget {
-    pub nbd_slots: i64,
     pub mem_mib: i64,
     pub vcpus: i64,
+}
+
+/// One host's resource accounting: what the host can hold, what the
+/// coordinator has reserved on it, and what is left. Every decision that
+/// asks "is there room on this host" reads it: placement (create, resume,
+/// queue, capture, teleport, drain guard), parking, and the fleet's
+/// autoscaling signal.
+///
+/// The host measures `allocatable_mib`: the RAM a reservation may use,
+/// with every resident VM's memory added back, so a VM's RAM counts once,
+/// in `reserved`. The coordinator owns `reserved`. Free is the
+/// difference: a parked VM keeps its reservation until it descends, so
+/// it is not free.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostHeadroom {
+    /// Host-measured `allocatable_mib`; `<= 0` means unmeasured (a host
+    /// that has not sampled its RAM yet).
+    pub allocatable_mib: i64,
+    /// `total_vcpus × overcommit` ([`host_cpu_budget`]); `0` means the
+    /// host has not reported its cores.
+    pub cpu_budget: i64,
+    pub reserved: ReservedBudget,
+}
+
+impl HostHeadroom {
+    pub fn of(host: &HostRecord, reserved: ReservedBudget) -> Self {
+        Self {
+            allocatable_mib: host.utilization.allocatable_mib as i64,
+            cpu_budget: host_cpu_budget(host.total_vcpus),
+            reserved,
+        }
+    }
+
+    /// Whether the host has measured its RAM. An unmeasured host does
+    /// not gate placement (a brand-new or dev host must still work) and
+    /// never parks a session.
+    pub fn measured(&self) -> bool {
+        self.allocatable_mib > 0
+    }
+
+    /// Unreserved RAM. Only meaningful when [`Self::measured`].
+    pub fn free_mib(&self) -> i64 {
+        self.allocatable_mib - self.reserved.mem_mib
+    }
+
+    /// Unreserved vCPU budget; `None` when the host reports no cores.
+    pub fn free_vcpus(&self) -> Option<i64> {
+        (self.cpu_budget > 0).then(|| self.cpu_budget - self.reserved.vcpus)
+    }
+
+    /// Whether a reservation of `mem_mib` and `vcpus` fits now. An
+    /// unmeasured RAM figure or an unreported core count does not gate.
+    pub fn fits(&self, mem_mib: i64, vcpus: i64) -> bool {
+        (!self.measured() || self.free_mib() >= mem_mib)
+            && self.free_vcpus().is_none_or(|free| free >= vcpus)
+    }
 }
 
 /// ADR 0048: the CPU overcommit factor. The host CPU budget is
@@ -741,7 +842,7 @@ mod tests {
         for cap in [
             CapStatus::Unknown,
             CapStatus::Ok(None),
-            CapStatus::Ok(Some("nbds_max=128".to_string())),
+            CapStatus::Ok(Some("session volumes".to_string())),
             CapStatus::Failed("ENOENT".to_string()),
             CapStatus::NotApplicable,
         ] {
@@ -777,11 +878,12 @@ mod tests {
             grpc_self_connect: CapStatus::Ok(None),
             base_shm_tmpfs: CapStatus::NotApplicable,
             uffd_minor_shmem: CapStatus::NotApplicable,
-            nbd: CapStatus::NotApplicable,
+            session_disk: CapStatus::NotApplicable,
             page_idle: CapStatus::NotApplicable,
             bundle_stamp: CapStatus::Failed("no stamp".to_string()),
             fc_snapshot_version: None,
             wire_version: 7,
+            reattach_generation: 0,
         };
         assert_eq!(vz_like.failing_capabilities(), vec!["bundle_stamp"]);
     }
@@ -802,15 +904,16 @@ mod tests {
             grpc_self_connect: CapStatus::Failed("x".into()),
             base_shm_tmpfs: CapStatus::Failed("x".into()),
             uffd_minor_shmem: CapStatus::Ok(None),
-            nbd: CapStatus::Unknown,
+            session_disk: CapStatus::Unknown,
             page_idle: CapStatus::Unknown,
             bundle_stamp: CapStatus::Ok(None),
             fc_snapshot_version: None,
             wire_version: 7,
+            reattach_generation: 0,
         };
         assert_eq!(
             broken.failing_capabilities(),
-            vec!["grpc_self_connect", "base_shm_tmpfs", "nbd"]
+            vec!["grpc_self_connect", "base_shm_tmpfs", "session_disk"]
         );
     }
 }
@@ -818,6 +921,52 @@ mod tests {
 #[cfg(test)]
 mod retirement_tests {
     use super::*;
+
+    #[test]
+    fn only_a_higher_reattach_generation_lifts_a_cordon() {
+        let host = |cordoned, generation| HostRecord {
+            id: HostId::new(),
+            hostname: "h".into(),
+            cloud_metadata: Default::default(),
+            capacity: HostCapacity {
+                total_gb: 0,
+                used_gb: 0,
+                total_mib: 0,
+                used_mib: 0,
+                running_sandboxes: 0,
+            },
+            utilization: Default::default(),
+            status: HostStatus::Ready,
+            last_heartbeat_at: chrono::DateTime::UNIX_EPOCH,
+            host_addr: None,
+            ready_images: Vec::new(),
+            current_bundles: Vec::new(),
+            sandbox_bundles: Vec::new(),
+            cordoned,
+            cordon_owner: None,
+            cordon_reason: None,
+            retire_requested_at: None,
+            retired_at: None,
+            total_vcpus: 0,
+            wire_version: 0,
+            stages_images: false,
+            capabilities: HostCapabilities {
+                reattach_generation: generation,
+                ..Default::default()
+            },
+            lease_expires_at: None,
+            lease_state: Default::default(),
+            lease_epoch: 0,
+        };
+        let reports = |generation| HostCapabilities {
+            reattach_generation: generation,
+            ..Default::default()
+        };
+        assert!(register_lifts_cordon(&host(true, 0), &reports(1)));
+        assert!(!register_lifts_cordon(&host(true, 1), &reports(1)));
+        assert!(!register_lifts_cordon(&host(true, 2), &reports(1)));
+        assert!(!register_lifts_cordon(&host(false, 0), &reports(1)));
+    }
     #[test]
     fn blocker_kind_strings() {
         let cases = [
@@ -855,5 +1004,44 @@ mod retirement_tests {
             assert_eq!(b.kind(), kind);
             assert_eq!(b.count(), count);
         }
+    }
+}
+
+#[cfg(test)]
+mod headroom_tests {
+    use super::{HostHeadroom, ReservedBudget};
+
+    fn room(allocatable_mib: i64, cpu_budget: i64, mem_mib: i64, vcpus: i64) -> HostHeadroom {
+        HostHeadroom {
+            allocatable_mib,
+            cpu_budget,
+            reserved: ReservedBudget { mem_mib, vcpus },
+        }
+    }
+
+    #[test]
+    fn free_is_allocatable_less_reserved_in_both_dimensions() {
+        let r = room(32_768, 32, 28_000, 30);
+        assert_eq!(r.free_mib(), 4_768);
+        assert_eq!(r.free_vcpus(), Some(2));
+        assert!(r.fits(4_096, 2));
+        assert!(!r.fits(8_192, 2), "RAM binds");
+        assert!(!r.fits(4_096, 4), "CPU binds");
+    }
+
+    #[test]
+    fn an_unmeasured_host_does_not_gate_placement() {
+        let r = room(0, 0, 0, 0);
+        assert!(!r.measured());
+        assert!(
+            r.fits(65_536, 64),
+            "unmeasured RAM and unreported cores do not gate"
+        );
+        assert_eq!(room(32_768, 0, 0, 0).free_vcpus(), None);
+    }
+
+    #[test]
+    fn an_over_reserved_host_has_negative_free_ram() {
+        assert_eq!(room(60_000, 0, 70_000, 0).free_mib(), -10_000);
     }
 }

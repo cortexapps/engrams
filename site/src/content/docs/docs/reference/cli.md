@@ -161,7 +161,6 @@ Explicit triggers for things engrams otherwise does on its own schedule.
 
 | Command | What it does |
 |---|---|
-| `admin flush <session-id>` | Flush a session's dirty disk chunks now. |
 | `admin evict-idle <session-id>` | Run the idle-eviction pipeline for one session now. The session ends idle. |
 | `admin gc [--apply] [--grace-secs <n>]` | Run the blob garbage-collection sweeps. A report only, unless `--apply`. |
 

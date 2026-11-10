@@ -20,8 +20,20 @@
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+
+/// Tell the host which base shm file this handler opened. The host gives
+/// exactly this file to the Firecracker snapshot load, so the handler and
+/// Firecracker can never disagree about it. An empty ack means the handler
+/// runs without a shared base (the canonical/session mismatch fallback),
+/// and the load must not name a base file. Written before the FC-facing
+/// socket binds; the host reads it only after that socket appears.
+pub fn write_ack(ack: &Path, opened: Option<&Path>) -> std::io::Result<()> {
+    let body = opened.map(|p| p.as_os_str().as_bytes()).unwrap_or_default();
+    std::fs::write(ack, body)
+}
 
 #[derive(Debug)]
 pub enum BaseShmError {
@@ -116,7 +128,7 @@ impl BaseShm {
     /// host the kernel's extent map is cold and a DENSE (pre-warmed)
     /// file makes each `SEEK_HOLE` walk every extent from `offset` to
     /// the next hole — thousands of first-touch faults compounded into
-    /// a ~46 s post-restore guest crawl (prod canary 1f64052e), gone on
+    /// a ~46 s post-restore guest crawl, gone on
     /// the second restore once the extent cache warmed.
     ///
     /// Staleness is one-sided and safe: a SIBLING handler populating a
@@ -198,6 +210,19 @@ impl BaseShm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ack_names_the_opened_base_or_is_empty_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let ack = dir.path().join("uffd-base-shm.ack");
+        let base = dir.path().join("m-v1.base");
+
+        write_ack(&ack, Some(&base)).unwrap();
+        assert_eq!(std::fs::read(&ack).unwrap(), base.as_os_str().as_bytes());
+
+        write_ack(&ack, None).unwrap();
+        assert!(std::fs::read(&ack).unwrap().is_empty());
+    }
 
     /// The populated map must agree with the file's real hole structure
     /// (pre-existing data from a "pre-warm"), and `write_chunk` must

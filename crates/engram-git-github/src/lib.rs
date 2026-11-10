@@ -656,9 +656,9 @@ mod tests {
 
     #[test]
     fn clamp_drops_permissions_the_app_lacks() {
-        // The prod incident (session 2f25d473): the profile requested secrets/actions
-        // the App installation doesn't grant → GitHub 422'd the WHOLE token, breaking
-        // git push + the API. Clamp keeps what the App grants (so push + PRs work) and
+        // When the profile requests secrets/actions that the App installation does
+        // not grant, GitHub rejects the WHOLE token with 422, and git push + the API
+        // break. Clamp keeps what the App grants (so push + PRs work) and
         // drops the rest.
         let requested = permissions_for_caps(&caps(&[
             "github:contents:write",

@@ -1,4 +1,4 @@
-//! Post-copy source exports hold the checkpoint fence and sealed disk bytes.
+//! Post-copy source exports hold the checkpoint fence and the sealed disk checkpoints.
 //! Capture pauses the source. Commit destroys it; an explicit abort resumes it.
 //! The TTL sweep checks coordinator ownership after serving activity stops.
 //! Once state.bin is served, the sweep must not resume the source.
@@ -60,13 +60,20 @@ pub struct MigrationExport {
     pub sandbox_id: SandboxId,
     /// Holds state.bin + the (patched) sidecar manifest.json.
     pub snapshot_dir: PathBuf,
-    /// ADR 0045 C2 disk post-copy: the sealed dirty/pending disk
-    /// tiers, raw bytes in RAM — served by index over
-    /// `MigrationFetch::DiskChunkAt`, re-queued into `dirty` on abort,
-    /// dropped on commit (the dest drained them).
+    /// The disk snapshots under the pause and the blocks they changed
+    /// since the presetup's snapshots, served over
+    /// `MigrationFetch::DiskBlockAt`; discarded on abort, released with
+    /// the sandbox on commit.
     pub disk_seal: std::collections::BTreeMap<
         engram_core::types::snapshot::DiskRole,
-        Arc<crate::disk_daemon::PostCopyDiskSeal>,
+        Arc<crate::pooled_backend::DiskSeal>,
+    >,
+    /// The presetup's disk snapshots, taken while the guest ran, and the
+    /// blocks they changed since the advertised checkpoints. The dest
+    /// pulls these before the pause.
+    pub precopy: std::collections::BTreeMap<
+        engram_core::types::snapshot::DiskRole,
+        Arc<crate::pooled_backend::DiskSeal>,
     >,
     /// ADR 0098 P8: the TTL clock is the INJECTED monotonic clock
     /// (`now_mono`), not a raw `Instant` — expiry DECIDES destroy/abort,
@@ -83,9 +90,8 @@ pub struct MigrationExport {
     /// Last required page/artifact-serving activity (the export TTL clock), as a
     /// `now_mono` reading.
     pub last_activity: Arc<std::sync::Mutex<Duration>>,
-    /// The sandbox's capture lock, held for the export's lifetime —
-    /// this IS the checkpoint fence (the periodic driver's
-    /// `capture_in_flight` try_lock keeps skipping).
+    /// The sandbox's capture lock, held for the export's lifetime: the
+    /// checkpoint fence.
     pub capture_guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
@@ -166,6 +172,26 @@ impl MigrationRegistry {
                 constant_time_str_eq(&e.export_id, export_id)
             })
             .map(|(_, e)| e)
+    }
+
+    /// [`Self::remove_validated`], but only while `state.bin` has not left
+    /// this host. The fetch path raises `state_served` under the shard
+    /// lock it found the export with, so a racing fetch either finds no
+    /// export or makes this return [`UnservedRemoval::Served`].
+    pub fn remove_unserved(&self, sandbox_id: SandboxId, export_id: &str) -> UnservedRemoval {
+        let mut served = false;
+        let removed = self.by_sandbox.remove_if(&sandbox_id, |_, e| {
+            if !constant_time_str_eq(&e.export_id, export_id) {
+                return false;
+            }
+            served = e.state_served.load(Ordering::SeqCst);
+            !served
+        });
+        match removed {
+            Some((_, export)) => UnservedRemoval::Removed(export),
+            None if served => UnservedRemoval::Served,
+            None => UnservedRemoval::Missing,
+        }
     }
 
     /// The open export's id for a sandbox (the TTL sweep's handle).
@@ -249,6 +275,16 @@ impl MigrationRegistry {
             .map(|x| format!("{x:02x}"))
             .collect()
     }
+}
+
+/// What [`MigrationRegistry::remove_unserved`] found.
+pub enum UnservedRemoval {
+    /// The state never left this host; the caller owns the export.
+    Removed(MigrationExport),
+    /// A destination fetched the state; the export stays open.
+    Served,
+    /// No open export matches the sandbox and export id.
+    Missing,
 }
 
 /// ADR 0045: what the TTL sweep should do with an expired export,
@@ -335,7 +371,7 @@ pub fn reattach_source_verdict(
 }
 
 /// Constant-time string compare (export_id nonces).
-fn constant_time_str_eq(a: &str, b: &str) -> bool {
+pub(crate) fn constant_time_str_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
         return false;
@@ -415,6 +451,7 @@ mod tests {
             sandbox_id: id,
             snapshot_dir: "/tmp".into(),
             disk_seal: Default::default(),
+            precopy: Default::default(),
             clock: clock.clone(),
             state_served: Arc::new(AtomicBool::new(false)),
             last_activity: last_activity.clone(),
@@ -486,6 +523,7 @@ mod tests {
             sandbox_id: id,
             snapshot_dir: "/tmp".into(),
             disk_seal: Default::default(),
+            precopy: Default::default(),
             clock: Arc::new(engram_core::traits::SystemClock::new()),
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(
@@ -506,6 +544,7 @@ mod tests {
             sandbox_id: id,
             snapshot_dir: "/tmp".into(),
             disk_seal: Default::default(),
+            precopy: Default::default(),
             clock: Arc::new(engram_core::traits::SystemClock::new()),
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(
@@ -532,6 +571,7 @@ mod tests {
             sandbox_id,
             snapshot_dir: "/tmp".into(),
             disk_seal: Default::default(),
+            precopy: Default::default(),
             clock: Arc::new(engram_core::traits::SystemClock::new()),
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(

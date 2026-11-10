@@ -556,7 +556,7 @@ async fn ensure_ds_images(
     image: &str,
     node_assets_image: &str,
 ) -> Result<(), OperatorError> {
-    let tmpl = ds.spec.as_ref().and_then(|s| s.template.spec.as_ref());
+    let tmpl = ds.spec.template.spec.as_ref();
     let host_cur = tmpl
         .and_then(|s| s.containers.iter().find(|c| c.name == HOST_AGENT_CONTAINER))
         .and_then(|c| c.image.as_deref());
@@ -598,8 +598,9 @@ async fn list_ds_pods(
 ) -> Result<Vec<PodInfo>, OperatorError> {
     let selector = ds
         .spec
+        .selector
+        .match_labels
         .as_ref()
-        .and_then(|s| s.selector.match_labels.as_ref())
         .map(|ml| {
             ml.iter()
                 .map(|(k, v)| format!("{k}={v}"))
@@ -625,8 +626,9 @@ async fn list_managed_nodes(client: &Client, ds: &DaemonSet) -> Result<Vec<Node>
 fn managed_node_list_params(ds: &DaemonSet) -> Result<ListParams, OperatorError> {
     let selector = ds
         .spec
+        .template
+        .spec
         .as_ref()
-        .and_then(|s| s.template.spec.as_ref())
         .and_then(|s| s.node_selector.as_ref())
         .filter(|selector| !selector.is_empty())
         .map(|selector| {

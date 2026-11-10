@@ -1,76 +1,51 @@
 //! Portable host-agent core (ADR 0098 Phase 2, the P-series).
 //!
 //! This crate holds the host-agent's side-effect seams and the
-//! prod-portable impls of them. It depends only on `engram-core` (plus the
-//! ambient async/serde/time crates) — deliberately NOT on
-//! `engram-host-agent`, reqwest, or anything Linux-gated — which is what
-//! makes the extracted lifecycle logic **runnable on macOS** and drivable
-//! by the host-internal simulator (`engram-dst-host`).
+//! prod-portable impls of them. It depends on `engram-core` and
+//! `engram-chunk-store` (plus the ambient async/serde/time crates) —
+//! deliberately NOT on `engram-host-agent`, reqwest, or anything
+//! Linux-gated — which is what makes the extracted lifecycle logic
+//! **runnable on macOS** and drivable by the boundary simulator
+//! (`engram-dst-cosim`).
 //!
-//! # Why a bundle struct, not a mega-trait
+//! # Seams
 //!
-//! [`HostEffects`] is a bundle STRUCT (`clock` + `entropy` + four focused
-//! traits), mirroring the coordinator's `Services` — not one god
-//! `HostEffects` trait. ADR 0098 §Phase 2 makes this explicit: a single
-//! mega-trait would recreate exactly the mock-zoo that D4 retired, and it
-//! would force every flow to depend on the union of all effects. Instead
-//! each seam is its own trait at an orchestration boundary:
+//! Each side effect a lifecycle flow makes sits behind its own focused
+//! trait at an orchestration boundary, never one god trait:
 //!
-//! - [`coord::CoordControlPlane`] — the three decision-feeding coordinator
-//!   calls (`publish_live_manifest`, `sandbox_ownership`, `sandbox_owner`);
-//!   the concrete `HttpCoordClient` in `engram-host-agent` implements it,
-//!   and the simulator supplies an adversarial scripted stub.
+//! - [`coord::CoordControlPlane`] — the decision-feeding coordinator calls
+//!   (`sandbox_ownership`, `sandbox_owner`); the concrete `HttpCoordClient`
+//!   in `engram-host-agent` implements it, and the simulator answers it
+//!   from the real coordinator handler cores.
 //! - [`fs::HostFs`] — granular durable-fs primitives (write / sync_file /
 //!   rename / sync_dir / read / read_dir / remove_file) so a crash injector
 //!   can fail between each.
-//! - [`device::DeviceSync`] — the `/dev/nbdN` host-page-cache sync
-//!   (abandon-in-place stays a `NbdSandboxState` method; see `device`).
-//! - [`nbd::NbdKernel`] — the connect/reconfigure/disconnect/
-//!   backend-identifier kernel ops.
-//!
-//! The data plane (the NBD serve loop, `read_chunk`/`write_chunk`, the
-//! migrate_peer page server, the flush lock ladder) is deliberately NOT
-//! behind a seam — wrapping the hot path would add per-op cost for logic
-//! the simulator never drives.
+//! - [`disk::SessionDisk`] — volumes the kernel owns (create, O(1)
+//!   snapshot, delete, dirty-chunk diff); [`disk_flows`] moves chunks
+//!   between a volume and the chunk store; [`image_volumes`] keeps the
+//!   enabled images staged and [`session_volumes`] owns every session's
+//!   volumes.
 
 pub mod checkpoint;
 pub mod coord;
-pub mod device;
-pub mod effects;
+pub mod disk;
+pub mod disk_flows;
 pub mod finalize;
 pub mod fs;
-pub mod nbd;
-pub mod reattach;
+pub mod image_volumes;
+pub mod session_volumes;
 pub mod shutdown;
-pub mod startup;
-pub mod survivor;
+#[cfg(test)]
+mod test_support;
 
 pub use checkpoint::checkpoint_tail_admits_publish;
-pub use coord::{
-    CoordControlPlane, CoordError, LiveManifestPublishOutcome, LiveManifestPublishRequest,
-    LiveManifestPublishResponse,
+pub use coord::{CoordControlPlane, CoordError};
+pub use disk::{
+    data_extents, is_zero_chunk, Capacity, ChunkIndex, FileDisk, Hydration, SessionDisk,
+    SourceDevice, SourceServer, Volume, VolumeName,
 };
-pub use device::DeviceSync;
-pub use effects::HostEffects;
+pub use disk_flows::{checkpoint, checkpoint_split, hydration_plan, stage, HydrationPlan};
 pub use finalize::{plan_finalize_retry, FinalizeRetry, FinalizeStage};
 pub use fs::{HostFs, TokioFs};
-pub use nbd::{ConnectedDevice, NbdConnectRequest, NbdKernel, NbdReconfigureRequest};
-pub use reattach::{
-    first_seeded_probe, is_local_survivor_candidate, plan_reattach, probe_matches,
-    resume_data_plane_served, sweep_verdict, DeviceHolder, PidLiveness, ReattachPlan, ReattachStep,
-    SweepAction,
-};
-pub use startup::{
-    classify_startup_slot, classify_startup_slots, ReapList, SlotClass, StartupClassification,
-    StartupSlot,
-};
-pub use survivor::{
-    all_disk_roles_served, plan_capture_disk_drain, plan_resume_attach, CaptureDrainPlan,
-    ResumeAttachPlan,
-};
-
-pub use shutdown::{
-    admits_new_plane, classify_survivor, flush_budget, is_straggler, nbd_drop_action,
-    plan_shutdown, FlushProbe, NbdDropAction, ShutdownPlan, ShutdownStage, SurvivorAction,
-    DEFAULT_FLUSH_BUDGET_SECS,
-};
+pub use session_volumes::SessionVolumes;
+pub use shutdown::{capture_drain_budget, HandoffMarker};

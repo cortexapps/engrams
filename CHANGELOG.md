@@ -10,6 +10,82 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Firecracker hosts need a session-disk pool.** The host agent no longer serves disks
+  over NBD, and it refuses to start the Firecracker backend without a pool. Node-prep in
+  the `engram-host-fleet` chart builds a device-mapper thin pool from two files on the
+  host's working filesystem, and the host agent opens it through `ENGRAM_THIN_POOL`; with
+  node-prep disabled, the node image must provide the pool. The node needs the
+  `dm_thin_pool` module and `thin-provisioning-tools`. The `nbd` chart values, the node-prep
+  NBD step, and `ENGRAM_NBD_MAX_SLOTS` / `ENGRAM_NBD_WARM_SLOTS` are gone.
+- **The upgrade drains every host first.** The new host agent cannot adopt VMs whose disk
+  the old one served, so `helm upgrade` of either chart runs a job, before it changes
+  anything, that cordons every host and evicts each running session to a checkpoint (taking
+  one first for a session that never had one). A session the job cannot evict within
+  `upgradeDrain.timeoutSeconds` stops the upgrade before any change. After the host fleet
+  chart upgrades, a second job replaces the drained host pods (the operator does it when it
+  is enabled), and each host's cordon lifts when it registers on the new build. Each session
+  resumes from its checkpoint the next time it is used. An idle session whose only
+  recoverable state was the host's live disk manifest is marked dead by migration 0126.
+- **Node-prep makes room for the pool.** When the pool's files would leave less than 15% of
+  the disk free (`POOL_RESERVE` in the node-prep script), node-prep clears the chunk cache
+  before it creates them; the cache refills from the chunk store, so the first resumes on
+  that host are slower. A disk without that room even then fails node-prep with a clear
+  message and no change. `storage.chunkCacheDiskFraction` now defaults to `0.3`, so the pool's half
+  of the disk and the cache fit together.
+- **Three database migrations (0126, 0127, 0128).** They drop the live disk manifest, cancel
+  queued evictions of the retired quarantine flavour, and replace the NBD slot columns with
+  the pool capacity columns. Either chart can be upgraded first; both run the drain.
+  Until the old coordinator pods stop, they fail requests that read the dropped columns. If
+  a drain job fails with a database error about a missing column, run the same
+  `helm upgrade` again; the drain is safe to repeat.
+- **With the operator enabled, the roll needs room under `operator.capacityFloor`.** The
+  operator replaces a host pod only when the fleet keeps at least `capacityFloor` Ready
+  hosts without it. A fleet with no more hosts than the floor waits with every host
+  cordoned. Set the floor below the host count (`0` for a single host) before you upgrade.
+- **Removed metrics and knobs.** `engram_quarantine_stuck_total`,
+  `engram_durability_rollback_total`, and `ENGRAM_QUARANTINE_CAPTURE_TIMEOUT_SECS` no longer
+  exist; delete alert policies that read them. The capability vector reports `session_disk`
+  where it reported `nbd`. `engrams admin flush` is gone: a checkpoint is the only way disk
+  state leaves a host.
+- **Fleet API.** `HostView` loses `nbd_slots_total` and `nbd_slots_in_use` and gains
+  `pool_data_free_mib`, `pool_data_total_mib`, `pool_metadata_free_mib`, and
+  `pool_metadata_total_mib`. `FlushSession` is gone.
+- **A Firecracker resume always restores memory lazily.** `ENGRAM_FC_RESTORE_MODE` and the
+  `firecracker.restoreMode` chart value (`engram-host-fleet`) are removed; delete them from
+  your values. Every resume spawns `engram-uffd-handler`, so the host image must ship it.
+- **This upgrade drains every host again.** The host agent no longer serves memory handlers,
+  Firecracker processes, or migration sources from an earlier build, so the reattach
+  generation goes to 2. With `upgradeDrain.enabled` (the default), the pre-upgrade job
+  evicts each running session to a checkpoint before Helm changes anything, as described
+  above. Nothing ends and no data is lost: each session resumes on the new build the next
+  time it is used. With `upgradeDrain.enabled: false`, evict every session before the
+  upgrade. To roll back past this release, drain the hosts first the same way.
+- **A resume copies its disk in behind the running VM, which needs `ublk_drv`.** The host
+  agent serves the part of a session's disk the host does not hold as a ublk block device,
+  so the node needs the `ublk_drv` module; node-prep loads it. On a node without
+  `/dev/ublk-control` the host agent logs an error at startup and writes each disk in full
+  before its VM starts, as before. The reattach generation goes to 3, so this upgrade
+  drains every host as described above. To roll back past this release, drain the hosts
+  first: an earlier host agent cannot serve a disk that is still copying, and its VM would
+  hang.
+
+### Changed
+
+- **The kernel owns the session disk.** A VM's disk is a thin volume in a device-mapper pool;
+  no host process is in the data path, and a host agent restart does not touch a running
+  VM's disk. A base image is staged into the pool once per host and every session's volume
+  is a snapshot of it, so a create writes nothing. A resume starts the VM on a snapshot of
+  the nearest base the host holds and copies the difference in behind it, so the time to
+  the first prompt does not grow with the size of the session's disk. A checkpoint pauses the VM for tens of
+  milliseconds however much it wrote and uploads only the blocks that changed. The disk daemon, the
+  copy-on-write view, the flush pipeline, the durability-rollback path, and the
+  quarantined-survivor eviction are gone with it.
+- Placement refuses a host whose pool is below a floor: `ENGRAM_PLACEMENT_POOL_FLOOR_BYTES`
+  (16 GiB by default) of data space, and 64 MiB of metadata space. There is no per-session
+  disk reservation.
+
 ## [0.12.0] - 2026-10-26
 
 ### Upgrade notes

@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::ids::SessionId;
 use engram_core::types::sandbox::{AgentSpec, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_harness_proto::{
@@ -160,7 +161,11 @@ async fn baked_noop_harness_emits_run_started() {
         swap_source: None,
         swap_manifest: None,
     };
-    let sandbox_id = backend.create(spec).await.expect("create sandbox");
+    let sandbox_id = SandboxId::new();
+    backend
+        .create(sandbox_id, spec)
+        .await
+        .expect("create sandbox");
 
     // Keep the jail dir around on failure so we can post-mortem
     // firecracker.log (same pattern as exec_real_vm.rs).

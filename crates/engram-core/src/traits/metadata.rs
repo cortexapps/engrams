@@ -51,8 +51,6 @@ pub enum DisableEnabledImageOutcome {
 /// to commit in a single transaction, before any host RPC.
 #[derive(Clone, Debug)]
 pub struct SessionCreateWriteSet {
-    /// One root slot plus one slot when swap is enabled.
-    pub nbd_slot_need: u32,
     pub session_id: SessionId,
     pub spec: SessionSpec,
     pub mem_budget_mib: i64,
@@ -82,7 +80,7 @@ pub struct SessionCreateWriteSet {
 
 /// One candidate host's fit verdict from
 /// [`MetadataStore::placement_no_fit_details`]. `reason` is a bounded
-/// vocabulary (metric-label safe): `nbd_slots` / `ram_full` / `cpu_full` /
+/// vocabulary (metric-label safe): `ram_full` / `cpu_full` /
 /// `unmeasured` (no allocatable measurement yet) / `not_lockable`
 /// (status/cordon changed between ranking and the pick) / `fits_now`
 /// (freed up since the failed pick — indicates a race, not a bug).
@@ -293,7 +291,7 @@ pub trait MetadataStore: Send + Sync {
     /// ADR 0090: reverse ownership lookup — which session (if any)
     /// currently binds `sandbox_id` on `host_id`? Answers the teardown
     /// reconciler's unknown-binding arm: a host-agent generation whose
-    /// in-memory binding table missed a sandbox (NBD rehydrate failed
+    /// in-memory binding table missed a sandbox (binding rehydrate failed
     /// mid-roll) must ask the coordinator before counting an orphan
     /// strike — local absence-of-binding is NOT ownership truth
     /// (2026-07-11 campaign: a healthy pidfd-reattached VM was SIGKILLed
@@ -332,7 +330,6 @@ pub trait MetadataStore: Send + Sync {
         _candidates: &[HostId],
         _mem_budget_mib: i64,
         _cpu_budget_vcpus: i32,
-        _nbd_slot_need: u32,
     ) -> Result<Vec<PlacementNoFit>, MetaError> {
         Ok(Vec::new())
     }
@@ -694,8 +691,8 @@ pub trait MetadataStore: Send + Sync {
     /// ADR 0047/0048: per-host reserved budget (Σ `mem_budget_mib` AND
     /// Σ `cpu_budget_vcpus` over the memory-reserving session states) —
     /// the read-side twin of `reserve_and_persist_create`'s aggregate, for the
-    /// capacity-soft resume/evac picker and the fleet view. Default impl
-    /// (mocks): empty map (no reservations).
+    /// capacity-soft resume/evac picker, the fleet view and the parking
+    /// headroom gate. Default impl (mocks): empty map (no reservations).
     async fn per_host_reserved(
         &self,
     ) -> Result<std::collections::HashMap<HostId, crate::types::host::ReservedBudget>, MetaError>
@@ -703,16 +700,12 @@ pub trait MetadataStore: Send + Sync {
         Ok(std::collections::HashMap::new())
     }
 
-    /// ADR 0009 reconcile pass: enumerate the `(session_id, sandbox_id,
-    /// status)` triples for every RESIDENT session (any
-    /// `reserves_host_memory` state — a paused `parked` VM is exactly as
-    /// resident as an `active` one) assigned to `host_id` whose
-    /// `sandbox_id` is populated. The reconcile pass intersects this
-    /// against the host's heartbeat-reported `running_sandboxes` (which
-    /// is the backend's whole live set, not just Active). Was
-    /// `status='active'`-only until 2026-07-21 (status-set audit
-    /// finding 3): a vanished parked VM accrued no strikes and never
-    /// flipped HostLost.
+    /// The `(session_id, sandbox_id, status)` triples for every RESIDENT
+    /// session (any `reserves_host_memory` state; a paused `parked` VM is
+    /// as resident as an `active` one) bound to `host_id`. The reconcile
+    /// pass intersects this against the host's reported
+    /// `running_sandboxes`; the register handler hands it to a restarted
+    /// host as its rehydrate list.
     ///
     /// The listing is the full resident set; each caller filters to the
     /// statuses its own semantics need — reconcile strikes only
@@ -782,59 +775,6 @@ pub trait MetadataStore: Send + Sync {
         Ok(DeleteHostOutcome::Deleted)
     }
 
-    /// ADR 0016 Phase B commit 7 — restart-time rehydration source.
-    /// Returns one record per session with a VM resident on
-    /// `host_id` (any [`SessionState::reserves_host_memory`] state
-    /// with `sandbox_id` bound — NOT just `Active`: a rung-parked
-    /// `Evicting` session's paused VM survives a host-agent pod roll
-    /// exactly like an active one, and session 731df805 (2026-07-17)
-    /// showed what excluding it does — the successor pod's rehydrate
-    /// pass never re-claims the parked survivor's NBD device, the
-    /// stale-binding sweep then disconnects the live rootfs, and the
-    /// un-pause resumes the guest onto a dead data plane), including
-    /// the effective disk manifest the host should rebuild
-    /// `ChunkedDiskBackend` from: the newer of
-    /// `sessions.live_disk_manifest_*` (last FlushScheduler publish)
-    /// and the latest recoverable snapshot's `disk_manifest`.
-    /// Same resolver semantic as `effective_resume_disk_manifest`
-    /// (commit 6); kept server-side so the host issues one query
-    /// per restart instead of N+1 round-trips.
-    ///
-    /// Default impl: scans `list_active_sessions()` + walks
-    /// `list_session_snapshots(...)` per row. Postgres overrides
-    /// with a single LEFT JOIN. The default exists so test mocks
-    /// without a snapshot index still satisfy the trait.
-    ///
-    /// `Option<ManifestRef>` is `None` when:
-    /// - The session never published a live manifest AND has no
-    ///   recoverable snapshot — legacy session or sandbox without
-    ///   chunked-disk tracking. Host skips rehydration (no
-    ///   `attach_chunked_disk` to call).
-    /// - The session's status changed mid-query (defensive).
-    async fn list_resident_sandboxes_on_host_with_disk_manifest(
-        &self,
-        host_id: HostId,
-    ) -> Result<Vec<(SessionId, SandboxId, Option<ManifestRef>)>, MetaError> {
-        let all = self.list_active_sessions().await?;
-        let mut out = Vec::new();
-        for s in all {
-            if !s.status.reserves_host_memory() {
-                continue;
-            }
-            let (Some(h), Some(sb)) = (s.host_id, s.sandbox_id) else {
-                continue;
-            };
-            if h != host_id {
-                continue;
-            }
-            // Pick newer of live vs. latest snapshot. The default
-            // impl can't cheaply query "latest snapshot"; default
-            // to live_disk_manifest only and let PgMeta's override
-            // do the JOIN.
-            out.push((s.id, sb, s.live_disk_manifest));
-        }
-        Ok(out)
-    }
     /// ADR 0015 M2: the single validated entry point for `UPDATE
     /// sessions SET status = ...`. Reads the current state, runs
     /// [`SessionState::try_transition_to`] against `target`, and
@@ -1097,6 +1037,20 @@ pub trait MetadataStore: Send + Sync {
         Ok(true)
     }
 
+    /// A fixed-cadence wait, not a failure: requeue as
+    /// [`Self::op_requeue_with_backoff`] does and give back the attempt the
+    /// claim counted, so the wait does not grow a later backoff or spend
+    /// an attempt budget. Fenced.
+    async fn op_requeue_wait(
+        &self,
+        _op_id: i64,
+        _epoch: i64,
+        _delay: std::time::Duration,
+        _reason: &str,
+    ) -> Result<bool, MetaError> {
+        unimplemented!("op_requeue_wait")
+    }
+
     /// Make every QUEUED op of `kind` for this session due now
     /// (`not_before = LEAST(not_before, now)`) and NOTIFY when any such
     /// op exists — INCLUDING ops that are already due. ADR 0079
@@ -1319,11 +1273,9 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
-    /// A set returns the new binding epoch; a clear returns None.
-    /// A stale fence returns Conflict. Both writes reset missing-sandbox strikes;
-    /// a clear also removes the live manifest and bumps chunk_generation.
-    /// Fenced sandbox (re)bind — subsumes `rebind_session_guarded`'s
-    /// bespoke expected-state list with the one epoch predicate.
+    /// Fenced sandbox (re)bind. A set returns the new binding epoch; a
+    /// clear returns None; a stale fence returns Conflict. Both reset the
+    /// missing-sandbox strikes.
     async fn fenced_assign_sandbox(
         &self,
         session_id: SessionId,
@@ -1438,7 +1390,7 @@ pub trait MetadataStore: Send + Sync {
     /// for a session back to due (`not_before := now`), for when fresh
     /// evidence (an attach signal, a heartbeat disagreement) proves the
     /// wait is pointless — e.g. a row waiting out `ACK_TIMEOUT` after a
-    /// forward into a dead harness link (prod 7eddce62). Returns the
+    /// forward into a dead harness link. Returns the
     /// number of rows moved. Two REQUIRED properties: (a) `attempts` is
     /// NEVER bumped — this cancels a provably-pointless wait, it is not
     /// a delivery try, and a bump would inflate `failure_backoff` for
@@ -1965,7 +1917,7 @@ pub trait MetadataStore: Send + Sync {
     /// Returns `Ok(false)` when the op executor has been fenced by a
     /// successor's re-claim (the epoch moved) — NOTHING is written, so a
     /// reclaimed-out predecessor can never land a phantom `recoverable` row
-    /// a resume would later pick (the 89f7984d durability-lie class). The
+    /// a resume would later pick. The
     /// op-driven capture sites (idle eviction, manual snapshot) use this
     /// instead of the plain insert; the host-heartbeat reconcile and
     /// image-enable base captures keep [`record_snapshot`] (not op-fenced).
@@ -2084,35 +2036,9 @@ pub trait MetadataStore: Send + Sync {
         Ok(None)
     }
 
-    /// Enumerate every disk `manifest_id` referenced by a live
-    /// snapshot row. Today's sole caller is `reap_materialize_dir`,
-    /// which uses the result as the "do not delete" filter when
-    /// pruning assembled `<manifest_id>-vN.ext4` files on hosts.
-    /// (The chunk-store GC that previously consumed this set was
-    /// removed 2026-05-23 — see ADR 0015 M5.)
-    ///
-    /// Returns DISTINCT ids; versions aren't surfaced. Default
-    /// `Ok(vec![])` keeps in-memory test impls quiet — the real
-    /// query lives in `engram-postgres`.
-    async fn list_live_disk_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
-        Ok(Vec::new())
-    }
-
-    /// Symmetric memory-side companion to
-    /// `list_live_disk_manifest_ids`. Currently unused by any
-    /// in-tree caller after the chunk-store GC was removed, but
-    /// kept on the trait so a future reintroduction has a
-    /// pre-shaped seam.
-    async fn list_live_memory_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
-        Ok(Vec::new())
-    }
-
-    /// ADR 0016 Phase C: pin-set source #3 — every recoverable
-    /// snapshot's root and swap `ManifestRef` pair (id + version). Unlike
-    /// `list_live_disk_manifest_ids` (which returns Uuid-only for
-    /// the `reap_materialize_dir` reaper), the pin-set query needs
-    /// the version so `chunk_store.get_manifest` reads the exact
-    /// manifest that snapshot row depends on.
+    /// Pin-set source: every recoverable snapshot's root and swap
+    /// `ManifestRef` pair (id + version), so `chunk_store.get_manifest`
+    /// reads the exact manifest that snapshot row depends on.
     ///
     /// Filtered to `recoverable=true` per the ADR's pin-set
     /// definition: non-recoverable snapshot rows are informational
@@ -3097,6 +3023,15 @@ pub trait MetadataStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// The disk manifest of every non-terminal capture job, without
+    /// duplicates — the `HeartbeatAck.capturing_disk_manifests` source.
+    /// Hosts stage these as image volumes while the capture runs, so the
+    /// captured disk stages as a delta over them. Read every heartbeat
+    /// tick. Default: empty.
+    async fn capturing_disk_manifests(&self) -> Result<Vec<ManifestRef>, MetaError> {
+        Ok(Vec::new())
+    }
+
     /// Active (non-terminal) job assignments currently on `host` — the
     /// `HeartbeatAck.capture_assignments` source, read every heartbeat
     /// regardless of whether any capture jobs exist fleet-wide.
@@ -3306,47 +3241,15 @@ pub trait MetadataStore: Send + Sync {
         Ok(None)
     }
 
-    /// ADR 0016 Phase B: write the host's freshly-flushed disk
-    /// manifest into `sessions.live_disk_manifest_*`, gated by a
-    /// `sandbox_id` match so a stale publish from a destroyed
-    /// sandbox can't clobber a fresh binding. Bumps
-    /// `chunk_generation` in the same transaction on `Applied` so
-    /// Phase C's GC barrier sees an atomic step from "old pin set
-    /// → write → new pin set" (no mid-sweep window where the new
-    /// manifest exists but the generation hasn't ticked).
-    ///
-    /// `DroppedStale` means the UPDATE matched zero rows — either
-    /// the session was destroyed between flush and publish, or the
-    /// sandbox was rebound. Coord-side handler logs a `warn!` with
-    /// the mismatch and returns 200 to the host (the host shouldn't
-    /// retry; the staleness is structural).
-    ///
-    /// Default returns `Applied` and does nothing, so test mocks
-    /// don't need to plumb the columns until they exercise Phase B.
-    async fn update_live_disk_manifest(
-        &self,
-        _session_id: SessionId,
-        _sandbox_id: SandboxId,
-        _manifest_ref: ManifestRef,
-    ) -> Result<UpdateOutcome, MetaError> {
-        Ok(UpdateOutcome::Applied)
-    }
-
-    /// ADR 0016 Phase C support: read the one-row `chunk_generation`
-    /// counter. Phase C's GC sweep reads this before listing the
-    /// pin set and again at the end; if it ticked, the sweep
-    /// restarts with a fresh pin set. Default `0` so non-PG
-    /// backends don't have to track it.
+    /// Read the one-row `chunk_generation` counter: the GC promote pass
+    /// re-checks its candidates when it ticks. Default `0` for stores
+    /// that do not track it.
     async fn chunk_generation(&self) -> Result<u64, MetaError> {
         Ok(0)
     }
 
-    /// ADR 0016 Phase C: bump `chunk_generation` independent of a
-    /// flush. Used by `enable_image` and `record_snapshot` writes
-    /// (commit 2 of the Phase C chain) to keep the barrier complete
-    /// across all manifest-lineage-producing paths, not just live
-    /// disk flushes. Default is a no-op so non-PG backends opt out
-    /// cleanly. PG override increments the single row.
+    /// Barrier bump for manifest-lineage writes (`enable_image`,
+    /// `record_snapshot`). Default no-op for stores that do not track it.
     async fn bump_chunk_generation(&self) -> Result<(), MetaError> {
         Ok(())
     }
@@ -3394,21 +3297,6 @@ pub trait MetadataStore: Send + Sync {
     async fn list_enabled_image_base_snapshot_disk_manifests(
         &self,
     ) -> Result<Vec<ManifestRef>, MetaError> {
-        Ok(Vec::new())
-    }
-
-    /// ADR 0016 Phase C: enumerate every `(live_disk_manifest_id,
-    /// live_disk_manifest_version)` pair currently advertised by a
-    /// session row. Pin-set source #2 (the other two are
-    /// `list_enabled_image_disk_manifest_ids` and
-    /// `list_live_disk_manifest_ids` / `list_live_memory_manifest_ids`
-    /// over snapshots).
-    ///
-    /// Returns DISTINCT (id, version) tuples wrapped as `ManifestRef`.
-    /// Default `Ok(vec![])` keeps in-memory mocks quiet; PG impl
-    /// runs an indexed `WHERE live_disk_manifest_id IS NOT NULL`
-    /// query against the partial index added by migration 0034.
-    async fn list_live_session_disk_manifest_ids(&self) -> Result<Vec<ManifestRef>, MetaError> {
         Ok(Vec::new())
     }
 
@@ -3870,17 +3758,4 @@ pub struct GcCandidateRow {
     pub content_hash: [u8; 32],
     pub first_seen_at: chrono::DateTime<chrono::Utc>,
     pub last_seen_at: chrono::DateTime<chrono::Utc>,
-}
-
-/// Outcome of [`MetadataStore::update_live_disk_manifest`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UpdateOutcome {
-    /// The session row was updated and `chunk_generation` ticked.
-    /// Coord handler logs `info!`; host's coalescing mpsc moves on.
-    Applied,
-    /// The UPDATE matched zero rows — `sessions.sandbox_id !=
-    /// publish.sandbox_id` (destroyed/rebound) or the session is
-    /// gone. Coord handler logs `warn!` with the mismatch fields;
-    /// host shouldn't retry.
-    DroppedStale,
 }

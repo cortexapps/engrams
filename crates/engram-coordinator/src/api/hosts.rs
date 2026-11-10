@@ -10,50 +10,13 @@
 //! - `GET /api/hosts/:id` — one host's view.
 //! - `POST /api/hosts/:id/drain` — flip the row + scheduler view
 //!   to Draining so the scheduler stops picking it.
-//! - `GET /api/hosts/:id/cow-state` — ADR 0016 Phase A: per-sandbox
-//!   COW diagnostic for every chunk-tracked sandbox on this host.
 
 use chrono::{DateTime, Utc};
 use engram_core::HostId;
 use serde::Serialize;
 
-use crate::state::SharedState;
-
-/// Memory-tier enrichment: project the session's latest snapshot row
-/// into the diagnostic view's `memory_manifest` +
-/// `last_snapshot_at` fields. Returns `(None, None)` when the
-/// session has never been snapshotted — `CowStateView` falls back to
-/// the host's in-memory `last_snapshot_unix_ms` in that case.
-pub(crate) async fn enrichment_for_session(
-    state: &SharedState,
-    session_id: engram_core::SessionId,
-) -> (
-    Option<engram_core::types::manifest::ManifestRef>,
-    Option<chrono::DateTime<chrono::Utc>>,
-) {
-    match state
-        .services
-        .meta
-        .latest_snapshot_for_session(session_id)
-        .await
-    {
-        Ok(Some(rec)) => (rec.memory_manifest, Some(rec.created_at)),
-        Ok(None) => (None, None),
-        Err(e) => {
-            tracing::debug!(
-                %session_id,
-                error = %e,
-                "cow-state enrichment: snapshot lookup failed; rendering without memory tier",
-            );
-            (None, None)
-        }
-    }
-}
-
 #[derive(Serialize)]
 pub struct HostView {
-    pub nbd_slots_total: u32,
-    pub nbd_slots_in_use: u32,
     pub id: HostId,
     pub hostname: String,
     pub status: &'static str,
@@ -81,6 +44,12 @@ pub struct HostView {
     pub util_mem_total_mib: u64,
     pub util_mem_used_mib: u64,
     pub util_cpu_pct: f32,
+    /// The session-disk pool from the latest heartbeat; a zero total
+    /// means the host has no pool.
+    pub pool_data_free_mib: u64,
+    pub pool_data_total_mib: u64,
+    pub pool_metadata_free_mib: u64,
+    pub pool_metadata_total_mib: u64,
     /// Issue #540 (host RAM ledger attribution): measured base-shm tmpfs
     /// residency, and the running/parked split of guest PSS. `0` until
     /// the host's first post-0078 heartbeat. `base_shm_pending_mib` is
@@ -117,6 +86,8 @@ pub struct HostView {
     /// vector (pre-0068 row, or mid-roll) — the soft-pass posture.
     /// `>= 1` once it has.
     pub capabilities_schema: u32,
+    /// Which host-agent builds can adopt this host's running VMs (ADR 0126).
+    pub reattach_generation: u32,
     /// ADR 0088: in-flight enable work bound to this host — live
     /// materializes (fresh-claimed `materializing` enable_jobs) and
     /// non-terminal capture_jobs. The host-operator's roll/drain gates
@@ -133,10 +104,7 @@ impl HostView {
     ) -> Self {
         let mut ready_image_digests = row.ready_images.clone();
         ready_image_digests.sort();
-        let allocatable_mib = row.utilization.allocatable_mib;
-        let reserved_mib = reserved.mem_mib.max(0) as u64;
-        let cpu_budget = engram_core::types::host::host_cpu_budget(row.total_vcpus).max(0) as u64;
-        let reserved_vcpus = reserved.vcpus.max(0) as u64;
+        let room = engram_core::types::host::HostHeadroom::of(&row, reserved);
         let failing_capabilities = row
             .capabilities
             .failing_capabilities()
@@ -145,6 +113,7 @@ impl HostView {
             .collect();
         let fc_snapshot_version = row.capabilities.fc_snapshot_version.clone();
         let capabilities_schema = row.capabilities.schema;
+        let reattach_generation = row.capabilities.reattach_generation;
         Self {
             id: row.id,
             hostname: row.hostname,
@@ -165,19 +134,22 @@ impl HostView {
             util_base_shm_mib: row.utilization.base_shm_mib,
             util_parked_pss_mib: row.utilization.parked_pss_mib,
             util_running_pss_mib: row.utilization.running_pss_mib,
-            nbd_slots_total: row.utilization.nbd_slots_total,
-            nbd_slots_in_use: row.utilization.nbd_slots_in_use,
-            allocatable_mib,
-            reserved_mib,
-            free_mib: allocatable_mib.saturating_sub(reserved_mib),
+            pool_data_free_mib: row.utilization.pool_data_free_mib,
+            pool_data_total_mib: row.utilization.pool_data_total_mib,
+            pool_metadata_free_mib: row.utilization.pool_metadata_free_mib,
+            pool_metadata_total_mib: row.utilization.pool_metadata_total_mib,
+            allocatable_mib: room.allocatable_mib.max(0) as u64,
+            reserved_mib: room.reserved.mem_mib.max(0) as u64,
+            free_mib: room.free_mib().max(0) as u64,
             total_vcpus: row.total_vcpus,
-            cpu_budget_vcpus: cpu_budget,
-            reserved_vcpus,
-            free_vcpus: cpu_budget.saturating_sub(reserved_vcpus),
+            cpu_budget_vcpus: room.cpu_budget.max(0) as u64,
+            reserved_vcpus: room.reserved.vcpus.max(0) as u64,
+            free_vcpus: room.free_vcpus().unwrap_or(0).max(0) as u64,
             last_heartbeat_at: row.last_heartbeat_at,
             failing_capabilities,
             fc_snapshot_version,
             capabilities_schema,
+            reattach_generation,
             live_materializes: enable_work.materializes,
             live_capture_jobs: enable_work.captures,
         }

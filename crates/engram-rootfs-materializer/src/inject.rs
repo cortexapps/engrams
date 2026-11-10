@@ -98,8 +98,7 @@ mount -t proc  proc /proc 2>/dev/null || true
 # follow-up can have host-agent forward `engram-init: mark` lines into
 # Cloud Logging. Until then they're a dev-vm spike aid (read over SSH).
 mark() { echo "engram-init: mark $1 uptime=$(cut -d' ' -f1 /proc/uptime 2>/dev/null || echo '?')" >&2; }
-# ~kernel boot + rootfs ext4 mount (the chunked-NBD page-in window) up to
-# the first userspace instruction.
+# ~kernel boot + rootfs ext4 mount up to the first userspace instruction.
 mark kernel_to_init
 mount -t sysfs sys  /sys  2>/dev/null || true
 mount -t devtmpfs dev /dev 2>/dev/null || true

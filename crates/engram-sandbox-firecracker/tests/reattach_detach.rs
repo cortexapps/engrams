@@ -35,6 +35,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_sandbox_firecracker::sandbox_manifest;
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
@@ -100,8 +101,9 @@ async fn detached_vm_survives_backend_drop_and_reattaches() {
 
     // --- Generation A: create the VM ---
     let backend_a = FirecrackerBackend::new(work.path(), mk_cfg());
-    let id = backend_a
-        .create(test_spec(local_rootfs.clone()))
+    let id = SandboxId::new();
+    backend_a
+        .create(id, test_spec(local_rootfs.clone()))
         .await
         .expect("create");
     assert_eq!(backend_a.list().await.expect("list"), vec![id]);
@@ -179,50 +181,4 @@ async fn detached_vm_survives_backend_drop_and_reattaches() {
         !fc_alive(fc_pid),
         "destroy must SIGKILL the FC by recorded pid even with no owned Child"
     );
-}
-
-#[tokio::test]
-#[ignore = "requires Linux + KVM + firecracker; run with --ignored on the dev VM"]
-async fn post_copy_restore_persists_role_before_list() {
-    let Some(env) = common::fc_preflight() else {
-        return;
-    };
-    let work = tempfile::tempdir().unwrap();
-    let rootfs = work.path().join("rootfs.ext4");
-    common::clone_rootfs(&env.rootfs, &rootfs).await.unwrap();
-    let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
-    cfg.net_pool = None;
-    // File restore isolates the manifest transaction from peer transport.
-    let backend = FirecrackerBackend::new(work.path(), cfg);
-    let source = backend.create(test_spec(rootfs)).await.unwrap();
-    let snapshot = backend.snapshot(source).await.unwrap();
-    backend.destroy(source).await.unwrap();
-    std::fs::write(
-        backend
-            .snapshot_path_for(snapshot.id)
-            .join(engram_sandbox_firecracker::MIGRATION_PEER_FILE),
-        b"{}",
-    )
-    .unwrap();
-    let restore = backend.restore(snapshot);
-    tokio::pin!(restore);
-    let id = loop {
-        tokio::select! {
-            result = &mut restore => break result.unwrap(),
-            () = tokio::task::yield_now() => {
-                for id in backend.list().await.unwrap() {
-                    let manifest = sandbox_manifest::read_manifest(&sandbox_manifest::manifest_path(work.path(), id)).unwrap();
-                    assert_eq!(manifest.migration_role.as_deref(), Some(sandbox_manifest::ROLE_POST_COPY_DEST));
-                }
-            }
-        }
-    };
-    assert!(backend.list().await.unwrap().contains(&id));
-    let manifest =
-        sandbox_manifest::read_manifest(&sandbox_manifest::manifest_path(work.path(), id)).unwrap();
-    assert_eq!(
-        manifest.migration_role.as_deref(),
-        Some(sandbox_manifest::ROLE_POST_COPY_DEST)
-    );
-    backend.destroy(id).await.unwrap();
 }

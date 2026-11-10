@@ -1,11 +1,10 @@
 //! ADR 0095 transport bench — MANUAL (`#[ignore]`), not a CI test.
 //!
-//! Measures the peer-chunk pull's end-to-end loopback throughput (real
-//! gRPC serve arm + real pull machinery + real CRC + real cache
-//! landing) against a raw-TCP baseline moving the same bytes, to gate
-//! the transport shape: tuned tonic ships if it sustains ≥ the local-
-//! NVMe write rate (~700 MB/s); raw TCP is only worth its extra
-//! surface if H2 overhead provably caps below that.
+//! Measures the peer tier's end-to-end loopback throughput (real gRPC
+//! serve arm, the fill engine with a `PeerFetcher` source, real CRC and
+//! cache writes) against a raw-TCP baseline moving the same bytes. The
+//! transport shape is right while it sustains at least the local NVMe
+//! write rate (about 700 MB/s).
 //!
 //! Run (numbers belong in the ADR; run on Linux for the real gate —
 //! macOS loopback still exposes protocol overhead honestly):
@@ -15,9 +14,8 @@
 //!   --run-ignored all --no-capture
 //! ```
 //!
-//! Knobs: ENGRAM_PEER_PULL_CONNS / ENGRAM_PEER_FRAME_BYTES /
-//! ENGRAM_PEER_SERVE_STREAMS (see peer_fill.rs), and
-//! BENCH_TOTAL_MIB (default 512).
+//! Knobs: ENGRAM_PEER_FRAME_BYTES / ENGRAM_PEER_SERVE_STREAMS (see
+//! peer_fill.rs), and BENCH_TOTAL_MIB (default 512).
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
 
@@ -27,7 +25,7 @@ use std::time::{Duration, Instant};
 use engram_chunk_store::cache::{ChunkCache, ChunkCacheConfig, NO_CEILING};
 use engram_chunk_store::manifest::ChunkHash;
 use engram_host_agent::image_prefetch::ImageReadiness;
-use engram_host_agent::peer_fill::{pull_chunks_from_peer, PeerHealth, PeerServe};
+use engram_host_agent::peer_fill::{PeerFetcher, PeerHealth, PeerServe};
 use engram_protocol::grpc_client::PeerChunkScope;
 use engram_protocol::heartbeat::ManifestDigest;
 
@@ -149,39 +147,51 @@ const DIGEST: &str = "sha256:bench";
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "manual transport bench — see module docs"]
-async fn bench_tuned_grpc_pull() {
+async fn bench_engine_peer_fill() {
     let serve_dir = tempfile::tempdir().unwrap();
     let land_dir = tempfile::tempdir().unwrap();
+    let blob_dir = tempfile::tempdir().unwrap();
     let serve_cache = mk_cache(&serve_dir);
     let land_cache = mk_cache(&land_dir);
-
-    // 16 MiB disk-shaped chunks + one tail of 512 KiB memory-shaped
-    // chunks, matching the prod mix.
+    // 16 MiB disk-shaped chunks and 128 MiB of 512 KiB memory-shaped
+    // chunks, the production mix.
     let disk_chunks = total_mib() / 16;
-    let mem_chunks = 256; // 128 MiB of 512 KiB objects
-    let mut bodies: Vec<Vec<u8>> = Vec::new();
+    let mem_chunks = 256;
+    let mut hashes = Vec::new();
+    let mut total_bytes = 0usize;
     for i in 0..disk_chunks {
         let mut b = vec![0u8; 16 * 1024 * 1024];
-        b[0] = i as u8; // distinct hashes
+        b[0] = i as u8;
         b[1] = 0xD1;
-        bodies.push(b);
+        let h = ChunkHash::of(&b);
+        total_bytes += b.len();
+        serve_cache
+            .put_trusted(
+                h,
+                bytes::Bytes::from(b),
+                engram_chunk_store::Class::Background,
+            )
+            .await
+            .unwrap();
+        hashes.push(h);
     }
     for i in 0..mem_chunks {
         let mut b = vec![0u8; 512 * 1024];
         b[0] = i as u8;
         b[1] = (i >> 8) as u8;
         b[2] = 0x3E;
-        bodies.push(b);
-    }
-    let mut hashes = Vec::new();
-    for b in &bodies {
-        let h = ChunkHash::of(b);
-        serve_cache.put(h, b).await.unwrap();
+        let h = ChunkHash::of(&b);
+        total_bytes += b.len();
+        serve_cache
+            .put_trusted(
+                h,
+                bytes::Bytes::from(b),
+                engram_chunk_store::Class::Background,
+            )
+            .await
+            .unwrap();
         hashes.push(h);
     }
-    let total_bytes: usize = bodies.iter().map(Vec::len).sum();
-    drop(bodies);
-
     let ready = ImageReadiness::new();
     ready.mark_ready(ManifestDigest::new(DIGEST.to_string()));
     let peer = PeerServe::new(serve_cache, ready);
@@ -193,43 +203,43 @@ async fn bench_tuned_grpc_pull() {
         tokio::spawn(engram_host_agent::grpc_server::boot(
             a,
             host,
-            None,
             engram_host_agent::session_epochs::ephemeral(),
             Some(peer),
         ));
         tokio::time::sleep(Duration::from_millis(300)).await;
         format!("http://{a}")
     };
-
-    let health = PeerHealth::new();
+    // An empty store: a chunk the peer does not answer fails the fill.
+    let store = engram_chunk_store::ChunkStore::new(Arc::new(
+        engram_storage_local::LocalBlobStorage::new(blob_dir.path()),
+    ))
+    .with_chunk_cache(land_cache.clone());
+    let fill = engram_fill::FillEngine::new(store, engram_fill::Config::default()).with_peer(
+        PeerFetcher::spawn(
+            addr,
+            PeerChunkScope::BaseImage(DIGEST.into()),
+            PeerHealth::new(),
+        ),
+    );
     let started = Instant::now();
-    let stats = pull_chunks_from_peer(
-        &addr,
-        PeerChunkScope::BaseImage(DIGEST.into()),
-        &hashes,
-        &land_cache,
-        &health,
-    )
-    .await;
+    let stats = fill
+        .fill(hashes.clone(), engram_fill::Class::Background)
+        .await
+        .expect("every chunk from the peer");
     let elapsed = started.elapsed();
-    assert!(!stats.failed, "bench pull failed: {stats:?}");
-    assert_eq!(stats.landed, hashes.len());
-    let mbps = (total_bytes as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
+    assert_eq!(stats.fetched, hashes.len());
     println!(
-        "tuned gRPC pull: {} chunks / {:.0} MiB in {:.2?} = {:.0} MiB/s \
-         (conns={}, frame={} B)",
+        "engine peer fill: {} chunks / {:.0} MiB in {:.2?} = {:.0} MiB/s",
         hashes.len(),
         total_bytes as f64 / (1024.0 * 1024.0),
         elapsed,
-        mbps,
-        std::env::var("ENGRAM_PEER_PULL_CONNS").unwrap_or_else(|_| "4 (default)".into()),
-        std::env::var("ENGRAM_PEER_FRAME_BYTES").unwrap_or_else(|_| "4 MiB (default)".into()),
+        (total_bytes as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64(),
     );
 }
 
 /// Raw-TCP baseline: the theoretical ceiling for this box's loopback +
 /// buffer handling, no protocol at all. The gap between this and the
-/// tuned gRPC number is the H2+proto tax.
+/// engine fill is the cost of HTTP/2, the protocol and the cache writes.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "manual transport bench — see module docs"]
 async fn bench_raw_tcp_baseline() {

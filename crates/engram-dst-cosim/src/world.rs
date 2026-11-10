@@ -2,10 +2,9 @@
 //! real coordinator replica, and a real [`CosimHost`], wired across the
 //! boundary bridge (ADR 0098 R-CoSim, rung 1).
 //!
-//! The single shared clock is the crux: `engram-dst` and `engram-dst-host`
-//! each build their own paused-clock world; here BOTH the coordinator's
-//! `Services` and the host's `CosimHost` read the same `SimClock`, so a time
-//! advance moves both sides together and the interleaving is deterministic.
+//! The single shared clock is the crux: BOTH the coordinator's `Services`
+//! and the host's `CosimHost` read the same `SimClock`, so a time advance
+//! moves both sides together and the interleaving is deterministic.
 
 use std::sync::Arc;
 
@@ -169,7 +168,7 @@ impl CosimWorld {
         if !tombstoned.is_empty() {
             let mut host = self.host.lock().await;
             for sandbox in tombstoned {
-                host.destroy(sandbox);
+                host.destroy(sandbox).await;
             }
         }
     }

@@ -1,6 +1,6 @@
 # ADR 0090: Sandbox ownership is coordinator truth — rolls and recoveries must not kill owned VMs
 
-- Status: Accepted (2026-07-13)
+- Status: Accepted (2026-07-13); Decision 3 (the quarantined-survivor channel) superseded by [ADR 0125](./0125-kernel-owned-session-disk.md) (proposed 2026-11-03). Decisions 1, 2, 4, 5 and 6 stand.
 - Date: 2026-07-13
 - Commit chain: PR #653 (`4ee65faa`) — the whole decision landed in one
   change: the reconciler's coordinator-ask (+ `session_owning_sandbox` /

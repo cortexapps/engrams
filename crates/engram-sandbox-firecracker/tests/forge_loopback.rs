@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::ids::SessionId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_harness_proto::{read_msg, write_msg, ForgeOp, ForgeRequest, ForgeResponse};
@@ -147,7 +148,11 @@ async fn forge_credential_round_trips_over_vsock() {
         swap_source: None,
         swap_manifest: None,
     };
-    let sandbox_id = backend.create(spec).await.expect("create sandbox");
+    let sandbox_id = SandboxId::new();
+    backend
+        .create(sandbox_id, spec)
+        .await
+        .expect("create sandbox");
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
 
     // ---- 3. exec `engram-agentd forge-credential` in the guest. ----

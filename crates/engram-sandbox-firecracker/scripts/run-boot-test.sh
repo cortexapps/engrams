@@ -9,7 +9,7 @@ here="$(dirname "${BASH_SOURCE[0]}")"
 # fetch-fc-test-artifacts.sh prints `export FC_TEST_KERNEL=...` lines.
 eval "$(bash "$here/fetch-fc-test-artifacts.sh")"
 
-# UFFD restore needs the handler binary built first.
+# Every resume spawns the UFFD handler; build it first.
 cargo build -p engram-uffd-handler
 
 # The real-VM tests bake engram-agentd and engram-harness-noop into
@@ -26,7 +26,7 @@ cargo build \
   --release
 
 case "${1:-all}" in
-  boot|lifecycle|snapshot|snapshot_uffd|exec_real_vm|agentd_bundle_reexec|materialize_boot|baked_harness_loopback|forge_loopback|upload_loopback|multi_restore|cross_host_restore|restore_chain|snapshot_net|host_startup|proxy_e2e|diff_snapshot|file_restore_shared_rss)
+  boot|lifecycle|snapshot|exec_real_vm|agentd_bundle_reexec|materialize_boot|baked_harness_loopback|forge_loopback|upload_loopback|multi_restore|cross_host_restore|restore_chain|snapshot_net|host_startup|proxy_e2e|diff_snapshot|file_restore_shared_rss)
     # Root-required tests: snapshot_net + host_startup + proxy_e2e
     # all use real TAP / iptables / netns. Detect and re-exec via
     # sudo when not already root.
@@ -45,7 +45,6 @@ case "${1:-all}" in
     cargo test -p engram-sandbox-firecracker --test boot                   -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test lifecycle              -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test snapshot               -- --ignored --nocapture
-    cargo test -p engram-sandbox-firecracker --test snapshot_uffd          -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test exec_real_vm           -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test agentd_bundle_reexec   -- --ignored --nocapture
     # ADR 0080 phase 3b: materialize a synthetic docker image + boot it
@@ -62,7 +61,7 @@ case "${1:-all}" in
     cargo test -p engram-sandbox-firecracker --test file_restore_shared_rss -- --ignored --nocapture
     ;;
   *)
-    echo "usage: $0 [boot|lifecycle|snapshot|snapshot_uffd|exec_real_vm|agentd_bundle_reexec|materialize_boot|baked_harness_loopback|forge_loopback|upload_loopback|multi_restore|cross_host_restore|restore_chain|snapshot_net|host_startup|proxy_e2e|diff_snapshot|file_restore_shared_rss|all]" >&2
+    echo "usage: $0 [boot|lifecycle|snapshot|exec_real_vm|agentd_bundle_reexec|materialize_boot|baked_harness_loopback|forge_loopback|upload_loopback|multi_restore|cross_host_restore|restore_chain|snapshot_net|host_startup|proxy_e2e|diff_snapshot|file_restore_shared_rss|all]" >&2
     exit 2
     ;;
 esac

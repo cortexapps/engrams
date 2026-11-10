@@ -41,11 +41,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .file_descriptor_set_path(&descriptor_path)
-        // The default 4 MiB inbound message cap is fine for unary
-        // payloads (SandboxSpec, SnapshotMetadata are well under
-        // that). `ReapMaterializeDir` ships a vec of UUIDs that can
-        // reach 16 MiB at 1M IDs; the host server bumps its decode
-        // cap inline at the call site rather than globally here.
         .compile_protos(&protos, &includes)?;
     Ok(())
 }

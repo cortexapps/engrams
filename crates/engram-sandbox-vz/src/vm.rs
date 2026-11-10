@@ -20,10 +20,11 @@ use objc2::AnyThread;
 use objc2_foundation::NSFileHandle;
 use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 use objc2_virtualization::{
-    VZBootLoader, VZDiskImageStorageDeviceAttachment, VZFileHandleSerialPortAttachment,
-    VZLinuxBootLoader, VZNATNetworkDeviceAttachment, VZSerialPortAttachment,
-    VZSerialPortConfiguration, VZSocketDeviceConfiguration, VZStorageDeviceConfiguration,
-    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
+    VZBootLoader, VZDiskImageStorageDeviceAttachment, VZEntropyDeviceConfiguration,
+    VZFileHandleSerialPortAttachment, VZLinuxBootLoader, VZNATNetworkDeviceAttachment,
+    VZSerialPortAttachment, VZSerialPortConfiguration, VZSocketDeviceConfiguration,
+    VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
+    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
     VZVirtioNetworkDeviceConfiguration, VZVirtioSocketDeviceConfiguration, VZVirtualMachine,
     VZVirtualMachineConfiguration, VZVirtualMachineState,
 };
@@ -449,6 +450,18 @@ impl VzVm {
         self.dead.load(Ordering::SeqCst)
     }
 
+    /// Liveness from the framework, not from the sandbox map: the stop
+    /// delegate has not fired and the machine is in a running-family
+    /// state. `Stopped` and `Error` are dead.
+    pub async fn is_alive(&self) -> bool {
+        use VZVirtualMachineState as S;
+        !self.is_dead()
+            && matches!(
+                self.state().await,
+                S::Running | S::Paused | S::Starting | S::Pausing | S::Resuming
+            )
+    }
+
     /// Start the VM. Resolves once VZ's `startWithCompletionHandler`
     /// fires its callback (success) or returns an NSError (failure).
     pub async fn start(&self) -> Result<(), VzError> {
@@ -826,10 +839,8 @@ fn build_configuration(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfig
         let nat_super: Retained<objc2_virtualization::VZNetworkDeviceAttachment> =
             Retained::cast_unchecked(nat);
         net_dev.setAttachment(Some(&nat_super));
-        // ADR 0096 spike round 2: pin the MAC when asked — the default
-        // is a fresh random VZMACAddress per configuration, and a
-        // machine-state restore requires the restoring config's MAC to
-        // MATCH the saved VM's (mismatch = generic VZErrorRestore=12).
+        // A machine-state restore requires the restoring config's MAC to
+        // equal the saved VM's; the default is a fresh random one.
         if let Some(mac) = &cfg.mac_address {
             let mac_ns = NSString::from_str(mac);
             let mac_addr = objc2_virtualization::VZMACAddress::initWithString(
@@ -845,20 +856,21 @@ fn build_configuration(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfig
             NSArray::from_retained_slice(&[net_dev_super]);
         vz_cfg.setNetworkDevices(&network_array);
 
-        // virtio-fs is no longer used — the harness substrate is now
-        // attached as a read-only virtio-blk image (task 2 of the FC
-        // parity work), and `WorkspaceSpec::LocalMount` is gone.
-        // The directory-sharing device path stays unset.
+        // virtio-rng: the guest's CRNG must initialise at boot. arm64 has
+        // no CPU random instruction the kernel trusts, so without this
+        // device the pool fills from interrupt jitter alone and an early
+        // `getrandom()` (ttyd's TLS seed, sshd, anything in agentd) blocks
+        // for seconds or forever.
+        let rng_dev = VZVirtioEntropyDeviceConfiguration::new();
+        let rng_dev_super: Retained<VZEntropyDeviceConfiguration> =
+            Retained::cast_unchecked(rng_dev);
+        let entropy_array: Retained<NSArray<VZEntropyDeviceConfiguration>> =
+            NSArray::from_retained_slice(&[rng_dev_super]);
+        vz_cfg.setEntropyDevices(&entropy_array);
 
-        // Real virtio-vsock — a single device, shared across all ports.
-        // The `vsock_bridge` (vsock_bridge.rs) attaches per-port
-        // listeners (harness 1026 / ready 1027 / upload 1029) and dials
-        // host→guest ports (agentd 1024 / relay 1030) after
-        // `VZVirtualMachine::initWithConfiguration_queue`. Unlike the
-        // retired multi-port virtio-console, vsock muxes any number of
-        // concurrent streams per port, so a persistent forwarded
-        // connection (an HMR WebSocket, a noVNC stream) can't head-of-line
-        // block other forwarded connections (ADR 0066 Phase 2).
+        // One virtio-vsock device muxes every port; `vsock_bridge`
+        // attaches the per-port listeners and dials after
+        // `initWithConfiguration_queue`.
         let vsock_dev = VZVirtioSocketDeviceConfiguration::new();
         let vsock_dev_super: Retained<VZSocketDeviceConfiguration> =
             Retained::cast_unchecked(vsock_dev);
@@ -1135,7 +1147,7 @@ mod tests {
 
         let scratch = tempfile::tempdir().expect("scratch");
         let rootfs_copy = scratch.path().join("rootfs.ext4");
-        crate::disk::clone_or_copy(&rootfs, &rootfs_copy)
+        tokio::fs::copy(&rootfs, &rootfs_copy)
             .await
             .expect("clone rootfs");
         let state = scratch.path().join("machine.vzs");
@@ -1268,7 +1280,7 @@ mod tests {
         };
         let scratch = tempfile::tempdir().expect("scratch");
         let rootfs_a = scratch.path().join("a.rootfs.ext4");
-        crate::disk::clone_or_copy(&rootfs, &rootfs_a)
+        tokio::fs::copy(&rootfs, &rootfs_a)
             .await
             .expect("clone rootfs");
         let state = scratch.path().join("machine.vzs");
@@ -1301,7 +1313,7 @@ mod tests {
 
         // (a) restore with the rootfs at a DIFFERENT path.
         let rootfs_b = scratch.path().join("b.rootfs.ext4");
-        crate::disk::clone_or_copy(&rootfs_a, &rootfs_b)
+        tokio::fs::copy(&rootfs_a, &rootfs_b)
             .await
             .expect("clone to different path");
         let vm2 = VzVm::new(spike_cfg(&kernel, &rootfs_b, mid.clone(), MAC, 1024))
@@ -1385,7 +1397,7 @@ mod tests {
         match phase.as_str() {
             "save" => {
                 std::fs::create_dir_all(&dir).expect("spike dir");
-                crate::disk::clone_or_copy(&rootfs, &rootfs_copy)
+                tokio::fs::copy(&rootfs, &rootfs_copy)
                     .await
                     .expect("clone rootfs");
                 let mid = fresh_machine_identifier();

@@ -70,9 +70,11 @@ impl GcsBlobStorage {
         // - bounded connect: a blackholed endpoint fails in 5 s and
         //   surfaces to the BlobClient retry layer, instead of pinning
         //   an attempt for the OS default (minutes).
-        // - sized keep-alive pool: the sparse re-chunk and NBD flush
-        //   fan out dozens of concurrent chunk ops; idle-connection
-        //   reuse keeps those off the TLS-handshake path — and keeps
+        // - sized keep-alive pool: as large as the fill engine's in-flight
+        //   ceiling (256), so a fill at that width reuses its connections;
+        //   idle-connection reuse keeps chunk ops off the TLS-handshake
+        //   path (a smaller pool closes the extra connections after each
+        //   use and the next request pays a new handshake) — and keeps
         //   DNS off the hot path entirely, which is why hickory async
         //   DNS was tried and RETIRED here: reqwest's `hickory-dns`
         //   feature unifies workspace-wide and flips the DEFAULT
@@ -98,7 +100,7 @@ impl GcsBlobStorage {
         // with the feature enabled rather than trusting this number.
         let http = engram_tls::client_builder()
             .connect_timeout(std::time::Duration::from_secs(5))
-            .pool_max_idle_per_host(64)
+            .pool_max_idle_per_host(256)
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .tcp_keepalive(std::time::Duration::from_secs(30))
             .http1_only()
@@ -162,18 +164,31 @@ fn map_http_err(e: GcsHttpError) -> BlobError {
     // Both shapes mean the same thing: object doesn't exist.
     // Collapse them so callers downstream of `get_streaming` get
     // the same `BlobError::NotFound` that callers of `head` do.
-    let is_404 = match &e {
-        GcsHttpError::Response(resp) => resp.code == 404,
-        GcsHttpError::HttpClient(rq) | GcsHttpError::RawResponse(rq, _) => {
-            rq.status().is_some_and(|s| s.as_u16() == 404)
-        }
-        _ => false,
-    };
-    if is_404 {
-        BlobError::NotFound
-    } else {
-        BlobError::Sdk(Box::new(e))
+    // GCS answers 429 when a bucket's write rate grows faster than it
+    // redistributes load, and 503 when a backend is busy.
+    match http_status(&e) {
+        Some(404) => BlobError::NotFound,
+        Some(429 | 503) => BlobError::Throttled(Box::new(e)),
+        _ => BlobError::Sdk(Box::new(e)),
     }
+}
+
+/// The HTTP status of a failed request, from either error shape.
+fn http_status(e: &GcsHttpError) -> Option<u16> {
+    match e {
+        GcsHttpError::Response(resp) => Some(resp.code),
+        GcsHttpError::HttpClient(rq) | GcsHttpError::RawResponse(rq, _) => {
+            rq.status().map(|s| s.as_u16())
+        }
+        _ => None,
+    }
+}
+
+/// The SDK range for `[offset, offset + len)`; the SDK sends it as
+/// `Range: bytes=first-last`.
+fn gcs_range(offset: u64, len: u64) -> Result<Range, BlobError> {
+    let (first, last) = engram_core::traits::storage::inclusive_range(offset, len)?;
+    Ok(Range(Some(first), Some(last)))
 }
 
 #[async_trait]
@@ -184,7 +199,7 @@ impl BlobStorage for GcsBlobStorage {
     /// refcounted (zero-copy) and carries Content-Length, which is
     /// both cheaper per request and what GCS's simple-upload path
     /// prefers. This is the chunk-upload hot path (sparse re-chunk,
-    /// NBD flush).
+    /// disk checkpoint).
     async fn put(&self, key: &str, body: bytes::Bytes) -> Result<u64, BlobError> {
         let len = body.len() as u64;
         let req = UploadObjectRequest {
@@ -196,7 +211,7 @@ impl BlobStorage for GcsBlobStorage {
             .upload_object(&req, body, &upload_type)
             .await
             .map_err(map_http_err)?;
-        tracing::debug!(bucket = %self.bucket, key = %key, bytes = len, "gcs put (sized)");
+        tracing::trace!(bucket = %self.bucket, key = %key, bytes = len, "gcs put (sized)");
         Ok(len)
     }
 
@@ -234,7 +249,7 @@ impl BlobStorage for GcsBlobStorage {
             .await
             .map_err(map_http_err)?;
         let total = total.load(std::sync::atomic::Ordering::Relaxed);
-        tracing::debug!(bucket = %self.bucket, key = %key, bytes = total, "gcs put");
+        tracing::trace!(bucket = %self.bucket, key = %key, bytes = total, "gcs put");
         Ok(total)
     }
 
@@ -254,6 +269,27 @@ impl BlobStorage for GcsBlobStorage {
         // off the wire — no re-buffering.
         let mapped = stream.map(|chunk| chunk.map_err(|e| BlobError::Sdk(Box::new(e))));
         Ok(ByteStream::new(mapped))
+    }
+
+    /// One ranged GET (`206 Partial Content`). GCS answers a range that
+    /// starts past the end with 416, and one that ends past it with the
+    /// bytes it has; both are out of bounds.
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<bytes::Bytes, BlobError> {
+        let range = gcs_range(offset, len)?;
+        let req = GetObjectRequest {
+            bucket: self.bucket.clone(),
+            object: key.to_string(),
+            ..Default::default()
+        };
+        let body =
+            self.client
+                .download_object(&req, &range)
+                .await
+                .map_err(|e| match http_status(&e) {
+                    Some(416) => BlobError::RangeOutOfBounds { offset, len },
+                    _ => map_http_err(e),
+                })?;
+        engram_core::traits::storage::checked_range(body.into(), offset, len)
     }
 
     async fn head(&self, key: &str) -> Result<BlobObjectMeta, BlobError> {
@@ -361,6 +397,42 @@ mod tests {
 
     use engram_testkit::blob_conformance;
 
+    fn json_error(code: u16, message: &str) -> GcsHttpError {
+        GcsHttpError::Response(gcloud_storage::http::error::ErrorResponse {
+            code,
+            errors: Vec::new(),
+            message: message.to_string(),
+        })
+    }
+
+    #[test]
+    fn status_codes_map_to_blob_errors() {
+        let rate_limited = json_error(
+            429,
+            "Your request distribution is too uneven across the key-ranges in your bucket.",
+        );
+        assert!(matches!(
+            map_http_err(rate_limited),
+            BlobError::Throttled(_)
+        ));
+        assert!(matches!(
+            map_http_err(json_error(503, "backendError")),
+            BlobError::Throttled(_)
+        ));
+        assert!(matches!(
+            map_http_err(json_error(404, "No such object")),
+            BlobError::NotFound
+        ));
+        assert!(matches!(
+            map_http_err(json_error(500, "internal")),
+            BlobError::Sdk(_)
+        ));
+        assert!(matches!(
+            map_http_err(json_error(403, "forbidden")),
+            BlobError::Sdk(_)
+        ));
+    }
+
     /// Pins the rustls CryptoProvider contract for this crate's clients.
     ///
     /// `connect()` reaches TLS twice — the tuned client it builds, and the
@@ -447,6 +519,16 @@ mod tests {
             return;
         };
         blob_conformance::streaming_round_trip(&store, 64 * 1024, 1024).await;
+    }
+
+    #[test]
+    fn a_gcs_range_names_the_first_and_last_byte() {
+        let range = gcs_range(65_536, 65_536).unwrap();
+        assert_eq!((range.0, range.1), (Some(65_536), Some(131_071)));
+        assert!(matches!(
+            gcs_range(0, 0),
+            Err(BlobError::RangeOutOfBounds { .. })
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

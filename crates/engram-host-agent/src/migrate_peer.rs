@@ -67,8 +67,7 @@ pub struct PeerExport {
     pub durable_at: Vec<Option<ChunkHash>>,
     pub chunk_size: u64,
     pub total_bytes: u64,
-    /// Per-leg serve attribution (logged at DrainDone): where the
-    /// per-request wall actually goes on this no-SHA-NI fleet.
+    /// Per-leg serve attribution, logged at DrainDone.
     pub serve: ServeStats,
     /// Issue #216 Gap 2: the TTL clock SHARED with the registry's
     /// `MigrationExport.last_activity` (same `Arc`). The post-copy TTL
@@ -640,12 +639,12 @@ impl PeerServer {
             .readv_us
             .fetch_add(t_readv.elapsed().as_micros() as u64, Relaxed);
 
-        // v3: the AltSource classify (sha256 of the raw 512 KiB, ~1 ms
-        // on this no-SHA-NI fleet) runs ONLY for drain serves. On the
-        // fault path a demote is strictly WORSE than shipping the
-        // resident bytes — it converts one stalled-vCPU round trip
-        // into a dest-side cache/GCS fetch. The zero check stays on
-        // both paths (cheap scan, saves the whole payload).
+        // v3: the AltSource classify (sha256 of the raw 512 KiB) runs
+        // ONLY for drain serves. On the fault path a demote is strictly
+        // WORSE than shipping the resident bytes — it converts one
+        // stalled-vCPU round trip into a dest-side cache/GCS fetch.
+        // The zero check stays on both paths (cheap scan, saves the
+        // whole payload).
         let t_classify = crate::time_source::metrics_now();
         let classified = if latency_critical {
             if bytes.iter().all(|b| *b == 0) {
@@ -675,11 +674,17 @@ impl PeerServer {
                 durable_sha256: *hash.as_bytes(),
             },
             ServedChunk::Page(bytes, _raw_hash) => {
-                // v2: ship the smaller of lz4/raw; integrity covers
-                // the wire bytes (and hashing the smaller payload is
-                // itself a win on this no-SHA-NI fleet).
+                // Fault serves ship raw: on the fleet LAN, lz4 of a
+                // 512 KiB chunk takes longer than sending the raw bytes,
+                // and a vCPU waits on every fault. Every destination
+                // build since v2 accepts `lz4: false`. Integrity covers
+                // the wire bytes.
                 let t_encode = crate::time_source::metrics_now();
-                let (wire, lz4) = engram_migrate_proto::compress_page(bytes);
+                let (wire, lz4) = if latency_critical {
+                    (bytes, false)
+                } else {
+                    engram_migrate_proto::compress_page(bytes)
+                };
                 let hash = engram_migrate_proto::wire_hash(&wire);
                 export
                     .serve
@@ -710,6 +715,15 @@ where
     R: tokio::io::AsyncRead + Unpin,
     T: serde::de::DeserializeOwned,
 {
+    bincode::deserialize(&read_body_async(r).await?)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bincode: {e}")))
+}
+
+/// The body of one length-prefixed frame, not yet decoded.
+pub(crate) async fn read_body_async<R>(r: &mut R) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -724,8 +738,7 @@ where
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;
-    bincode::deserialize(&body)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bincode: {e}")))
+    Ok(body)
 }
 
 /// Write one length-prefixed frame asynchronously (mirror of
@@ -939,6 +952,54 @@ mod tests {
             assert_eq!(
                 engram_migrate_proto::decompress_page(bytes.clone(), *lz4).unwrap(),
                 memory[offset as usize..offset as usize + 4096]
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fault_serves_ship_raw_and_drain_serves_compress() {
+        let memory = vec![0x5Au8; 16384];
+        for (purpose, want_lz4) in [
+            (engram_migrate_proto::ConnPurpose::Fault, false),
+            (engram_migrate_proto::ConnPurpose::Drain, true),
+        ] {
+            let server = PeerServer::new(9102);
+            let mut export = test_export("t");
+            export.vmas = vec![GuestVma {
+                start: memory.as_ptr() as u64,
+                end: memory.as_ptr() as u64 + memory.len() as u64,
+                file_offset: 0,
+            }];
+            server.register(export);
+            let got = talk(
+                server,
+                vec![
+                    ToSource::Hello {
+                        version: PROTO_VERSION,
+                        export_id: "exp-1".into(),
+                        token: "t".into(),
+                        purpose,
+                    },
+                    ToSource::NeedAt {
+                        req_id: 1,
+                        chunk_offset: 4096,
+                    },
+                ],
+                3,
+            )
+            .await;
+            let Some(FromSource::Page {
+                bytes, hash, lz4, ..
+            }) = got.get(2)
+            else {
+                panic!("{purpose:?}: expected Page, got {got:?}")
+            };
+            assert_eq!(*lz4, want_lz4, "{purpose:?}");
+            assert_eq!(*hash, engram_migrate_proto::wire_hash(bytes));
+            assert_eq!(
+                engram_migrate_proto::decompress_page(bytes.clone(), *lz4).unwrap(),
+                memory[4096..8192]
             );
         }
     }

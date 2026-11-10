@@ -8,8 +8,8 @@ use engram_core::traits::storage::BlobStorage;
 /// `head()` (HEAD/exists) and `put()` (upload) calls the chunk-store
 /// makes, so tests can assert which round-trips a path performs — e.g.
 /// that flush paths skip the dedup HEAD (ADR 0078 move 5) and that the
-/// sparse re-chunk's unchanged-skip performs no store I/O at all
-/// (ADR 0101 A).
+/// sparse re-chunk's unchanged-skip performs no store I/O at all (ADR
+/// 0101 A).
 pub(crate) struct CountingBlob {
     inner: Arc<dyn BlobStorage>,
     exists_calls: std::sync::atomic::AtomicUsize,

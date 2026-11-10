@@ -41,12 +41,13 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
 
 /// How many serial restore-destroy cycles to exercise. 3 is the
 /// smallest N that catches "first restore works but second fails"
-/// (state-bin path collisions, leaked TAP, leaked NBD slot, etc.).
+/// (state-bin path collisions, leaked TAP, etc.).
 const N: usize = 3;
 
 #[tokio::test]
@@ -66,6 +67,7 @@ async fn serial_restore_from_one_canonical_n_times() {
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
     cfg.net_pool = None;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
+    common::resume_through_uffd(&mut cfg, work.path());
     let backend = FirecrackerBackend::new(work.path(), cfg);
 
     let spec = SandboxSpec {
@@ -87,16 +89,21 @@ async fn serial_restore_from_one_canonical_n_times() {
     };
 
     // Step 1: Create source + let it settle + snapshot + destroy.
-    let source_id = backend.create(spec).await.expect("create source");
+    let source_id = SandboxId::new();
+    backend
+        .create(source_id, spec)
+        .await
+        .expect("create source");
     tokio::time::sleep(Duration::from_secs(2)).await;
     let metadata = backend.snapshot(source_id).await.expect("snapshot source");
+    common::chunk_memory(&backend.snapshot_path_for(metadata.id), work.path()).await;
     backend.destroy(source_id).await.expect("destroy source");
 
     // Step 2: N serial restore→destroy cycles. This is the
     // warm-pool-refill semantic: each iteration is what happens
     // when a leased slot gets consumed and the refill loop
     // produces a fresh one. We assert each cycle is independent
-    // — distinct restored SandboxIds, no leaked TAP / NBD / vsock
+    // — distinct restored SandboxIds, no leaked TAP / vsock
     // / firecracker child state across iterations.
     //
     // The test deliberately stops at "restore + verify list +
@@ -107,8 +114,9 @@ async fn serial_restore_from_one_canonical_n_times() {
     // `snapshot.rs` round-trip test works around).
     let mut seen_ids = std::collections::HashSet::new();
     for i in 0..N {
-        let id = backend
-            .restore(metadata.clone())
+        let id = SandboxId::new();
+        backend
+            .restore(id, metadata.clone(), common::disks(&local_rootfs))
             .await
             .unwrap_or_else(|e| panic!("restore iter {i}: {e}"));
         assert!(
@@ -162,6 +170,7 @@ async fn concurrent_restores_from_one_snapshot_rekey_vsock() {
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
     cfg.net_pool = None;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
+    common::resume_through_uffd(&mut cfg, work.path());
     let backend = FirecrackerBackend::new(work.path(), cfg);
 
     let spec = SandboxSpec {
@@ -182,17 +191,23 @@ async fn concurrent_restores_from_one_snapshot_rekey_vsock() {
         swap_manifest: None,
     };
 
-    let source_id = backend.create(spec).await.expect("create source");
+    let source_id = SandboxId::new();
+    backend
+        .create(source_id, spec)
+        .await
+        .expect("create source");
     tokio::time::sleep(Duration::from_secs(2)).await;
     let metadata = backend.snapshot(source_id).await.expect("snapshot source");
+    common::chunk_memory(&backend.snapshot_path_for(metadata.id), work.path()).await;
     backend.destroy(source_id).await.expect("destroy source");
     let source_vsock = work.path().join(format!("{source_id}.vsock"));
 
     // All N restores live simultaneously.
     let mut ids = Vec::new();
     for i in 0..N {
-        let id = backend
-            .restore(metadata.clone())
+        let id = SandboxId::new();
+        backend
+            .restore(id, metadata.clone(), common::disks(&local_rootfs))
             .await
             .unwrap_or_else(|e| panic!("concurrent restore {i}: {e}"));
         ids.push(id);
@@ -245,12 +260,12 @@ const OVERLAP_N: usize = 4;
 /// base — restore futures all IN FLIGHT AT ONCE, not awaited one-by-one like
 /// the serial siblings above. Every descendant shares the base's
 /// `source_rootfs_canonical` (FC's state.bin-embedded rootfs path; unlike
-/// vsock there's no load-time override to re-key it), so before the
-/// per-source-path serialization their `install_symlink` → `load_snapshot`
-/// windows raced: a TOCTOU `EEXIST` (the prod "…/<sb>.dev -> /dev/nbdN: File
-/// exists (os error 17)" 503) and, worse, one VM could repoint the shared path
-/// between a sibling's install and its load → FC opens the wrong device. All N
-/// concurrent restores must now succeed and coexist.
+/// vsock there's no load-time override to re-key it). Per-source-path
+/// serialization of their `install_symlink` → `load_snapshot` windows prevents
+/// a TOCTOU `EEXIST` ("…/<sb>.dev: File exists (os error 17)") and a VM
+/// repointing the shared path between a sibling's install and its load (FC
+/// would open the wrong device). All N concurrent restores must succeed and
+/// coexist.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Linux + KVM + firecracker; run with --ignored on the dev VM"]
 async fn overlapping_restores_from_one_base_dont_collide_on_rootfs_symlink() {
@@ -268,6 +283,7 @@ async fn overlapping_restores_from_one_base_dont_collide_on_rootfs_symlink() {
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
     cfg.net_pool = None;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
+    common::resume_through_uffd(&mut cfg, work.path());
     let backend = std::sync::Arc::new(FirecrackerBackend::new(work.path(), cfg));
 
     let spec = SandboxSpec {
@@ -288,9 +304,14 @@ async fn overlapping_restores_from_one_base_dont_collide_on_rootfs_symlink() {
         swap_manifest: None,
     };
 
-    let source_id = backend.create(spec).await.expect("create source");
+    let source_id = SandboxId::new();
+    backend
+        .create(source_id, spec)
+        .await
+        .expect("create source");
     tokio::time::sleep(Duration::from_secs(2)).await;
     let metadata = backend.snapshot(source_id).await.expect("snapshot source");
+    common::chunk_memory(&backend.snapshot_path_for(metadata.id), work.path()).await;
     backend.destroy(source_id).await.expect("destroy source");
 
     // Fire all N restores concurrently — overlapping, so their canonical-symlink
@@ -300,14 +321,20 @@ async fn overlapping_restores_from_one_base_dont_collide_on_rootfs_symlink() {
     for i in 0..OVERLAP_N {
         let b = backend.clone();
         let md = metadata.clone();
+        let disks = common::disks(&local_rootfs);
+        let id = SandboxId::new();
         handles.push(tokio::spawn(async move {
-            (i, SandboxBackend::restore(b.as_ref(), md).await)
+            (
+                i,
+                id,
+                SandboxBackend::restore(b.as_ref(), id, md, disks).await,
+            )
         }));
     }
     let mut ids = Vec::new();
     for h in handles {
-        let (i, res) = h.await.expect("join restore task");
-        let id = res.unwrap_or_else(|e| panic!("overlapping restore {i} failed: {e}"));
+        let (i, id, res) = h.await.expect("join restore task");
+        res.unwrap_or_else(|e| panic!("overlapping restore {i} failed: {e}"));
         ids.push(id);
     }
 

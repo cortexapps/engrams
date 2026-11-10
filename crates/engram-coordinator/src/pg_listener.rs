@@ -18,9 +18,10 @@ use std::sync::Arc;
 
 use engram_core::traits::MetadataStore;
 use engram_core::{HostId, SessionId};
+use engram_postgres::OP_FINISHED_CHANNEL;
 use serde::Deserialize;
 use sqlx::postgres::PgListener;
-use tokio::sync::Notify;
+use tokio::sync::{broadcast, Notify};
 
 use crate::boot_bundle::BootBundleCache;
 use crate::host_registry::HostRegistry;
@@ -59,6 +60,7 @@ pub fn spawn(
     queue_wake: Arc<Notify>,
     outbox_wake: Arc<Notify>,
     session_ops_wake: Arc<Notify>,
+    op_finished: broadcast::Sender<i64>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = run(
@@ -71,6 +73,7 @@ pub fn spawn(
             queue_wake,
             outbox_wake,
             session_ops_wake,
+            op_finished,
         )
         .await
         {
@@ -90,6 +93,7 @@ async fn run(
     queue_wake: Arc<Notify>,
     outbox_wake: Arc<Notify>,
     session_ops_wake: Arc<Notify>,
+    op_finished: broadcast::Sender<i64>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut listener = PgListener::connect(database_url).await?;
     listener.listen("session_events").await?;
@@ -113,11 +117,11 @@ async fn run(
     // channel; the delivery driver's poll interval is only the
     // crash-recovery fallback.
     listener.listen("session_outbox").await?;
+    // ADR 0079: `session_ops` wakes the op executor; the op-finished
+    // channel wakes the RPCs that wait for an op to end.
     listener.listen("session_ops").await?;
-    tracing::info!(
-        "pg_listener subscribed to session_events + session_event_deltas + host_dead + \
-         org_secret_changed + enabled_image_changed + fleet_catalog_changed + placement_changed"
-    );
+    listener.listen(OP_FINISHED_CHANNEL).await?;
+    tracing::info!("pg_listener subscribed");
 
     loop {
         let notification = listener.recv().await?;
@@ -126,6 +130,20 @@ async fn run(
                 // ADR 0079: wake the op executor (the enqueue's NOTIFY —
                 // the kernel's hot path; the 5s poll is fallback only).
                 session_ops_wake.notify_waiters();
+                continue;
+            }
+            OP_FINISHED_CHANNEL => {
+                match notification.payload().parse::<i64>() {
+                    // No receivers is the normal case: no RPC is waiting.
+                    Ok(op_id) => {
+                        let _ = op_finished.send(op_id);
+                    }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        payload = notification.payload(),
+                        "malformed session_op_finished notification; skipping",
+                    ),
+                }
                 continue;
             }
             "session_outbox" => {

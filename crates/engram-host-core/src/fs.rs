@@ -19,8 +19,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 
 /// Granular durable-filesystem operations. The prod impl ([`TokioFs`])
-/// delegates to `tokio::fs`; the sim impl (in `engram-dst-host`) drives a
-/// per-run tempdir and injects crashes between calls.
+/// delegates to `tokio::fs`; a test impl can inject crashes between calls.
 #[async_trait]
 pub trait HostFs: Send + Sync {
     /// Write `bytes` to `path`, creating/truncating it. Does NOT fsync —
@@ -51,7 +50,8 @@ pub trait HostFs: Send + Sync {
     async fn remove_file(&self, path: &Path) -> io::Result<()>;
 
     /// Recursively create `dir` and its parents (`create_dir_all`
-    /// semantics: idempotent, ok-if-exists).
+    /// semantics: idempotent, ok-if-exists). Each dir it creates is
+    /// durable on return: the parent that holds its entry is fsynced.
     async fn create_dir(&self, dir: &Path) -> io::Result<()>;
 
     /// Recursively remove `dir` and everything under it (`remove_dir_all`
@@ -108,10 +108,43 @@ impl HostFs for TokioFs {
     }
 
     async fn create_dir(&self, dir: &Path) -> io::Result<()> {
-        tokio::fs::create_dir_all(dir).await
+        let mut missing = Vec::new();
+        let mut probe = Some(dir);
+        while let Some(path) = probe {
+            if tokio::fs::try_exists(path).await? {
+                break;
+            }
+            missing.push(path);
+            probe = path.parent().filter(|p| !p.as_os_str().is_empty());
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        tokio::fs::create_dir_all(dir).await?;
+        for created in missing {
+            if let Some(parent) = created.parent().filter(|p| !p.as_os_str().is_empty()) {
+                self.sync_dir(parent).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn remove_dir(&self, dir: &Path) -> io::Result<()> {
         tokio::fs::remove_dir_all(dir).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn create_dir_creates_every_missing_ancestor_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("finalize").join("failed");
+        TokioFs.create_dir(&dir).await.unwrap();
+        assert!(dir.is_dir());
+        TokioFs.create_dir(&dir).await.unwrap();
+        TokioFs.create_dir(tmp.path()).await.unwrap();
     }
 }

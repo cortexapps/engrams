@@ -154,11 +154,11 @@ fn write_entries(
 }
 
 /// Pack `root` to `img_path`, open + verify the image, and assert every
-/// recorded expectation reads back exactly. Returns the packed bytes.
-fn pack_verify_readback(root: &Path, img_path: &Path, expects: &[(String, Expect)]) -> Vec<u8> {
+/// recorded expectation reads back exactly.
+fn pack_verify_readback(root: &Path, img_path: &Path, expects: &[(String, Expect)]) {
     pack_tree(root, img_path).expect("pack_tree");
-    let bytes = std::fs::read(img_path).unwrap();
-    let fs = Fs::open(&bytes[..]).expect("Fs::open on the packed image");
+    let fs =
+        Fs::open(std::fs::File::open(img_path).unwrap()).expect("Fs::open on the packed image");
     let issues = fs.verify().expect("verify");
     assert!(
         issues.is_empty(),
@@ -192,7 +192,30 @@ fn pack_verify_readback(root: &Path, img_path: &Path, expects: &[(String, Expect
             }
         }
     }
-    bytes
+}
+
+/// Whether two image files hold the same bytes. Images are 1 GiB or more
+/// and sparse, so they are compared 1 MiB at a time, never held whole.
+fn same_bytes(a: &Path, b: &Path) -> bool {
+    use std::io::Read;
+    let (mut a, mut b) = (
+        std::fs::File::open(a).unwrap(),
+        std::fs::File::open(b).unwrap(),
+    );
+    if a.metadata().unwrap().len() != b.metadata().unwrap().len() {
+        return false;
+    }
+    let (mut x, mut y) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    loop {
+        let n = a.read(&mut x).unwrap();
+        if n == 0 {
+            return true;
+        }
+        b.read_exact(&mut y[..n]).unwrap();
+        if x[..n] != y[..n] {
+            return false;
+        }
+    }
 }
 
 proptest! {
@@ -212,13 +235,12 @@ proptest! {
         let mut expects = Vec::new();
         write_entries(root.path(), "", &tree, &mut expects);
 
-        let img1 = pack_verify_readback(root.path(), &out.path().join("a.ext4"), &expects);
+        let (img1, img2) = (out.path().join("a.ext4"), out.path().join("b.ext4"));
+        pack_verify_readback(root.path(), &img1, &expects);
 
         // Determinism (ADR 0093): the SAME tree packs byte-identical.
-        pack_tree(root.path(), &out.path().join("b.ext4")).unwrap();
-        let img2 = std::fs::read(out.path().join("b.ext4")).unwrap();
-        prop_assert_eq!(img1.len(), img2.len(), "repack image length differs");
-        prop_assert!(img1 == img2, "repack is not byte-identical");
+        pack_tree(root.path(), &img2).unwrap();
+        prop_assert!(same_bytes(&img1, &img2), "repack is not byte-identical");
     }
 }
 
@@ -251,8 +273,7 @@ fn multi_megabyte_file_round_trips_and_repacks_byte_identical() {
 
     let img_path = out.path().join("big.ext4");
     pack_tree(root.path(), &img_path).unwrap();
-    let bytes = std::fs::read(&img_path).unwrap();
-    let fs = Fs::open(&bytes[..]).unwrap();
+    let fs = Fs::open(std::fs::File::open(&img_path).unwrap()).unwrap();
     assert!(
         fs.verify().unwrap().is_empty(),
         "multi-MiB image must verify clean",
@@ -269,9 +290,8 @@ fn multi_megabyte_file_round_trips_and_repacks_byte_identical() {
 
     let img2_path = out.path().join("big2.ext4");
     pack_tree(root.path(), &img2_path).unwrap();
-    assert_eq!(
-        bytes,
-        std::fs::read(&img2_path).unwrap(),
+    assert!(
+        same_bytes(&img_path, &img2_path),
         "12 MiB repack must be byte-identical (ADR 0093 determinism)",
     );
 }

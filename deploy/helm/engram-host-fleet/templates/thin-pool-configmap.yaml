@@ -1,0 +1,11 @@
+{{- if .Values.nodePrep.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "hostfleet.hostAgent.fullname" . }}-thin-pool
+  labels:
+    {{- include "hostfleet.hostAgent.labels" . | nindent 4 }}
+data:
+  thin-pool.sh: |
+{{ .Files.Get "files/thin-pool.sh" | indent 4 }}
+{{- end }}

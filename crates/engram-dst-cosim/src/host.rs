@@ -1,21 +1,21 @@
 //! The co-simulated host world (ADR 0098 R-CoSim, rung 1).
 //!
 //! [`CosimHost`] models one host-agent process at the coordinator↔host
-//! boundary. Unlike [`engram_dst_host::SimHost`] — which owns a fixed slot
-//! id-space and drives the host's disk/spool/NBD oracles in isolation —
-//! this host is keyed by the **coordinator-minted** sandbox/session ids
+//! boundary. It is keyed by the **coordinator-minted** sandbox/session ids
 //! (the coordinator owns the id-space at this boundary), and its job is to
 //! run the REAL host-agent lifecycle flows the coordinator's verbs trigger:
 //!
-//! * **create / restore** → build a real [`ChunkedDiskBackend`] over the
-//!   shared [`ChunkStore`] on a fresh private base manifest;
+//! * **create / restore** → provision the sandbox's root volume through the
+//!   real [`SessionVolumes`] (a [`FileDisk`] under the run's tempdir) from a
+//!   fresh private base manifest in the shared [`ChunkStore`];
 //! * **eviction capture** ([`CosimHost::snapshot_begin`]) → the REAL
-//!   `EvictionFinalizer` capture leg: drain the dirty tier through the real
-//!   `persist_disk_pending_chunks`, persist a real `EvictionFinalizeRecord`,
-//!   take the capture lock, pause the VM;
+//!   capture leg: take the root checkpoint under the pause, persist a real
+//!   `EvictionFinalizeRecord`, take the capture lock;
 //! * **finalize** ([`CosimHost::finalize_tick`]) → the REAL production loop
-//!   body `run_eviction_finalize_attempt` (upload + disk-manifest publish +
+//!   body `run_eviction_finalize_attempt` (publish the pending checkpoint +
 //!   terminal destroy);
+//! * **restart** ([`CosimHost::startup_reconcile`]) → the REAL startup
+//!   volume reconcile over the live set and the pending finalizes;
 //! * **durable exec** → the REAL Firecracker host reader and REAL agentd
 //!   journal handler over per-sandbox duplex connections; checkpoint steps
 //!   quietly sever the modeled vsock transport;
@@ -23,37 +23,23 @@
 //!   [`reconcile_once`](engram_host_agent::teardown_reconcile::reconcile_once)
 //!   over [`CosimReconcileBackend`].
 //!
-//! **Why not reuse `SimHost` wholesale (documented divergence, per the ADR
-//! plan's "follow unless the code proves it wrong"):** `SimHost::new` seeds
-//! a fixed set of sandboxes with pre-minted literal ids (`0x5B00_0000+i`)
-//! and assumes it owns the session/sandbox id-space. At the co-sim boundary
-//! the coordinator mints those ids (entropy stream) and the host must track
-//! whatever the coordinator creates — so the top-level slot model is wrong
-//! here. We reuse the *real extracted flows* it is built on (the
-//! `EvictionFinalizer` machinery, `ChunkedDiskBackend`, `reconcile_once`,
-//! [`SimFs`]) — just keyed by the boundary's id-space.
-//!
 //! **Concurrency.** [`CosimHost`] lives behind an `Arc<tokio::sync::Mutex>`
 //! (the coordinator's async `HostClient` verbs and the host's async steps
 //! both mutate it). The teardown-reconcile trait has SYNC methods, which
 //! cannot take an async lock — so the reconcile-visible state (live set,
 //! local bindings, capture-in-flight flags) is mirrored into a
 //! `parking_lot`-guarded [`HostView`] the sync methods read, kept in
-//! lockstep by every mutating host op. This mirrors `engram-dst-host`'s
-//! own split (its `SimReconcileBackend` is a separate model seeded in
-//! lockstep with the disk world).
+//! lockstep by every mutating host op.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use dashmap::DashMap;
 use engram_agentd::exec_journal::{AttachOrStart, ExecJournal};
 use engram_agentd::{
     serve_connection_with_journal, CaCertInstaller, CaCertPaths, HarnessSupervisor,
 };
-use engram_chunk_store::cache::{ChunkCache, ChunkCacheConfig};
 use engram_chunk_store::manifest::{
     ChunkHash, ChunkRef, ChunkSize, Manifest, ManifestKind, MANIFEST_SCHEMA_VERSION,
 };
@@ -62,21 +48,20 @@ use engram_core::error::SandboxError;
 use engram_core::traits::{Clock as _, Entropy as _};
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::{AuxBundleRef, ExecRequest, SandboxAuxBundles};
+use engram_core::types::snapshot::DiskRole;
 use engram_core::types::SnapshotId;
 use engram_core::{HostId, SandboxId, SessionId};
-use engram_dst_host::device_plane::{DevicePlane, ServeOutcome};
-use engram_dst_host::SimFs;
-use engram_host_agent::disk_daemon::backend::ChunkedDiskBackend;
-use engram_host_agent::disk_daemon::{NbdSlot, NbdSlotAllocator};
 use engram_host_agent::eviction_finalize::{
-    persist_disk_pending_chunks, run_eviction_finalize_attempt, DiskPendingRecord,
-    EvictionFinalizeRecord, EvictionFinalizer, EvictionSandbox, FinalizeAttempt,
+    reconcile_volumes, run_eviction_finalize_attempt, EvictionFinalizeRecord, EvictionFinalizer,
+    EvictionSandbox, FinalizeAttempt, PendingDisk,
 };
 use engram_host_agent::teardown_reconcile::ReconcileBackend;
-use engram_host_core::{FinalizeStage, HostFs, TokioFs};
+use engram_host_core::session_volumes::{Report, Source};
+use engram_host_core::{ChunkIndex, FileDisk, FinalizeStage, HostFs, SessionVolumes, TokioFs};
 use engram_sandbox_firecracker::BoxExecIo;
 use engram_sim::{SimClock, SimEntropy};
 use parking_lot::Mutex;
+use tempfile::TempDir;
 
 /// Disk geometry — small on purpose (the oracle asserts a boundary
 /// property, not throughput).
@@ -84,11 +69,6 @@ pub const CHUNK_SIZE: u64 = 4096;
 pub const NUM_CHUNKS: u64 = 8;
 /// Small redrive cap so a quarantine arm stays cheap (prod is 10).
 pub const FINALIZE_MAX_ATTEMPTS: u32 = 3;
-
-/// The NBD device universe for one co-simulated host — small (the small-world
-/// bounding, #784 rung 2): enough `/dev/nbdN` slots for every concurrent
-/// sandbox plus a couple of spares for the slot-accounting exercise.
-pub const DEVICE_CAPACITY: u32 = 8;
 
 /// The staged-bundle file extension for the co-simulated host (the
 /// `SandboxBackend::bundle_file_ext` analog — `squashfs` in prod, a plain
@@ -122,34 +102,19 @@ fn base_manifest(base_hash: ChunkHash) -> Manifest {
             })
             .collect(),
         parent: None,
-        working_set_trace: None,
         annotations: Default::default(),
     }
 }
 
-async fn build_backend(
-    store: &Arc<ChunkStore>,
-    cache_root: &std::path::Path,
-    key: &SandboxId,
-    manifest_ref: ManifestRef,
-) -> ChunkedDiskBackend {
-    let mut cfg = ChunkCacheConfig::new(cache_root.join(format!("sandbox-{key}")));
-    cfg.budget_bytes = 64 * 1024 * 1024;
-    let cache = ChunkCache::new(cfg);
-    // u64::MAX threshold: flushes are explicit (never auto-threshold).
-    ChunkedDiskBackend::from_blob(manifest_ref, cache, store.clone(), u64::MAX)
-        .await
-        .expect("build backend from base manifest")
-}
-
-/// Build a fresh base-manifest-backed sandbox WITHOUT the host lock held
-/// (the concurrency rule above). The bridge calls this with cloned handles,
+/// Provision a fresh sandbox's root volume WITHOUT the host lock held (the
+/// concurrency rule above): seed a private base manifest in the shared store
+/// and fork the volume from it. The bridge calls this with cloned handles,
 /// then commits the result under a brief synchronous lock.
 pub(crate) async fn build_base_sandbox(
-    store: Arc<ChunkStore>,
-    cache_root: std::path::PathBuf,
+    store: ChunkStore,
+    volumes: Arc<SessionVolumes>,
     entropy: Arc<SimEntropy>,
-) -> (SandboxId, ManifestRef, Arc<ChunkedDiskBackend>) {
+) -> SandboxId {
     let sandbox_id = SandboxId::from(entropy.uuid());
     let base_hash = store
         .put_chunk(&synth_chunk(0))
@@ -163,8 +128,11 @@ pub(crate) async fn build_base_sandbox(
         .put_manifest(base_ref, &base_manifest(base_hash))
         .await
         .expect("seed base manifest");
-    let backend = build_backend(&store, &cache_root, &sandbox_id, base_ref).await;
-    (sandbox_id, base_ref, Arc::new(backend))
+    volumes
+        .provision(sandbox_id, Source::Fork { manifest: base_ref }, None)
+        .await
+        .expect("provision the root volume");
+    sandbox_id
 }
 
 /// The reconcile-visible slice of host state (parking_lot-guarded so the
@@ -211,7 +179,7 @@ impl HostView {
     }
     /// Drop the in-RAM local binding for a sandbox — models the post-roll
     /// survivor whose `PooledBackend` binding table died with the process
-    /// (ADR 0090 / 731df805). The VM stays live; reconcile must REPAIR the
+    /// (ADR 0090). The VM stays live; reconcile must REPAIR the
     /// binding from the coordinator, never reap.
     pub fn drop_binding(&self, id: SandboxId) {
         self.inner.lock().bindings.remove(&id);
@@ -240,14 +208,6 @@ struct CosimSandbox {
     /// commit time). What the heartbeat's `sandbox_bundles` reports and
     /// what a capture's `aux_bundles` pins.
     attached_bundles: Vec<AuxBundleRef>,
-    /// The private base manifest the sandbox was created on — the ref a
-    /// post-roll rehydrate rebuilds the RAM backend from (rung 2: the survivor
-    /// re-serve leg reconstructs `ChunkedDiskBackend` off the durable pointer).
-    base_ref: ManifestRef,
-    published_ref: Option<ManifestRef>,
-    /// The live RAM backend — `None` once paused for a finalize, destroyed, or
-    /// (rung 2) dropped by a host-agent roll until the rehydrate re-serves it.
-    backend: Option<Arc<ChunkedDiskBackend>>,
     /// The work cursor (an events-index stand-in): advanced by each guest
     /// write, captured at eviction time. The boundary oracle keys on it.
     cursor: i64,
@@ -425,8 +385,15 @@ pub struct CosimHost {
     pub host_id: HostId,
     pub clock: Arc<SimClock>,
     pub entropy: Arc<SimEntropy>,
-    pub fs: SimFs,
-    pub store: Arc<ChunkStore>,
+    /// The run's tempdir: staged bundles, capture staging dirs, exec
+    /// journals and the session volumes live under it. It survives a
+    /// modeled process restart, exactly like the node's disk.
+    root: TempDir,
+    pub store: ChunkStore,
+    /// The fill engine over `store`, as on a real host.
+    fill: engram_fill::FillEngine,
+    /// The REAL session-volume owner over a [`FileDisk`] in the tempdir.
+    pub volumes: Arc<SessionVolumes>,
     fs_seam: Arc<dyn HostFs>,
     pub view: Arc<HostView>,
     sandboxes: BTreeMap<SandboxId, CosimSandbox>,
@@ -438,24 +405,6 @@ pub struct CosimHost {
     finalize_cursor: BTreeMap<SnapshotId, i64>,
     destroyer: Arc<CosimDestroyer>,
     next_tag: u64,
-    /// Rung 2 (#784): the REAL NBD slot/generation/park/un-pause device-plane
-    /// model, shared with `engram-dst-host` via
-    /// [`engram_dst_host::device_plane`], keyed by the coordinator-minted
-    /// [`SandboxId`]. Drives the roll → register-rehydrate → stale-sweep →
-    /// un-pause family co-simulated at the boundary.
-    pub device: DevicePlane,
-    /// Oracle memory (survives): sandboxes the stale-sweep PARKed because a
-    /// live guest still held the device (the `sweep-blocked-live-holder` set,
-    /// #806) — never severed, must be re-served. Under Wave 7b this is the
-    /// dead-owner live-holder set the barrier classified `ReconnectMe` OR
-    /// `QuarantinedUnknown` (both left RECONNECTABLE).
-    sweep_parked_live: BTreeSet<SandboxId>,
-    /// Wave 7b (ADR 0098 §Phase 3, #784 layers 2–3): oracle memory — sandboxes
-    /// the classification barrier put in
-    /// [`SlotClass::QuarantinedUnknown`](engram_host_core::SlotClass::QuarantinedUnknown):
-    /// a kernel-connected device with a live holder that NO tracked record
-    /// accounted for (#769 gap A). CLASSIFIED + alertable, never skipped.
-    quarantined_unknown: BTreeSet<SandboxId>,
     /// ADR 0035 amendment: the SHARED blob bucket (one `MemBlobStorage`
     /// backing the coordinator's blob tier, this host's `ChunkStore`, AND
     /// the bundle store) — the pre-amendment cosim gave coord and host two
@@ -480,28 +429,32 @@ impl CosimHost {
     /// co-sim shares), the SHARED blob bucket (ADR 0035 amendment: the
     /// coordinator's blob tier and this host's chunk/bundle stores are one
     /// bucket, exactly like prod's single GCS bucket), and its own per-run
-    /// [`SimFs`].
+    /// tempdir.
     pub fn new(
         host_id: HostId,
         clock: Arc<SimClock>,
         entropy: Arc<SimEntropy>,
         blob: Arc<dyn engram_core::traits::BlobStorage>,
     ) -> Self {
-        let fs = SimFs::new().expect("sim tempdir");
+        let root = tempfile::tempdir().expect("sim tempdir");
         // The blob tier is the deterministic in-memory `MemBlobStorage` (ADR
         // 0098 determinism-audit item 7 / the #799 fix): no `tokio::fs`
         // blocking-pool I/O to auto-advance the paused clock, and sorted
-        // `list_prefix` for free. The `ChunkedDiskBackend`'s own `ChunkCache`
-        // still uses the `SimFs` tempdir (inherent to reusing the REAL
-        // backend), but its I/O never feeds a decision — see the swarm's
-        // I/O-audit verdict.
-        let store = Arc::new(ChunkStore::new(blob.clone()));
+        // `list_prefix` for free. The session volumes are files in the
+        // tempdir (inherent to reusing the REAL volume owner), but their
+        // I/O never feeds a decision — see the swarm's I/O-audit verdict.
+        let store = ChunkStore::new(blob.clone());
+        let disk = FileDisk::new(root.path().join("volumes"), CHUNK_SIZE).expect("file disk");
+        let fill = engram_fill::FillEngine::new(store.clone(), engram_fill::Config::default());
+        let volumes = Arc::new(SessionVolumes::new(Arc::new(disk), fill.clone()));
         Self {
             host_id,
             clock,
             entropy,
-            fs,
+            root,
             store,
+            fill,
+            volumes,
             fs_seam: Arc::new(TokioFs),
             view: Arc::new(HostView::default()),
             sandboxes: BTreeMap::new(),
@@ -510,9 +463,6 @@ impl CosimHost {
             finalize_cursor: BTreeMap::new(),
             destroyer: Arc::new(CosimDestroyer::default()),
             next_tag: 0,
-            device: DevicePlane::new(DEVICE_CAPACITY),
-            sweep_parked_live: BTreeSet::new(),
-            quarantined_unknown: BTreeSet::new(),
             blob,
             stamp: Vec::new(),
             stamp_published: false,
@@ -525,14 +475,14 @@ impl CosimHost {
     // The REAL `BundleStore` (publish / materialize / sweep_unpinned) over
     // the SHARED blob bucket + this host's staged-bundle dir. The stamp is
     // the `current.json` analog; rotation models a node-assets roll staging
-    // a new bake. The 2026-08-10 incident's whole mechanism — attach the
-    // current generation at create, rotate the stamp, sweep the only copy,
-    // fail the capture's publish — is expressible through these ops.
+    // a new bake. These ops can express the sweep-before-publish failure:
+    // attach the current generation at create, rotate the stamp, sweep the
+    // only copy, fail the capture's publish.
 
     /// The staged-bundle dir (what the real `EvictionFinalizer` gets as
     /// `bundle_dir`).
     pub fn bundle_dir(&self) -> std::path::PathBuf {
-        self.fs.root().join("bundles")
+        self.root.path().join("bundles")
     }
 
     fn bundle_store(&self) -> engram_host_agent::bundles::BundleStore {
@@ -659,41 +609,19 @@ impl CosimHost {
     // synchronous insert. These accessors + [`commit_created_sandbox`] are
     // that split.
 
-    pub fn store_handle(&self) -> Arc<ChunkStore> {
+    pub fn store_handle(&self) -> ChunkStore {
         self.store.clone()
     }
     pub fn entropy_handle(&self) -> Arc<SimEntropy> {
         self.entropy.clone()
     }
-    pub fn cache_root(&self) -> std::path::PathBuf {
-        self.fs.cache_dir().to_path_buf()
-    }
-    /// The current-generation NBD slot pool handle (cloned) — the bridge claims
-    /// a new sandbox's device on THIS pool OUTSIDE the host lock, then commits
-    /// the slot under a brief lock (the same concurrency split the backend
-    /// build uses; see the module-level note).
-    pub fn device_pool(&self) -> Arc<NbdSlotAllocator> {
-        self.device.nbd_pool.clone()
-    }
-    /// A free `/dev/nbdN` path for a new sandbox (see
-    /// [`DevicePlane::next_free_device`]).
-    pub fn next_free_device(&self) -> std::path::PathBuf {
-        self.device
-            .next_free_device()
-            .expect("cosim device universe not exhausted (DEVICE_CAPACITY)")
+    pub fn volumes_handle(&self) -> Arc<SessionVolumes> {
+        self.volumes.clone()
     }
 
-    /// Insert a pre-built sandbox (the sync half of the boot restore leg),
-    /// together with its pre-claimed NBD device slot.
-    pub fn commit_created_sandbox(
-        &mut self,
-        id: SandboxId,
-        base_ref: ManifestRef,
-        backend: Arc<ChunkedDiskBackend>,
-        device: std::path::PathBuf,
-        lease: NbdSlot,
-    ) {
-        let exec = CosimExecPlane::new(self.fs.root().join("exec").join(id.to_string()));
+    /// Insert a provisioned sandbox (the sync half of the boot restore leg).
+    pub fn commit_created_sandbox(&mut self, id: SandboxId) {
+        let exec = CosimExecPlane::new(self.root.path().join("exec").join(id.to_string()));
         self.sandboxes.insert(
             id,
             CosimSandbox {
@@ -703,14 +631,10 @@ impl CosimHost {
                 // (`fc.swap_aux_bundles`' cosim analog). A later stamp
                 // rotation must not strand these refs.
                 attached_bundles: self.stamp.clone(),
-                base_ref,
-                published_ref: None,
-                backend: Some(backend),
                 cursor: 0,
                 exec,
             },
         );
-        self.device.insert_served_slot(id, device, lease);
         self.view.inner.lock().live.insert(id);
     }
 
@@ -744,8 +668,8 @@ impl CosimHost {
     }
 
     /// Coordinator-driven destroy of a sandbox (a `HostClient::destroy`).
-    pub fn destroy(&mut self, sandbox_id: SandboxId) {
-        self.remove_sandbox(sandbox_id);
+    pub async fn destroy(&mut self, sandbox_id: SandboxId) {
+        self.remove_sandbox(sandbox_id).await;
     }
 
     /// Is a sandbox present (for probes)?
@@ -817,269 +741,101 @@ impl CosimHost {
         self.pending_finalizes.contains_key(&sandbox_id)
     }
 
-    // ─────────── Rung 2: the NBD device-plane family (#784) ───────────
-    //
-    // All decisions run over the REAL host-core verdicts (`sweep_verdict` incl.
-    // the #806 holder table, `resume_data_plane_served`,
-    // `is_local_survivor_candidate`) and the REAL `NbdSlotAllocator`, via the
-    // shared `engram_dst_host::device_plane::DevicePlane`. Only the world
-    // bookkeeping (generation / served_by / parked / guest liveness) is sim.
+    // ─────────── Process restart ───────────
 
-    /// A host-agent process ROLL: the successor comes up as a fresh generation.
-    /// The RAM disk backends die (rebuilt by the rehydrate); the FC VMs stay
-    /// resident survivors (`view.live` unchanged); the device plane rolls
-    /// (`served_by` clears, `kernel_owner` persists at the now-dead gen). A
-    /// sandbox mid-capture already has `backend == None` (paused for finalize),
-    /// so this leaves it untouched.
-    pub fn roll(&mut self) {
-        self.device.roll();
-        for s in self.sandboxes.values_mut() {
-            s.backend = None; // RAM died with the process
-        }
+    /// The successor process's startup: the REAL volume reconcile over the
+    /// resident sandboxes and the durable finalize records. RAM state the
+    /// real host-agent reloads from node-durable records (bindings,
+    /// finalize records) is modeled as surviving; the `DropHostBinding`
+    /// fault models the binding loss separately.
+    pub async fn startup_reconcile(&mut self) -> Result<Report, String> {
+        let finalizer = self.finalizer();
+        reconcile_volumes(&self.volumes, Some(&finalizer), self.view.live())
+            .await
+            .map_err(|e| format!("startup volume reconcile: {e}"))
     }
 
-    /// The register-time rehydrate sequence (ADR 0098 P7 / #739 / #784):
-    /// coord-list pass → local ChainHeadRecord pass → stale-binding sweep. The
-    /// `rehydrate_list` is the REAL coordinator listing
-    /// (`register_rehydrate_list_core`), passed in by the harness; the local
-    /// pass + sweep run over the pure predicates. `local_pass_enabled=false`
-    /// replays the pre-#739 ungated variant (proving the un-pause gate is the
-    /// last line).
-    pub async fn register_rehydrate(
-        &mut self,
-        rehydrate_list: &[SandboxId],
-        local_pass_enabled: bool,
-    ) -> Result<(), String> {
-        // 1. Coord-list pass: re-serve every LISTED resident survivor. The coord
-        //    list is authoritative for what it CONTAINS (each listed survivor
-        //    carries the coordinator's disk-manifest ref), so it is NOT gated on
-        //    the local record — a gap-A survivor is one the list OMITS (e.g. a
-        //    HostLost row is not reserves-host-memory), which the REAL
-        //    `register_rehydrate_list_core` already excludes. Only the #739 local
-        //    pass below reads the (loseable) ChainHeadRecord.
-        for &id in rehydrate_list {
-            if self.device.is_resident_survivor(id) {
-                self.serve_and_rebuild(id).await?;
+    /// The registration ack: the coordinator lists every sandbox it still
+    /// binds on this host, and the host records each binding (the REAL
+    /// `record_session_binding` the register response drives).
+    pub fn register_rehydrate(&mut self, listed: &[(SandboxId, SessionId)]) {
+        for &(sandbox_id, session_id) in listed {
+            if self.sandboxes.contains_key(&sandbox_id) {
+                self.bind(session_id, sandbox_id);
             }
         }
-        // 2. Local ChainHeadRecord pass (#739): re-serve any live survivor the
-        //    coord list missed (live ∧ unserved ∧ session-bound) — but only when
-        //    a record actually exists to read.
-        if local_pass_enabled {
-            let ids: Vec<SandboxId> = self.device.slots.keys().copied().collect();
-            for id in ids {
-                if !self.device.record_present(id) {
-                    continue;
-                }
-                let has_session = self.sandboxes.get(&id).and_then(|s| s.session_id).is_some();
-                if self.device.is_local_survivor_candidate(id, has_session) {
-                    self.serve_and_rebuild(id).await?;
-                }
-            }
-        }
-        // 3. The Wave 7b classification barrier: reconcile the kernel inventory
-        //    against the records, reap ONLY TerminalSafeToReap. A dead-owner
-        //    device a live guest still holds is ReconnectMe (record) or
-        //    QuarantinedUnknown (no record) — NEITHER reaped (never severed).
-        self.barrier_sweep();
-        Ok(())
     }
 
-    /// Wave 7b (#784 layers 2–3): classify the kernel-derived inventory against
-    /// the records, then reap ONLY the `TerminalSafeToReap` subset via the REAL
-    /// [`DevicePlane::reap_terminal`] (which accepts only a
-    /// [`ReapList`](engram_host_core::ReapList) — the ordering contract). Records
-    /// the parked-live (ReconnectMe ∪ QuarantinedUnknown) + the quarantined
-    /// (record-invisible) sets for the oracles.
-    fn barrier_sweep(&mut self) {
-        let classification = self.device.classify_startup();
-        self.sweep_parked_live
-            .extend(classification.reconnect.iter().map(|(id, _)| *id));
-        self.sweep_parked_live
-            .extend(classification.quarantined.iter().map(|(id, _)| *id));
-        self.quarantined_unknown
-            .extend(classification.quarantined.iter().map(|(id, _)| *id));
-        self.device.reap_terminal(classification.reap);
+    /// Every sandbox the host holds, paused or not.
+    pub fn held_sandboxes(&self) -> Vec<SandboxId> {
+        self.sandboxes.keys().copied().collect()
     }
 
-    /// Serve `id`'s device on the current generation (RECONFIGURE) and rebuild
-    /// its RAM backend if the roll dropped it. A capture-in-flight sandbox is
-    /// skipped (its VM is paused for the finalize).
-    async fn serve_and_rebuild(&mut self, id: SandboxId) -> Result<(), String> {
-        if self.capture_in_flight(id) {
-            return Ok(());
-        }
-        match self.device.serve(id).await? {
-            ServeOutcome::NewlyServed => self.ensure_backend(id).await,
-            ServeOutcome::AlreadyServed => Ok(()),
-        }
+    /// The sandboxes whose guest runs: held and not paused for a capture.
+    pub fn active_sandboxes(&self) -> Vec<SandboxId> {
+        self.sandboxes
+            .keys()
+            .copied()
+            .filter(|id| !self.capture_in_flight(*id))
+            .collect()
     }
 
-    /// Rebuild `id`'s RAM backend from its durable pointer (last publish, else
-    /// base) if it is currently `None` — the post-roll survivor re-serve leg.
-    async fn ensure_backend(&mut self, id: SandboxId) -> Result<(), String> {
-        let needs = self.sandboxes.get(&id).is_some_and(|s| s.backend.is_none())
-            && !self.capture_in_flight(id);
-        if !needs {
-            return Ok(());
-        }
-        let manifest_ref = {
-            let s = self.sandboxes.get(&id).expect("sandbox present");
-            s.published_ref.unwrap_or(s.base_ref)
-        };
-        let backend = build_backend(&self.store, self.fs.cache_dir(), &id, manifest_ref).await;
-        if let Some(s) = self.sandboxes.get_mut(&id) {
-            s.backend = Some(Arc::new(backend));
+    /// The volume invariant every held sandbox must satisfy: its live root
+    /// volume and its latest root checkpoint both exist. A reconcile that
+    /// deleted either severed a resident guest or lost its lineage.
+    pub async fn volumes_intact(&self) -> Result<(), String> {
+        for id in self.sandboxes.keys() {
+            self.volumes.live(*id, DiskRole::Root).await.map_err(|e| {
+                format!("volumes-intact: sandbox {id} has no live root volume: {e}")
+            })?;
+            self.volumes
+                .checkpoint_of(*id, DiskRole::Root)
+                .await
+                .map_err(|e| format!("volumes-intact: sandbox {id} has no root checkpoint: {e}"))?;
         }
         Ok(())
-    }
-
-    /// Rung-2 PARK sandbox `id` (FC paused, VM resident, device still served) —
-    /// the 731df805 pre-condition.
-    pub fn park(&mut self, id: SandboxId) {
-        self.device.park(id);
-    }
-
-    /// Un-pause sandbox `id` over the REAL un-pause data-plane gate. Returns
-    /// `true` if un-paused, `false` if the gate fired (unserved plane).
-    pub fn unpause(&mut self, id: SandboxId) -> bool {
-        self.device.unpause(id)
-    }
-
-    /// Model the FC guest genuinely dying (#806): it no longer holds its device
-    /// node open, so a dead-owner sweep may legally DISCONNECT.
-    pub fn kill_guest(&mut self, id: SandboxId) {
-        self.device.kill_guest(id);
-    }
-
-    /// Wave 7b (#784 layer 2): lose `id`'s tracked records (#769 gap A) — a
-    /// resident guest holds a device no record accounts for.
-    pub fn lose_record(&mut self, id: SandboxId) {
-        self.device.lose_record(id);
-    }
-
-    /// The operator/runbook reconcile: restore `id`'s record so the next register
-    /// re-serves the reconnectable device with zero loss.
-    pub fn regain_record(&mut self, id: SandboxId) {
-        self.device.regain_record(id);
-    }
-
-    /// Quiescence heal (Wave 7b): restore EVERY device's record — the record-loss
-    /// fault is healed globally at quiescence exactly like every other fault
-    /// (re-served survivors, drained finalizes), so the drain's rehydrate can
-    /// re-serve every survivor and convergence is required against a healed world.
-    pub fn regain_all_records(&mut self) {
-        let ids: Vec<SandboxId> = self.device.slots.keys().copied().collect();
-        for id in ids {
-            self.device.regain_record(id);
-        }
-    }
-
-    /// Run the stale-binding sweep independently, GATED by the Wave 7b
-    /// classification barrier (classify → reap only TerminalSafeToReap).
-    pub fn stale_sweep_tick(&mut self) {
-        self.barrier_sweep();
-    }
-
-    /// `try_claim` a spare device on the real allocator (slot-accounting).
-    pub async fn slot_claim(&mut self) {
-        // Spare device: the first free path ABOVE the sandbox devices.
-        if let Some(device) = self.device.next_free_device() {
-            self.device.slot_claim(device).await;
-        }
-    }
-
-    /// Release the oldest held spare lease (slot-accounting).
-    pub fn slot_populate_tick(&mut self) {
-        self.device.slot_populate_tick();
-    }
-
-    // ── Device-plane oracle/read accessors ──
-    pub fn is_parked(&self, id: SandboxId) -> bool {
-        self.device.is_parked(id)
-    }
-    pub fn served_by_current(&self, id: SandboxId) -> bool {
-        self.device.served_by_current(id)
-    }
-    /// Does the host hold a LIVE RAM backend for this sandbox — i.e. is it
-    /// ACTIVELY serving the guest (not paused for a capture, not post-roll
-    /// pre-rehydrate)? The split-brain oracle keys on this: a paused/capturing
-    /// device is mid-lifecycle-transition, not actively double-serving.
-    pub fn has_live_backend(&self, id: SandboxId) -> bool {
-        self.sandboxes.get(&id).is_some_and(|s| s.backend.is_some())
-    }
-    pub fn guest_holds_device(&self, id: SandboxId) -> bool {
-        self.device.guest_holds_device(id)
-    }
-    pub fn kernel_owner(&self, id: SandboxId) -> Option<u32> {
-        self.device.kernel_owner(id)
-    }
-    pub fn device_slot_ids(&self) -> Vec<SandboxId> {
-        self.device.slots.keys().copied().collect()
-    }
-    /// The slot-accounting identity terms: `(free, warm, held, capacity)`.
-    pub async fn slot_accounting(&self) -> (usize, usize, usize, usize) {
-        let free = self.device.nbd_pool.free_count().await;
-        let warm = self.device.nbd_pool.warm_count().await;
-        let held = self.device.leases_held();
-        (free, warm, held, self.device.nbd_capacity as usize)
-    }
-    /// Oracle read: sandboxes the sweep PARKed because a live guest held the
-    /// device (#806) — never severed.
-    pub fn sweep_parked_live(&self) -> Vec<SandboxId> {
-        self.sweep_parked_live.iter().copied().collect()
-    }
-    /// Oracle read (Wave 7b): sandboxes the classification barrier put in
-    /// `QuarantinedUnknown` — a record-invisible live survivor (#769 gap A).
-    pub fn quarantined_unknown(&self) -> Vec<SandboxId> {
-        self.quarantined_unknown.iter().copied().collect()
-    }
-    /// The session a sandbox is bound to, as the HOST knows it — what the
-    /// real host-agent stamps into a `QuarantinedSurvivor` advertise.
-    pub fn session_of(&self, id: SandboxId) -> Option<SessionId> {
-        self.sandboxes.get(&id).and_then(|s| s.session_id)
     }
 
     /// A unit of guest work: write one real content-tagged chunk (advancing
     /// the backend's dirty tier) and bump the work cursor.
     pub async fn guest_write(&mut self, sandbox_id: SandboxId) -> Result<(), String> {
         let tag = self.next_tag();
+        if self.capture_in_flight(sandbox_id) {
+            return Ok(()); // paused
+        }
         let Some(s) = self.sandboxes.get_mut(&sandbox_id) else {
             return Ok(());
         };
-        let Some(backend) = s.backend.clone() else {
-            return Ok(()); // paused/destroyed
-        };
-        let chunk_idx = (tag % NUM_CHUNKS) * CHUNK_SIZE;
-        backend
-            .write(chunk_idx, &synth_chunk(tag))
+        let volume = self
+            .volumes
+            .live(sandbox_id, DiskRole::Root)
+            .await
+            .map_err(|e| format!("guest_write {sandbox_id}: open root: {e}"))?;
+        volume
+            .write_chunk(ChunkIndex(tag % NUM_CHUNKS), synth_chunk(tag))
             .await
             .map_err(|e| format!("guest_write {sandbox_id}: {e}"))?;
         s.cursor += 1;
         Ok(())
     }
 
-    /// A flush: upload the dirty tier + advance the durable pointer (the
-    /// periodic-checkpoint disk leg). Real `ChunkedDiskBackend::flush`.
+    /// The periodic-checkpoint disk leg: take and publish the root
+    /// checkpoint (the REAL `SessionVolumes::checkpoint`).
     pub async fn flush(&mut self, sandbox_id: SandboxId) -> Result<(), String> {
-        let Some(s) = self.sandboxes.get_mut(&sandbox_id) else {
+        if !self.sandboxes.contains_key(&sandbox_id) || self.capture_in_flight(sandbox_id) {
             return Ok(());
-        };
-        let Some(backend) = s.backend.clone() else {
-            return Ok(());
-        };
-        backend
-            .flush()
+        }
+        self.volumes
+            .checkpoint(sandbox_id, DiskRole::Root)
             .await
-            .map_err(|e| format!("flush {sandbox_id}: {e}"))?;
-        s.published_ref = Some(backend.manifest_ref().await);
-        Ok(())
+            .map(|_| ())
+            .map_err(|e| format!("flush {sandbox_id}: {e}"))
     }
 
-    /// The eviction capture leg (`PooledBackend::snapshot_begin`): drain the
-    /// dirty tier through the REAL `persist_disk_pending_chunks`, persist a
-    /// REAL `EvictionFinalizeRecord`, take the capture lock, pause the VM.
-    /// Idempotent: a pending finalize re-observes the same snapshot id.
+    /// The eviction capture leg (`PooledBackend::snapshot_begin`): take the
+    /// root checkpoint under the pause, persist a REAL
+    /// `EvictionFinalizeRecord`, take the capture lock. Idempotent: a
+    /// pending finalize re-observes the same snapshot id.
     pub async fn snapshot_begin(&mut self, sandbox_id: SandboxId) -> Result<SnapshotId, String> {
         if let Some(existing) = self.pending_finalizes.get(&sandbox_id) {
             return Ok(*existing);
@@ -1092,11 +848,6 @@ impl CosimHost {
             .ok_or_else(|| format!("snapshot_begin: sandbox {sandbox_id} not bound"))?;
         let cursor = s.cursor;
         let aux_bundles = s.attached_bundles.clone();
-        let Some(backend) = s.backend.clone() else {
-            return Err(format!(
-                "snapshot_begin: sandbox {sandbox_id} has no backend"
-            ));
-        };
 
         // The eviction/manual capture path reaches the same Firecracker
         // `prepare_save` hook as a periodic checkpoint. Every live guest
@@ -1104,31 +855,42 @@ impl CosimHost {
         self.sever_exec_transports(sandbox_id);
 
         let snapshot_id = SnapshotId::from(self.entropy.uuid());
-        let dest = self.fs.root().join("staging").join(snapshot_id.to_string());
+        let dest = self
+            .root
+            .path()
+            .join("staging")
+            .join(snapshot_id.to_string());
         tokio::fs::create_dir_all(&dest)
             .await
             .map_err(|e| format!("snapshot_begin staging dir: {e}"))?;
-        tokio::fs::write(dest.join("state.bin"), b"cosim fc state")
-            .await
-            .map_err(|e| format!("snapshot_begin state.bin: {e}"))?;
+        // The files a Firecracker full capture leaves: the finalize's
+        // memory leg chunks `memory.bin` and patches the `manifest.json`
+        // sidecar, and its blob leg uploads both with `state.bin`.
+        for (name, body) in [
+            ("state.bin", &b"cosim fc state"[..]),
+            ("memory.bin", &b"cosim guest memory"[..]),
+            ("manifest.json", &br#"{"format":"fc"}"#[..]),
+        ] {
+            tokio::fs::write(dest.join(name), body)
+                .await
+                .map_err(|e| format!("snapshot_begin {name}: {e}"))?;
+        }
 
-        // The capture disk drain: the un-uploaded tier moves from RAM to the
-        // node-durable staging files via the REAL writer.
-        let (base_manifest_ref, chunks) = backend.export_unflushed().await;
-        let disk_chunks: Vec<(usize, ChunkHash, Bytes)> = chunks
-            .iter()
-            .map(|(i, b)| (*i, ChunkHash::of(b), Bytes::from(b.clone())))
-            .collect();
-        persist_disk_pending_chunks(
-            &dest,
-            engram_core::types::snapshot::DiskRole::Root,
-            &disk_chunks,
-        )
-        .await
-        .map_err(|e| format!("persist_disk_pending_chunks: {e}"))?;
+        // The checkpoint taken under the pause: the transient volume the
+        // finalize publishes by name.
+        let root = self
+            .volumes
+            .take(sandbox_id, DiskRole::Root)
+            .await
+            .map_err(|e| format!("snapshot_begin take root checkpoint: {e}"))?;
+        let disk_pending = vec![PendingDisk {
+            role: DiskRole::Root,
+            previous: root.previous(),
+        }];
+        drop(root);
 
         let now = self.clock.now_utc();
-        let record = EvictionFinalizeRecord {
+        let mut record = EvictionFinalizeRecord {
             snapshot_id,
             session_id,
             sandbox_id,
@@ -1138,38 +900,30 @@ impl CosimHost {
             captured_at: now,
             dest,
             chain_prev_ref: None,
-            disk_pending: vec![DiskPendingRecord {
-                role: engram_core::types::snapshot::DiskRole::Root,
-                base_manifest: base_manifest_ref,
-                chunk_size: CHUNK_SIZE,
-                total_bytes: NUM_CHUNKS * CHUNK_SIZE,
-                chunks: disk_chunks.iter().map(|(i, h, _)| (*i, *h)).collect(),
-            }],
+            disk_pending,
             // ADR 0035 amendment: the capture pins what the sandbox actually
             // has attached, so the REAL finalize's bundle-publish leg
-            // (`run_upload_blobs` → `BundleStore::publish`) runs — the exact
-            // leg the 2026-08-10 incident failed on.
+            // (`run_upload_blobs` → `BundleStore::publish`) runs (the leg a
+            // sweep-before-publish race breaks).
             aux_bundles,
             stage: FinalizeStage::Captured,
             attempts: 0,
             swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
+            diff_extents: None,
         };
         let finalizer = self.finalizer();
         record
-            .persist(self.fs_seam.as_ref(), &finalizer.finalize_dir())
+            .persist_captured(self.fs_seam.as_ref(), &finalizer.finalize_dir())
             .await
             .map_err(|e| format!("snapshot_begin record persist: {e}"))?;
 
         self.pending_finalizes.insert(sandbox_id, snapshot_id);
         self.in_flight.insert(sandbox_id, record);
         self.finalize_cursor.insert(snapshot_id, cursor);
-        // Take the capture lock (view mirror) + pause the VM.
+        // Take the capture lock (view mirror); the VM is paused for it.
         self.view.inner.lock().capturing.insert(sandbox_id);
-        if let Some(s) = self.sandboxes.get_mut(&sandbox_id) {
-            s.backend = None;
-        }
         Ok(snapshot_id)
     }
 
@@ -1187,15 +941,10 @@ impl CosimHost {
         match run_eviction_finalize_attempt(&finalizer, &mut record).await {
             FinalizeAttempt::Completed => {
                 let disk_manifest = record.disk_manifest.is_some();
-                if let Some(published) = record.disk_manifest {
-                    if let Some(s) = self.sandboxes.get_mut(&sandbox_id) {
-                        s.published_ref = Some(published);
-                    }
-                }
                 // Capture lock released; the terminal leg destroyed the VM.
                 self.pending_finalizes.remove(&sandbox_id);
                 self.finalize_cursor.remove(&snapshot_id);
-                self.remove_sandbox(sandbox_id);
+                self.remove_sandbox(sandbox_id).await;
                 FinalizeTickOutcome::Completed {
                     snapshot_id,
                     session_id,
@@ -1217,55 +966,60 @@ impl CosimHost {
         }
     }
 
-    /// Test hook (#784 rung 2, the capture-lock release pin): delete the
-    /// in-flight finalize's node-durable staging dir so every redrive attempt
-    /// fails (the ENOENT class) and the REAL `run_eviction_finalize_attempt`
-    /// QUARANTINES after the redrive budget — proving the quarantine arm
-    /// releases the capture lock (`pending_finalizes` entry cleared), so
-    /// #783's teardown-reconcile capture-in-flight exemption can never become a
-    /// permanent reap-shield.
-    pub async fn sabotage_finalize_staging(&self, sandbox_id: SandboxId) {
+    /// Test hook (the capture-lock release pin): delete the in-flight
+    /// finalize's staging dir and release the sandbox's volumes. The
+    /// release keeps the checkpoint the pending one was taken over, so the
+    /// disk leg finds its pending checkpoint gone and never published, and
+    /// every redrive fails. The REAL `run_eviction_finalize_attempt` then
+    /// QUARANTINES after the redrive budget, which proves the quarantine
+    /// arm releases the capture lock (`pending_finalizes` entry cleared), so
+    /// #783's teardown-reconcile capture-in-flight exemption can never
+    /// become a permanent reap-shield.
+    pub async fn sabotage_finalize_inputs(&self, sandbox_id: SandboxId) {
         if let Some(record) = self.in_flight.get(&sandbox_id) {
             let _ = tokio::fs::remove_dir_all(&record.dest).await;
         }
+        let _ = self.volumes.release(sandbox_id).await;
     }
 
     /// Reconcile's local reap: cancel any in-flight finalize (the #570
     /// loss), drop the VM, record the destroy in the oracle log.
-    fn reconcile_destroy(&mut self, sandbox_id: SandboxId) {
+    async fn reconcile_destroy(&mut self, sandbox_id: SandboxId) {
         // Cancelling a mid-upload finalize is the corruption: its inputs
         // are dropped and no snapshot row will ever land.
         self.in_flight.remove(&sandbox_id);
         if let Some((_, snap)) = self.pending_finalizes.remove(&sandbox_id) {
             self.finalize_cursor.remove(&snap);
         }
-        let mut view = self.view.inner.lock();
-        view.destroyed.push(sandbox_id);
-        drop(view);
-        self.remove_sandbox(sandbox_id);
+        self.view.inner.lock().destroyed.push(sandbox_id);
+        self.remove_sandbox(sandbox_id).await;
     }
 
-    fn remove_sandbox(&mut self, sandbox_id: SandboxId) {
-        self.sandboxes.remove(&sandbox_id);
-        // Drop the device slot too (its lease Drop releases the `/dev/nbdN`
-        // back to the pool). A terminal finalize / coordinator destroy tears
-        // the whole plane entry down.
-        self.device.remove_slot(sandbox_id);
-        self.sweep_parked_live.remove(&sandbox_id);
-        self.quarantined_unknown.remove(&sandbox_id);
-        let mut view = self.view.inner.lock();
-        view.live.remove(&sandbox_id);
-        view.bindings.remove(&sandbox_id);
-        view.capturing.remove(&sandbox_id);
+    /// Drop the VM and release its volumes (the `PooledBackend::destroy`
+    /// order: the sandbox leaves the live set, then the disk).
+    async fn remove_sandbox(&mut self, sandbox_id: SandboxId) {
+        if self.sandboxes.remove(&sandbox_id).is_none() {
+            return;
+        }
+        {
+            let mut view = self.view.inner.lock();
+            view.live.remove(&sandbox_id);
+            view.bindings.remove(&sandbox_id);
+            view.capturing.remove(&sandbox_id);
+        }
+        if let Err(e) = self.volumes.release(sandbox_id).await {
+            tracing::warn!(%sandbox_id, error = %e, "cosim: release volumes");
+        }
     }
 
     fn finalizer(&self) -> EvictionFinalizer {
         EvictionFinalizer::new(
-            Some((*self.store).clone()),
-            None,
+            Some(self.volumes.clone()),
+            Some(self.fill.clone()),
             self.bundle_dir(),
             BUNDLE_EXT,
-            self.fs.root().to_path_buf(),
+            self.root.path().to_path_buf(),
+            Arc::new(tokio::sync::Notify::new()),
             self.pending_finalizes.clone(),
             self.destroyer.clone(),
             self.fs_seam.clone(),
@@ -1326,7 +1080,7 @@ impl ReconcileBackend for CosimReconcileBackend {
         view.binding_repairs.push((id, session));
     }
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
-        self.host.lock().await.reconcile_destroy(id);
+        self.host.lock().await.reconcile_destroy(id).await;
         Ok(())
     }
 }

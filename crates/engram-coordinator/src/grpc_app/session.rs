@@ -10,6 +10,7 @@ use engram_core::types::sandbox::SessionFileSpec;
 use engram_protocol::app;
 use futures::StreamExt as _;
 use tonic::{Request, Response, Status};
+use tracing::Instrument as _;
 
 use super::{auth, into_status, parse_session_id, BoxStream};
 use crate::state::SharedState;
@@ -103,22 +104,32 @@ impl app::session_service_server::SessionService for AppSessionService {
         req: Request<app::SendPromptRequest>,
     ) -> Result<Response<app::SendPromptResponse>, Status> {
         self.auth.check(&req)?;
-        let r = req.into_inner();
-        let id = parse_session_id(&r.session_id)?;
-        let note = crate::api::prompt::send_prompt_core(
-            &self.state,
-            id,
-            r.prompt_id,
-            r.text,
-            r.harness_mode,
-            crate::api::prompt::PromptDelivery::Enqueue,
-        )
+        let span = tracing::info_span!(
+            "coord.send_prompt",
+            session_id = %req.get_ref().session_id,
+            prompt_id = %req.get_ref().prompt_id,
+        );
+        engram_protocol::grpc_client::link_remote_parent(&span, &req);
+        async move {
+            let r = req.into_inner();
+            let id = parse_session_id(&r.session_id)?;
+            let note = crate::api::prompt::send_prompt_core(
+                &self.state,
+                id,
+                r.prompt_id,
+                r.text,
+                r.harness_mode,
+                crate::api::prompt::PromptDelivery::Enqueue,
+            )
+            .await
+            .map_err(into_status)?;
+            Ok(Response::new(app::SendPromptResponse {
+                session_id: id.to_string(),
+                note: note.to_string(),
+            }))
+        }
+        .instrument(span)
         .await
-        .map_err(into_status)?;
-        Ok(Response::new(app::SendPromptResponse {
-            session_id: id.to_string(),
-            note: note.to_string(),
-        }))
     }
 
     async fn edit_queued_prompt(
@@ -693,22 +704,6 @@ impl app::session_service_server::SessionService for AppSessionService {
         Ok(Response::new(app::EvictIdleResponse {
             session_id: result.session_id.to_string(),
             status: result.status.to_string(),
-        }))
-    }
-
-    async fn get_cow_state(
-        &self,
-        req: Request<app::GetCowStateRequest>,
-    ) -> Result<Response<app::GetCowStateResponse>, Status> {
-        self.auth.check(&req)?;
-        let id = parse_session_id(&req.get_ref().session_id)?;
-        let maybe_view = crate::api::sessions_inspect::cow_state_core(&self.state, id)
-            .await
-            .map_err(into_status)?;
-        let proto_state = maybe_view.map(|v| super::convert::cow_state_to_proto(&v));
-        Ok(Response::new(app::GetCowStateResponse {
-            session_id: id.to_string(),
-            state: proto_state,
         }))
     }
 

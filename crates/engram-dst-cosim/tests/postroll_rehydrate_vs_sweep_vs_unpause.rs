@@ -1,19 +1,11 @@
 //! Deliverable 4b (ADR 0098 R-CoSim, rung 1): the post-roll survivor family
-//! (the 731df805 / #739 / #769 shape), at the coordinator↔host BOUNDARY.
+//! (the #739 / #769 shape), at the coordinator↔host BOUNDARY.
 //!
-//! # Scope (documented divergence)
-//!
-//! The FULL post-roll family also spans the host's NBD generation / slot /
-//! park / un-pause-gate data-plane model — which lives in `engram-dst-host`'s
-//! `SimHost` and is NOT carried into this boundary host (rung 1 keys sandboxes
-//! by the coordinator's id-space and reuses the finalize/reconcile flows, not
-//! the NBD machinery). Porting that model into the boundary host is rung-2
-//! work. What rung 1 CAN co-simulate — and does here — is the **ownership**
-//! leg of the family: the ADR 0090 survivor-reattach interaction between the
-//! coordinator's `session_owning_sandbox` (non-terminal, INCLUDING
-//! `HostLost`) and the host's real `reconcile_once` Unbound arm. That is
-//! exactly the class where a survivor invisible to a naive lookup gets
-//! wrongly reaped.
+//! What this test co-simulates is the **ownership** leg of the family: the
+//! ADR 0090 survivor-reattach interaction between the coordinator's
+//! `session_owning_sandbox` (non-terminal, INCLUDING `HostLost`) and the
+//! host's real `reconcile_once` Unbound arm. That is exactly the class where
+//! a survivor invisible to a naive lookup gets wrongly reaped.
 //!
 //! # The #777 tension, pinned
 //!
@@ -21,17 +13,15 @@
 //! finding no local binding after the roll, asks the coordinator "who owns
 //! this?" and — because `HostLost` is non-terminal — gets the session back,
 //! so it REPAIRS the binding rather than reaping. This test pins that CURRENT
-//! behavior. The open design call it records: the coordinator-side
-//! `host_lost_straggler_sweep`'s 60s min-age eventually decides such a
-//! survivor's fate; co-simulating the sweep vs. this repair (and the un-pause
-//! gate) together is the rung-2 increment.
+//! behavior. The coordinator-side `host_lost_straggler_sweep`'s 60s min-age
+//! eventually decides such a survivor's fate.
 
 use engram_core::types::session::SessionState;
 use engram_core::types::BindingDisposition;
 use engram_dst_cosim::Cosim;
 
 /// A `HostLost` survivor with a live VM but a dropped local binding must be
-/// REPAIRED by reconcile, never reaped (ADR 0090; the 731df805/#739 class).
+/// REPAIRED by reconcile, never reaped (ADR 0090; the #739 class).
 #[tokio::test(start_paused = true)]
 async fn hostlost_survivor_with_dropped_binding_is_repaired_not_reaped() {
     let mut sim = Cosim::new(0x0769_0001).await;
@@ -58,7 +48,7 @@ async fn hostlost_survivor_with_dropped_binding_is_repaired_not_reaped() {
 
     assert!(
         !sim.reconcile_destroys().contains(&sandbox),
-        "a HostLost survivor must NEVER be reaped (ADR 0090 / 731df805)"
+        "a HostLost survivor must NEVER be reaped (ADR 0090)"
     );
     assert!(
         sim.reconcile_binding_repairs()

@@ -6,14 +6,11 @@ license.workspace = true
 repository.workspace = true
 description = "Per-host daemon: chunked-OCI session create, snapshot manager, resource governor."
 
-# ADR 0007 Phase 4: the NBD daemon's `disk_daemon::runtime` module
-# wraps Linux kernel ioctls (`NBD_SET_SOCK`, `socketpair`, raw fd
-# ownership transfer to the kernel) that the safe Rust surface
-# can't model. We loosen `unsafe_code` from the workspace's
-# `forbid` to `allow` here so the unavoidable kernel-surface
-# blocks pass clippy; each block carries a `// SAFETY:` comment
-# explaining the invariant it relies on. Other lints stay at the
-# workspace default.
+# The host agent calls kernel interfaces the safe Rust surface can't
+# model (pidfd, mmap'd page-idle bitmaps, userfaultfd prefetch, raw
+# sysctls). We loosen `unsafe_code` from the workspace's `forbid` to
+# `allow` here; each block carries a `// SAFETY:` comment explaining
+# the invariant it relies on. Other lints stay at the workspace default.
 [lints.rust]
 unsafe_code = "allow"
 
@@ -34,8 +31,10 @@ path = "src/main.rs"
 engram-tls.workspace = true
 engram-core.workspace = true
 engram-host-core.workspace = true
+engram-disk-thin.workspace = true
 engram-protocol.workspace = true
 engram-chunk-store.workspace = true
+engram-fill.workspace = true
 engram-substrate-proto.workspace = true
 engram-migrate-proto.workspace = true
 engram-storage-local.workspace = true
@@ -57,9 +56,8 @@ async-trait.workspace = true
 base64.workspace = true
 bincode.workspace = true
 bytes.workspace = true
-# Raw libc bindings: the NBD ioctl orchestration in
-# `disk_daemon::runtime` (Linux) and the `hw.memsize` capacity
-# sysctl in `resource` (macOS). Call sites are target_os-gated;
+# Raw libc bindings for the kernel calls above and the `hw.memsize`
+# capacity sysctl in `resource` (macOS). Call sites are target_os-gated;
 # the dep is unconditional because `libc` is platform-portable.
 libc = "0.2"
 rustls.workspace = true
@@ -108,6 +106,10 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 # linux5_13: `RegisterMode::MINOR` — the exact ioctl mode the probe
 # exercises.
 userfaultfd = { version = "0.9", features = ["linux5_13"] }
+# The ublk device `blk_source` serves; `io-uring` for the eventfd read
+# that wakes its queue thread.
+libublk = "0.4.8"
+io-uring = "0.7"
 # #1003: jemalloc as the global allocator (prod is musl-static; musl
 # mallocng retained 23 GB of ~48 MiB groups under chunk-buffer churn)
 # + the sampled heap profiler (SIGUSR2 → pprof dump) + allocator
@@ -123,8 +125,7 @@ engram-uffd-handler.workspace = true
 engram-egress-proxyd.workspace = true
 # ADR 0035 amendment (2026-08-10): startup-publish retry test injects a first-PUT blob fault.
 engram-testkit.workspace = true
-# 2026-08-02 durability-rollback RCA: paused-clock (`start_paused`)
-# regression tests for the SIGTERM flush join's deadline-overrun arm.
+# Paused-clock tests for the SIGTERM flush join.
 tokio = { workspace = true, features = ["test-util"] }
 # base_shm_gc tests backdate mtimes
 filetime = "0.2"
@@ -134,10 +135,3 @@ engram-sandbox-process.workspace = true
 # (Mke2fsPacker in lib.rs); every remaining use is test-fixture image
 # packing in tests/*.rs, so this only needs to build for `cargo test`.
 tempfile = "3"
-# ADR 0008 Phase 5: the chunked-OCI fault integration test spins
-# up a loopback fake-registry that speaks just enough of the OCI
-# Distribution Spec for `OciChunkResolver` to fault chunks.
-# axum + tokio TcpListener bound to 127.0.0.1:0 keeps the test
-# self-contained — no docker, no external registry.
-axum = { workspace = true }
-http = { workspace = true }

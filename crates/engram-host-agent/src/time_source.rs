@@ -9,7 +9,7 @@
 //!
 //! - [`metrics_now`] / [`metrics_now_tokio`] — the monotonic-`Instant`
 //!   carve-out. Two homes: (a) the data-plane latency histograms and
-//!   duration logs (the migrate_peer page-server timers, NBD/attach
+//!   duration logs (the migrate_peer page-server timers, attach
 //!   budgets, per-stage finalize timers) — the data plane is never
 //!   simulated, so a `Box::pin`-per-op `clock.now_mono()` would trade
 //!   latency for nothing; and (b) the not-yet-extracted flow timers

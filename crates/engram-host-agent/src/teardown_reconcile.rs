@@ -24,8 +24,8 @@
 //! [`ReconcileInput`] to a [`ReapVerdict`]) and a **one-tick driver**
 //! ([`reconcile_once`]) over a focused [`ReconcileBackend`] seam — the same
 //! `run_once`/pure-core split every coordinator driver already has, so the
-//! host-internal simulator (`engram-dst-host`) can drive the REAL tick
-//! against an adversarial coordinator. `lib.rs` keeps only a thin interval
+//! boundary simulator (`engram-dst-cosim`) can drive the REAL tick against
+//! an adversarial coordinator. `lib.rs` keeps only a thin interval
 //! wrapper. The pure core is table-tested below; in particular the None-arm
 //! rule — **only a coordinator-CONFIRMED absence is an orphan** (the
 //! 2026-07-11 mis-reap fix) — is one auditable `match` arm.
@@ -95,8 +95,8 @@ pub enum ReconcileInput {
     /// ("does ANY session own this on me?"). `Ok(Some)` = coord owns it
     /// (repair the missing local binding), `Ok(None)` = coord-CONFIRMED no
     /// owner, `Err` = coord unreachable. ADR 0090: a missing local binding
-    /// is NOT ownership truth — a fresh generation whose NBD rehydrate
-    /// failed has no entry for a legitimately-owned, pidfd-reattached
+    /// is NOT ownership truth — a fresh generation whose registration ack
+    /// missed it has no entry for a legitimately-owned, pidfd-reattached
     /// survivor, and this arm's old unconditional "orphan" SIGKILLed exactly
     /// such a VM mid-build (2026-07-11 campaign).
     Unbound(Result<Option<SessionId>, CoordUnreachable>),
@@ -411,7 +411,7 @@ mod tests {
     // co-simulated reproduction (real coordinator + real host) lives in
     // `engram-dst-cosim`; this pins the exemption at the unit boundary.
 
-    use engram_host_core::{CoordError, LiveManifestPublishRequest, LiveManifestPublishResponse};
+    use engram_host_core::CoordError;
 
     struct MidCaptureBackend {
         sandbox: SandboxId,
@@ -458,13 +458,6 @@ mod tests {
 
     #[async_trait]
     impl CoordControlPlane for UnownedCoord {
-        async fn publish_live_manifest(
-            &self,
-            _: HostId,
-            _: &LiveManifestPublishRequest,
-        ) -> Result<LiveManifestPublishResponse, CoordError> {
-            unreachable!("reconcile never publishes")
-        }
         async fn sandbox_ownership(
             &self,
             _: HostId,

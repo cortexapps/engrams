@@ -54,6 +54,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::ids::SessionId;
 use engram_core::types::sandbox::{
     AgentSpec, CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec,
@@ -173,7 +174,11 @@ async fn start_agent_corrects_a_guest_clock_with_no_ptp_device() {
         swap_source: None,
         swap_manifest: None,
     };
-    let sandbox_id = backend.create(spec).await.expect("create sandbox");
+    let sandbox_id = SandboxId::new();
+    backend
+        .create(sandbox_id, spec)
+        .await
+        .expect("create sandbox");
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
 
     wait_for_agent_ready(&backend, sandbox_id, Duration::from_secs(20))

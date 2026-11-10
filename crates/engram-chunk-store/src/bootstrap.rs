@@ -12,10 +12,9 @@
 //!
 //! This module is the bake-time *producer* (build a bootstrap from
 //! an existing `Manifest` — a pure function, no chunk I/O) and the
-//! runtime *consumer* (parse a bootstrap into an
-//! `OciChunkIndex`-shaped lookup table — the actual `OciChunkResolver`
-//! lives in `engram-oci` to keep the chunk-store crate registry-
-//! agnostic).
+//! runtime *consumer* (rebuild the `Manifest` from a bootstrap, for a
+//! host whose object store does not hold it). The runtime reads chunks
+//! from the chunk cache or the object store, never from the registry.
 //!
 //! Content addressing is single-layered and uniform: a chunk's
 //! sha256 is simultaneously its BlobStorage key, its `ChunkResolver`
@@ -27,9 +26,9 @@ use crate::manifest::{ChunkHash, ChunkSize, Manifest, ManifestKind};
 
 /// On-wire schema version. Bumped only on incompatible changes.
 /// v2 = ADR 0036 per-chunk blobs (`blob_digest` always `Some`,
-/// `blob_offset` always 0). v1 (monolithic chunk blob) readers and
-/// writers were retired in the same change — consumers reject v1
-/// with a "re-bake this image" error.
+/// `blob_offset` always 0). v1 (monolithic chunk blob) documents
+/// still parse; the manifest synthesis reads only each entry's
+/// offset, length and hash.
 pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 2;
 
 /// One entry in the bootstrap — a single chunk's metadata.
@@ -113,14 +112,6 @@ impl Bootstrap {
         }
     }
 
-    /// True iff this document is the ADR 0036 per-chunk shape every
-    /// current consumer requires. v1 documents (monolithic chunk
-    /// blob) should be rejected with a "re-bake this image" error.
-    pub fn is_per_chunk(&self) -> bool {
-        self.schema_version >= BOOTSTRAP_SCHEMA_VERSION
-            && self.entries.iter().all(|e| e.blob_digest.is_some())
-    }
-
     /// Synthesize a `Manifest` covering the same chunks.
     ///
     /// ADR 0008 Phase 5 final piece: a chunked-OCI image's
@@ -130,15 +121,14 @@ impl Bootstrap {
     /// reconstruct an equivalent `Manifest` on the runtime side:
     /// chunk hashes + file offsets + size + kind. Dropped fields
     /// (`blob_digest`, `blob_offset` on `BootstrapEntry`) are
-    /// OCI-specific — at runtime, chunks are fetched via the
-    /// tiered `ChunkResolver`, which knows how to find them in
-    /// BlobStorage or OCI.
+    /// OCI-specific — at runtime, chunks are read from the chunk
+    /// cache or BlobStorage.
     ///
     /// Caller is responsible for `put_manifest` under the
     /// `ManifestRef` from `bundle.json::disk_manifest` (or
     /// `canonical_memory_manifest` for memory bootstraps). After
     /// that, every consumer of `chunk_store.get_manifest` —
-    /// materialize, NBD daemon, UFFD handler — finds it in the
+    /// materialize, disk stage, UFFD handler — finds it in the
     /// local BlobStorage and works unchanged.
     pub fn to_manifest(&self) -> Manifest {
         Manifest {
@@ -155,7 +145,6 @@ impl Bootstrap {
                 })
                 .collect(),
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         }
     }
@@ -177,7 +166,6 @@ mod tests {
                 .map(|(offset, hash)| ChunkRef { offset, hash })
                 .collect(),
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         }
     }
@@ -193,7 +181,6 @@ mod tests {
         assert_eq!(bs.kind, ManifestKind::Disk);
         assert_eq!(bs.total_bytes, 8);
         assert_eq!(bs.entries.len(), 2);
-        assert!(bs.is_per_chunk());
 
         for (entry, hash) in bs.entries.iter().zip([h0, h1]) {
             assert_eq!(entry.sha256, hash);
@@ -244,15 +231,12 @@ mod tests {
         let json = serde_json::to_vec(&bootstrap).unwrap();
         let back: Bootstrap = serde_json::from_slice(&json).unwrap();
         assert_eq!(bootstrap, back);
-        assert!(back.is_per_chunk());
     }
 
     /// v1 documents (monolithic chunk blob: schema_version 1,
-    /// `blob_digest` absent) still *parse* — serde default — but
-    /// must be detectable so consumers can reject them with a
-    /// "re-bake this image" error instead of mis-reading offsets.
+    /// `blob_digest` absent) still parse, with `blob_digest` `None`.
     #[test]
-    fn v1_monolithic_bootstrap_parses_but_is_not_per_chunk() {
+    fn v1_monolithic_bootstrap_parses() {
         let v1 = serde_json::json!({
             "schema_version": 1,
             "kind": serde_json::to_value(ManifestKind::Disk).unwrap(),
@@ -266,7 +250,8 @@ mod tests {
             ],
         });
         let bs: Bootstrap = serde_json::from_value(v1).unwrap();
-        assert!(!bs.is_per_chunk());
+        assert_eq!(bs.entries.len(), 2);
+        assert!(bs.entries.iter().all(|e| e.blob_digest.is_none()));
     }
 
     /// `to_manifest` round-trip: build a Bootstrap from a Manifest,
