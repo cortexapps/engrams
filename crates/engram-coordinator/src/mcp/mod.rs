@@ -13,8 +13,14 @@ pub enum McpError {
 }
 pub type Result<T> = std::result::Result<T, McpError>;
 impl From<engram_core::MetaError> for McpError {
-    fn from(_: engram_core::MetaError) -> Self {
-        Self::Stale
+    fn from(error: engram_core::MetaError) -> Self {
+        use engram_core::MetaError;
+        match error {
+            MetaError::NotFound | MetaError::Conflict(_) => Self::Stale,
+            MetaError::Db(_) | MetaError::Migration(_) | MetaError::Serialization(_) => {
+                Self::Unavailable
+            }
+        }
     }
 }
 
@@ -386,6 +392,23 @@ mod tests {
     use engram_core::traits::StaticSecretStore;
     use engram_sim::{ManualClock, SimEntropy, SimMetadataStore};
     use std::collections::{BTreeSet, HashMap};
+
+    #[test]
+    fn metadata_failures_do_not_report_changed_authority() {
+        use engram_core::MetaError;
+        for error in [
+            MetaError::Db(std::io::Error::other("database unavailable").into()),
+            MetaError::Migration("migration unavailable".into()),
+            MetaError::Serialization("invalid stored metadata".into()),
+        ] {
+            assert_eq!(McpError::from(error), McpError::Unavailable);
+        }
+        assert_eq!(
+            McpError::from(MetaError::Conflict("version changed".into())),
+            McpError::Stale
+        );
+        assert_eq!(McpError::from(MetaError::NotFound), McpError::Stale);
+    }
 
     struct NoWorkerIo;
     #[async_trait::async_trait]
