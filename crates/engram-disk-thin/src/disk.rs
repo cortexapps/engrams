@@ -22,8 +22,8 @@ const ID_MASK: u32 = 0x00FF_FFFF;
 const REMOVE_ATTEMPTS: u32 = 10;
 const REMOVE_RETRY: Duration = Duration::from_millis(100);
 /// A dm-clone metadata volume: a superblock and one bit per region in
-/// 4 KiB blocks. 8 MiB holds the bitset of a 2 million region volume
-/// with room for its transaction shadows.
+/// 4 KiB blocks. A 300 GiB volume has 4.9 million 64 KiB regions, a
+/// 600 KiB bitset; 8 MiB leaves room for its transaction shadows.
 const CLONE_METADATA_BYTES: u64 = 8 << 20;
 /// Regions per background copy and copies in flight: 1 MiB bios, 8 MiB
 /// in flight. The kernel's defaults of 1 and 1 copy at a few MiB/s.
@@ -371,13 +371,14 @@ async fn skip_regions(device: &Volume, skip: &[ChunkIndex]) -> io::Result<()> {
                 last += 1;
             }
             let offset = first * chunk;
-            let end = (last + 1) * chunk;
-            if end > size {
+            if last * chunk >= size {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("skip chunk {last} lies beyond the {size}-byte volume"),
                 ));
             }
+            // The last chunk of a volume can be short.
+            let end = ((last + 1) * chunk).min(size);
             punch_hole(&file, offset, end - offset)?;
         }
         Ok(())
@@ -558,19 +559,22 @@ impl SessionDisk for ThinPoolDisk {
                 format!("{}: {sectors} sectors is not whole pool blocks", dest.name),
             ));
         }
+        // Only the path is kept: an open handle of ours would keep a
+        // failed hydrate from deleting the metadata volume.
         let metadata = self
             .create(&metadata_name(name)?, CLONE_METADATA_BYTES)
-            .await?;
-        let params = format!(
-            "{} {} {} {region_sectors} 2 no_hydration no_discard_passdown \
-             4 hydration_threshold {HYDRATION_THRESHOLD_REGIONS} \
-             hydration_batch_size {HYDRATION_BATCH_REGIONS}",
-            dm::devno_of(&metadata.path)?,
-            dm::devno_of(&dest.path)?,
-            dm::devno_of(source)?,
-        );
+            .await?
+            .path;
         let device = self.device_name(name);
         let hydrating = async {
+            let params = format!(
+                "{} {} {} {region_sectors} 2 no_hydration no_discard_passdown \
+                 4 hydration_threshold {HYDRATION_THRESHOLD_REGIONS} \
+                 hydration_batch_size {HYDRATION_BATCH_REGIONS}",
+                dm::devno_of(&metadata)?,
+                dm::devno_of(&dest.path)?,
+                dm::devno_of(source)?,
+            );
             self.dm.create(&device, sectors, "clone", &params).await?;
             let volume = self.volume(name, sectors).await?;
             skip_regions(&volume, skip).await?;

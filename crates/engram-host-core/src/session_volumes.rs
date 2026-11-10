@@ -920,7 +920,17 @@ impl SessionVolumes {
                 let dest = self.disk.open(&dest).await?;
                 self.disk.settle(&live, &dest).await?;
             }
-            Hydration::Settled => {}
+            // A settle that stopped after the cutover left the device's
+            // metadata volume; the disk's settle removes it. No
+            // destination: the first checkpoint ended the layout.
+            Hydration::Settled => match self.lazy_layout(sandbox, role).await {
+                Ok((dest, _)) => {
+                    let dest = self.disk.open(&dest).await?;
+                    self.disk.settle(&live, &dest).await?;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            },
         }
         self.stop_source(&live).await?;
         Ok(Hydration::Settled)
@@ -953,6 +963,8 @@ impl SessionVolumes {
                 continue;
             }
             let Hydration::Hydrating { source, .. } = self.disk.hydration(&live).await? else {
+                // The process died between the cutover and its cleanup.
+                self.settle(sandbox, role).await?;
                 continue;
             };
             let (dest, base) = self.lazy_layout(sandbox, role).await?;

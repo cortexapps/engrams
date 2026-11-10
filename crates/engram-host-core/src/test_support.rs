@@ -65,7 +65,8 @@ impl BlobStorage for CountingBlob {
 /// kernel: `hydrate` links `name` to the destination file, so a write
 /// to either lands in both, and each `hydration` call copies one chunk
 /// the plan did not skip from the source file. `settle` needs every
-/// chunk copied and changes nothing: the link is direct already.
+/// chunk copied and gives the device a file of its own; on a device
+/// that does not hydrate it does nothing.
 pub(crate) struct HydratingDisk {
     inner: FileDisk,
     chunk_size: u64,
@@ -187,12 +188,9 @@ impl SessionDisk for HydratingDisk {
     }
     async fn settle(&self, name: &VolumeName, _dest: &Volume) -> io::Result<()> {
         let mut clones = self.clones.lock().unwrap();
-        let clone = clones.get_mut(name).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("{name} is not hydrating"),
-            )
-        })?;
+        let Some(clone) = clones.get_mut(name).filter(|c| !c.settled) else {
+            return Ok(());
+        };
         if !clone.pending.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
