@@ -150,7 +150,7 @@ test("child compilation uses the live source profile and the parent's frozen eff
     },
     root,
   );
-  expect(policy.integrationGrants[0]!.mcp!.argumentConstraintDocuments).toHaveLength(2);
+  expect(policy.integrationGrants[0]!.mcp!.argumentConstraintDocuments).toHaveLength(1);
   const parent = restoreBindingSnapshot(root.mcpBindingEnvelope!, root.integrationConnections!);
   f.replaceParent(parent);
   const inherited = {
@@ -168,9 +168,7 @@ test("child compilation uses the live source profile and the parent's frozen eff
   expect(snapshot.immutableBindings[0]!.tools[0]!.grant).toMatchObject({
     unrestricted: false,
     automationWrite: false,
-    argumentConstraintDocuments: Array(5).fill(
-      f.live.profileGrants[0]!.mcp!.argumentConstraintDocuments[0],
-    ),
+    argumentConstraintDocuments: f.live.profileGrants[0]!.mcp!.argumentConstraintDocuments,
   });
   expect(f.reads()).toBe(1);
   const empty = await f.compile(f.input, { ...inherited, grants: [] });
@@ -180,14 +178,50 @@ test("child compilation uses the live source profile and the parent's frozen eff
   ).toHaveLength(0);
   f.staleParent();
   await expect(f.compile(f.input, inherited)).rejects.toThrow("parent unavailable");
+  const changedProfileGrants = structuredClone(policy.integrationGrants);
+  changedProfileGrants[0]!.mcp!.argumentConstraintDocuments = [
+    { type: "object", properties: { name: { maxLength: 5 } } },
+  ];
   await expect(
     f.compile(f.input, {
       profileId: f.live.profileId,
-      profileGrants: policy.integrationGrants,
+      profileGrants: changedProfileGrants,
       grants: policy.integrationGrants,
       directPolicy: direct,
     }),
   ).rejects.toThrow("MCP profile changed during compilation");
+});
+
+test("unchanged constrained grants stay bounded through deep child compilation", async () => {
+  const live = bindingAuthority();
+  const constraint = { type: "object", properties: { name: { maxLength: 10 } } };
+  live.profileGrants[0]!.mcp = {
+    ...live.profileGrants[0]!.mcp!,
+    unrestricted: false,
+    argumentConstraintDocuments: [constraint],
+  };
+  let parent = compileSessionBindings({
+    launchPolicy: { profileId: live.profileId, integrationGrants: live.profileGrants },
+    liveAuthority: live,
+    bindingEpoch: 0,
+    requestedGrants: live.profileGrants,
+  });
+  for (let depth = 0; depth < 12; depth++) {
+    const grants = [
+      { ...live.profileGrants[0]!, mcp: parent.immutableBindings[0]!.tools[0]!.grant },
+    ];
+    const snapshot = compileSessionBindings({
+      launchPolicy: { profileId: live.profileId, integrationGrants: live.profileGrants },
+      liveAuthority: live,
+      bindingEpoch: 0,
+      requestedGrants: grants,
+      parentAuthority: { sessionId: `parent-${depth}`, snapshot: parent },
+    });
+    expect(snapshot.immutableBindings[0]!.tools[0]!.grant.argumentConstraintDocuments).toEqual([
+      constraint,
+    ]);
+    parent = snapshot;
+  }
 });
 
 test("actual child compiler freezes native tools and intersects the fresh parent authority", async () => {

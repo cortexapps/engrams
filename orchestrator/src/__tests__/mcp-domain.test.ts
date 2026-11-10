@@ -166,6 +166,22 @@ test("MCP grants cannot become generic guest capabilities", async () => {
   expect(grantsToCapabilities([{ grant, connection }])).toEqual([]);
 });
 
+test("grant intersection removes only exact canonical constraint duplicates", async () => {
+  const { intersectMcpGrants } = await import("../mcp/bindings.ts");
+  const first = { type: "object", properties: { count: { minimum: 1, maximum: 5 } } };
+  const duplicate = { properties: { count: { maximum: 5, minimum: 1 } }, type: "object" };
+  const distinct = { type: "object", properties: { count: { maximum: 3 } } };
+  const constrained = (documents: Record<string, unknown>[]) => ({
+    ...grant,
+    mcp: { ...grant.mcp, unrestricted: false, argumentConstraintDocuments: documents },
+  });
+  const [effective] = intersectMcpGrants(
+    [constrained([first, first])],
+    [constrained([duplicate, distinct, distinct])],
+  );
+  expect(effective!.mcp!.argumentConstraintDocuments).toEqual([first, distinct]);
+});
+
 test("schema keyword checks do not reinterpret ordinary property names or constants", async () => {
   const { assertSchemaShape } = await import("../mcp/catalog.ts");
   expect(() =>

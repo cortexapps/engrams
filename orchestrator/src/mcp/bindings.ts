@@ -98,10 +98,16 @@ export function intersectMcpGrants(
     validateMcpGrant(inherited);
     const unrestricted = inherited.mcp!.unrestricted && child.mcp!.unrestricted;
     // Keep each root intact: allOf wrapping changes local references and resource scope.
+    const seen = new Set<string>();
     const argumentConstraintDocuments = [
       ...inherited.mcp!.argumentConstraintDocuments,
       ...child.mcp!.argumentConstraintDocuments,
-    ];
+    ].filter((document) => {
+      const digest = canonicalDigest(document);
+      if (seen.has(digest)) return false;
+      seen.add(digest);
+      return true;
+    });
     const effective = structuredClone({
       ...child,
       mcp: {

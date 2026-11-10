@@ -6,6 +6,8 @@ import {
   type SessionBindingResolverDeps,
 } from "../mcp/session-resolver.ts";
 import { bindingAuthority, bindingGrant } from "./mcp-binding-fixture.ts";
+import { canonicalDigest } from "../mcp/hash.ts";
+import { bindingSnapshotColumns, restoreBindingSnapshot } from "../mcp/binding-store.ts";
 
 function fixture() {
   const authority = bindingAuthority();
@@ -21,7 +23,7 @@ function fixture() {
     readSession: async (id) => rows.get(id) ?? null,
     readAuthority: async () => authority,
     readBindingEpoch: async () => 0,
-    // Explicit test adapter only. Production has no enforcement implementation.
+    // This test adapter does not prove host enforcement.
     enforceManagedDeny: async (expected) => expected,
   };
   return { authority, snapshot, rows, deps };
@@ -108,6 +110,58 @@ test("two existing sessions resolve different catalogs without a global name reg
   expect(
     await resolver.resolveBoundTool({ sessionId: "session-b", modelToolName: name }),
   ).toBeUndefined();
+});
+
+test("stored duplicate constraints retain their immutable binding until the actual profile changes", async () => {
+  const f = fixture();
+  const constraint = { type: "object", properties: { name: { maxLength: 10 } } };
+  f.authority.profileGrants[0]!.mcp = {
+    ...bindingGrant.mcp!,
+    unrestricted: false,
+    argumentConstraintDocuments: [constraint],
+  };
+  const source = compileSessionBindings({
+    launchPolicy: {
+      profileId: f.authority.profileId,
+      integrationGrants: f.authority.profileGrants,
+    },
+    liveAuthority: f.authority,
+    bindingEpoch: 0,
+  });
+  // Stored bindings can contain repeated whole schema roots.
+  const binding = source.immutableBindings[0]!;
+  binding.tools[0]!.grant.argumentConstraintDocuments = [constraint, structuredClone(constraint)];
+  binding.policyHash = canonicalDigest([
+    { ...f.authority.profileGrants[0]!, mcp: binding.tools[0]!.grant },
+  ]);
+  const { hash: _hash, ...bindingBody } = binding;
+  binding.hash = canonicalDigest(bindingBody);
+  const { bindingHash: _bindingHash, ...body } = source;
+  source.bindingHash = canonicalDigest(body);
+  const columns = bindingSnapshotColumns(source, [
+    {
+      id: binding.connectionId,
+      alias: binding.alias,
+      provider: "mcp",
+      displayName: "Tools",
+      config: binding.config,
+    },
+  ]);
+  const stored = restoreBindingSnapshot(columns.mcpBindingEnvelope, columns.integrationConnections);
+  const original = structuredClone(stored);
+  f.rows.set("session-a", { snapshot: stored, parentSessionId: null, active: true });
+  const resolver = makeSessionBindingResolver(f.deps);
+  const input = { sessionId: "session-a", modelToolName: binding.tools[0]!.name };
+  const resolved = await resolver.resolveBoundTool(input);
+  expect(resolved?.bindingHash).toBe(original.bindingHash);
+  expect(resolved?.effectiveGrant.argumentConstraintDocuments).toEqual([constraint, constraint]);
+  expect(await resolver.readCurrent("session-a")).toEqual(original);
+  expect(stored).toEqual(original);
+  f.authority.profileGrants[0]!.mcp!.argumentConstraintDocuments = [
+    { type: "object", properties: { name: { maxLength: 5 } } },
+  ];
+  expect(await resolver.resolveBoundTool(input)).toBeUndefined();
+  expect(stored).toEqual(original);
 });
 
 test("every ACK identity field and parent binding replacement is fenced", async () => {
