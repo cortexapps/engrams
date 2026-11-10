@@ -38,8 +38,8 @@
 //!   prefixes). A hung TCP connection becomes a retryable error, not
 //!   a wedged capture leg.
 //! - **Bounded retry**: transient failures ([`BlobError::Sdk`] /
-//!   [`BlobError::Protocol`] / a deadline) are retried with
-//!   deterministic exponential backoff. `NotFound`, `Config`, and
+//!   [`BlobError::Protocol`] / [`BlobError::Throttled`] / a deadline)
+//!   are retried with deterministic exponential backoff. `NotFound`, `Config`, and
 //!   `Io` (local-fs ENOSPC and friends) surface immediately. Every
 //!   blob op is idempotent (content-addressed chunks, versioned
 //!   manifests), so retry is unconditionally safe.
@@ -76,12 +76,16 @@ use engram_core::traits::{BlobObjectMeta, BlobStorage, ByteStream, ListPage};
 
 /// Whether an error is worth another attempt. `Sdk` carries the SDK
 /// backends' transport failures (they fold IO errors into it);
-/// `Protocol` is a garbled response (an LB hiccup). A permanent error
+/// `Protocol` is a garbled response (an LB hiccup); `Throttled` is the
+/// store asking for less load. A permanent error
 /// wearing `Sdk` clothing (403, 412) costs at most `attempts - 1`
 /// extra round-trips before surfacing — cheap next to the Full
 /// snapshot a poisoned chain costs.
 fn is_transient(e: &BlobError) -> bool {
-    matches!(e, BlobError::Sdk(_) | BlobError::Protocol(_))
+    matches!(
+        e,
+        BlobError::Sdk(_) | BlobError::Protocol(_) | BlobError::Throttled(_)
+    )
 }
 
 /// Attempt budget, backoff shape, and per-attempt deadlines.

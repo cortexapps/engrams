@@ -104,6 +104,8 @@ pub enum InjectedError {
     Sdk(String),
     /// `BlobError::Protocol(_)` — an unexpected response shape.
     Protocol(String),
+    /// `BlobError::Throttled(_)` — the store refused the request for load.
+    Throttled(String),
 }
 
 impl InjectedError {
@@ -117,6 +119,7 @@ impl InjectedError {
                 msg.clone(),
             )),
             Self::Protocol(msg) => BlobError::Protocol(msg.clone()),
+            Self::Throttled(msg) => BlobError::Throttled(msg.clone().into()),
         }
     }
 }

@@ -123,6 +123,8 @@ pub struct BlobObjectMeta {
 /// - Streaming both directions; never materialize bodies in RAM.
 /// - Mapping backend NotFound (404 / NoSuchKey) into
 ///   `BlobError::NotFound`; idempotent delete on missing keys.
+/// - Mapping a refusal for load (HTTP 429 / 503) into
+///   `BlobError::Throttled`.
 /// - All other errors surface as `BlobError::Sdk` with the underlying
 ///   error in the source chain.
 #[async_trait]

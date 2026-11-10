@@ -102,11 +102,11 @@ impl Permit {
 }
 
 /// Whether a store error can mean the link or the store is overloaded:
-/// an SDK, I/O or protocol error (a timeout arrives as an SDK error). A
-/// missing object or a bad configuration cannot.
+/// a throttle, an SDK, I/O or protocol error (a timeout arrives as an SDK
+/// error). A missing object or a bad configuration cannot.
 pub(crate) fn is_overload(e: &engram_core::error::BlobError) -> bool {
     use engram_core::error::BlobError as B;
-    matches!(e, B::Sdk(_) | B::Io(_) | B::Protocol(_))
+    matches!(e, B::Throttled(_) | B::Sdk(_) | B::Io(_) | B::Protocol(_))
 }
 
 impl Admission {
