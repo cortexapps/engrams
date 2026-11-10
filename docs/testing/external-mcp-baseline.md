@@ -17,8 +17,9 @@ The full Postgres suite failed in `sandbox.test.ts`: the deep-recursion case
 expected a stack error (`StackError`, `InternalError`, or `RangeError`), but
 observed `SandboxError`. The
 focused file then passed all 15 tests. A 100-repeat recursion probe observed
-`StackError`. This is an unrelated known baseline issue. Keep its assertion and
-suite intact; do not use the focused pass to describe the full suite as green.
+`StackError`. These results record the original baseline issue. The repair below
+keeps its assertion and suite intact; a focused pass alone does not establish a
+full-suite pass.
 
 ## Verification on 2026-11-08
 
@@ -63,10 +64,32 @@ The current worker CI job runs these commands, is selected by the path detector,
 and participates in the required `CI Gate`. Workflow wiring does not establish
 a passing current-head result or enable production dispatch.
 
+## Recursion failure repair
+
+Bun's compiled WebAssembly tier can exhaust the host stack before QuickJS's
+separate shadow-stack guard. A host exception bypasses QuickJS unwinding, so
+calling native cleanup afterward can produce the later runtime assertion. The
+[upstream robustness report](https://github.com/justjake/quickjs-emscripten/issues/275)
+records the same independent host-stack limit.
+
+The sandbox preserves a genuine host stack-overflow `RangeError` and discards
+that evaluation's fresh WASM instance without another native call. Normal guest
+outcomes retain ordered handle, context and runtime disposal. Log handles share
+that ownership, and cleanup stops at its first failure. Host garbage collection
+reclaims discarded instances; reclamation is not immediate. The existing CPU,
+memory, stack and output limits are unchanged.
+
+A subprocess regression selects the compiled tier only in its own process. It
+covers recursive execution, parsing and log conversion, checks that no native
+cleanup assertion occurs, and verifies that the next evaluation is healthy with
+fresh globals. Other host errors retain `SandboxError`. The original recursion
+assertion and unfiltered suite invocation remain intact.
+
 ## Unreleased migration numbering
 
-Upstream uses migrations 0126–0128 for session-disk storage. The unreleased MCP
+Upstream uses migrations 0126–0128 for session-disk storage. The original MCP
 migrations use 0129–0138, in their original order with unchanged SQL checksums.
+Forward migration 0139 preserves managed boot history after host deletion.
 The migration-version test rejects duplicate numbers after later merges.
 
 An earlier development build applied the MCP migrations as 0126–0135. A database
