@@ -148,7 +148,8 @@ export function makeMcpRecovery(deps: {
       )
         throw Error("MCP cancellation identity invalid");
       const call = await existing(input);
-      if (!call) throw Error("MCP accepted call not yet available");
+      // The persisted native cancellation fences delayed acceptance; reconciliation handles races.
+      if (!call) return;
       if (!active.has(call.state)) return;
       if (
         call.runId !== input.runId ||
@@ -375,7 +376,7 @@ export function makeMcpRecovery(deps: {
 }
 export type McpRecovery = ReturnType<typeof makeMcpRecovery>;
 
-// Task 6 installs trusted operator/host composition before DBOS launch. Absence stays closed.
+// Trusted operator/host composition is installed before DBOS launch. Absence stays closed.
 let runtime: McpRecovery | undefined;
 export function installMcpRecovery(value: McpRecovery): void {
   if (runtime) throw Error("MCP runtime already installed");
