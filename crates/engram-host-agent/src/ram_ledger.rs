@@ -24,8 +24,12 @@
 //! sandbox's PSS is added back into `allocatable_mib` iff its session
 //! holds a coordinator memory reservation. The host-side proxy for
 //! "holds a reservation" is the per-sandbox `parked` flag
-//! (`engram-sandbox-firecracker`'s `LiveSandbox::parked`, always
-//! `false` until epic-parking-ladder lands). Parked residents are
+//! (`engram-sandbox-firecracker`'s `LiveSandbox::parked`). No backend
+//! sets it: a parked session keeps its reservation (the coordinator
+//! counts `Parked` as a reserving state), so its VM is a reserved,
+//! running resident here. A backend that sets the flag must come with a
+//! coordinator that stops reserving for that session, or the VM's RAM
+//! is charged twice. Parked residents are
 //! charged at their full measured PSS — prod observed rss ≈ pss
 //! (12.39 GB ≈ 12.39 GB) for the running dev-brain sandbox on
 //! 2026-07-01, so no sharing discount is ever assumed; density math
@@ -65,8 +69,8 @@ pub struct RamLedgerSnapshot {
     /// The only bucket ever added back into `allocatable_mib`.
     pub running_vm_pss_mib: u64,
     /// Σ smaps_rollup PSS over FC sandboxes flagged `parked` — RAM-
-    /// resident, reservation-free (epic-parking-ladder rungs 2-3).
-    /// Always 0 until a backend ever parks a sandbox. Never added back
+    /// resident, reservation-free. Always 0: no backend sets the flag
+    /// (see the module invariant). Never added back
     /// into `allocatable_mib` — see the module invariant above. This is
     /// the seam the ladder/queue-scanner later use to count
     /// *reclaimable-under-pressure* capacity; deliberately NOT folded

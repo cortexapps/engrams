@@ -12,7 +12,7 @@ use std::sync::Arc;
 /// heartbeats report the actual machine size — without this, the
 /// coord scheduler sees `total_mib=0` on every host and rejects every
 /// session whose `vm_spec.memory.max_mib` is non-zero (every session
-/// in practice), and the idle-evictor's `host_has_memory_headroom`
+/// in practice), and the idle-evictor's park gate
 /// fails closed so rung-2 park never fires (ADR 0096 — macOS/VZ hosts
 /// reported 0 until this grew a Darwin arm). Returns 0 on failure —
 /// the caller logs and continues; sessions just won't be scheduled to

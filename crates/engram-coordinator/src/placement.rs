@@ -732,8 +732,10 @@ pub async fn placement_preview(
     let ranked = rank_hosts(&hosts, ctx, now, placement_ttl());
     Ok(ranked.hosts.iter().any(|id| {
         hosts.iter().find(|h| h.id == *id).is_some_and(|h| {
-            HostHeadroom::of(h, reserved.get(id).copied().unwrap_or_default())
-                .fits(mem_mib, cpu_vcpus)
+            let room = HostHeadroom::of(h, reserved.get(id).copied().unwrap_or_default());
+            // The placement transaction takes an unmeasured host as its
+            // last resort without a CPU check.
+            !room.measured() || room.fits(mem_mib, cpu_vcpus)
         })
     }))
 }

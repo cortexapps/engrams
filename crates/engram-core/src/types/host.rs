@@ -602,7 +602,7 @@ impl HostHeadroom {
 
     /// Whether the host has measured its RAM. An unmeasured host does
     /// not gate placement (a brand-new or dev host must still work) and
-    /// never has headroom to park.
+    /// never parks a session.
     pub fn measured(&self) -> bool {
         self.allocatable_mib > 0
     }
@@ -622,16 +622,6 @@ impl HostHeadroom {
     pub fn fits(&self, mem_mib: i64, vcpus: i64) -> bool {
         (!self.measured() || self.free_mib() >= mem_mib)
             && self.free_vcpus().is_none_or(|free| free >= vcpus)
-    }
-
-    /// Unreserved RAM as a percent of the host's `mem_total_mib`, the
-    /// parking headroom. `None` when either figure is unmeasured.
-    pub fn free_pct(&self, mem_total_mib: u64) -> Option<u8> {
-        if !self.measured() || mem_total_mib == 0 {
-            return None;
-        }
-        let pct = self.free_mib().max(0).saturating_mul(100) / mem_total_mib as i64;
-        Some(pct.min(100) as u8)
     }
 }
 
@@ -1040,27 +1030,18 @@ mod headroom_tests {
     }
 
     #[test]
-    fn an_unmeasured_host_fits_placement_but_has_no_park_headroom() {
+    fn an_unmeasured_host_does_not_gate_placement() {
         let r = room(0, 0, 0, 0);
+        assert!(!r.measured());
         assert!(
             r.fits(65_536, 64),
             "unmeasured RAM and unreported cores do not gate"
         );
-        assert_eq!(r.free_pct(65_536), None, "no park on an unknown host");
         assert_eq!(room(32_768, 0, 0, 0).free_vcpus(), None);
     }
 
     #[test]
-    fn park_headroom_counts_reservations() {
-        // A parked VM keeps its reservation: a host whose RAM measures
-        // roomy but whose reservations fill it has no headroom.
-        assert_eq!(room(60_000, 0, 0, 0).free_pct(65_536), Some(91));
-        assert_eq!(room(60_000, 0, 53_248, 0).free_pct(65_536), Some(10));
-        assert_eq!(
-            room(60_000, 0, 70_000, 0).free_pct(65_536),
-            Some(0),
-            "over-reserved clamps to 0"
-        );
-        assert_eq!(room(60_000, 0, 0, 0).free_pct(0), None);
+    fn an_over_reserved_host_has_negative_free_ram() {
+        assert_eq!(room(60_000, 0, 70_000, 0).free_mib(), -10_000);
     }
 }

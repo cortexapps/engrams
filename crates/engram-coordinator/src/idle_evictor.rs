@@ -23,11 +23,14 @@
 //! observe the resume op before routing.
 
 use engram_core::traits::SandboxBackend;
-use engram_core::types::host::HostHeadroom;
+use engram_core::types::host::{HostHeadroom, HostRecord, ReservedBudget};
+use engram_core::types::session::QueuedSession;
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::BindingDisposition;
 use engram_core::types::SessionState;
-use engram_core::{SandboxId, SessionId};
+use std::collections::HashMap;
+
+use engram_core::{HostId, SandboxId, SessionId};
 
 use crate::session_ops::OpCtx;
 use crate::state::{SessionEvent, SharedState};
@@ -141,47 +144,157 @@ async fn park_paused_bookkeeping(
     Ok(())
 }
 
-/// ADR 0074 rung 2: does the session's host have memory headroom to
-/// keep a VM PAUSED (rung 2) rather than fully evicting it? The host's
-/// unreserved RAM ([`HostHeadroom::free_pct`], the same accounting
-/// placement reserves against) must be at least
-/// `ENGRAM_PARK_HEADROOM_FLOOR_PCT` of its total. A parked VM keeps its
-/// reservation, so a host full of parks reads full here exactly as it does
-/// to placement, and the reaper descends them for the sessions that wait.
-/// Fails CLOSED (no headroom → full eviction) on an unmeasured host or a
-/// read error: a paused VM frees no RAM, so parking under unknown pressure
-/// is the dangerous direction.
-async fn host_has_memory_headroom(state: &SharedState, session_id: SessionId) -> bool {
-    // Resolve the host through PG, NOT the in-memory `host_registry`: this
-    // runs on whichever coord replica took the RPC / scanner tick, and a
-    // replica that never cached the sandbox→host bind would fail closed
-    // here — silently degrading every park into a full eviction on that
-    // pod (a coin flip in a 2-replica deployment).
-    let meta = &state.services.meta;
-    let Ok(Some(host_id)) = meta.get_session(session_id).await.map(|s| s.host_id) else {
-        return false;
-    };
-    let (Ok(hosts), Ok(reserved)) = (
-        meta.list_active_hosts().await,
-        meta.per_host_reserved().await,
-    ) else {
-        return false;
-    };
-    let Some(host) = hosts.into_iter().find(|h| h.id == host_id) else {
-        return false;
-    };
-    HostHeadroom::of(&host, reserved.get(&host_id).copied().unwrap_or_default())
-        .free_pct(host.utilization.mem_total_mib)
-        .is_some_and(|pct| pct >= park_headroom_floor_pct())
+/// What the parking decisions read (ADR 0074 rung 2): the headroom of
+/// each host that takes new sessions, and how many queued sessions fit on
+/// none of them.
+///
+/// A parked VM keeps its RAM and its reservation, so a park costs nothing
+/// until a session needs that room. A park holds while every queued
+/// session fits somewhere; it yields when one does not, or when its host
+/// is reserved beyond what it measures.
+struct ParkView {
+    /// Every active host's headroom, and whether placement ranks it.
+    rooms: HashMap<HostId, (HostHeadroom, bool)>,
+    /// Queued sessions that fit on no host placement ranks.
+    unplaced: usize,
 }
 
-/// Free-RAM percent above which a host will PARK (rung 2) instead of
-/// evict. Above the eviction mem floor by design (env-tunable).
-fn park_headroom_floor_pct() -> u8 {
-    std::env::var("ENGRAM_PARK_HEADROOM_FLOOR_PCT")
-        .ok()
-        .and_then(|s| s.parse::<u8>().ok())
-        .unwrap_or(30)
+impl ParkView {
+    fn new(
+        hosts: &[HostRecord],
+        reserved: &HashMap<HostId, ReservedBudget>,
+        queued: &[QueuedSession],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let ttl = crate::placement::placement_ttl();
+        let rooms: HashMap<HostId, (HostHeadroom, bool)> = hosts
+            .iter()
+            .map(|h| {
+                let room = HostHeadroom::of(h, reserved.get(&h.id).copied().unwrap_or_default());
+                let ranked = crate::placement::host_counts_as_capacity(h, now, ttl);
+                (h.id, (room, ranked))
+            })
+            .collect();
+        let unplaced = queued
+            .iter()
+            .filter(|q| {
+                !rooms.values().any(|(room, ranked)| {
+                    *ranked && room.fits(q.mem_budget_mib, i64::from(q.cpu_budget_vcpus))
+                })
+            })
+            .count();
+        Self { rooms, unplaced }
+    }
+
+    async fn read(state: &SharedState) -> Result<Self, engram_core::error::MetaError> {
+        let meta = &state.services.meta;
+        Ok(Self::new(
+            &meta.list_active_hosts().await?,
+            &meta.per_host_reserved().await?,
+            &meta.list_queued_sessions_fifo().await?,
+            state.services.clock.now_utc(),
+        ))
+    }
+
+    /// Whether a host is reserved beyond the RAM it measures.
+    fn over_reserved(&self, host: HostId) -> bool {
+        self.rooms
+            .get(&host)
+            .is_some_and(|(room, _)| room.measured() && room.free_mib() < 0)
+    }
+
+    /// Whether a session that goes idle on `host` parks. It does not when
+    /// a queued session waits for room, when the host is over-reserved,
+    /// or when the host is unknown or has not measured its RAM: a paused
+    /// VM frees no RAM, so a park under unknown pressure is the dangerous
+    /// direction.
+    fn may_park(&self, host: HostId) -> bool {
+        self.unplaced == 0
+            && self
+                .rooms
+                .get(&host)
+                .is_some_and(|(room, _)| room.measured() && room.free_mib() >= 0)
+    }
+
+    /// The parks that yield this pass, with the reason. At most one park
+    /// yields per host, the oldest, and none on a host where an eviction
+    /// already runs: that eviction frees room, and the next pass reads
+    /// the result. An over-reserved host yields a park (`pressure`). Then
+    /// each unplaced queued session that no running eviction serves takes
+    /// one park (`demand`) from the hosts placement ranks, the host with
+    /// the most unreserved RAM first, because it is the nearest to a fit.
+    fn yields(
+        &self,
+        parked: &[engram_core::types::Session],
+        evicting_on: &[HostId],
+    ) -> HashMap<SessionId, &'static str> {
+        let mut oldest: HashMap<HostId, &engram_core::types::Session> = HashMap::new();
+        for s in parked {
+            let Some(host) = s.host_id else { continue };
+            if s.park_rung != 2 || s.sandbox_id.is_none() || evicting_on.contains(&host) {
+                continue;
+            }
+            let slot = oldest.entry(host).or_insert(s);
+            if (s.parked_at, s.id) < (slot.parked_at, slot.id) {
+                *slot = s;
+            }
+        }
+        let mut out = HashMap::new();
+        oldest.retain(|host, s| {
+            let pressure = self.over_reserved(*host);
+            if pressure {
+                out.insert(s.id, "pressure");
+            }
+            !pressure
+        });
+        let served = evicting_on
+            .iter()
+            .filter(|h| self.rooms.get(h).is_some_and(|(_, ranked)| *ranked))
+            .count()
+            + out.len();
+        let mut hosts: Vec<(i64, HostId)> = oldest
+            .keys()
+            .filter_map(|h| {
+                let (room, ranked) = self.rooms.get(h)?;
+                ranked.then(|| (room.free_mib(), *h))
+            })
+            .collect();
+        hosts.sort_by(|a, b| b.cmp(a));
+        for (_, host) in hosts.into_iter().take(self.unplaced.saturating_sub(served)) {
+            out.insert(oldest[&host].id, "demand");
+        }
+        out
+    }
+}
+
+/// Whether the session parks instead of evicting: [`ParkView::may_park`]
+/// for its host. The host comes from PG, not the in-memory
+/// `host_registry`: a replica that never cached the sandbox's host would
+/// turn every park into a full eviction.
+async fn session_may_park(
+    state: &SharedState,
+    session_id: SessionId,
+) -> Result<bool, engram_core::error::MetaError> {
+    let Some(host) = state.services.meta.get_session(session_id).await?.host_id else {
+        return Ok(false);
+    };
+    Ok(ParkView::read(state).await?.may_park(host))
+}
+
+/// The parks that yield this reaper pass ([`ParkView::yields`]).
+async fn park_yields(
+    state: &SharedState,
+    parked: &[engram_core::types::Session],
+) -> Result<HashMap<SessionId, &'static str>, engram_core::error::MetaError> {
+    let evicting_on: Vec<HostId> = state
+        .services
+        .meta
+        .list_evicting_sessions()
+        .await?
+        .into_iter()
+        .filter_map(|(s, _)| s.host_id)
+        .collect();
+    Ok(ParkView::read(state).await?.yields(parked, &evicting_on))
 }
 
 /// ADR 0101 C: how long the eviction scanner trusts a COMPLETED evict
@@ -382,12 +495,13 @@ pub(crate) async fn run_evict_pipeline(
         // long pause, and the hub can still advertise a stale handle
         // at un-park — a forward then lands in a socket with no reader.
         // The ADR 0108 A8 attach-signal row recall + heartbeat
-        // disagreement repair bound that damage. Under real memory
-        // pressure this branch is skipped and the full eviction below runs (rung 4). Only the
+        // disagreement repair bound that damage. When the session may
+        // not park (or that cannot be read) this branch is skipped and the
+        // full eviction below runs (rung 4). Only the
         // idle-evict path parks; drain/evac (Evacuating) always captures.
         // `allow_park == false` is the reaper's DESCENT path (already
         // parked, now forcing the full capture) — it must never re-park.
-        if allow_park && host_has_memory_headroom(state, session_id).await {
+        if allow_park && session_may_park(state, session_id).await.unwrap_or(false) {
             match state.services.host.pause(sandbox_id, ctx.fence()).await {
                 Ok(()) => match park_paused_bookkeeping(ctx, session_id, entry_status).await {
                     Ok(()) => {
@@ -1021,9 +1135,18 @@ pub async fn scanner_run_once(
     // (the 8h-in-evicting weirdness, and half of the ADR 0077×0090
     // livelock surface).
     let parked = state.services.meta.list_parked_sessions().await?;
-    for session in parked {
-        if let Err(e) = park_reaper_advance_one(state, session).await {
-            tracing::warn!(error = %e, "park reaper per-session advance failed");
+    if !parked.is_empty() {
+        // A failed read yields no park: a descent is a full capture that
+        // cannot be undone, so the parks hold until a pass reads the fleet.
+        let yields = park_yields(state, &parked).await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "park reaper: could not read the fleet; parks hold this pass");
+            HashMap::new()
+        });
+        for session in parked {
+            let yield_reason = yields.get(&session.id).copied();
+            if let Err(e) = park_reaper_advance_one(state, session, yield_reason).await {
+                tracing::warn!(error = %e, "park reaper per-session advance failed");
+            }
         }
     }
 
@@ -1233,10 +1356,11 @@ fn park_dwell_cap() -> Option<chrono::Duration> {
 /// reaper decides whether to keep holding or DESCEND to a full eviction.
 ///
 /// Descent triggers (rung 2, parked-paused):
-/// - **dwell**: parked longer than [`park_dwell_cap`] — reclaim the RAM.
-/// - **pressure**: the host lost memory headroom — the whole point of
-///   parking was to use spare RAM; once it's scarce the parked VM must
-///   yield.
+/// - **demand** / **pressure**: `yield_reason`, this pass's answer from
+///   [`ParkView::yields`] — a queued session has no room, or the host is
+///   over-reserved.
+/// - **hard_ttl**: parked longer than the idle detector's hard TTL.
+/// - **dwell**: parked longer than [`park_dwell_cap`] (off by default).
 ///
 /// ADR 0079: descending ENQUEUES an evict op with `allow_park = false`
 /// (forcing the full snapshot+destroy regardless of headroom); the verb
@@ -1250,6 +1374,7 @@ fn park_dwell_cap() -> Option<chrono::Duration> {
 async fn park_reaper_advance_one(
     state: &SharedState,
     session: engram_core::types::Session,
+    yield_reason: Option<&'static str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let session_id = session.id;
     let Some(_sandbox_id) = session.sandbox_id else {
@@ -1299,10 +1424,6 @@ async fn park_reaper_advance_one(
         return Ok(());
     }
 
-    // ADR 0074 addendum: pressure is the primary (normally the only)
-    // trigger. A parked VM on a host with headroom KEEPS ITS RAM — the
-    // user's return is then an un-pause (ms) instead of a ~27s rebuild.
-    let has_headroom = host_has_memory_headroom(state, session_id).await;
     // The absolute ceiling. The idle DETECTOR's hard TTL can't reach a
     // parked session (it scans `Active` rows; a parked one is `Parked`),
     // so with the dwell clock retired the reaper owns the ceiling: an
@@ -1317,17 +1438,13 @@ async fn park_reaper_advance_one(
     let hard_exceeded = parked_for.to_std().is_ok_and(|elapsed| elapsed >= hard_cap);
     // Operator escape hatch (off by default) — see `park_dwell_cap`.
     let dwell_exceeded = park_dwell_cap().is_some_and(|cap| parked_for >= cap);
-    let reason = if !has_headroom {
-        "pressure"
-    } else if hard_exceeded {
-        "hard_ttl"
-    } else if dwell_exceeded {
-        "dwell"
-    } else {
-        // Host has room and the ceiling is far off — HOLD THE PARK. This
-        // is the ladder's whole point: idle sessions keep their VM (and
-        // therefore their ms-fast ascent) until the RAM is actually needed.
-        return Ok(());
+    let reason = match yield_reason {
+        Some(reason) => reason,
+        None if hard_exceeded => "hard_ttl",
+        None if dwell_exceeded => "dwell",
+        // Nothing needs the RAM and the ceiling is far off: the park
+        // holds, and the user's return is an un-pause.
+        None => return Ok(()),
     };
 
     descend_parked_session(state, &session, reason).await?;
@@ -3261,8 +3378,8 @@ mod tests {
     /// ADR 0074 rung 2: push a `HostRecord` into the mock's
     /// `list_active_hosts` set whose id matches the registry host that
     /// owns `sandbox_id`, with a memory utilization that either has or
-    /// lacks parking headroom. `free_mib` feeds `allocatable_mib`, which
-    /// `host_has_memory_headroom` reads net of the host's reservations.
+    /// lacks room. `free_mib` feeds `allocatable_mib`, which the park
+    /// gate reads net of the host's reservations.
     fn seed_host_with_free_ram(meta: &Arc<MiniMeta>, host_id: engram_core::HostId, free_mib: u64) {
         meta.hosts
             .lock()
@@ -3610,7 +3727,7 @@ mod tests {
         );
     }
 
-    /// ADR 0074's primary trigger: the host loses headroom → the parked
+    /// A host reserved beyond the RAM it measures → the parked
     /// VM yields its RAM via a full eviction (un-pause → capture →
     /// destroy → Idle), leaving no trace of the parking.
     #[tokio::test]
@@ -3638,14 +3755,8 @@ mod tests {
         assert_eq!(op.state, OpState::Done);
         assert_eq!(meta.session.lock().park_rung, 2, "parked-paused");
 
-        // The host now has none — the RAM the park was borrowing is needed.
-        // (Mutate the seeded row in place; `seed_host_with_free_ram` PUSHES,
-        // so re-seeding would leave the roomy record ahead of it.)
-        // MEASURED-but-tiny, not 0: a 0 allocatable means "unmeasured" and
-        // also has no headroom; this test asserts the measured case.
-        for h in meta.hosts.lock().iter_mut().filter(|h| h.id == host_id) {
-            h.utilization.allocatable_mib = 1;
-        }
+        // The host now measures less RAM than is reserved on it.
+        over_reserve(&meta, host_id, 70_000);
 
         wait_for_op_lane_free(&meta, session_id).await;
         scanner_run_once(&state).await.expect("tick");
@@ -3680,12 +3791,211 @@ mod tests {
         );
     }
 
-    /// The production case: a host whose RAM measures roomy, but whose
-    /// parked VMs hold reservations that leave a waiting resume no room.
-    /// A parked VM keeps its reservation, so the reaper reads the same
-    /// unreserved RAM placement reserves against and descends the park.
+    /// Parks a session on a roomy host and returns the state.
+    async fn parked_on_roomy_host(
+        sandbox_root: &std::path::Path,
+    ) -> (SharedState, Arc<MiniMeta>, engram_core::SessionId, HostId) {
+        let session_id = engram_core::SessionId::new();
+        let (state, meta) = build_state_and_meta(evicting_session(session_id), sandbox_root);
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
+            .await
+            .unwrap();
+        let host_id = state
+            .host_registry
+            .host_of(sandbox_id)
+            .expect("sandbox routed");
+        meta.session.lock().host_id = Some(host_id);
+        seed_host_with_free_ram(&meta, host_id, 60_000);
+        let op = drive_evict(&state, session_id, true, false).await;
+        assert_eq!(op.state, OpState::Done);
+        assert_eq!(meta.session.lock().park_rung, 2, "parked with room");
+        (state, meta, session_id, host_id)
+    }
+
+    fn over_reserve(meta: &Arc<MiniMeta>, host_id: HostId, mem_mib: i64) {
+        meta.reserved
+            .lock()
+            .insert(host_id, ReservedBudget { mem_mib, vcpus: 0 });
+    }
+
+    fn queued(mem_budget_mib: i64) -> QueuedSession {
+        QueuedSession {
+            session: evicting_session(engram_core::SessionId::new()),
+            origin: engram_core::types::session::QueueOrigin::Resume,
+            mem_budget_mib,
+            cpu_budget_vcpus: 1,
+            queued_at: chrono::Utc::now(),
+        }
+    }
+
+    /// The production case: the parks on a host reserve its RAM and a
+    /// queued resume has no room. The park yields.
     #[tokio::test]
-    async fn parked_reservations_without_headroom_descend_the_park() {
+    async fn a_park_yields_to_a_queued_session_with_no_room() {
+        let sandbox_root = TempDir::new().unwrap();
+        let (state, meta, session_id, host_id) = parked_on_roomy_host(sandbox_root.path()).await;
+        // 60 000 MiB allocatable, 53 248 reserved: 6 752 free.
+        over_reserve(&meta, host_id, 53_248);
+        meta.queued.lock().push(queued(8_192));
+
+        wait_for_op_lane_free(&meta, session_id).await;
+        scanner_run_once(&state).await.expect("tick");
+        {
+            let m = meta.clone();
+            wait_for("descended to Idle", move || {
+                m.session.lock().status == SessionState::Idle
+            })
+            .await;
+        }
+        assert_eq!(meta.session.lock().park_rung, 0);
+    }
+
+    /// A full host holds its parks while nothing waits for the RAM, and
+    /// while every queued session fits somewhere.
+    #[tokio::test]
+    async fn a_full_host_holds_its_parks_while_nothing_waits() {
+        let sandbox_root = TempDir::new().unwrap();
+        let (state, meta, session_id, host_id) = parked_on_roomy_host(sandbox_root.path()).await;
+        over_reserve(&meta, host_id, 53_248);
+        meta.queued.lock().push(queued(4_096));
+
+        wait_for_op_lane_free(&meta, session_id).await;
+        scanner_run_once(&state).await.expect("tick");
+        assert_eq!(meta.session.lock().status, SessionState::Parked);
+        assert_eq!(meta.session.lock().park_rung, 2, "the park holds");
+    }
+
+    /// A session that goes idle while a queued session has no room does
+    /// not park: its RAM is wanted now.
+    #[tokio::test]
+    async fn a_session_does_not_park_while_a_queued_session_has_no_room() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let (state, meta) = build_state_and_meta(evicting_session(session_id), sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
+            .await
+            .unwrap();
+        let host_id = state
+            .host_registry
+            .host_of(sandbox_id)
+            .expect("sandbox routed");
+        meta.session.lock().host_id = Some(host_id);
+        seed_host_with_free_ram(&meta, host_id, 60_000);
+        meta.queued.lock().push(queued(64_000));
+
+        let op = drive_evict(&state, session_id, true, false).await;
+        assert_eq!(op.state, OpState::Done);
+        assert_eq!(meta.session.lock().park_rung, 0, "no park");
+        assert_eq!(meta.session.lock().status, SessionState::Idle);
+    }
+
+    fn park_view(rooms: &[(HostId, i64, i64)], unplaced: usize) -> ParkView {
+        ParkView {
+            rooms: rooms
+                .iter()
+                .map(|&(id, allocatable_mib, mem_mib)| {
+                    let room = HostHeadroom {
+                        allocatable_mib,
+                        cpu_budget: 0,
+                        reserved: ReservedBudget { mem_mib, vcpus: 0 },
+                    };
+                    (id, (room, true))
+                })
+                .collect(),
+            unplaced,
+        }
+    }
+
+    fn parked_at(host: HostId, minutes_ago: i64) -> Session {
+        let mut s = evicting_session(engram_core::SessionId::new());
+        s.status = SessionState::Parked;
+        s.host_id = Some(host);
+        s.sandbox_id = Some(engram_core::SandboxId::new());
+        s.park_rung = 2;
+        s.parked_at = Some(chrono::Utc::now() - chrono::Duration::minutes(minutes_ago));
+        s
+    }
+
+    #[test]
+    fn one_unplaced_session_takes_the_oldest_park_of_the_roomiest_host() {
+        let (tight, roomy) = (HostId::new(), HostId::new());
+        let view = park_view(&[(tight, 60_000, 58_000), (roomy, 60_000, 40_000)], 1);
+        let parks = [
+            parked_at(tight, 90),
+            parked_at(roomy, 10),
+            parked_at(roomy, 50),
+        ];
+        let yields = view.yields(&parks, &[]);
+        assert_eq!(yields, HashMap::from([(parks[2].id, "demand")]));
+    }
+
+    #[test]
+    fn a_running_eviction_serves_one_unplaced_session_and_shields_its_host() {
+        let (a, b) = (HostId::new(), HostId::new());
+        let parks = [parked_at(a, 30), parked_at(b, 20)];
+        let rooms = [(a, 60_000, 50_000), (b, 60_000, 55_000)];
+        assert!(park_view(&rooms, 1).yields(&parks, &[a]).is_empty());
+        assert_eq!(
+            park_view(&rooms, 2).yields(&parks, &[a]),
+            HashMap::from([(parks[1].id, "demand")])
+        );
+    }
+
+    #[test]
+    fn parks_hold_with_no_unplaced_session_and_an_over_reserved_host_yields_one() {
+        let (full, over) = (HostId::new(), HostId::new());
+        let view = park_view(&[(full, 60_000, 60_000), (over, 60_000, 61_000)], 0);
+        let parks = [parked_at(full, 30), parked_at(over, 20), parked_at(over, 5)];
+        assert_eq!(
+            view.yields(&parks, &[]),
+            HashMap::from([(parks[1].id, "pressure")])
+        );
+        assert!(view.may_park(full));
+        assert!(!view.may_park(over));
+        assert!(!park_view(&[(full, 0, 0)], 0).may_park(full), "unmeasured");
+        assert!(!park_view(&[(full, 60_000, 0)], 1).may_park(full), "demand");
+    }
+
+    /// A host that has not measured its RAM has no headroom: the idle
+    /// eviction takes the full path, with no park.
+    #[tokio::test]
+    async fn an_unmeasured_host_does_not_park() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let session = evicting_session(session_id);
+        let (state, meta) = build_state_and_meta(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
+            .await
+            .unwrap();
+        let host_id = state
+            .host_registry
+            .host_of(sandbox_id)
+            .expect("sandbox routed");
+        meta.session.lock().host_id = Some(host_id);
+        seed_host_with_free_ram(&meta, host_id, 0);
+
+        let op = drive_evict(&state, session_id, true, false).await;
+        assert_eq!(op.state, OpState::Done);
+        assert_eq!(meta.session.lock().park_rung, 0, "no park");
+        assert_eq!(meta.session.lock().status, SessionState::Idle);
+    }
+
+    /// A reaper tick that cannot read the reservations holds the park: a
+    /// failed read is not pressure.
+    #[tokio::test]
+    async fn a_failed_headroom_read_holds_the_park() {
         let session_id = engram_core::SessionId::new();
         let sandbox_root = TempDir::new().unwrap();
         let session = evicting_session(session_id);
@@ -3708,30 +4018,11 @@ mod tests {
         assert_eq!(op.state, OpState::Done);
         assert_eq!(meta.session.lock().park_rung, 2, "parked with room");
 
-        // The host still measures 60 000 MiB allocatable, but the parks on
-        // it reserve 52 GiB of that: 10% of its RAM is unreserved.
-        meta.reserved.lock().insert(
-            host_id,
-            engram_core::types::host::ReservedBudget {
-                mem_mib: 53_248,
-                vcpus: 0,
-            },
-        );
-
+        *meta.reserved_read_fails.lock() = true;
         wait_for_op_lane_free(&meta, session_id).await;
         scanner_run_once(&state).await.expect("tick");
-        {
-            let m = meta.clone();
-            wait_for("descended to Idle", move || {
-                m.session.lock().status == SessionState::Idle
-            })
-            .await;
-        }
-        assert_eq!(
-            meta.session.lock().status,
-            SessionState::Idle,
-            "reservations, not raw RAM, decide the park's headroom"
-        );
+        assert_eq!(meta.session.lock().park_rung, 2, "the park holds");
+        assert_eq!(meta.session.lock().status, SessionState::Parked);
     }
 
     /// ADR 0101 C's third `Evicting` shape — the post-capture settle
