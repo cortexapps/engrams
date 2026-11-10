@@ -7,9 +7,11 @@
 //! did not rebuild from disk. A host-agent restart re-drives it from
 //! [`EvictionFinalizeRecord::load_all`]; nothing but node loss loses it.
 //!
-//! Stages: `Captured → DiskUploaded → MemoryChunked → BlobsUploaded →
-//! (terminal)`. Each leg is idempotent and persists the record with
-//! `stage` advanced before the next leg runs.
+//! `snapshot_begin` persists the record at `Captured`. A pass runs the
+//! shared snapshot post phase ([`crate::snapshot_post`]), persists the
+//! stage the legs reached, and at `BlobsUploaded` writes the terminal
+//! checkpoint record. Each leg is idempotent, so a redrive re-runs
+//! whatever the persisted record has not passed.
 use engram_core::types::snapshot::DiskRole;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,8 +20,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use engram_chunk_store::manifest::Manifest;
-use engram_chunk_store::{ChunkCache, ChunkStore};
 use engram_core::types::ids::{SandboxId, SessionId, SnapshotId};
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::AuxBundleRef;
@@ -80,6 +80,46 @@ pub struct EvictionFinalizeRecord {
     pub swap_manifest: Option<ManifestRef>,
     /// Filled by the `MemoryChunked` leg.
     pub memory_manifest: Option<ManifestRef>,
+    /// The extents of `memory.diff` after the capture's sync. `None` for
+    /// a Full capture, or for a record from a build that did not record
+    /// them: that diff publishes unchecked.
+    #[serde(default)]
+    pub diff_extents: Option<DiffExtents>,
+}
+
+/// The data extents of a `memory.diff`: the range count and byte sum. A
+/// dirty page that a crash lost before writeback reads as a hole, so a
+/// diff whose extents differ from the ones its capture recorded lost
+/// pages, and publishing it would keep the previous chunk for each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffExtents {
+    pub ranges: u64,
+    pub bytes: u64,
+}
+
+impl DiffExtents {
+    pub(crate) fn of(ranges: &[(u64, u64)]) -> Self {
+        Self {
+            ranges: ranges.len() as u64,
+            bytes: ranges.iter().map(|(_, len)| len).sum(),
+        }
+    }
+
+    async fn read(diff: &Path) -> std::io::Result<Self> {
+        let diff = diff.to_path_buf();
+        let ranges = tokio::task::spawn_blocking(move || {
+            std::fs::File::open(&diff).and_then(|f| engram_host_core::data_extents(&f))
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        Ok(Self::of(&ranges))
+    }
+}
+
+impl std::fmt::Display for DiffExtents {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ranges of {} bytes", self.ranges, self.bytes)
+    }
 }
 
 /// A pending checkpoint of one disk and the checkpoint it was taken
@@ -92,6 +132,19 @@ pub struct PendingDisk {
 }
 
 impl EvictionFinalizeRecord {
+    /// Make the staging dir the redrive's input: fsync every capture
+    /// file, record the diff's extents, then persist the record at
+    /// `Captured` into `dir`. No record exists unless the files reached
+    /// the disk first.
+    pub async fn persist_captured(&mut self, fs: &dyn HostFs, dir: &Path) -> std::io::Result<()> {
+        crate::snapshot_post::sync_capture(fs, &self.dest, crate::snapshot_post::SyncScope::All)
+            .await?;
+        if self.chain_prev_ref.is_some() {
+            self.diff_extents = Some(DiffExtents::read(&self.dest.join("memory.diff")).await?);
+        }
+        self.persist(fs, dir).await
+    }
+
     /// Durably persist into `dir` via the shared [`crate::durable_record`]
     /// engine (write `.partial` → fsync → rename → **fsync parent dir**).
     /// This used to be a hand-rolled copy that OMITTED the parent-dir
@@ -170,8 +223,7 @@ pub trait EvictionSandbox: Send + Sync {
 #[derive(Clone)]
 pub struct EvictionFinalizer {
     pub(crate) volumes: Option<Arc<engram_host_core::SessionVolumes>>,
-    pub(crate) chunk_store: Option<ChunkStore>,
-    pub(crate) chunk_cache: Option<ChunkCache>,
+    pub(crate) chunks: Option<crate::snapshot_post::Chunks>,
     pub(crate) bundle_dir: PathBuf,
     pub(crate) bundle_file_ext: &'static str,
     /// `<work_dir>/checkpoints`: `records/` and `finalize/` live under it.
@@ -188,8 +240,7 @@ impl EvictionFinalizer {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         volumes: Option<Arc<engram_host_core::SessionVolumes>>,
-        chunk_store: Option<ChunkStore>,
-        chunk_cache: Option<ChunkCache>,
+        fill: Option<engram_fill::FillEngine>,
         bundle_dir: PathBuf,
         bundle_file_ext: &'static str,
         checkpoint_dir: PathBuf,
@@ -201,8 +252,7 @@ impl EvictionFinalizer {
     ) -> Self {
         Self {
             volumes,
-            chunk_store,
-            chunk_cache,
+            chunks: fill.map(crate::snapshot_post::Chunks::new),
             bundle_dir,
             bundle_file_ext,
             checkpoint_dir,
@@ -238,232 +288,135 @@ pub async fn reconcile_volumes(
     volumes.reconcile(&live).await
 }
 
-/// The disk leg: publish each pending checkpoint from the session disk.
-/// A pending checkpoint that is gone was published by an earlier attempt
-/// that died before the stage bump only if the disk's checkpoint is newer
-/// than the one it was taken over; otherwise it was lost, and the leg
-/// fails instead of answering with the older checkpoint.
-async fn disk_leg_work(
-    f: &EvictionFinalizer,
-    record: &EvictionFinalizeRecord,
-) -> Result<(Option<ManifestRef>, Option<ManifestRef>), SandboxError> {
-    let start = crate::time_source::metrics_now();
-    let mut root_manifest = None;
-    let mut swap_manifest = None;
-    if !record.disk_pending.is_empty() {
-        let volumes = f.volumes.as_ref().ok_or_else(|| {
-            SandboxError::Snapshot(
-                "finalize has pending disk checkpoints but this host has no session disk".into(),
-            )
-        })?;
-        for &PendingDisk { role, previous } in &record.disk_pending {
-            let published = match volumes.pending(record.sandbox_id, role).await {
-                Ok(pending) => volumes.publish(pending).await.map_err(|e| {
-                    SandboxError::Snapshot(format!("eviction finalize: publish {role} disk: {e}"))
-                })?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    let current = volumes
-                        .checkpoint_of(record.sandbox_id, role)
-                        .await
-                        .map_err(|e| {
-                            SandboxError::Snapshot(format!(
-                                "eviction finalize: {role} disk has no pending checkpoint and no checkpoint: {e}"
-                            ))
-                        })?;
-                    if current.manifest_id != previous.manifest_id
-                        || current.version <= previous.version
-                    {
-                        return Err(SandboxError::Snapshot(format!(
-                            "eviction finalize: the pending {role} disk checkpoint is gone and was \
-                             never published (the disk holds {current}, taken over {previous})"
-                        )));
-                    }
-                    current
-                }
-                Err(e) => {
-                    return Err(SandboxError::Snapshot(format!(
-                        "eviction finalize: open pending {role} disk checkpoint: {e}"
-                    )));
-                }
-            };
-            match role {
-                DiskRole::Root => root_manifest = Some(published),
-                DiskRole::Swap => swap_manifest = Some(published),
-            }
+impl EvictionFinalizer {
+    fn post_phase(&self) -> crate::snapshot_post::PostPhase<'_> {
+        crate::snapshot_post::PostPhase {
+            volumes: self.volumes.as_deref(),
+            chunks: self.chunks.as_ref(),
+            bundle_dir: &self.bundle_dir,
+            bundle_file_ext: self.bundle_file_ext,
+            fs: self.fs.as_ref(),
         }
     }
-    metrics::histogram!(crate::metrics::EVICTION_FINALIZE_STAGE_SECONDS, "stage" => "disk")
-        .record(start.elapsed().as_secs_f64());
-    Ok((root_manifest, swap_manifest))
 }
 
-/// Publish deterministic finalize content without conflating an occupied
-/// version with an identical prior publish.
-async fn publish_manifest_collision_safe(
-    chunk_store: &ChunkStore,
-    deterministic_ref: ManifestRef,
-    manifest: &Manifest,
-) -> Result<ManifestRef, engram_chunk_store::ChunkStoreError> {
-    const MAX_RETRIES: u32 = 32;
-    let mut attempt_ref = deterministic_ref;
-    let mut attempts = 0u32;
-    loop {
-        attempts += 1;
-        match chunk_store.put_manifest(attempt_ref, manifest).await {
-            Ok(()) => return Ok(attempt_ref),
-            Err(engram_chunk_store::ChunkStoreError::VersionConflict {
-                latest,
-                attempted,
-                manifest_id,
-            }) => {
-                if attempt_ref == deterministic_ref && attempted == deterministic_ref.version {
-                    let existing = chunk_store.get_manifest(deterministic_ref).await?;
-                    if existing == *manifest {
-                        return Ok(deterministic_ref);
-                    }
-                }
-                if attempts >= MAX_RETRIES {
-                    return Err(engram_chunk_store::ChunkStoreError::VersionConflict {
-                        latest,
-                        attempted,
-                        manifest_id,
-                    });
-                }
-                attempt_ref = ManifestRef {
-                    manifest_id,
-                    version: latest + 1,
-                };
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-/// The memory leg's publish work — pure (no stage/record mutation):
-/// re-chunk + publish the memory manifest and patch the FC sidecar.
-/// Returns the published ref (`None` = diff-less capture / chunk store
-/// disabled) and the consumed input file to best-effort-delete once the
-/// stage bump is durable (finding 1). Idempotent from any point: an
-/// exact prior publish is reused, while a different occupant at the
-/// deterministic ref is preserved and the capture publishes at latest+1.
-async fn memory_leg_work(
-    f: &EvictionFinalizer,
-    record: &EvictionFinalizeRecord,
-) -> Result<(Option<ManifestRef>, Option<PathBuf>), SandboxError> {
-    let start = crate::time_source::metrics_now();
-    let mut consumed: Option<PathBuf> = None;
-    let mut memory_manifest: Option<ManifestRef> = None;
-    if let Some(chunk_store) = f.chunk_store.as_ref() {
-        let manifest_ref = if let Some(prev_ref) = record.chain_prev_ref {
-            let diff_path = record.dest.join("memory.diff");
-            if tokio::fs::metadata(&diff_path).await.is_ok() {
-                let prev_manifest = chunk_store.get_manifest(prev_ref).await.map_err(|e| {
-                    SandboxError::Snapshot(format!(
-                        "eviction finalize: get chain-prev manifest {prev_ref}: {e}"
-                    ))
-                })?;
-                // FC's Diff snapshot writes dirty pages at their
-                // guest-physical offsets into a sparse file, so its data
-                // extents are the dirty set.
-                let ranges = std::fs::File::open(&diff_path)
-                    .and_then(|f| engram_host_core::data_extents(&f))
-                    .map_err(|e| SandboxError::Snapshot(format!("dirty ranges: {e}")))?;
-                let next = chunk_store
-                    .update_for_dirty_ranges_sparse(&prev_manifest, &diff_path, &ranges)
-                    .await
-                    .map_err(|e| SandboxError::Snapshot(format!("sparse re-chunk: {e}")))?;
-                let next_ref = prev_ref.next_version();
-                let published_ref = publish_manifest_collision_safe(chunk_store, next_ref, &next)
-                    .await
-                    .map_err(|e| SandboxError::Snapshot(format!("put manifest {next_ref}: {e}")))?;
-                consumed = Some(diff_path);
-                Some(published_ref)
-            } else {
-                // No diff on disk and the memory stage hasn't persisted
-                // (the caller's ladder guard skips this leg once it has)
-                // — nothing dirty this round; matches `finish()`'s
-                // behavior for a diff-less capture.
-                None
-            }
-        } else {
-            let mem_path = record.dest.join("memory.bin");
-            if tokio::fs::metadata(&mem_path).await.is_ok() {
-                let mref = crate::pooled_backend::chunk_memory_to_store(
-                    chunk_store,
-                    &mem_path,
-                    f.chunk_cache.as_ref(),
-                    "evict_finalize",
-                )
-                .await?;
-                consumed = Some(mem_path);
-                Some(mref)
-            } else {
-                None
-            }
-        };
-        if let Some(mref) = manifest_ref {
-            let manifest_json = record.dest.join("manifest.json");
-            crate::pooled_backend::patch_fc_manifest_memory_ref(
-                &manifest_json,
-                mref,
-                Some(record.session_id),
-            )
-            .await?;
-            memory_manifest = Some(mref);
-        }
-    }
-    metrics::histogram!(crate::metrics::EVICTION_FINALIZE_STAGE_SECONDS, "stage" => "memory")
-        .record(start.elapsed().as_secs_f64());
-    Ok((memory_manifest, consumed))
-}
-
-async fn run_blobs_leg(
+/// Run the legs the record has not passed, then persist what the legs
+/// that succeeded published, even when another leg failed: a redrive
+/// after a failed blob upload must not chunk the whole memory file
+/// again. The stage only moves up the ladder, so a stage that passes a
+/// leg also passes every leg below it; a memory manifest recorded below
+/// `MemoryChunked` marks the memory leg done for this build. The memory
+/// file is retired only once a durable stage passes `MemoryChunked`, the
+/// mark every build reads.
+async fn run_post_phase(
     f: &EvictionFinalizer,
     record: &mut EvictionFinalizeRecord,
 ) -> Result<(), SandboxError> {
-    if record.stage != FinalizeStage::MemoryChunked {
-        return Ok(());
-    }
-    let start = crate::time_source::metrics_now();
-    if let Some(chunk_store) = f.chunk_store.as_ref() {
-        let blob = chunk_store.blob_storage();
-        let state_path = record.dest.join("state.bin");
-        let sidecar_path = record.dest.join("manifest.json");
-        if tokio::fs::metadata(&state_path).await.is_ok()
-            && tokio::fs::metadata(&sidecar_path).await.is_ok()
-        {
-            let state_key = engram_chunk_store::snapshot_blob::state_blob_key(record.snapshot_id);
-            let sidecar_key =
-                engram_chunk_store::snapshot_blob::sidecar_blob_key(record.snapshot_id);
-            // ADR 0101 A: independent blob objects — upload concurrently.
-            let (state_res, sidecar_res) = tokio::join!(
-                engram_chunk_store::snapshot_blob::upload_file(
-                    blob.as_ref(),
-                    &state_key,
-                    &state_path
-                ),
-                engram_chunk_store::snapshot_blob::upload_file(
-                    blob.as_ref(),
-                    &sidecar_key,
-                    &sidecar_path
-                )
-            );
-            state_res.map_err(|e| SandboxError::Snapshot(format!("upload state.bin: {e}")))?;
-            sidecar_res.map_err(|e| SandboxError::Snapshot(format!("upload sidecar.json: {e}")))?;
+    use crate::snapshot_post::{Disks, Memory, Work};
+    let memory_published =
+        record.stage >= FinalizeStage::MemoryChunked || record.memory_manifest.is_some();
+    let memory = (!memory_published).then_some(match record.chain_prev_ref {
+        Some(prev_ref) => Memory::Diff {
+            prev_ref,
+            prev: None,
+            extents: record.diff_extents,
+        },
+        None => Memory::Full,
+    });
+    let disks = (record.stage == FinalizeStage::Captured).then(|| Disks::Named {
+        sandbox: record.sandbox_id,
+        pending: record.disk_pending.clone(),
+    });
+    let ran = f
+        .post_phase()
+        .run_legs(Work {
+            snapshot_id: record.snapshot_id,
+            dest: &record.dest,
+            disks,
+            memory,
+            blobs: true,
+            trace_lineage: Some(record.session_id),
+            aux_bundles: &record.aux_bundles,
+            source: "evict_finalize",
+        })
+        .await?;
+    for (stage, seconds) in [
+        ("disk", ran.seconds.disk),
+        ("memory", ran.seconds.memory),
+        ("blobs", ran.seconds.blobs),
+    ] {
+        if let Some(seconds) = seconds {
+            metrics::histogram!(crate::metrics::EVICTION_FINALIZE_STAGE_SECONDS, "stage" => stage)
+                .record(seconds);
         }
-        if !record.aux_bundles.is_empty() {
-            crate::bundles::BundleStore::new(blob.clone(), f.bundle_dir.clone(), f.bundle_file_ext)
-                .publish(&record.aux_bundles)
-                .await?;
+    }
+
+    let before = record.clone();
+    let mut error = None;
+    let disks_done = match ran.disks {
+        Ok((root, swap)) => {
+            if record.stage == FinalizeStage::Captured {
+                record.disk_manifest = root;
+                record.swap_manifest = swap;
+            }
+            true
+        }
+        Err(e) => {
+            error.get_or_insert(e);
+            false
+        }
+    };
+    let memory_done = match ran.memory {
+        Ok(published) => {
+            if let Some(memory) = published {
+                record.memory_manifest = Some(memory.manifest_ref);
+            }
+            true
+        }
+        Err(e) => {
+            error.get_or_insert(e);
+            false
+        }
+    };
+    let blobs_done = match ran.blobs {
+        Ok(_) => true,
+        Err(e) => {
+            error.get_or_insert(e);
+            false
+        }
+    };
+    let reached = match (disks_done, memory_done, blobs_done) {
+        (true, true, true) => FinalizeStage::BlobsUploaded,
+        (true, true, false) => FinalizeStage::MemoryChunked,
+        (true, false, _) => FinalizeStage::DiskUploaded,
+        (false, _, _) => FinalizeStage::Captured,
+    };
+    record.stage = record.stage.max(reached);
+    let changed = record.stage != before.stage || record.memory_manifest != before.memory_manifest;
+    if changed {
+        if let Err(e) = record.persist(f.fs.as_ref(), &f.finalize_dir()).await {
+            // A retry must never believe an un-persisted stage is durable.
+            *record = before;
+            return Err(SandboxError::Snapshot(format!(
+                "persist finalize record: {e}"
+            )));
         }
     }
-    record.stage = FinalizeStage::BlobsUploaded;
-    record
-        .persist(f.fs.as_ref(), &f.finalize_dir())
-        .await
-        .map_err(|e| SandboxError::Snapshot(format!("persist finalize record: {e}")))?;
-    metrics::histogram!(crate::metrics::EVICTION_FINALIZE_STAGE_SECONDS, "stage" => "blobs")
-        .record(start.elapsed().as_secs_f64());
-    Ok(())
+    // The capture's sync covered the memory file, so a failed retire
+    // only leaks it.
+    if before.stage < FinalizeStage::MemoryChunked && record.stage >= FinalizeStage::MemoryChunked {
+        let file = record.dest.join(match record.chain_prev_ref {
+            Some(_) => "memory.diff",
+            None => "memory.bin",
+        });
+        if let Err(e) = crate::snapshot_post::retire_consumed(f.fs.clone(), file).await {
+            tracing::warn!(snapshot_id = %record.snapshot_id, error = %e, "retire of a consumed memory file failed");
+        }
+    }
+    match error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Terminal: write the ordinary durable `CheckpointRecord { kind:
@@ -477,9 +430,6 @@ async fn run_terminal(
     f: &EvictionFinalizer,
     record: &EvictionFinalizeRecord,
 ) -> Result<(), SandboxError> {
-    if record.stage != FinalizeStage::BlobsUploaded {
-        return Ok(());
-    }
     let start = crate::time_source::metrics_now();
     let checkpoint = CheckpointRecord {
         snapshot_id: record.snapshot_id,
@@ -530,83 +480,16 @@ async fn run_terminal(
     Ok(())
 }
 
-/// Persist the `DiskUploaded` bump (with the resolved refs), rolling
-/// back the in-RAM mutations on a failed persist so a retry never
-/// believes an un-persisted stage is durable.
-async fn persist_disk_bump(
-    f: &EvictionFinalizer,
-    record: &mut EvictionFinalizeRecord,
-    manifests: (Option<ManifestRef>, Option<ManifestRef>),
-) -> Result<(), SandboxError> {
-    let prev_stage = record.stage;
-    let prev_disk_manifest = record.disk_manifest;
-    let prev_swap_manifest = record.swap_manifest;
-    (record.disk_manifest, record.swap_manifest) = manifests;
-    record.stage = FinalizeStage::DiskUploaded;
-    if let Err(e) = record.persist(f.fs.as_ref(), &f.finalize_dir()).await {
-        record.stage = prev_stage;
-        record.disk_manifest = prev_disk_manifest;
-        record.swap_manifest = prev_swap_manifest;
-        return Err(SandboxError::Snapshot(format!(
-            "persist finalize record: {e}"
-        )));
-    }
-    Ok(())
-}
-
-/// Persist the `MemoryChunked` bump — same rollback-on-failed-persist
-/// discipline as [`persist_disk_bump`]; the consumed input file is
-/// deleted only once the bump is durable (a crash after the persist
-/// just leaks an already-consumed source file, never re-read).
-async fn persist_memory_bump(
-    f: &EvictionFinalizer,
-    record: &mut EvictionFinalizeRecord,
-    memory_manifest: Option<ManifestRef>,
-    consumed: Option<PathBuf>,
-) -> Result<(), SandboxError> {
-    let prev_stage = record.stage;
-    let prev_memory_manifest = record.memory_manifest;
-    record.memory_manifest = memory_manifest;
-    record.stage = FinalizeStage::MemoryChunked;
-    if let Err(e) = record.persist(f.fs.as_ref(), &f.finalize_dir()).await {
-        record.stage = prev_stage;
-        record.memory_manifest = prev_memory_manifest;
-        return Err(SandboxError::Snapshot(format!(
-            "persist finalize record: {e}"
-        )));
-    }
-    if let Some(p) = consumed {
-        let _ = f.fs.remove_file(&p).await;
-    }
-    Ok(())
-}
-
-/// The disk and memory legs are independent idempotent publishes, so
-/// they overlap when both are pending. The durable ladder is preserved
-/// by persisting the bumps in order after the join.
 async fn run_eviction_finalize_once(
     f: &EvictionFinalizer,
     record: &mut EvictionFinalizeRecord,
 ) -> Result<(), SandboxError> {
-    match record.stage {
-        FinalizeStage::Captured => {
-            let (disk_res, mem_res) =
-                tokio::join!(disk_leg_work(f, record), memory_leg_work(f, record));
-            let disk_manifest = disk_res?;
-            let (memory_manifest, consumed) = mem_res?;
-            persist_disk_bump(f, record, disk_manifest).await?;
-            persist_memory_bump(f, record, memory_manifest, consumed).await?;
-        }
-        FinalizeStage::DiskUploaded => {
-            let (memory_manifest, consumed) = memory_leg_work(f, record).await?;
-            persist_memory_bump(f, record, memory_manifest, consumed).await?;
-        }
-        _ => {}
+    if record.stage < FinalizeStage::BlobsUploaded {
+        run_post_phase(f, record).await?;
     }
-    run_blobs_leg(f, record).await?;
-    run_terminal(f, record).await?;
-    Ok(())
+    run_terminal(f, record).await
 }
+
 /// The outcome of one redrive attempt ([`run_eviction_finalize_attempt`]).
 #[derive(Debug)]
 pub enum FinalizeAttempt {
@@ -720,6 +603,7 @@ mod tests {
             disk_manifest: None,
             swap_manifest: None,
             memory_manifest: None,
+            diff_extents: None,
         };
         let body = serde_json::to_string(&record).unwrap();
         let bytes = crate::durable_envelope::seal(&record.snapshot_id.to_string(), &body);
@@ -757,10 +641,21 @@ mod tests {
         let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
             engram_storage_local::LocalBlobStorage::new(tmp.join("blob")),
         );
-        let store = ChunkStore::new(blob);
+        finalizer_over(tmp, sandbox, blob).await
+    }
+
+    async fn finalizer_over(
+        tmp: &Path,
+        sandbox: SandboxId,
+        blob: Arc<dyn engram_core::traits::BlobStorage>,
+    ) -> (EvictionFinalizer, Arc<engram_host_core::SessionVolumes>) {
+        let fill = engram_fill::FillEngine::new(
+            engram_chunk_store::ChunkStore::new(blob),
+            engram_fill::Config::default(),
+        );
         let disk: Arc<dyn engram_host_core::SessionDisk> =
             Arc::new(engram_host_core::FileDisk::new(tmp.join("volumes"), 64 * 1024).unwrap());
-        let volumes = Arc::new(engram_host_core::SessionVolumes::new(disk, store.clone()));
+        let volumes = Arc::new(engram_host_core::SessionVolumes::new(disk, fill.clone()));
         volumes
             .provision(
                 sandbox,
@@ -773,8 +668,7 @@ mod tests {
             .unwrap();
         let finalizer = EvictionFinalizer::new(
             Some(volumes.clone()),
-            Some(store),
-            None,
+            Some(fill),
             tmp.join("bundles"),
             "bundle",
             tmp.join("checkpoints"),
@@ -787,7 +681,45 @@ mod tests {
         (finalizer, volumes)
     }
 
-    fn record_for(sandbox: SandboxId, disk_pending: Vec<PendingDisk>) -> EvictionFinalizeRecord {
+    async fn publish_disks(
+        f: &EvictionFinalizer,
+        sandbox: SandboxId,
+        pending: Vec<PendingDisk>,
+    ) -> Result<(Option<ManifestRef>, Option<ManifestRef>), SandboxError> {
+        let published = f
+            .post_phase()
+            .run(crate::snapshot_post::Work {
+                snapshot_id: SnapshotId::new(),
+                dest: Path::new("/nonexistent"),
+                disks: Some(crate::snapshot_post::Disks::Named { sandbox, pending }),
+                memory: None,
+                blobs: false,
+                trace_lineage: None,
+                aux_bundles: &[],
+                source: "test",
+            })
+            .await?;
+        Ok((published.root, published.swap))
+    }
+
+    /// A staging dir holding what a Full FC capture leaves: a memory
+    /// file, a state file and a sidecar.
+    fn full_capture_dest(tmp: &Path) -> PathBuf {
+        let dest = tmp.join("capture");
+        std::fs::create_dir_all(&dest).unwrap();
+        let mut memory = vec![0u8; 4 << 20];
+        memory[..5].copy_from_slice(b"guest");
+        std::fs::write(dest.join("memory.bin"), memory).unwrap();
+        std::fs::write(dest.join("state.bin"), b"vmstate").unwrap();
+        std::fs::write(dest.join("manifest.json"), b"{}").unwrap();
+        dest
+    }
+
+    fn captured_record(
+        sandbox: SandboxId,
+        dest: PathBuf,
+        stage: FinalizeStage,
+    ) -> EvictionFinalizeRecord {
         EvictionFinalizeRecord {
             snapshot_id: SnapshotId::new(),
             session_id: SessionId::new(),
@@ -796,16 +728,86 @@ mod tests {
             size_bytes: 0,
             paused_at: chrono::DateTime::UNIX_EPOCH,
             captured_at: chrono::DateTime::UNIX_EPOCH,
-            dest: PathBuf::from("/nonexistent"),
+            dest,
             chain_prev_ref: None,
-            disk_pending,
+            disk_pending: Vec::new(),
             aux_bundles: Vec::new(),
-            stage: FinalizeStage::default(),
+            stage,
             attempts: 0,
             disk_manifest: None,
             swap_manifest: None,
             memory_manifest: None,
+            diff_extents: None,
         }
+    }
+
+    /// One pass runs every leg, persists one bump to `BlobsUploaded`,
+    /// and writes the terminal checkpoint record with what it published.
+    #[tokio::test]
+    async fn one_pass_publishes_every_leg_and_records_the_checkpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxId::new();
+        let (finalizer, volumes) = finalizer_with_a_root(tmp.path(), sandbox).await;
+        let pending = volumes.take(sandbox, DiskRole::Root).await.unwrap();
+        let entry = PendingDisk {
+            role: DiskRole::Root,
+            previous: pending.previous(),
+        };
+        drop(pending);
+        let dest = full_capture_dest(tmp.path());
+        let mut record = captured_record(sandbox, dest.clone(), FinalizeStage::Captured);
+        record.disk_pending = vec![entry];
+
+        let outcome = run_eviction_finalize_attempt(&finalizer, &mut record).await;
+        assert!(matches!(outcome, FinalizeAttempt::Completed), "{outcome:?}");
+        assert_eq!(record.stage, FinalizeStage::BlobsUploaded);
+        let disk = record.disk_manifest.expect("the disk leg ran");
+        assert!(disk.version > entry.previous.version);
+        let memory = record.memory_manifest.expect("the memory leg ran");
+
+        let checkpoints =
+            CheckpointRecord::load_all(&engram_host_core::TokioFs, &finalizer.records_dir()).await;
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].memory_manifest, Some(memory));
+        assert_eq!(checkpoints[0].disk_manifest, Some(disk));
+        assert!(
+            EvictionFinalizeRecord::load_all(&engram_host_core::TokioFs, &finalizer.finalize_dir())
+                .await
+                .is_empty(),
+            "the terminal leg deletes the finalize record",
+        );
+        let sidecar: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dest.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(
+            sidecar["memory_manifest"],
+            serde_json::to_value(memory).unwrap()
+        );
+        let blob = finalizer.chunks.as_ref().unwrap().store.blob_storage();
+        let state_key = engram_chunk_store::snapshot_blob::state_blob_key(record.snapshot_id);
+        assert_eq!(&blob.get(&state_key).await.unwrap()[..], b"vmstate");
+    }
+
+    /// A record an earlier build left at `DiskUploaded` runs only the
+    /// memory and blob legs: its pending disk checkpoint is gone, so a
+    /// disk leg would fail.
+    #[tokio::test]
+    async fn a_disk_uploaded_record_from_an_earlier_build_skips_the_disk_leg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxId::new();
+        let (finalizer, _volumes) = finalizer_with_a_root(tmp.path(), sandbox).await;
+        let dest = full_capture_dest(tmp.path());
+        let mut record = captured_record(sandbox, dest, FinalizeStage::DiskUploaded);
+        let published_disk = ManifestRef::new();
+        record.disk_manifest = Some(published_disk);
+        record.disk_pending = vec![PendingDisk {
+            role: DiskRole::Root,
+            previous: ManifestRef::new(),
+        }];
+
+        let outcome = run_eviction_finalize_attempt(&finalizer, &mut record).await;
+        assert!(matches!(outcome, FinalizeAttempt::Completed), "{outcome:?}");
+        assert_eq!(record.disk_manifest, Some(published_disk));
+        assert!(record.memory_manifest.is_some());
     }
 
     /// An attempt that published and died before the stage bump leaves
@@ -822,7 +824,7 @@ mod tests {
         };
         let published = volumes.publish(pending).await.unwrap();
 
-        let (root, swap) = disk_leg_work(&finalizer, &record_for(sandbox, vec![entry]))
+        let (root, swap) = publish_disks(&finalizer, sandbox, vec![entry])
             .await
             .unwrap();
         assert_eq!(root, Some(published));
@@ -845,10 +847,481 @@ mod tests {
         volumes.discard(pending).await.unwrap();
 
         let Err(SandboxError::Snapshot(message)) =
-            disk_leg_work(&finalizer, &record_for(sandbox, vec![entry])).await
+            publish_disks(&finalizer, sandbox, vec![entry]).await
         else {
             panic!("a lost pending checkpoint must fail the disk leg");
         };
         assert!(message.contains("never published"), "{message}");
+    }
+
+    /// Run redrive attempts until the record leaves the loop.
+    async fn redrive_to_the_end(
+        f: &EvictionFinalizer,
+        record: &mut EvictionFinalizeRecord,
+    ) -> FinalizeAttempt {
+        loop {
+            match run_eviction_finalize_attempt(f, record).await {
+                FinalizeAttempt::RetryAfter(_) => continue,
+                outcome => return outcome,
+            }
+        }
+    }
+
+    async fn checkpoints(f: &EvictionFinalizer) -> Vec<CheckpointRecord> {
+        CheckpointRecord::load_all(&engram_host_core::TokioFs, &f.records_dir()).await
+    }
+
+    /// A sidecar shaped like the FC backend's, without a trailing newline:
+    /// every strict prefix of it is invalid JSON.
+    fn fc_sidecar() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "sandbox_id": "s-old",
+            "format": "fc",
+            "memory_manifest": null,
+        }))
+        .unwrap()
+    }
+
+    /// A capture with a memory file also wrote the sidecar, so a staging
+    /// dir without it lost the file. The redrive fails instead of
+    /// recording a checkpoint whose state and sidecar blobs were never
+    /// uploaded.
+    #[tokio::test]
+    async fn a_redrive_over_a_staging_dir_without_its_sidecar_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxId::new();
+        let (finalizer, _volumes) = finalizer_with_a_root(tmp.path(), sandbox).await;
+        let dest = full_capture_dest(tmp.path());
+        std::fs::remove_file(dest.join("manifest.json")).unwrap();
+        let mut record = captured_record(sandbox, dest, FinalizeStage::Captured);
+
+        let outcome = redrive_to_the_end(&finalizer, &mut record).await;
+        assert!(
+            matches!(outcome, FinalizeAttempt::Quarantined),
+            "{outcome:?}"
+        );
+        assert!(checkpoints(&finalizer).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_redrive_over_a_zero_length_sidecar_quarantines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxId::new();
+        let (finalizer, _volumes) = finalizer_with_a_root(tmp.path(), sandbox).await;
+        let dest = full_capture_dest(tmp.path());
+        std::fs::write(dest.join("manifest.json"), b"").unwrap();
+        let mut record = captured_record(sandbox, dest.clone(), FinalizeStage::Captured);
+
+        let outcome = redrive_to_the_end(&finalizer, &mut record).await;
+        assert!(
+            matches!(outcome, FinalizeAttempt::Quarantined),
+            "{outcome:?}"
+        );
+        assert!(checkpoints(&finalizer).await.is_empty());
+        let failed = EvictionFinalizeRecord::load_all(
+            &engram_host_core::TokioFs,
+            &finalizer.finalize_dir().join("failed"),
+        )
+        .await;
+        assert_eq!(failed.len(), 1);
+        assert!(!dest.exists(), "the quarantine frees the staging dir");
+    }
+
+    #[tokio::test]
+    async fn a_redrive_over_a_sidecar_torn_at_every_offset_never_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxId::new();
+        let (finalizer, _volumes) = finalizer_with_a_root(tmp.path(), sandbox).await;
+        let dest = full_capture_dest(tmp.path());
+        std::fs::write(dest.join("memory.bin"), finalize_memory()).unwrap();
+        let sidecar = fc_sidecar();
+        for end in 0..sidecar.len() {
+            std::fs::write(dest.join("manifest.json"), &sidecar[..end]).unwrap();
+            let mut record = captured_record(sandbox, dest.clone(), FinalizeStage::Captured);
+            let outcome = run_eviction_finalize_attempt(&finalizer, &mut record).await;
+            assert!(
+                matches!(outcome, FinalizeAttempt::RetryAfter(_)),
+                "torn at {end}: {outcome:?}"
+            );
+            assert!(checkpoints(&finalizer).await.is_empty(), "torn at {end}");
+        }
+        std::fs::write(dest.join("manifest.json"), &sidecar).unwrap();
+        let mut record = captured_record(sandbox, dest, FinalizeStage::Captured);
+        let outcome = run_eviction_finalize_attempt(&finalizer, &mut record).await;
+        assert!(matches!(outcome, FinalizeAttempt::Completed), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_redrive_over_a_zero_length_state_bin_never_records_the_checkpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxId::new();
+        let (finalizer, _volumes) = finalizer_with_a_root(tmp.path(), sandbox).await;
+        let dest = full_capture_dest(tmp.path());
+        std::fs::write(dest.join("state.bin"), b"").unwrap();
+        let mut record = captured_record(sandbox, dest, FinalizeStage::Captured);
+
+        let outcome = redrive_to_the_end(&finalizer, &mut record).await;
+        assert!(
+            matches!(outcome, FinalizeAttempt::Quarantined),
+            "{outcome:?}"
+        );
+        assert!(checkpoints(&finalizer).await.is_empty());
+    }
+
+    /// Every finalize record comes from a capture that wrote guest
+    /// memory, so a staging dir that lost its memory file, its state file
+    /// or its whole entry fails the redrive instead of recording a
+    /// checkpoint with no memory.
+    #[tokio::test]
+    async fn a_redrive_over_a_full_capture_that_lost_its_memory_fails() {
+        for lost in [
+            &["memory.bin"][..],
+            &["memory.bin", "state.bin"],
+            &["memory.bin", "state.bin", "manifest.json"],
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let sandbox = SandboxId::new();
+            let (finalizer, _volumes) = finalizer_with_a_root(tmp.path(), sandbox).await;
+            let dest = full_capture_dest(tmp.path());
+            for name in lost {
+                std::fs::remove_file(dest.join(name)).unwrap();
+            }
+            if lost.len() == 3 {
+                std::fs::remove_dir(&dest).unwrap();
+            }
+            let mut record = captured_record(sandbox, dest, FinalizeStage::Captured);
+
+            let outcome = redrive_to_the_end(&finalizer, &mut record).await;
+            assert!(
+                matches!(outcome, FinalizeAttempt::Quarantined),
+                "lost {lost:?}: {outcome:?}"
+            );
+            assert!(checkpoints(&finalizer).await.is_empty(), "lost {lost:?}");
+        }
+    }
+
+    /// A failed `state.bin` upload keeps what the other legs published:
+    /// the record durably reaches `MemoryChunked`, and the redrive uploads
+    /// the blobs without chunking the memory file again.
+    #[tokio::test]
+    async fn a_failed_state_upload_keeps_the_chunked_memory_for_the_redrive() {
+        use engram_testkit::storage::{
+            FaultPlan, FaultyBlobStorage, InjectedError, KeyMatch, PutFault, PutFaultKind, When,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxId::new();
+        let dest = full_capture_dest(tmp.path());
+        let mut record = captured_record(sandbox, dest.clone(), FinalizeStage::Captured);
+        let plan = FaultPlan::new().with_put(PutFault {
+            key: KeyMatch::Exact(engram_chunk_store::snapshot_blob::state_blob_key(
+                record.snapshot_id,
+            )),
+            when: When::Nth(1),
+            kind: PutFaultKind::FailBeforeWrite(InjectedError::Sdk("injected".into())),
+        });
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(FaultyBlobStorage::new(
+            Arc::new(engram_storage_local::LocalBlobStorage::new(
+                tmp.path().join("blob"),
+            )),
+            plan,
+        ));
+        let (finalizer, _volumes) = finalizer_over(tmp.path(), sandbox, blob).await;
+
+        let outcome = run_eviction_finalize_attempt(&finalizer, &mut record).await;
+        assert!(
+            matches!(outcome, FinalizeAttempt::RetryAfter(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(record.stage, FinalizeStage::MemoryChunked);
+        let memory = record.memory_manifest.expect("the memory leg published");
+        let durable =
+            EvictionFinalizeRecord::load_all(&engram_host_core::TokioFs, &finalizer.finalize_dir())
+                .await;
+        assert_eq!(durable.len(), 1);
+        assert_eq!(durable[0].stage, FinalizeStage::MemoryChunked);
+        assert_eq!(durable[0].memory_manifest, Some(memory));
+        assert!(
+            !dest.join("memory.bin").exists(),
+            "the memory file is retired"
+        );
+
+        let mut redriven = durable.into_iter().next().unwrap();
+        let outcome = run_eviction_finalize_attempt(&finalizer, &mut redriven).await;
+        assert!(matches!(outcome, FinalizeAttempt::Completed), "{outcome:?}");
+        let checkpoints = checkpoints(&finalizer).await;
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].memory_manifest, Some(memory));
+    }
+
+    /// A memory leg that succeeds beside a failed disk leg is recorded
+    /// without a stage bump, so the redrive skips it but every build still
+    /// finds the memory file.
+    #[tokio::test]
+    async fn a_failed_disk_leg_keeps_the_memory_manifest_and_the_memory_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxId::new();
+        let (finalizer, volumes) = finalizer_with_a_root(tmp.path(), sandbox).await;
+        let pending = volumes.take(sandbox, DiskRole::Root).await.unwrap();
+        let entry = PendingDisk {
+            role: DiskRole::Root,
+            previous: pending.previous(),
+        };
+        volumes.discard(pending).await.unwrap();
+        let dest = full_capture_dest(tmp.path());
+        let mut record = captured_record(sandbox, dest.clone(), FinalizeStage::Captured);
+        record.disk_pending = vec![entry];
+
+        let outcome = run_eviction_finalize_attempt(&finalizer, &mut record).await;
+        assert!(
+            matches!(outcome, FinalizeAttempt::RetryAfter(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(record.stage, FinalizeStage::Captured);
+        let memory = record.memory_manifest.expect("the memory leg published");
+        assert!(dest.join("memory.bin").exists());
+        let durable =
+            EvictionFinalizeRecord::load_all(&engram_host_core::TokioFs, &finalizer.finalize_dir())
+                .await;
+        assert_eq!(durable[0].memory_manifest, Some(memory));
+    }
+
+    /// 64 KiB of non-zero bytes: small, so a test can run many passes.
+    fn finalize_memory() -> Vec<u8> {
+        (0..64 * 1024).map(|i| (i % 251 + 1) as u8).collect()
+    }
+
+    // The diff-extents tests need a filesystem that reports holes, as the
+    // ext4 under a Firecracker host does; APFS reports a sparse file as
+    // one extent.
+    #[cfg(target_os = "linux")]
+    const DIFF_LEN: u64 = 4 << 20;
+    #[cfg(target_os = "linux")]
+    const DIRTY: [u64; 2] = [0, 2 << 20];
+
+    /// Write a sparse `memory.diff` of `DIFF_LEN` bytes with 64 KiB of
+    /// dirty pages at each of `dirty`.
+    #[cfg(target_os = "linux")]
+    fn write_diff(path: &Path, dirty: &[u64]) {
+        use std::io::{Seek, SeekFrom, Write};
+        let _ = std::fs::remove_file(path);
+        let mut file = std::fs::File::create(path).unwrap();
+        file.set_len(DIFF_LEN).unwrap();
+        for &offset in dirty {
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.write_all(&[0xA5; 64 * 1024]).unwrap();
+        }
+        file.sync_all().unwrap();
+    }
+
+    /// A crash before writeback leaves a hole where a dirty page was,
+    /// which reads as a clean page. The capture recorded the diff's
+    /// extents, so the redrive refuses the torn file instead of
+    /// publishing the previous chunk for the lost page.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_redrive_over_a_diff_whose_extents_differ_from_the_record_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxId::new();
+        let (finalizer, _volumes) = finalizer_with_a_root(tmp.path(), sandbox).await;
+        let store = finalizer.chunks.clone().unwrap().store;
+        let prev_path = tmp.path().join("prev.bin");
+        std::fs::write(
+            &prev_path,
+            (0..DIFF_LEN)
+                .map(|i| (i % 251 + 1) as u8)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let prev_ref = crate::snapshot_post::chunk_memory_to_store(&store, &prev_path, "test")
+            .await
+            .unwrap();
+
+        let dest = tmp.path().join("capture");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("state.bin"), b"vmstate").unwrap();
+        std::fs::write(dest.join("manifest.json"), fc_sidecar()).unwrap();
+        let diff = dest.join("memory.diff");
+        write_diff(&diff, &DIRTY);
+        let mut record = captured_record(sandbox, dest, FinalizeStage::Captured);
+        record.chain_prev_ref = Some(prev_ref);
+        record
+            .persist_captured(&engram_host_core::TokioFs, &finalizer.finalize_dir())
+            .await
+            .unwrap();
+        let recorded = record
+            .diff_extents
+            .expect("a diff capture records its extents");
+
+        write_diff(&diff, &DIRTY[..1]);
+        assert_ne!(DiffExtents::read(&diff).await.unwrap(), recorded);
+        let outcome = run_eviction_finalize_attempt(&finalizer, &mut record).await;
+        assert!(
+            matches!(outcome, FinalizeAttempt::RetryAfter(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(record.memory_manifest, None);
+        assert!(checkpoints(&finalizer).await.is_empty());
+
+        write_diff(&diff, &DIRTY);
+        let outcome = run_eviction_finalize_attempt(&finalizer, &mut record).await;
+        assert!(matches!(outcome, FinalizeAttempt::Completed), "{outcome:?}");
+    }
+
+    /// A record from a build that did not record the extents redrives
+    /// as before.
+    #[tokio::test]
+    async fn a_record_without_diff_extents_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = captured_record(
+            SandboxId::new(),
+            tmp.path().join("c"),
+            FinalizeStage::Captured,
+        );
+        let mut body = serde_json::to_value(&record).unwrap();
+        body.as_object_mut().unwrap().remove("diff_extents");
+        let body = serde_json::to_string(&body).unwrap();
+        let id = record.snapshot_id.to_string();
+        std::fs::write(
+            tmp.path().join(format!("{id}.json")),
+            crate::durable_envelope::seal(&id, &body),
+        )
+        .unwrap();
+        let loaded = EvictionFinalizeRecord::load_all(&engram_host_core::TokioFs, tmp.path()).await;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].diff_extents, None);
+    }
+
+    /// A [`HostFs`] over the real filesystem that logs each op and can
+    /// fail the sync of one file name.
+    #[derive(Default)]
+    struct LoggingFs {
+        ops: parking_lot::Mutex<Vec<(&'static str, PathBuf)>>,
+        fail_sync_of: Option<&'static str>,
+    }
+
+    impl LoggingFs {
+        fn ops(&self) -> Vec<(&'static str, PathBuf)> {
+            self.ops.lock().clone()
+        }
+        fn log(&self, op: &'static str, path: &Path) {
+            self.ops.lock().push((op, path.to_path_buf()));
+        }
+    }
+
+    #[async_trait]
+    impl HostFs for LoggingFs {
+        async fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+            self.log("write", path);
+            engram_host_core::TokioFs.write(path, bytes).await
+        }
+        async fn sync_file(&self, path: &Path) -> std::io::Result<()> {
+            self.log("sync_file", path);
+            if self.fail_sync_of.is_some_and(|name| path.ends_with(name)) {
+                return Err(std::io::Error::other("injected sync failure"));
+            }
+            engram_host_core::TokioFs.sync_file(path).await
+        }
+        async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            self.log("rename", to);
+            engram_host_core::TokioFs.rename(from, to).await
+        }
+        async fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+            self.log("sync_dir", dir);
+            engram_host_core::TokioFs.sync_dir(dir).await
+        }
+        async fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            engram_host_core::TokioFs.read(path).await
+        }
+        async fn read_dir(&self, dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+            engram_host_core::TokioFs.read_dir(dir).await
+        }
+        async fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+            self.log("remove_file", path);
+            engram_host_core::TokioFs.remove_file(path).await
+        }
+        async fn create_dir(&self, dir: &Path) -> std::io::Result<()> {
+            engram_host_core::TokioFs.create_dir(dir).await
+        }
+        async fn remove_dir(&self, dir: &Path) -> std::io::Result<()> {
+            engram_host_core::TokioFs.remove_dir(dir).await
+        }
+    }
+
+    /// Every capture file, the sidecar too, and the staging dir reach the
+    /// disk before the record that names them is written.
+    #[tokio::test]
+    async fn a_captured_record_is_written_only_after_every_capture_file_is_synced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = full_capture_dest(tmp.path());
+        let fs = LoggingFs::default();
+        let mut record = captured_record(SandboxId::new(), dest.clone(), FinalizeStage::Captured);
+        record
+            .persist_captured(&fs, &tmp.path().join("finalize"))
+            .await
+            .unwrap();
+
+        let ops = fs.ops();
+        let first_write = ops.iter().position(|(op, _)| *op == "write").unwrap();
+        let synced: Vec<_> = ops[..first_write]
+            .iter()
+            .filter(|(op, _)| *op == "sync_file")
+            .map(|(_, path)| path.clone())
+            .collect();
+        for name in ["state.bin", "memory.bin", "manifest.json"] {
+            assert!(
+                synced.contains(&dest.join(name)),
+                "{name} synced before the record: {ops:?}"
+            );
+        }
+        assert!(ops[..first_write].contains(&("sync_dir", dest)), "{ops:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_capture_sync_writes_no_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = full_capture_dest(tmp.path());
+        let fs = LoggingFs {
+            fail_sync_of: Some("memory.bin"),
+            ..Default::default()
+        };
+        let finalize_dir = tmp.path().join("finalize");
+        let mut record = captured_record(SandboxId::new(), dest, FinalizeStage::Captured);
+        assert!(record.persist_captured(&fs, &finalize_dir).await.is_err());
+        assert!(!fs.ops().iter().any(|(op, _)| *op == "write"));
+        assert!(
+            EvictionFinalizeRecord::load_all(&engram_host_core::TokioFs, &finalize_dir)
+                .await
+                .is_empty()
+        );
+    }
+
+    /// A File restore uses a `memory.bin` it finds in the staging dir. A
+    /// periodic Full capture's memory file is never synced, so its retire
+    /// must be durable before the checkpoint record lands: otherwise a
+    /// crash can bring the file back with holes, and the restore reads
+    /// those holes as zeroed guest memory.
+    #[tokio::test]
+    async fn a_retired_memory_file_is_durably_gone_before_the_retire_returns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = full_capture_dest(tmp.path());
+        let memory = dest.join("memory.bin");
+        let fs = Arc::new(LoggingFs::default());
+        crate::snapshot_post::retire_consumed(fs.clone(), memory.clone())
+            .await
+            .unwrap();
+
+        assert!(!memory.exists());
+        let ops: Vec<_> = fs
+            .ops()
+            .into_iter()
+            .filter(|(op, _)| *op != "remove_file")
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                ("rename", dest.join("memory.bin.consumed")),
+                ("sync_dir", dest),
+            ]
+        );
     }
 }

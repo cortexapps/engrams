@@ -372,7 +372,6 @@ async fn fork(state: &SharedState, i: &ManagedBootIntent) -> Result<(), ApiError
         return Err(conflict().into());
     }
     expected.parent = Some(i.selection.base_manifest);
-    expected.working_set_trace = None;
     // PUT is create-only. A lost reply is reconciled by complete immutable content.
     let written = store.put_manifest(i.disk_manifest, &expected).await;
     if written.is_err() {
@@ -380,9 +379,7 @@ async fn fork(state: &SharedState, i: &ManagedBootIntent) -> Result<(), ApiError
             .get_manifest(i.disk_manifest)
             .await
             .map_err(|_| unavailable())?;
-        if serde_json::to_value(actual).map_err(|_| conflict())?
-            != serde_json::to_value(expected).map_err(|_| conflict())?
-        {
+        if actual != expected {
             return Err(conflict().into());
         }
     }

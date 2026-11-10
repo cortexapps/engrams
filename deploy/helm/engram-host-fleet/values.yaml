@@ -58,16 +58,13 @@ firecracker:
   # /opt/engram by the node-assets init container (see nodeAssets); the
   # host-agent reads them from there (ENGRAM_FIRECRACKER_BIN + the configmap
   # ENGRAM_KERNEL_IMAGE_PATH). No node hostPath for them anymore.
-  restoreMode: ""     # "" (binary default) | file | uffd
   # ADR 0045 D3 (the unified memory substrate, v2b): a tmpfs directory for
-  # per-template base shm files. When set: node-prep mounts a tmpfs there,
-  # Uffd restores back guest memory MAP_PRIVATE on the shared base
-  # (canonical pages CONTINUE-shared across same-template VMs), and
-  # fresh-creates flip from File mode to the substrate (parity-gated:
-  # density 35%==35%, restore median 61ms vs 56ms). "" = off (File-mode
-  # fresh-creates + anonymous-Uffd resumes, today's behavior). Requires
-  # the v2 forked firecracker (engrams#164+). Under workDirHostPath so it
-  # survives pod restarts (K2 reattach).
+  # per-template base shm files. When set, node-prep mounts a tmpfs there
+  # and a resume backs guest memory MAP_PRIVATE on the shared base
+  # (canonical pages CONTINUE-shared across same-template VMs). "" = off
+  # (anonymous-memory resumes). A fresh create always maps the image's
+  # memory file. Requires the v2 forked firecracker. Under workDirHostPath
+  # so it survives pod restarts (K2 reattach).
   uffdBaseDir: ""     # e.g. /var/lib/engram/shm
   # ADR 0092: the density knobs. Chart-DEFAULTED to the reclaimable-
   # residency config (prod-canaried 2026-07-14: TTFM parity, File-mode
@@ -236,6 +233,14 @@ thinPool:
   blockSizeSectors: 128
   # Blocks; 32768 = 2 GiB at 64 KiB.
   lowWaterMarkBlocks: 32768
+  # A resumed session's disk is copied in behind the running VM. Larger
+  # values copy faster until the pool's disk is the limit.
+  hydration:
+    # Whole chunks (16 MiB) fetched ahead of the kernel's copy, per disk.
+    # The host-agent holds up to this many plus two in memory per disk.
+    windowChunks: 12
+    # Pool blocks the kernel copies at one time, per disk.
+    inFlightRegions: 512
 
 hostAgent:
   grpcPort: 9101
@@ -247,6 +252,11 @@ hostAgent:
     limits:
       cpu: "16"
       memory: 32Gi
+  # What an idle eviction does with the agent in the VM. `keep` captures
+  # the running agent, and a resume continues the same process. `drain`
+  # stops the agent before the capture, and a resume starts it again from
+  # its saved conversation.
+  idleEvictionHarness: keep
   extraEnv: []        # [{name, value}] escape hatch for any ENGRAM_* knob
 
 # Distributed tracing (ADR 0019 / telemetry restoration #526). The K8s host

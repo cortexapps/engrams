@@ -216,6 +216,7 @@ impl FirecrackerClient {
             dir.join("state.bin"),
             dir.join("memory.bin"),
             SnapshotType::Full,
+            false,
         )
         .await
     }
@@ -227,11 +228,16 @@ impl FirecrackerClient {
     /// cold boot, or `enable_diff_snapshots` at `snapshot/load`).
     /// Same pause/resume + cancellation-guard contract as
     /// [`Self::create_snapshot`].
+    ///
+    /// With `defer_sync`, Firecracker does not fsync the two files inside
+    /// the pause and the caller must sync them before it relies on them
+    /// across a host crash.
     pub async fn create_snapshot_at(
         &self,
         state_path: PathBuf,
         mem_path: PathBuf,
         snapshot_type: SnapshotType,
+        defer_sync: bool,
     ) -> Result<SnapshotPaths, SandboxError> {
         self.pause().await?;
 
@@ -250,10 +256,11 @@ impl FirecrackerClient {
             mem_file_path: mem_path.to_string_lossy().into_owned(),
             snapshot_type,
             vmstate_only: false,
+            defer_sync,
         };
         let create_res = self
             .put("/snapshot/create", &body)
-            .instrument(tracing::info_span!("fc.snapshot_create"))
+            .instrument(tracing::info_span!("fc.snapshot_create", defer_sync))
             .await;
 
         // Always try to resume, regardless of whether the create
@@ -288,6 +295,7 @@ impl FirecrackerClient {
                 mem_file_path: mem_path.to_string_lossy().into_owned(),
                 snapshot_type,
                 vmstate_only: false,
+                defer_sync: false,
             },
         )
         .instrument(tracing::info_span!("fc.snapshot_create"))
@@ -327,6 +335,7 @@ impl FirecrackerClient {
                 .into_owned(),
             snapshot_type: SnapshotType::Full,
             vmstate_only: true,
+            defer_sync: false,
         };
         self.put("/snapshot/create", &body).await
     }
@@ -823,6 +832,10 @@ struct SnapshotCreateBody {
     /// the fork-v3 capability gate.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     vmstate_only: bool,
+    /// Fork only: write both files without an fsync; the caller syncs them
+    /// after the resume. Left off the wire when false, like `vmstate_only`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    defer_sync: bool,
 }
 
 /// PascalCase variant names match Firecracker's expected JSON values
@@ -1293,6 +1306,7 @@ mod tests {
             mem_file_path: "/snap/memory.bin".into(),
             snapshot_type: SnapshotType::Full,
             vmstate_only: false,
+            defer_sync: false,
         };
         let v: serde_json::Value = serde_json::to_value(&body).unwrap();
         assert_eq!(v["snapshot_path"], "/snap/state.bin");
@@ -1302,15 +1316,18 @@ mod tests {
         // byte-identical to stock so non-migration captures keep working
         // against any FC binary (R2 posture).
         assert!(v.get("vmstate_only").is_none());
+        assert!(v.get("defer_sync").is_none());
 
         let body = SnapshotCreateBody {
             snapshot_path: "/snap/state.bin".into(),
             mem_file_path: "/snap/ignored".into(),
             snapshot_type: SnapshotType::Full,
             vmstate_only: true,
+            defer_sync: true,
         };
         let v: serde_json::Value = serde_json::to_value(&body).unwrap();
         assert_eq!(v["vmstate_only"], true);
+        assert_eq!(v["defer_sync"], true);
     }
 
     #[test]

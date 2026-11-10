@@ -9,10 +9,10 @@
 //!      (`SnapshotType::Diff`) — assert it's sparse (allocated bytes ≪
 //!      guest RAM) and time the pause window.
 //!   3. **Rebase**: overlay the diff's data extents onto a copy of the
-//!      Full memory.bin (the "rolling memory.bin" of ADR 0028), restore
-//!      from (diff state.bin + rebased memory) and verify *both* markers
-//!      via sha256 — proving the (capture → overlay → restore) loop is
-//!      byte-faithful.
+//!      Full memory.bin (the "rolling memory.bin" of ADR 0028), chunk it,
+//!      resume from (diff state.bin + rebased memory) and verify *both*
+//!      markers via sha256 — proving the (capture → overlay → restore)
+//!      loop is byte-faithful.
 //!   4. **Chained diff after a restore**: the restored VM re-armed dirty
 //!      tracking via `enable_diff_snapshots` at `snapshot/load`
 //!      (`FirecrackerConfig::track_dirty_pages`); plant a third marker,
@@ -117,6 +117,7 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
     // ADR 0028: cold creates arm KVM dirty tracking via machine-config;
     // restores re-arm it via enable_diff_snapshots at snapshot/load.
     cfg.track_dirty_pages = true;
+    common::resume_through_uffd(&mut cfg, work.path());
     let backend = FirecrackerBackend::new(work.path(), cfg);
 
     let rootfs = outcome.rootfs_path;
@@ -160,10 +161,14 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
     let api1 = FirecrackerClient::new(&st1.firecracker_socket);
     let diff1_dir = tempfile::tempdir().expect("diff1 dir");
     let t = Instant::now();
+    // `defer_sync`: the fork skips the fsync; a binary without the field
+    // rejects it and the client retries without it. Either way the diff
+    // must restore.
     api1.create_snapshot_at(
         diff1_dir.path().join("state.bin"),
         diff1_dir.path().join("memory.diff"),
         SnapshotType::Diff,
+        true,
     )
     .await
     .expect("diff snapshot (cold-boot dirty tracking)");
@@ -198,9 +203,9 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
         &[diff1_dir.path().join("memory.diff")],
         &full_dir.join("manifest.json"),
     );
-    // The rolling memory file vm2 will map — diff2 overlays onto it
-    // below, after vm2 is destroyed.
+    // The rolling memory file — diff2 overlays onto it below.
     let rebased_mem = backend.snapshot_path_for(meta2.id).join("memory.bin");
+    common::chunk_memory(&backend.snapshot_path_for(meta2.id), work.path()).await;
     let t = Instant::now();
     let vm2 = SandboxId::new();
     backend
@@ -237,6 +242,7 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
         diff2_dir.path().join("state.bin"),
         diff2_dir.path().join("memory.diff"),
         SnapshotType::Diff,
+        false,
     )
     .await
     .expect("diff snapshot after restore (enable_diff_snapshots path)");
@@ -249,8 +255,6 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
          did not arm dirty tracking ({diff2_alloc} of {full_mem_len} bytes)",
     );
 
-    // Destroy BEFORE overlaying: vm2 has the rebased file MAP_PRIVATE'd;
-    // mutating a live mapping's backing file corrupts unfaulted pages.
     backend.destroy(vm2).await.expect("destroy vm2");
 
     let meta3 = stage_rebased_snapshot(
@@ -261,6 +265,7 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
         &[diff2_dir.path().join("memory.diff")],
         &full_dir.join("manifest.json"),
     );
+    common::chunk_memory(&backend.snapshot_path_for(meta3.id), work.path()).await;
     let vm3 = SandboxId::new();
     backend
         .restore(vm3, meta3, common::disks(&rootfs))

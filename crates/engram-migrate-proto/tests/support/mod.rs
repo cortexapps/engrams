@@ -132,6 +132,8 @@ pub fn handler_control() -> impl Strategy<Value = HandlerControl> {
             any::<u64>(),
             any::<u64>(),
             any::<u64>(),
+            any::<u64>(),
+            any::<bool>(),
         )
             .prop_map(
                 |(
@@ -143,6 +145,8 @@ pub fn handler_control() -> impl Strategy<Value = HandlerControl> {
                     fault_us,
                     fault_max_us,
                     fault_around_chunks_installed,
+                    hot_leading,
+                    hot_hint_received,
                 )| {
                     HandlerControl::DrainDone {
                         pulled,
@@ -153,6 +157,8 @@ pub fn handler_control() -> impl Strategy<Value = HandlerControl> {
                         fault_us,
                         fault_max_us,
                         fault_around_chunks_installed,
+                        hot_leading,
+                        hot_hint_received,
                     }
                 }
             ),

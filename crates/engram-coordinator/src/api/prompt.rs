@@ -16,6 +16,7 @@
 
 use engram_core::SessionId;
 use engram_harness_proto::AgentRole;
+use tracing::Instrument as _;
 
 use crate::error::ApiError;
 use crate::state::{SessionEvent, SharedState};
@@ -106,7 +107,12 @@ pub(crate) async fn send_prompt_core(
     // accept write also means a rejected SendPrompt leaves no orphan
     // receipt row (the pre-idempotency behavior PR #556 finding #3
     // documented).
-    let session = state.services.meta.get_session(id).await?;
+    let session = state
+        .services
+        .meta
+        .get_session(id)
+        .instrument(tracing::info_span!("coord.send_prompt.gate"))
+        .await?;
     if session.status.is_terminal() {
         return Err(ApiError::Gone(format!(
             "session is {} — fork it to continue from its last snapshot",
@@ -185,6 +191,7 @@ pub(crate) async fn send_prompt_core(
     // the row.
     if state
         .emit_prompt_accept(id, events, &row)
+        .instrument(tracing::info_span!("coord.send_prompt.accept"))
         .await
         .map_err(|e| ApiError::Internal(format!("accept prompt: {e}")))?
         .is_none()
@@ -198,7 +205,9 @@ pub(crate) async fn send_prompt_core(
     if matches!(delivery, PromptDelivery::Enqueue) {
         // ADR 0079: enqueue the Deliver op directly (no wake hop for
         // first delivery); the shim's NOTIFY/poll loop owns redelivery.
-        crate::outbox_delivery::enqueue_deliver_op(state, id).await;
+        crate::outbox_delivery::enqueue_deliver_op(state, id)
+            .instrument(tracing::info_span!("coord.send_prompt.enqueue"))
+            .await;
         state.outbox_wake.notify_one();
     }
 

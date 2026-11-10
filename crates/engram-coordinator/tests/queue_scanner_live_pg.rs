@@ -914,6 +914,54 @@ async fn resume_origin_timeout_returns_to_idle() {
     );
 }
 
+/// A queued resume stays queued while no host fits the budget the resume
+/// reserves (its image's memory), even when the session row's own budget
+/// (here none, so 0) would fit. The scanner and the resume verb share one
+/// fit check; when the scanner judged by the row's budget, it dequeued the
+/// session, the resume queued it again, and the two looped.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn queued_resume_waits_for_the_budget_the_resume_reserves() {
+    let Some((meta, state, _database_url)) = setup(true).await else {
+        return;
+    };
+    let session_spec = spec();
+    seed_enabled_image(&meta, &session_spec.image).await;
+    // Measured and ready, but smaller than the image's default 4096 MiB.
+    seed_ready_host(&meta, 1024, 8, &[]).await;
+
+    let sid = meta.create_session(session_spec).await.expect("create");
+    meta.transition_session(sid, SessionState::Created, BindingDisposition::Retain)
+        .await
+        .expect("Pending->Created");
+    meta.transition_session(sid, SessionState::Active, BindingDisposition::Retain)
+        .await
+        .expect("Created->Active");
+    meta.transition_session(sid, SessionState::Idle, BindingDisposition::Detach)
+        .await
+        .expect("Active->Idle");
+    assert!(
+        meta.enqueue_session_resume(sid, 0)
+            .await
+            .expect("enqueue resume"),
+        "the Idle row (epoch 0, never op-claimed) must queue"
+    );
+
+    queue_scanner::run_once(&QueueScannerConfig::default(), &state)
+        .await
+        .expect("run_once");
+
+    assert_eq!(
+        meta.get_session(sid).await.unwrap().status,
+        SessionState::Queued,
+        "no host fits the resume's budget, so the session stays queued"
+    );
+    assert!(
+        !has_status_change_to(&meta, sid, "idle").await,
+        "the scanner must not dequeue a resume that cannot place"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn notify_placement_changed_fires_at_every_site() {

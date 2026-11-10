@@ -1,6 +1,6 @@
 //! ADR 0045 unified memory substrate (v2b) — end-to-end over real FC.
 //!
-//! Same shape as `tests/snapshot_uffd.rs`, but with `uffd_base_dir` set:
+//! Same shape as `tests/snapshot.rs`, but with `uffd_base_dir` set:
 //! the restore sends `uffd_base_file` to the FORKED Firecracker, which
 //! maps guest memory `MAP_PRIVATE` on the per-template base shm file and
 //! registers UFFD `MISSING|MINOR`; the handler populates the base with
@@ -37,17 +37,14 @@ mod common;
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
-use engram_chunk_store::{ChunkStore, ManifestKind};
+use engram_chunk_store::ManifestKind;
 use engram_core::traits::sandbox::SandboxBackend;
-use engram_core::traits::BlobStorage;
 use engram_core::types::ids::SandboxId;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
-use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreMode};
-use engram_storage_local::LocalBlobStorage;
+use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
 
 /// First data extent at-or-after `offset`, or `None` if all-hole from
 /// there. Used to prove the handler actually populated the base file.
@@ -72,20 +69,6 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
         }
     };
 
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-    let target_root = Path::new(&manifest_dir)
-        .join("..")
-        .join("..")
-        .join("target");
-    let handler = target_root.join("debug").join("engram-uffd-handler");
-    if !handler.exists() {
-        eprintln!(
-            "SKIP: engram-uffd-handler not built at {} — run `cargo build -p engram-uffd-handler`",
-            handler.display()
-        );
-        return;
-    }
-
     // The base dir MUST be tmpfs/shmem (UFFD MINOR is shmem-only).
     let base_dir = PathBuf::from(format!(
         "/dev/shm/engram-substrate-test-{}",
@@ -102,8 +85,7 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
     cfg.net_pool = None;
     cfg.firecracker_bin = fork_bin;
-    cfg.uffd_handler_bin = handler;
-    cfg.restore_mode = RestoreMode::Uffd;
+    common::resume_through_uffd(&mut cfg, work.path());
     cfg.uffd_base_dir = Some(base_dir.clone());
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
     let backend = FirecrackerBackend::new(work.path(), cfg);
@@ -136,37 +118,8 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
     let metadata = backend.snapshot(original_id).await.expect("snapshot");
     let snap_dir = backend.snapshot_path_for(metadata.id);
 
-    // Inline the PooledBackend memory-chunking wrap (see snapshot_uffd.rs
-    // for the full rationale — a host-agent dep here would be circular).
-    let local_path = work.path().join("local-state");
-    let blobs_dir = local_path.join("blobs");
-    std::env::set_var("ENGRAM_BLOB_BACKEND", "local");
-    std::env::set_var("ENGRAM_LOCAL_PATH", &local_path);
-    let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(blobs_dir));
-    let cs = ChunkStore::new(blob);
-    let memory_bin = snap_dir.join("memory.bin");
-    let chunked = cs
-        .chunk_file(&memory_bin, ManifestKind::Memory, None)
-        .await
-        .expect("chunk memory.bin");
-    let manifest_ref = ManifestRef::new();
-    cs.put_manifest(manifest_ref, &chunked)
-        .await
-        .expect("put memory manifest");
-    let manifest_json = snap_dir.join("manifest.json");
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&tokio::fs::read(&manifest_json).await.expect("read mj"))
-            .expect("parse mj");
-    value.as_object_mut().expect("mj root is an object").insert(
-        "memory_manifest".into(),
-        serde_json::to_value(manifest_ref).expect("serialize mref"),
-    );
-    tokio::fs::write(
-        &manifest_json,
-        serde_json::to_vec_pretty(&value).expect("re-serialize mj"),
-    )
-    .await
-    .expect("write patched mj");
+    let manifest_ref = common::chunk_memory(&snap_dir, work.path()).await;
+    let cs = common::uffd_chunk_store(work.path());
 
     backend
         .destroy(original_id)
@@ -388,13 +341,6 @@ async fn capture_of_substrate_vm_round_trips_and_diffs() {
             return;
         }
     };
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-    let handler = Path::new(&manifest_dir).join("../../target/debug/engram-uffd-handler");
-    if !handler.exists() {
-        eprintln!("SKIP: engram-uffd-handler not built");
-        return;
-    }
-
     let base_dir = PathBuf::from(format!(
         "/dev/shm/engram-substrate-capture-test-{}",
         std::process::id()
@@ -410,8 +356,7 @@ async fn capture_of_substrate_vm_round_trips_and_diffs() {
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
     cfg.net_pool = None;
     cfg.firecracker_bin = fork_bin;
-    cfg.uffd_handler_bin = handler;
-    cfg.restore_mode = RestoreMode::Uffd;
+    common::resume_through_uffd(&mut cfg, work.path());
     cfg.uffd_base_dir = Some(base_dir.clone());
     // Arm KVM dirty tracking so the Diff capture of the substrate VM works
     // (and so the substrate load passes enable_diff_snapshots, matching
@@ -449,33 +394,7 @@ async fn capture_of_substrate_vm_round_trips_and_diffs() {
     let metadata = backend.snapshot(original_id).await.expect("snapshot");
     let snap_dir = backend.snapshot_path_for(metadata.id);
 
-    let local_path = work.path().join("local-state");
-    std::env::set_var("ENGRAM_BLOB_BACKEND", "local");
-    std::env::set_var("ENGRAM_LOCAL_PATH", &local_path);
-    let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(local_path.join("blobs")));
-    let cs = ChunkStore::new(blob);
-    let chunked = cs
-        .chunk_file(&snap_dir.join("memory.bin"), ManifestKind::Memory, None)
-        .await
-        .expect("chunk memory.bin");
-    let manifest_ref = ManifestRef::new();
-    cs.put_manifest(manifest_ref, &chunked)
-        .await
-        .expect("put memory manifest");
-    let manifest_json = snap_dir.join("manifest.json");
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&tokio::fs::read(&manifest_json).await.expect("read mj"))
-            .expect("parse mj");
-    value.as_object_mut().expect("mj root is an object").insert(
-        "memory_manifest".into(),
-        serde_json::to_value(manifest_ref).expect("serialize mref"),
-    );
-    tokio::fs::write(
-        &manifest_json,
-        serde_json::to_vec_pretty(&value).expect("re-serialize mj"),
-    )
-    .await
-    .expect("write patched mj");
+    let manifest_ref = common::chunk_memory(&snap_dir, work.path()).await;
     backend
         .destroy(original_id)
         .await
@@ -545,24 +464,7 @@ async fn capture_of_substrate_vm_round_trips_and_diffs() {
 
     // 3. Restore #2 FROM the capture-of-substrate snapshot (chunk it like
     //    the eviction pipeline would) — must come up alive.
-    let chunked2 = cs
-        .chunk_file(&cap_mem, ManifestKind::Memory, None)
-        .await
-        .expect("chunk captured memory.bin");
-    let manifest_ref2 = ManifestRef::new();
-    cs.put_manifest(manifest_ref2, &chunked2)
-        .await
-        .expect("put second manifest");
-    let mj2 = cap_dir.join("manifest.json");
-    let mut v2: serde_json::Value =
-        serde_json::from_slice(&tokio::fs::read(&mj2).await.expect("read mj2")).expect("parse");
-    v2.as_object_mut().expect("object").insert(
-        "memory_manifest".into(),
-        serde_json::to_value(manifest_ref2).expect("ser"),
-    );
-    tokio::fs::write(&mj2, serde_json::to_vec_pretty(&v2).expect("ser"))
-        .await
-        .expect("write");
+    let manifest_ref2 = common::chunk_memory(&cap_dir, work.path()).await;
     let mut meta2 = capture.clone();
     meta2.memory_manifest = Some(manifest_ref2);
     // ADR 0045 D4: the canonical split — pass the IMAGE's base manifest so

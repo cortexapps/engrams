@@ -294,9 +294,7 @@ pub enum HandlerControl {
     /// here on. `faults`/`fault_us` are the FAULT-path totals (guest
     /// faults that round-tripped the peer + their cumulative wall) —
     /// the serial P2P cost inside the FC load + early execution, the
-    /// restore-tail attribution the drain numbers can't show. Control
-    /// sock is same-host (handler ↔ its own host-agent, one image), so
-    /// extending the variant is bincode-safe.
+    /// restore-tail attribution the drain numbers can't show.
     DrainDone {
         pulled: u64,
         alt_sourced: u64,
@@ -306,6 +304,10 @@ pub enum HandlerControl {
         fault_us: u64,
         fault_max_us: u64,
         fault_around_chunks_installed: u64,
+        /// Sealed chunks the hot-set hint placed first.
+        hot_leading: u64,
+        /// A nonempty hot-set hint arrived while requests remained.
+        hot_hint_received: bool,
     },
     /// The peer is gone (dial/reconnect exhausted, frame error, or sha
     /// mismatch) with sealed chunks still uninstalled. FATAL by design:
@@ -321,6 +323,14 @@ where
     R: Read,
     T: DeserializeOwned,
 {
+    bincode::deserialize(&read_body(r)?).map_err(invalid)
+}
+
+fn invalid(e: bincode::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bincode: {e}"))
+}
+
+fn read_body<R: Read>(r: &mut R) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -332,8 +342,7 @@ where
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body)?;
-    bincode::deserialize(&body)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bincode: {e}")))
+    Ok(body)
 }
 
 /// Bincode-encode `msg` and write it as a length-prefixed frame.
@@ -466,6 +475,8 @@ mod tests {
             fault_us: 55_000,
             fault_max_us: 9_000,
             fault_around_chunks_installed: 0,
+            hot_leading: 3,
+            hot_hint_received: true,
         });
         round_trip(&HandlerControl::PeerLost {
             remaining: 3,

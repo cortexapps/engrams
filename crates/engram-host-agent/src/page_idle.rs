@@ -57,7 +57,7 @@ impl HotPages {
 }
 
 /// Resolve offsets without repeated manifest scans. Deduplicate equal hashes
-/// before the idle-only cap. Preserve the complete bounded handler-trace tier.
+/// before the cap on `offsets`. `fallback` (a bounded rider) leads, whole.
 pub fn hot_hashes(
     manifest: &engram_chunk_store::Manifest,
     offsets: &[u64],
@@ -98,7 +98,7 @@ pub fn open_bitmap() -> io::Result<std::fs::File> {
 pub fn note_unavailable(error: &io::Error) {
     static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::info!(%error, "page_idle unavailable; using handler working-set trace");
+        tracing::info!(%error, "page_idle unavailable; using the first-touch rider");
     }
 }
 
@@ -323,7 +323,6 @@ mod tests {
             total_bytes: 5001 * 4096,
             chunks,
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
         let first = *manifest.chunks[5].hash.as_bytes();

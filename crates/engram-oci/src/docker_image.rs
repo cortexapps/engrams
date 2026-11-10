@@ -184,7 +184,13 @@ impl OciClient {
     /// with exponential backoff (429 backs off harder). One re-auth on
     /// 401 (GHCR bearer tokens live ~5 min) doesn't consume an attempt.
     ///
+    /// A blob of at least [`RangedPullConfig::min_blob_bytes`] first
+    /// downloads as concurrent `Range` requests. When that fails for any
+    /// reason (a registry that ignores ranges, a part out of retries, a
+    /// digest mismatch) the blob downloads again on one stream.
+    ///
     /// [`BlobRetryConfig`]: crate::BlobRetryConfig
+    /// [`RangedPullConfig::min_blob_bytes`]: crate::RangedPullConfig::min_blob_bytes
     pub async fn pull_docker_blob_to_file(
         &self,
         uri: &str,
@@ -194,10 +200,201 @@ impl OciClient {
         let reference: Reference = uri
             .parse()
             .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
-        let client = self.client_for(&reference);
         let desc = blob.to_descriptor();
+        let ranged = self.ranged_pull;
+        if blob.size >= ranged.min_blob_bytes && blob.size > ranged.part_bytes {
+            let started = std::time::Instant::now();
+            match self.pull_blob_ranged(&reference, &desc, blob, dest).await {
+                Ok(()) => {
+                    tracing::debug!(
+                        digest = %blob.digest,
+                        bytes = blob.size,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "layer pulled in ranges"
+                    );
+                    return Ok(());
+                }
+                Err(e) => tracing::warn!(
+                    digest = %blob.digest,
+                    error = %e,
+                    "ranged layer pull failed; pulling on one stream"
+                ),
+            }
+        }
+        let client = self.client_for(&reference);
         self.stream_blob_resumable(client, &reference, &desc, &blob.digest, dest)
             .await
+    }
+
+    /// Download `blob` as `part_bytes` ranges, `parts_in_flight` at a
+    /// time, into a sibling file renamed to `dest` once the whole-blob
+    /// digest matches. Each part runs on its own task; the digest is
+    /// computed in part order while later parts download. On failure the
+    /// sibling is removed, so a part task still writing cannot touch
+    /// `dest`.
+    async fn pull_blob_ranged(
+        &self,
+        reference: &Reference,
+        desc: &OciDescriptor,
+        blob: &DockerBlobRef,
+        dest: &Path,
+    ) -> Result<(), OciError> {
+        use futures::StreamExt as _;
+        use tokio::io::AsyncReadExt as _;
+
+        let cfg = self.ranged_pull;
+        let parts_path = dest.with_extension("parts");
+        let result = async {
+            let file = tokio::fs::File::create(&parts_path)
+                .await
+                .map_err(OciError::Io)?;
+            file.set_len(blob.size).await.map_err(OciError::Io)?;
+            drop(file);
+
+            let parts = (0..blob.size)
+                .step_by(cfg.part_bytes as usize)
+                .map(|start| (start, cfg.part_bytes.min(blob.size - start)));
+            let mut fetched = futures::stream::iter(parts.map(|(start, len)| {
+                let this = self.clone();
+                let reference = reference.clone();
+                let desc = desc.clone();
+                let path = parts_path.clone();
+                AbortOnDrop(tokio::spawn(async move {
+                    this.pull_part(&reference, &desc, &path, start, len).await
+                }))
+            }))
+            .buffered(cfg.parts_in_flight.max(1));
+
+            let mut reader = tokio::fs::File::open(&parts_path)
+                .await
+                .map_err(OciError::Io)?;
+            let mut hasher = Sha256::new();
+            let mut buf = vec![0u8; 1 << 20];
+            while let Some(joined) = fetched.next().await {
+                let len = joined.map_err(|e| OciError::Io(std::io::Error::other(e)))??;
+                let mut left = len as usize;
+                while left > 0 {
+                    let want = left.min(buf.len());
+                    reader
+                        .read_exact(&mut buf[..want])
+                        .await
+                        .map_err(OciError::Io)?;
+                    hasher.update(&buf[..want]);
+                    left -= want;
+                }
+            }
+            let actual = format!("sha256:{}", hex::encode(hasher.finalize()));
+            if actual != blob.digest {
+                return Err(OciError::Distribution(format!(
+                    "pull layer {} in ranges: digest mismatch (got {actual})",
+                    blob.digest
+                )));
+            }
+            tokio::fs::rename(&parts_path, dest)
+                .await
+                .map_err(OciError::Io)
+        }
+        .await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&parts_path).await;
+        }
+        result
+    }
+
+    /// Write bytes `start..start + len` of the blob at the same offset of
+    /// `path`, resuming within the range after a transient failure. A 200
+    /// (the registry ignored `Range`) or a body longer than the range
+    /// fails the part. Returns `len`.
+    async fn pull_part(
+        &self,
+        reference: &Reference,
+        desc: &OciDescriptor,
+        path: &Path,
+        start: u64,
+        len: u64,
+    ) -> Result<u64, OciError> {
+        use tokio::io::AsyncSeekExt as _;
+
+        let cfg = self.blob_retry();
+        let client = self.client_for(reference);
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .await
+            .map_err(OciError::Io)?;
+        let fail = |what: String| {
+            OciError::Distribution(format!(
+                "pull layer {} bytes {start}+{len}: {what}",
+                desc.digest
+            ))
+        };
+        let mut done = 0u64;
+        let mut attempt = 0u32;
+        let mut reauthed = false;
+        loop {
+            let mut stream = match client
+                .pull_blob_stream_partial(reference, desc, start + done, Some(len - done))
+                .await
+            {
+                Ok(BlobResponse::Partial(s)) => s,
+                Ok(BlobResponse::Full(_)) => return Err(fail("the registry ignored Range".into())),
+                Err(e) if is_unauthorized(&e) && !reauthed => {
+                    reauthed = true;
+                    self.reauth(client, reference).await?;
+                    continue;
+                }
+                Err(e) => {
+                    attempt += 1;
+                    if request_retryable(&e) && attempt < cfg.max_attempts {
+                        tokio::time::sleep(cfg.backoff(attempt, is_rate_limited(&e))).await;
+                        continue;
+                    }
+                    return Err(fail(format!("{e} (after {attempt} attempt(s))")));
+                }
+            };
+            file.seek(std::io::SeekFrom::Start(start + done))
+                .await
+                .map_err(OciError::Io)?;
+            let mut stream_err = None;
+            loop {
+                match stream.try_next().await {
+                    Ok(Some(chunk)) => {
+                        if done + chunk.len() as u64 > len {
+                            return Err(fail("the registry sent more than the range".into()));
+                        }
+                        file.write_all(&chunk).await.map_err(OciError::Io)?;
+                        done += chunk.len() as u64;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        stream_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            if done == len {
+                file.flush().await.map_err(OciError::Io)?;
+                return Ok(len);
+            }
+            attempt += 1;
+            if attempt >= cfg.max_attempts {
+                return Err(fail(match stream_err {
+                    Some(e) => format!("error at byte {done} (after {attempt} attempt(s)): {e}"),
+                    None => format!("short body of {done} bytes (after {attempt} attempt(s))"),
+                }));
+            }
+            tokio::time::sleep(cfg.backoff(attempt, false)).await;
+        }
+    }
+
+    /// Mint a new pull token for `reference` on `client`.
+    async fn reauth(&self, client: &Client, reference: &Reference) -> Result<(), OciError> {
+        let auth = self.auth_for(reference).await?;
+        client
+            .auth(reference, &auth, RegistryOperation::Pull)
+            .await
+            .map(|_| ())
+            .map_err(|e| OciError::Distribution(format!("re-auth (pull): {e}")))
     }
 
     /// Stream `desc` to `dest`, retrying transient failures in place with
@@ -246,11 +443,7 @@ impl OciClient {
                 // budget) and retry the request.
                 Err(e) if is_unauthorized(&e) && !reauthed => {
                     reauthed = true;
-                    let auth = self.auth_for(reference).await?;
-                    client
-                        .auth(reference, &auth, RegistryOperation::Pull)
-                        .await
-                        .map_err(|e| OciError::Distribution(format!("re-auth (pull): {e}")))?;
+                    self.reauth(client, reference).await?;
                     continue;
                 }
                 Err(e) => {
@@ -324,6 +517,27 @@ impl OciClient {
                 dest.display()
             )));
         }
+    }
+}
+
+/// A spawned task that is aborted when its handle drops, so a failed
+/// ranged pull stops its remaining parts.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

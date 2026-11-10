@@ -27,7 +27,8 @@
 //! ```text
 //! chunks/sha256/<2-hex>/<rest-of-64-hex>      (immutable, content-addressed)
 //! manifests/<manifest_id>/v<version>.json     (immutable, versioned)
-//! traces/<manifest_id>/<host_id>.json         (host-local working-set hint)
+//! traces/<session_id>/first-touch.v1          (first-touch prefix)
+//! traces/<session_id>/first-touch-rest.v1     (the rest of the record)
 //! ```
 //!
 //! # Layers above this crate
@@ -39,33 +40,38 @@
 //! - `engram-sandbox-vz::disk` — materialize-to-file for macOS dev
 //! - `engram-rootfs-materializer` — chunks bake/materialize outputs
 
+pub mod admission;
 pub mod bootstrap;
-pub mod budget;
+pub mod buffers;
 pub mod cache;
 pub mod error;
 pub mod file;
+pub mod first_touch;
 pub mod gc;
 pub mod manifest;
 pub mod reader;
 pub mod region;
 pub mod resolver;
 pub mod snapshot_blob;
+pub mod source;
 pub mod store;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod time_source;
-pub mod working_set;
+mod uploads;
 
+pub use admission::{Admission, Class, Permit};
 pub use bootstrap::{Bootstrap, BootstrapEntry, BOOTSTRAP_SCHEMA_VERSION};
-pub use budget::{UploadBudget, UploadClass};
+pub use buffers::ChunkBuf;
 pub use cache::{ChunkCache, ChunkCacheConfig};
 pub use error::{ChunkStoreError, Result};
 pub use file::ChunkFileStats;
+pub use first_touch::FirstTouch;
 pub use gc::{shard_hash_bounds, GcError, PinSet, DEFAULT_COLLECT_CONCURRENCY, SHARD_SPACE};
 pub use manifest::{
     ChunkHash, ChunkRef, ChunkSize, Manifest, ManifestDelta, ManifestKind, ManifestRef,
     DEFAULT_DISK_CHUNK_SIZE, DEFAULT_MEMORY_CHUNK_SIZE,
 };
-pub use resolver::{BlobStorageResolver, ChunkResolver, TieredChunkResolver};
+pub use resolver::{BlobStorageResolver, ChunkResolver};
+pub use source::ChunkSource;
 pub use store::ChunkStore;
-pub use working_set::{TraceRef, WorkingSetTrace};

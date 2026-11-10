@@ -27,9 +27,7 @@ use engram_host_agent::pooled_backend::PooledBackend;
 use engram_host_core::disk::{Capacity, SessionDisk, Volume, VolumeName};
 use engram_host_core::SessionVolumes;
 use engram_rootfs_materializer::{InitInjection, Transport};
-use engram_sandbox_firecracker::{
-    FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
-};
+use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use futures::StreamExt;
 
 /// The disk half of a checkpoint under full-rate writes: one page-cache
@@ -210,7 +208,10 @@ async fn a_host_agent_restart_keeps_the_guest_and_every_write() {
             .with_chunk_store(rig.chunk_store.clone())
             .with_session_volumes(Arc::new(SessionVolumes::new(
                 counted.clone(),
-                rig.chunk_store.clone(),
+                engram_fill::FillEngine::new(
+                    rig.chunk_store.clone(),
+                    engram_fill::Config::default(),
+                ),
             )))
             .with_checkpoint_dir(rig.work.path().join("checkpoints")),
     );
@@ -385,7 +386,7 @@ impl Rig {
         let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agent);
         cfg.bundle_dir = staged.bundle_dir.clone();
         cfg.net_pool = None;
-        cfg.restore_mode = RestoreMode::File;
+        common::resume_through_uffd(&mut cfg, &work.path().join("blob"));
         cfg.track_dirty_pages = true;
         cfg.default_boot_args =
             "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
@@ -402,7 +403,10 @@ impl Rig {
 
     /// A backend over `disk`, with the volumes it owns.
     fn pooled(&self, disk: Arc<dyn SessionDisk>) -> (Arc<PooledBackend>, Arc<SessionVolumes>) {
-        let volumes = Arc::new(SessionVolumes::new(disk, self.chunk_store.clone()));
+        let volumes = Arc::new(SessionVolumes::new(
+            disk,
+            engram_fill::FillEngine::new(self.chunk_store.clone(), engram_fill::Config::default()),
+        ));
         let inner = Arc::new(FirecrackerBackend::new(self.work.path(), self.cfg.clone()));
         let pooled = Arc::new(
             PooledBackend::new(inner)

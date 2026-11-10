@@ -252,6 +252,14 @@ pub const SESSION_CREATE_TOTAL: &str = "engram_session_create_total";
 /// Postgres for the slice of time both views are consistent.
 pub const HOSTS_READY: &str = "engram_hosts_ready";
 
+/// Gauge. Open connections in the metadata store's Postgres pool, idle
+/// or in use. At the pool maximum with
+/// [`PG_POOL_IDLE_CONNECTIONS`] at zero, queries wait for a connection.
+pub const PG_POOL_CONNECTIONS: &str = "engram_pg_pool_connections";
+
+/// Gauge. Idle connections in the metadata store's Postgres pool.
+pub const PG_POOL_IDLE_CONNECTIONS: &str = "engram_pg_pool_idle_connections";
+
 /// Counter (ADR 0073). Outbox rows handed to the host relay. The gap
 /// between this and OUTBOX_ACKED going nonzero-and-growing is the
 /// alarmed "delivered but never acked" signal.
@@ -440,9 +448,10 @@ pub const EVICTION_PARK_DESCEND_TOTAL: &str = "engram_eviction_park_descend_tota
 /// Alert on a sustained nonzero rate.
 pub const HARNESS_ATTACH_DISAGREEMENT_TOTAL: &str = "engram_harness_attach_disagreement_total";
 /// Counter (ADR 0108 A8). Sessions the heartbeat disagreement REPAIR
-/// re-drove: waiting outbox rows recalled to due + a Deliver op
-/// enqueued, for an Active session whose sandbox the host reports
-/// RUNNING with no attached harness.
+/// re-drove, for an Active session whose sandbox the host reports
+/// RUNNING with no attached harness: waiting outbox rows recalled to due
+/// and a Deliver op enqueued, or, with no waiting rows, the idle harness
+/// re-attached.
 pub const HARNESS_DESYNC_REDRIVEN_TOTAL: &str = "engram_harness_desync_redriven_total";
 /// Counter (ADR 0073). Rows terminally acked by a confirming event.
 pub const OUTBOX_ACKED_TOTAL: &str = "engram_outbox_acked_total";

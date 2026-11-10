@@ -29,6 +29,9 @@ import { POLICY, policyKey } from "../authz/policy-map.ts";
 import { abilityFor } from "../authz/ability.ts";
 import { resolveSessionOwner } from "../authz/resolve.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
+import { log as rootLog } from "../log.ts";
+
+const log = rootLog.child({ component: "passthrough" });
 
 // ---------------------------------------------------------------------------
 // Types
@@ -47,9 +50,7 @@ export interface PassthroughSpec {
  * Injected getSession implementation. The default is getSessionFromHeaders
  * (auth/session.ts); tests inject a stub.
  */
-export type GetSession = (
-  headers: Headers,
-) => Promise<{
+export type GetSession = (headers: Headers) => Promise<{
   user: { id: string; role?: string | null; email?: string | null };
 } | null>;
 
@@ -59,11 +60,27 @@ export type GetSession = (
  */
 export type ResolveOwner = (sessionId: string) => Promise<string | null>;
 
-/** Optional per-method pre-flight, keyed by policyKey ("ImageService.DisableImage").
- *  Runs AFTER the authz gate and BEFORE the upstream forward. Throws to block. */
-export type UnaryOverride = (req: unknown, ctx: HandlerContext) => Promise<{ response: unknown } | undefined>;
+/** Optional handler after authorization and preflight; undefined forwards upstream. */
+export type UnaryOverride = (
+  req: unknown,
+  ctx: HandlerContext,
+) => Promise<{ response: unknown } | undefined>;
 
+/** Optional per-method preflight after authorization and before dispatch. */
 export type Preflight = (req: unknown, ctx: HandlerContext) => Promise<void>;
+
+/** Unary methods that log one line per call with the time of each stage. */
+const TIMED_METHODS = new Set(["SessionService.SendPrompt"]);
+
+/** Milliseconds the authz gate spent in each of its awaited lookups. */
+interface GateTimings {
+  authMs: number;
+  ownerMs: number;
+}
+
+function elapsedMs(start: number): number {
+  return Math.round((performance.now() - start) * 10) / 10;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -76,11 +93,11 @@ export type Preflight = (req: unknown, ctx: HandlerContext) => Promise<void>;
  * meaningful (and actively harmful) on a Connect response.
  */
 const BLOCKED_RESPONSE_HEADERS = new Set([
-  "content-type",        // ConnectRouter owns this — forwarding application/grpc breaks browser parsing
-  "grpc-status",         // gRPC trailer, not a Connect response header
-  "grpc-message",        // gRPC trailer
+  "content-type", // ConnectRouter owns this — forwarding application/grpc breaks browser parsing
+  "grpc-status", // gRPC trailer, not a Connect response header
+  "grpc-message", // gRPC trailer
   "grpc-status-details-bin", // gRPC trailer
-  "transfer-encoding",   // hop-by-hop, must not be forwarded
+  "transfer-encoding", // hop-by-hop, must not be forwarded
 ]);
 
 /**
@@ -181,9 +198,7 @@ export function registerPassthrough(
   preflight?: Record<string, Preflight>,
   overrides?: Record<string, UnaryOverride>,
 ): void {
-  const resolveSession: GetSession =
-    getSession ??
-    getSessionFromHeaders;
+  const resolveSession: GetSession = getSession ?? getSessionFromHeaders;
 
   const ownerResolver: ResolveOwner = resolveOwner ?? resolveSessionOwner;
 
@@ -197,10 +212,7 @@ export function registerPassthrough(
 
       // Only support unary and server-streaming (bidi/client-streaming live
       // on dedicated routes).
-      if (
-        m.methodKind !== "unary" &&
-        m.methodKind !== "server_streaming"
-      ) {
+      if (m.methodKind !== "unary" && m.methodKind !== "server_streaming") {
         continue;
       }
 
@@ -213,9 +225,11 @@ export function registerPassthrough(
        * Authz gate — runs before any upstream call.
        * Throws a ConnectError on failure.
        */
-      const gate = async (req: unknown, ctx: HandlerContext): Promise<void> => {
+      const gate = async (req: unknown, ctx: HandlerContext): Promise<GateTimings> => {
         // 1. Authenticate.
+        const authStart = performance.now();
         const session = await resolveSession(headersOf(ctx));
+        const timings: GateTimings = { authMs: elapsedMs(authStart), ownerMs: 0 };
         if (!session) {
           throw new ConnectError("unauthenticated", Code.Unauthenticated);
         }
@@ -223,10 +237,7 @@ export function registerPassthrough(
         // 2. Look up policy (fail-closed: no entry → denied).
         const entry = POLICY[key];
         if (!entry) {
-          throw new ConnectError(
-            `no policy for ${key}`,
-            Code.PermissionDenied,
-          );
+          throw new ConnectError(`no policy for ${key}`, Code.PermissionDenied);
         }
 
         // 3. Build ability.
@@ -254,16 +265,13 @@ export function registerPassthrough(
             throw new ConnectError("not found", Code.NotFound);
           }
 
+          const ownerStart = performance.now();
           const ownerId = await ownerResolver(sid);
+          timings.ownerMs = elapsedMs(ownerStart);
 
           // Anti-enumeration: return NotFound even when the session exists
           // but is not owned by the caller — don't confirm existence.
-          if (
-            !ability.can(
-              entry.action,
-              subject("Session", { createdByUserId: ownerId }),
-            )
-          ) {
+          if (!ability.can(entry.action, subject("Session", { createdByUserId: ownerId }))) {
             throw new ConnectError("not found", Code.NotFound);
           }
         } else {
@@ -272,16 +280,21 @@ export function registerPassthrough(
             throw new ConnectError("forbidden", Code.PermissionDenied);
           }
         }
+        return timings;
       };
 
       // Register handler.
       if (m.methodKind === "unary") {
         impl[m.localName] = async (req: unknown, ctx: HandlerContext) => {
-          await gate(req, ctx);
+          const timings = await gate(req, ctx);
           const pf = preflight?.[key];
+          const preflightStart = performance.now();
           if (pf) await pf(req, ctx);
           const handled = await overrides?.[key]?.(req, ctx);
           if (handled) return handled.response;
+          const preflightMs = elapsedMs(preflightStart);
+          const forwardStart = performance.now();
+          let ok = false;
           let res;
           try {
             res = await upstream.unary(
@@ -298,8 +311,27 @@ export function registerPassthrough(
               req as any,
               ctx.values,
             );
+            ok = true;
           } catch (error) {
             throw browserFacingError(error);
+          } finally {
+            if (TIMED_METHODS.has(key)) {
+              const sessionIdField = POLICY[key]?.sessionIdField;
+              log.info(
+                {
+                  method: key,
+                  sessionId: sessionIdField
+                    ? (req as Record<string, unknown>)[sessionIdField]
+                    : undefined,
+                  traceparent: ctx.requestHeader.get("traceparent") ?? undefined,
+                  ok,
+                  ...timings,
+                  preflightMs,
+                  forwardMs: elapsedMs(forwardStart),
+                },
+                "passthrough: stage timings",
+              );
+            }
           }
           copyHeaders(res.header, ctx.responseHeader);
           copyHeaders(res.trailer, ctx.responseTrailer);
@@ -317,7 +349,9 @@ export function registerPassthrough(
             // Same header-scrubbing rationale as the unary case above.
             upstreamHeaders(ctx.requestHeader),
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            (async function* () { yield req as any; })(),
+            (async function* () {
+              yield req as any;
+            })(),
             ctx.values,
           );
           copyHeaders(res.header, ctx.responseHeader);

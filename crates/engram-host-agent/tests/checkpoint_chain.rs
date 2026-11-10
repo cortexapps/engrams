@@ -44,9 +44,7 @@ use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit,
 use engram_host_agent::checkpoint::CheckpointRecord;
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
-use engram_sandbox_firecracker::{
-    FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
-};
+use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use futures::StreamExt;
 
 #[tokio::test]
@@ -116,7 +114,7 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agent);
     cfg.bundle_dir = staged.bundle_dir.clone();
     cfg.net_pool = None;
-    cfg.restore_mode = RestoreMode::File;
+    common::resume_through_uffd(&mut cfg, &work.path().join("blob"));
     // ADR 0028: dirty tracking armed — required for Diff captures.
     cfg.track_dirty_pages = true;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
@@ -226,7 +224,7 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
 
     // ---- 6. Restore from the DIFF checkpoint on the same backend ----
     // File mode materializes memory.bin from the v2 sparse-rechunk
-    // manifest — the byte-fidelity proof for update_for_dirty_ranges_sparse
+    // manifest — the byte-fidelity proof for update_for_dirty_ranges_sparse_from
     // against real guest memory. Destroy first (frees the canonical
     // vsock path for the restored sibling).
     pooled.destroy(sandbox).await.expect("destroy original");
@@ -254,7 +252,7 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     // ---- 7. ADR 0038 B2: the restored sandbox's chain was seeded
     // SPARSE on resume (manifest-only, no rolling memfile). Its NEXT
     // checkpoint must therefore be a DIFF via
-    // `update_for_dirty_ranges_sparse` — NOT a fresh Full. This is the
+    // `update_for_dirty_ranges_sparse_from` — NOT a fresh Full. This is the
     // production path (UFFD idle→active resume → first checkpoint) the
     // 60 s hang lived on; pre-fix it would have re-Full-seeded (a new
     // manifest_id) and faulted the whole working set in.
@@ -281,7 +279,7 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
 
     // ---- 8. Restore from the SPARSE-built checkpoint and verify all
     // three markers survive byte-identical — the end-to-end byte-
-    // fidelity proof for `update_for_dirty_ranges_sparse` against real
+    // fidelity proof for `update_for_dirty_ranges_sparse_from` against real
     // guest memory (fetch-prev-chunk + apply-diff == current).
     pooled.destroy(restored).await.expect("destroy restored");
     let restored2 = SandboxId::new();

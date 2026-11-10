@@ -413,6 +413,18 @@ mod tests {
         );
     }
 
+    /// The register POST probes after `grpc_server::bind` and before the
+    /// server runs: a bound listener must already pass.
+    #[tokio::test]
+    async fn grpc_self_connect_ok_once_bound_before_the_server_runs() {
+        let incoming = crate::grpc_server::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = incoming.local_addr().unwrap();
+        assert_eq!(
+            probe_grpc_self_connect(Some(addr)).await,
+            CapStatus::Ok(None)
+        );
+    }
+
     #[tokio::test]
     async fn grpc_self_connect_failed_against_a_closed_port() {
         // Bind then immediately drop to free the port but make a

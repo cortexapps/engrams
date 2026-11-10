@@ -16,13 +16,12 @@
 //!   handshake), sends a `WireExecRequest`, and translates the
 //!   streamed `WireExecEvent`s back into `engram_core::ExecEvent`s.
 //!
-//! `restore` has two memory backends. A fresh create always uses
-//! `RestoreMode::File`: FC maps the per-image memfile privately, no
-//! extra process, residency is reclaimable page cache (ADR 0092). A
-//! resume follows `FirecrackerConfig::restore_mode`: `Uffd` (lazy paging
-//! via the `engram-uffd-handler` companion process against the
-//! substrate base shm — production) or `File` (tests). Both are
-//! verified by `tests/snapshot.rs` and `tests/snapshot_uffd.rs`.
+//! `restore` has two memory backends. A fresh create maps the per-image
+//! memfile privately (FC's File backend): no extra process, residency is
+//! reclaimable page cache (ADR 0092). A resume pages memory in lazily
+//! (FC's Uffd backend) through the `engram-uffd-handler` companion
+//! process, from the snapshot's chunked memory manifest.
+//! `tests/file_restore_shared_rss.rs` and `tests/snapshot.rs` verify them.
 //!
 //! End-to-end `tests/exec_real_vm.rs` bakes a debian-slim rootfs with
 //! a static-musl `engram-agentd` exec'd out of its bundle slot (ADR 0080),
@@ -426,19 +425,6 @@ fn pool_for_slot(pool: std::net::Ipv4Addr, slot: u32) -> std::net::Ipv4Addr {
     std::net::Ipv4Addr::new(o[0], second, 0, 0)
 }
 
-/// ADR 0045 C2 (E2B fold): per-jail working-set trace dump filename —
-/// the uffd-handler's fault-order hot set, read best-effort by the
-/// migration capture for the `hot_chunks` rider.
-pub const WORKING_SET_TRACE_FILE: &str = "working-set-trace.json";
-
-/// ADR 0019 / telemetry restoration (#526): per-jail prefault-
-/// effectiveness snapshot filename, written by the uffd-handler as a
-/// sibling of [`WORKING_SET_TRACE_FILE`] in the same jail dir. Must
-/// stay in sync with `engram_uffd_handler::runtime::PREFAULT_STATS_FILE`
-/// (duplicated, not shared, by design — the two binaries don't depend
-/// on each other; the filename is the contract).
-pub const PREFAULT_STATS_FILE: &str = "prefault-stats.json";
-
 /// Per-jail file where the uffd-handler records the base shm file it
 /// opened (empty: none). The Firecracker load names exactly that file.
 const UFFD_BASE_SHM_ACK_FILE: &str = "uffd-base-shm.ack";
@@ -474,14 +460,15 @@ async fn read_base_shm_ack(
 /// (Sealed/DrainProgress/DrainDone/PeerLost), bound in the jail dir.
 pub const UFFD_CONTROL_SOCK_FILE: &str = "uffd-control.sock";
 
+/// The peer-mode handler's record of the chunks the source supplied,
+/// in the jail dir beside [`UFFD_CONTROL_SOCK_FILE`]. It exists under
+/// this name only once the drain is done.
+pub const POST_COPY_SEALED_FILE: &str = "postcopy-sealed.bin";
+
 /// ADR 0045 C2: the marker the destination's prestage writes into the
 /// snapshot dir to arm a POST-COPY restore (peer-mode handler spawn,
 /// state.bin appears late via the fetch poller).
 pub const MIGRATION_PEER_FILE: &str = "migration-peer.json";
-
-/// The final source hot trace, staged by the destination poller in the
-/// snapshot directory. The handler reads this advisory file concurrently with drain.
-pub const MIGRATION_HOT_TRACE_FILE: &str = "migration-hot-trace.json";
 
 /// ADR 0045 C2: `migration-peer.json` content.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -519,9 +506,8 @@ pub struct FirecrackerConfig {
     /// `firecracker` binary on PATH or absolute path. Override for
     /// testing or when a different build is required.
     pub firecracker_bin: PathBuf,
-    /// Path to the UFFD handler binary (engram-uffd-handler). Used
-    /// when `restore_mode == Uffd`. Defaults to `engram-uffd-handler`
-    /// (resolved via PATH).
+    /// Path to the UFFD handler binary that every resume spawns.
+    /// Defaults to `engram-uffd-handler` (resolved via PATH).
     pub uffd_handler_bin: PathBuf,
     /// ADR 0045 unified memory substrate (v2b). When set, Uffd-mode
     /// restores back guest memory `MAP_PRIVATE` on a per-template base
@@ -532,11 +518,6 @@ pub struct FirecrackerConfig {
     /// `UFFDIO_CONTINUE`. MUST point at a tmpfs/shmem mount (MINOR
     /// faults are shmem-only). `None` ⇒ stock anonymous Uffd restore.
     pub uffd_base_dir: Option<PathBuf>,
-    /// How to wire memory on a RESUME restore (a fresh create is always
-    /// File, ADR 0092). File mode maps memory.bin privately (no extra
-    /// processes). Uffd mode spawns engram-uffd-handler and serves pages
-    /// on demand (requires Linux + the handler binary on the host).
-    pub restore_mode: RestoreMode,
     /// ADR 0028: arm KVM dirty-page tracking on every VM — cold
     /// creates via `MachineConfig.track_dirty_pages`, restores via
     /// `enable_diff_snapshots` at `snapshot/load` — so periodic
@@ -580,15 +561,6 @@ pub struct FirecrackerConfig {
     /// TCP port for the session-scoped guest gateway. Iptables redirects guest
     /// 169.254.169.254:80 here for native services and compatibility adapters.
     pub guest_gateway_port: Option<u16>,
-    /// ADR 0007 Phase 5: this host's stable `HostId`. Stamped on
-    /// the FC sidecar JSON at snapshot time (so cross-host restore
-    /// knows which host's working-set trace to prefault) AND
-    /// passed to the UFFD handler at restore time as
-    /// `--publish-trace-host` (so the recorder publishes this
-    /// host's trace under the right key). `None` keeps the
-    /// pre-Phase-5 behaviour: traces aren't recorded or replayed,
-    /// every restore pays full first-fault cost.
-    pub host_id: Option<engram_core::HostId>,
     /// ADR 0007 Phase 5: NVMe-backed chunk cache dir handed to
     /// `engram-uffd-handler` as `--cache-root`. `None` falls back
     /// to the handler's compiled-in default
@@ -666,26 +638,6 @@ pub fn cpu_template_from_env() -> Option<String> {
         Err(_) => None,
         Ok(s) if s.is_empty() || s.eq_ignore_ascii_case("none") => None,
         Ok(s) => Some(s),
-    }
-}
-
-/// ADR 0020 Route B / ADR 0039: pick the *idle-resume* memory backend
-/// from `ENGRAM_FC_RESTORE_MODE` (`uffd` | `file`). **Defaults to `uffd`**
-/// (ADR 0039 — UFFD lazy-fault is the one true resume path; cross-host
-/// idle-resume can't rely on a resident image, so File there would be a
-/// synchronous multi-GB reconstruct). `file` is the explicit opt-out
-/// (no chunk store / no `/dev/userfaultfd`). Because this is now the
-/// default, the Helm chart no longer needs to set the env. `uffd`
-/// requires `engram-uffd-handler` on PATH (or `uffd_handler_bin` set)
-/// and `/dev/userfaultfd` accessible to the host-agent.
-pub fn restore_mode_from_env() -> RestoreMode {
-    match std::env::var("ENGRAM_FC_RESTORE_MODE") {
-        Ok(s) if s.eq_ignore_ascii_case("file") => RestoreMode::File,
-        Ok(s) if !s.is_empty() && !s.eq_ignore_ascii_case("uffd") => {
-            tracing::warn!(value = %s, "unrecognised ENGRAM_FC_RESTORE_MODE; defaulting to uffd");
-            RestoreMode::Uffd
-        }
-        _ => RestoreMode::Uffd,
     }
 }
 
@@ -799,20 +751,6 @@ impl std::fmt::Display for ReattachError {
 
 impl std::error::Error for ReattachError {}
 
-/// Backing-memory strategy for `restore`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RestoreMode {
-    /// `mem_backend = { backend_type: "File", ... }`: FC maps the memory
-    /// file `MAP_PRIVATE`; pages fault in from the page cache and guest
-    /// writes are copy-on-write. The only backend for a fresh create
-    /// (ADR 0092: the per-image memfile's residency is reclaimable).
-    File,
-    /// `mem_backend = { backend_type: "Uffd", ... }`. Lazy — pages
-    /// stream in on demand via a `engram-uffd-handler` process the
-    /// backend spawns alongside firecracker.
-    Uffd,
-}
-
 impl FirecrackerConfig {
     /// Convenience constructor for production wiring: just the kernel
     /// path; everything else uses defaults.
@@ -835,10 +773,8 @@ impl FirecrackerConfig {
             firecracker_bin: PathBuf::from("firecracker"),
             uffd_handler_bin: PathBuf::from("engram-uffd-handler"),
             uffd_base_dir: None,
-            restore_mode: RestoreMode::File,
             track_dirty_pages: false,
             balloon: std::env::var("ENGRAM_FC_BALLOON").map_or(true, |v| v != "0"),
-            host_id: None,
             uffd_cache_root: None,
             uffd_substrate_sock: None,
             uffd_blob_root: None,
@@ -892,9 +828,8 @@ impl Drop for AgentReadiness {
 /// over the `destroy` kill window, where the post-removal teardown also
 /// runs in a detached `tokio::spawn` ([`destroy_teardown`]) so a
 /// cancelled `destroy` can't orphan the VM.
-/// `uffd_handler` is `Some` only for sandboxes restored via
-/// `RestoreMode::Uffd`; it lives as long as the VM does and serves
-/// page faults from memory.bin.
+/// `uffd_handler` is `Some` only for resumed sandboxes; it lives as
+/// long as the VM does and serves its page faults.
 struct LiveSandbox {
     state: SandboxState,
     /// `Some` for sandboxes created or restored within this
@@ -1015,35 +950,13 @@ struct FcSnapshotManifest {
     #[serde(default)]
     format: String,
     /// ADR 0007 / Phase 5: chunked memory manifest ref. Populated by
-    /// `PooledBackend::snapshot` after FC writes memory.bin; the
-    /// chunked UFFD restore path reads it to wire the handler. When
-    /// `None` (FC backend ran without `PooledBackend` chunking), UFFD
-    /// restore mode refuses to start — the operator must either wrap
-    /// with PooledBackend+chunk_store or switch to RestoreMode::File.
+    /// `PooledBackend::snapshot` after FC writes memory.bin; a resume
+    /// serves its memory from it and refuses to start without it.
     #[serde(default)]
     memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
-    /// ADR 0007 / Phase 5: hint about whose working-set trace to
-    /// prefault on the restoring host. Set to the snapshotting
-    /// host's `HostId` so cross-host restore can ask
-    /// `traces/<manifest_id>/<this_hint>.json` for the chunks
-    /// the original host knew were hot. `None` skips trace replay
-    /// (pre-Phase-5 snapshots or hosts that didn't have a
-    /// `HostId` configured on FC). Note: this is a HINT — the
-    /// recorder on the restoring host still publishes its own
-    /// trace under its own host id, so subsequent restores on
-    /// this host use the local recording.
-    #[serde(default)]
-    trace_host_hint: Option<engram_core::HostId>,
-    /// Tier 2 (resume-prefault fix): a **session-stable** id (the session
-    /// id) that keys this session's working-set trace across ALL of its
-    /// checkpoints. Unlike `memory_manifest` (a fresh `ManifestRef` minted
-    /// every snapshot), this is constant for the session's life, so the
-    /// handler's prefault-replay on resume finds the trace the prior life
-    /// published (`traces/<trace_lineage_id>/canonical.json`) instead of
-    /// looking under a per-checkpoint manifest id that never matches.
-    /// Stamped by the host-agent at snapshot-finish. `None` on base
-    /// snapshots and pre-Tier-2 checkpoints (the handler then falls back to
-    /// the per-host manifest key — today's always-miss-on-resume behavior).
+    /// The session id, under which the session's first-touch prefix is
+    /// published. Stamped by the host-agent at snapshot-finish; `None` on
+    /// base snapshots.
     #[serde(default)]
     trace_lineage_id: Option<engram_core::SessionId>,
     /// ADR 0014 M1.11: the exact `path_on_host` the bake's FC
@@ -1152,15 +1065,13 @@ struct RestoreInputs {
     /// The disks this residence attaches; the sidecar's paths name the
     /// source residence's.
     disks: SessionDisks,
-    /// Fresh-create flavor: swap pinned aux bundles to this host's current
-    /// generation, load-paused (ADR 0035 §3).
-    swap_aux_to_current: bool,
+    /// Fresh-create flavor: map the image's memory file, and swap pinned
+    /// aux bundles to this host's current generation, load-paused (ADR
+    /// 0035 §3). A resume serves memory through the UFFD handler.
+    fresh: bool,
     /// Per-session skills assigned to reserved slots, patched in
     /// load-paused. Empty on resume.
     selected_mounts: Vec<AuxRoDrive>,
-    /// The memory backend for THIS restore: base-create may be File while
-    /// resume follows the host's configured mode.
-    restore_mode: RestoreMode,
     /// The image's base memory manifest. `Some` ⇒ substrate restores
     /// continue base-identical pages against the shared per-image base
     /// shm; `None` ⇒ canonical == session.
@@ -1361,26 +1272,36 @@ impl FirecrackerBackend {
         self.sandboxes.get(&id).map(|r| r.state.clone())
     }
 
-    /// The effective memory backend for one restore. `fresh` (the
-    /// `swap_aux_to_current` flavor) is a base `session.create` and is
-    /// always File: FC maps the per-image memfile privately, so its
-    /// residency is reclaimable page cache (ADR 0092). Idle-resume
-    /// (`fresh == false`) follows `restore_mode` — Uffd against the
-    /// substrate base shm in production, because `UFFDIO_CONTINUE` is
-    /// shmem-only and a resume's divergent pages come from its own
-    /// chain. Neither backend is configurable per fresh create; the
-    /// retired `ENGRAM_FC_FRESH_RESTORE_MODE` knob's job is fixed.
-    fn effective_restore_mode(&self, fresh: bool) -> RestoreMode {
-        if fresh {
-            RestoreMode::File
-        } else {
-            self.config.restore_mode
+    /// Commit a started VM: write its `sandbox.json` (if FC is still
+    /// running), move its processes into the node cgroup, then build its
+    /// entry with `live` and make it listable. `list` therefore never shows
+    /// a sandbox whose manifest and migration role are not on disk. A
+    /// failed write returns before `live` runs, so the guards `live` would
+    /// disarm still fire.
+    fn commit_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+        record: Option<sandbox_manifest::SandboxManifest>,
+        live: impl FnOnce() -> LiveSandbox,
+    ) -> Result<(), SandboxError> {
+        if let Some(record) = record {
+            let path = sandbox_manifest::manifest_path(&self.work_dir, sandbox_id);
+            sandbox_manifest::write_manifest(&path, &record)
+                .map_err(|e| SandboxError::Vm(format!("write sandbox manifest: {e}").into()))?;
+            // FC and its handler must survive a host-agent pod restart's
+            // `cgroup.kill`: a killed handler leaves the guest
+            // page-faulting forever.
+            let mut pids = vec![record.firecracker.process.pid];
+            pids.extend(record.uffd_handler.as_ref().map(|h| h.pid));
+            place_vm_in_node_cgroup(self.config.vm_cgroup_parent.as_deref(), sandbox_id, &pids);
         }
+        self.sandboxes.insert(sandbox_id, live());
+        Ok(())
     }
 
     /// Shared body of [`SandboxBackend::restore`] (resume flavor,
-    /// `swap_aux_to_current = false`) and
-    /// [`SandboxBackend::restore_fresh`] (fresh-create flavor, `true`).
+    /// `fresh = false`) and [`SandboxBackend::restore_fresh`]
+    /// (fresh-create flavor, `true`).
     /// See ADR 0035 §3 for why the flavors attach aux bundles
     /// differently.
     async fn restore_with(
@@ -1388,7 +1309,7 @@ impl FirecrackerBackend {
         sandbox_id: SandboxId,
         metadata: SnapshotMetadata,
         disks: Option<SessionDisks>,
-        swap_aux_to_current: bool,
+        fresh: bool,
         selected_mounts: Vec<AuxRoDrive>,
     ) -> Result<(), SandboxError> {
         let disks = disks.ok_or_else(|| {
@@ -1412,20 +1333,10 @@ impl FirecrackerBackend {
         }
 
         let jail_dir = self.work_dir.join(sandbox_id.to_string());
-        // A migration restore has no memory.bin: its memory is the staged
-        // session manifest plus cached chunks, so it is UFFD whatever the
-        // host's configured mode says.
-        let restore_mode = if src.join("migration-session-manifest.json").exists() {
-            RestoreMode::Uffd
-        } else {
-            self.effective_restore_mode(swap_aux_to_current)
-        };
-
         let inputs = RestoreInputs {
             disks,
-            swap_aux_to_current,
+            fresh,
             selected_mounts,
-            restore_mode,
             base_memory_manifest: metadata.base_memory_manifest,
         };
         match self
@@ -2098,20 +2009,6 @@ impl FirecrackerBackend {
         Ok((socket, child, guard))
     }
 
-    /// Spawn `engram-uffd-handler` in ADR 0020 chunk-native mode and
-    /// wait until it's listening on `uffd_uds`. `canonical_ref` +
-    /// `session_ref` identify the manifests it reads from the chunk
-    /// store; it serves every fault from chunks (no `memory.bin`).
-    /// `prefault_trace_host` optionally points at a host's prior
-    /// working-set recording for REAP-style replay; `publish_trace_host`
-    /// names the host the recorder publishes the new trace under on
-    /// clean shutdown.
-    ///
-    /// Stdout/stderr go into the jail dir's `uffd-handler.log` so a
-    /// snapshot-restore failure has a recoverable diagnostic.
-    /// Returns the live `Child` so the caller can hold it for the
-    /// VM's lifetime.
-    #[allow(clippy::too_many_arguments)]
     /// ADR 0045 substrate (v2b): the per-template base shm path for a
     /// canonical manifest, or `None` when the substrate is off. The
     /// handler spawn passes it as `--base-shm`; the FC load maps only what
@@ -2126,26 +2023,28 @@ impl FirecrackerBackend {
             .map(|dir| uffd_base_path_in(dir, canonical_ref))
     }
 
-    #[tracing::instrument(name = "fc.spawn_uffd_handler", skip_all)]
-    // 8 args: the migration manifest file is a restore-time input
-    // orthogonal to the trace/publish hosts; a params struct is the
-    // cleanup when the next arg arrives.
+    /// Spawn `engram-uffd-handler` in ADR 0020 chunk-native mode and
+    /// wait until it's listening on `uffd_uds`. `canonical_ref` +
+    /// `session_ref` identify the manifests it reads from the chunk
+    /// store; it serves every fault from chunks (no `memory.bin`).
+    ///
+    /// Stdout/stderr go into the jail dir's `uffd-handler.log` so a
+    /// snapshot-restore failure has a recoverable diagnostic.
+    /// Returns the live `Child` so the caller can hold it for the
+    /// VM's lifetime.
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(name = "fc.spawn_uffd_handler", skip_all)]
     async fn spawn_uffd_handler(
         &self,
         uffd_uds: &Path,
         canonical_ref: engram_core::types::manifest::ManifestRef,
         session_ref: engram_core::types::manifest::ManifestRef,
-        // ADR 0045 C1: when a migration pre-staged the (not-yet-durable)
-        // session manifest as a local JSON file, the handler reads it
-        // from disk instead of the blob store.
+        // Local copies of the manifests (a migration's not-yet-durable
+        // session manifest, or the host's staged copies): the handler
+        // reads them from disk instead of the blob store.
+        canonical_manifest_json: Option<&Path>,
         session_manifest_json: Option<&Path>,
-        prefault_trace_host: Option<uuid::Uuid>,
-        publish_trace_host: Option<uuid::Uuid>,
-        // Tier 2 (resume-prefault fix): the session-stable trace key (the
-        // session id). When set, the handler keys prefault-replay + publish
-        // by this id under the canonical variant, so a resumed session finds
-        // the trace its own prior life recorded.
+        // The session id: the handler reads its first-touch prefix.
         trace_key: Option<uuid::Uuid>,
         jail_dir: &Path,
         // ADR 0045 C2: post-copy peer mode. The handler dials the
@@ -2169,6 +2068,9 @@ impl FirecrackerBackend {
             .arg(canonical_ref.to_string())
             .arg("--session-manifest")
             .arg(session_ref.to_string());
+        if let Some(path) = canonical_manifest_json {
+            cmd.arg("--canonical-manifest-json").arg(path);
+        }
         if let Some(path) = session_manifest_json {
             cmd.arg("--session-manifest-json").arg(path);
         }
@@ -2205,41 +2107,13 @@ impl FirecrackerBackend {
                 .arg("--base-shm-ack")
                 .arg(ack);
         }
-        // The destination poller atomically stages the capture-time rider in
-        // the snapshot directory. Hint reads run independently: neither the drain
-        // nor the fault loop or Firecracker resume waits for this file.
-        let migration_hot_trace = if let Some(peer) = peer {
-            let dir = session_manifest_json
-                .and_then(Path::parent)
-                .ok_or_else(|| vm_err("post-copy requires a staged session manifest"))?;
-            Some(dir.join(&peer.hot_trace_file))
-        } else {
-            None
-        };
-        if let Some(path) = migration_hot_trace.as_ref() {
-            cmd.arg("--prefault-trace")
-                .arg(format!("file:{}", path.display()));
-        } else if let Some(host) = prefault_trace_host {
-            cmd.arg("--prefault-trace").arg(host.to_string());
-        }
-        if let Some(host) = publish_trace_host {
-            cmd.arg("--publish-trace-host").arg(host.to_string());
-        }
-        // Tier 2 (resume-prefault fix): the per-session stable trace key.
-        // Keyed under the canonical variant (`traces/<key>/canonical.json`)
-        // for both replay and publish, so life N's recorded working-set
-        // trace lands exactly where life N+1's resume looks — unlike the
-        // per-checkpoint `session_manifest.manifest_id`, which is minted
-        // fresh each snapshot and so always missed on resume.
         if let Some(key) = trace_key {
             cmd.arg("--trace-key").arg(key.to_string());
         }
-        // ADR 0045 C2 (E2B fold): production spawns default to a
-        // PER-JAIL trace file — the migration capture reads it to ship
-        // the `hot_chunks` rider (the publish-trace-host channel only
-        // lands at handler EXIT, which is too late for a live move).
-        cmd.arg("--trace-output")
-            .arg(jail_dir.join(WORKING_SET_TRACE_FILE));
+        // The jail dir holds the first-touch record, which the migration
+        // capture reads for the `hot_chunks` rider and the host-agent
+        // publishes for the session's next restore.
+        cmd.arg("--report-dir").arg(jail_dir);
         if let Some(path) = self.config.uffd_blob_root.as_ref() {
             cmd.arg("--blob-root").arg(path);
         }
@@ -2248,6 +2122,16 @@ impl FirecrackerBackend {
             cmd.arg("--peer-export-id").arg(&peer.export_id);
             cmd.arg("--control-sock")
                 .arg(jail_dir.join(UFFD_CONTROL_SOCK_FILE));
+            cmd.arg("--sealed-output")
+                .arg(jail_dir.join(POST_COPY_SEALED_FILE));
+            // The destination poller stages the source's hot-set hint in
+            // the snapshot dir. Neither the drain nor the fault loop nor
+            // the Firecracker resume waits for this file.
+            let dir = session_manifest_json
+                .and_then(Path::parent)
+                .ok_or_else(|| vm_err("post-copy requires a staged session manifest"))?;
+            cmd.arg("--migration-hint")
+                .arg(dir.join(&peer.hot_trace_file));
             // Token via env: argv leaks on /proc/*/cmdline.
             cmd.env("ENGRAM_PEER_TOKEN", &peer.peer_token);
         }
@@ -2715,13 +2599,9 @@ impl FirecrackerBackend {
         // whose underlying VM is dead, defeating reconcile.
         let fc_pid = child.id();
 
-        // ADR 0009 §5 / ADR 0044 K2: write the per-sandbox on-disk
-        // manifest before handing control back, so the startup reattach
-        // pass can re-adopt this still-live FC after a host-agent
-        // restart. Cold create = host-root `network`, no netns, no uffd.
-        if let Some(pid) = fc_pid {
-            persist_sandbox_manifest(
-                &self.work_dir,
+        // Cold create = host-root `network`, no netns, no uffd.
+        let record = fc_pid.map(|pid| {
+            sandbox_manifest_for(
                 sandbox_id,
                 &state,
                 (pid, None),
@@ -2733,18 +2613,13 @@ impl FirecrackerBackend {
                 }),
                 None,
                 None,
-            )?;
-            // ADR 0044 K2: move FC into the node cgroup so a host-agent pod
-            // restart doesn't `cgroup.kill` it. Cold create = FC only.
-            place_vm_in_node_cgroup(self.config.vm_cgroup_parent.as_deref(), sandbox_id, &[pid]);
-        }
-
-        // FC is configured, started, and recorded in its manifest: the
-        // sandbox is now committed. Defuse the create-window backstop so
-        // the VM is fully decoupled from this host-agent's lifecycle.
-        fc_guard.disarm();
-        self.sandboxes.insert(
-            sandbox_id,
+            )
+        });
+        // Once FC is recorded in its manifest the sandbox is committed:
+        // defuse the create-window backstop so the VM is fully decoupled
+        // from this host-agent's lifecycle.
+        self.commit_sandbox(sandbox_id, record, || {
+            fc_guard.disarm();
             LiveSandbox {
                 state,
                 child: Some(child),
@@ -2761,8 +2636,8 @@ impl FirecrackerBackend {
                 agent_ready: agent_ready_rx,
                 vsock_epoch: tokio::sync::watch::channel(0).0,
                 started_at: Some(std::time::Instant::now()),
-            },
-        );
+            }
+        })?;
         if let Some(pid) = fc_pid {
             spawn_process_supervisor(
                 self.sandboxes.clone(),
@@ -3089,9 +2964,8 @@ impl FirecrackerBackend {
     ) -> Result<(), SandboxError> {
         let RestoreInputs {
             disks,
-            swap_aux_to_current,
+            fresh,
             selected_mounts,
-            restore_mode,
             base_memory_manifest,
         } = inputs;
         let state_path = snapshot_dir.join("state.bin");
@@ -3123,7 +2997,7 @@ impl FirecrackerBackend {
                     )));
                 }
             }
-            if swap_aux_to_current {
+            if fresh {
                 match self.read_bundle_stamp().await {
                     Ok(stamp) => {
                         for aux in &mut live_spec.aux_ro_drives {
@@ -3209,9 +3083,9 @@ impl FirecrackerBackend {
                 state_path.display()
             )));
         }
-        // UFFD mode faults pages from chunks through the handler and never
-        // reads memory.bin, which a cross-host receive does not stage.
-        if matches!(restore_mode, RestoreMode::File) && !mem_path.exists() {
+        // A fresh create maps memory.bin. A resume faults its pages from
+        // chunks through the handler, so a cross-host receive stages none.
+        if fresh && !mem_path.exists() {
             return Err(SandboxError::Snapshot(format!(
                 "snapshot memory.bin missing at {}",
                 mem_path.display()
@@ -3254,58 +3128,58 @@ impl FirecrackerBackend {
         };
 
         // The UFFD page-fault handler listens before `load_snapshot`
-        // connects; File mode has none.
+        // connects; a fresh create maps the memory file and has none.
         let leg_uffd = async {
-            match restore_mode {
-                RestoreMode::File => Ok::<_, SandboxError>(None),
-                RestoreMode::Uffd => {
-                    let session_ref = manifest.memory_manifest.ok_or_else(|| {
-                        SandboxError::Snapshot(
-                            "RestoreMode::Uffd requires manifest.memory_manifest".into(),
-                        )
-                    })?;
-                    // Base-identical pages continue against the shared
-                    // per-image base shm when the coordinator names it.
-                    let canonical_ref = base_memory_manifest.unwrap_or(session_ref);
-                    let uffd_uds = jail_dir.join("uffd.sock");
-                    let _ = tokio::fs::remove_file(&uffd_uds).await;
-                    // A migration destination stages the not-yet-durable
-                    // session manifest as a local file.
-                    let migration_manifest = snapshot_dir.join("migration-session-manifest.json");
-                    let migration_manifest =
-                        migration_manifest.exists().then_some(migration_manifest);
-                    // A post-copy destination also stages the peer spec: the
-                    // handler dials the source's page server.
-                    let peer_spec: Option<MigrationPeerSpec> = {
-                        let p = snapshot_dir.join(MIGRATION_PEER_FILE);
-                        match tokio::fs::read(&p).await {
-                            Ok(bytes) => Some(serde_json::from_slice(&bytes).map_err(|e| {
-                                SandboxError::Snapshot(format!("parse {MIGRATION_PEER_FILE}: {e}"))
-                            })?),
-                            Err(_) => None,
-                        }
-                    };
-                    // Prefault from the capture host's trace; publish this
-                    // host's own.
-                    let prefault_host = manifest.trace_host_hint.map(|hid| hid.as_uuid());
-                    let publish_host = self.config.host_id.map(|hid| hid.as_uuid());
-                    let trace_key = manifest.trace_lineage_id.map(|sid| sid.as_uuid());
-                    let (handler, uffd_guard) = self
-                        .spawn_uffd_handler(
-                            &uffd_uds,
-                            canonical_ref,
-                            session_ref,
-                            migration_manifest.as_deref(),
-                            prefault_host,
-                            publish_host,
-                            trace_key,
-                            jail_dir,
-                            peer_spec.as_ref(),
-                        )
-                        .await?;
-                    Ok(Some((handler, uffd_uds, uffd_guard)))
-                }
+            if fresh {
+                return Ok::<_, SandboxError>(None);
             }
+            let session_ref = manifest.memory_manifest.ok_or_else(|| {
+                SandboxError::Snapshot(
+                    "a resume needs the snapshot's chunked memory manifest, and this \
+                     snapshot has none"
+                        .into(),
+                )
+            })?;
+            // Base-identical pages continue against the shared
+            // per-image base shm when the coordinator names it.
+            let canonical_ref = base_memory_manifest.unwrap_or(session_ref);
+            let uffd_uds = jail_dir.join("uffd.sock");
+            let _ = tokio::fs::remove_file(&uffd_uds).await;
+            // A migration destination stages the not-yet-durable
+            // session manifest as a local file.
+            let migration_manifest = snapshot_dir.join("migration-session-manifest.json");
+            let migration_manifest = migration_manifest.exists().then_some(migration_manifest);
+            let staged = |r| {
+                let path = staged_manifest_path(snapshot_dir, sandbox_id, &r);
+                path.exists().then_some(path)
+            };
+            let session_json = migration_manifest.clone().or_else(|| staged(session_ref));
+            let canonical_json = staged(canonical_ref);
+            // A post-copy destination also stages the peer spec: the
+            // handler dials the source's page server.
+            let peer_spec: Option<MigrationPeerSpec> = {
+                let p = snapshot_dir.join(MIGRATION_PEER_FILE);
+                match tokio::fs::read(&p).await {
+                    Ok(bytes) => Some(serde_json::from_slice(&bytes).map_err(|e| {
+                        SandboxError::Snapshot(format!("parse {MIGRATION_PEER_FILE}: {e}"))
+                    })?),
+                    Err(_) => None,
+                }
+            };
+            let trace_key = manifest.trace_lineage_id.map(|sid| sid.as_uuid());
+            let (handler, uffd_guard) = self
+                .spawn_uffd_handler(
+                    &uffd_uds,
+                    canonical_ref,
+                    session_ref,
+                    canonical_json.as_deref(),
+                    session_json.as_deref(),
+                    trace_key,
+                    jail_dir,
+                    peer_spec.as_ref(),
+                )
+                .await?;
+            Ok(Some((handler, uffd_uds, uffd_guard)))
         };
 
         let (setup_res, uffd_res) = tokio::join!(leg_setup, leg_uffd);
@@ -3553,9 +3427,10 @@ impl FirecrackerBackend {
             // What guest RAM is a private mapping of (Uffd: the base the
             // load named, None for anonymous RAM), in the absolute,
             // symlink-resolved form `/proc/<pid>/maps` prints.
-            memory_backing: match restore_mode {
-                RestoreMode::File => Some(mem_path.clone()),
-                RestoreMode::Uffd => uffd_base,
+            memory_backing: if fresh {
+                Some(mem_path.clone())
+            } else {
+                uffd_base
             }
             .map(canonical_backing_path),
         };
@@ -3564,14 +3439,14 @@ impl FirecrackerBackend {
         // agentd was captured running: it never dials the ready port, so
         // the watch starts true.
         let (_ready_tx, ready_rx) = tokio::sync::watch::channel(true);
-        // Persist the role while all restore guards remain armed. A failed
-        // write must kill the processes and release the network namespace.
-        if let Some(fc_pid_u) = fc_pid {
-            persist_sandbox_manifest(
-                &self.work_dir,
+        // The guards stay armed until the manifest (with the migration role)
+        // is durable: a failed write kills the processes and releases the
+        // network namespace.
+        let record = fc_pid.map(|pid| {
+            sandbox_manifest_for(
                 sandbox_id,
                 &state,
-                (fc_pid_u, uffd_pid),
+                (pid, uffd_pid),
                 None, // warm restores run in a per-VM netns, not host-root
                 netns_guard
                     .setup
@@ -3585,21 +3460,13 @@ impl FirecrackerBackend {
                         snat_cidr_network: ns.snat_cidr.network(),
                     }),
                 post_copy.then_some(sandbox_manifest::ROLE_POST_COPY_DEST),
-            )?;
-            // Both must survive a host-agent restart: a killed handler
-            // leaves the guest page-faulting forever.
-            let mut pids = vec![fc_pid_u];
-            pids.extend(uffd_pid);
-            place_vm_in_node_cgroup(self.config.vm_cgroup_parent.as_deref(), sandbox_id, &pids);
-        }
-        // The manifest is durable. Transfer resource ownership to the live map.
-        fc_guard.disarm();
-        if let Some(g) = uffd_guard.as_mut() {
-            g.disarm();
-        }
-        let netns_setup = netns_guard.into_committed();
-        self.sandboxes.insert(
-            sandbox_id,
+            )
+        });
+        self.commit_sandbox(sandbox_id, record, || {
+            fc_guard.disarm();
+            if let Some(g) = uffd_guard.as_mut() {
+                g.disarm();
+            }
             LiveSandbox {
                 state,
                 child: Some(child),
@@ -3607,7 +3474,7 @@ impl FirecrackerBackend {
                 uffd_handler,
                 uffd_pid,
                 net: net_setup,
-                netns: netns_setup,
+                netns: netns_guard.into_committed(),
                 guest_endpoints: parking_lot::Mutex::new(None),
                 #[cfg(target_os = "linux")]
                 parked: false,
@@ -3615,8 +3482,8 @@ impl FirecrackerBackend {
                 agent_ready: ready_rx.into(),
                 vsock_epoch: tokio::sync::watch::channel(0).0,
                 started_at: Some(std::time::Instant::now()),
-            },
-        );
+            }
+        })?;
         if let Some(pid) = fc_pid {
             spawn_process_supervisor(
                 self.sandboxes.clone(),
@@ -3639,7 +3506,7 @@ impl FirecrackerBackend {
             %sandbox_id,
             jail = %jail_dir.display(),
             from = %snapshot_dir.display(),
-            mode = ?restore_mode,
+            fresh,
             "firecracker microVM restored from snapshot",
         );
         Ok(())
@@ -3995,22 +3862,20 @@ fn process_record(pid: u32) -> sandbox_manifest::ProcessRecord {
     }
 }
 
-/// Write the per-sandbox `sandbox.json` so the startup reattach pass can
-/// re-adopt this still-live VM after a host-agent restart (ADR 0044 K2).
-/// Called at the end of BOTH `create()` and `restore()` — the only
-/// difference is host-root `network` vs per-VM `netns`, and whether a
-/// uffd handler is present. A write failure aborts the guarded operation.
-fn persist_sandbox_manifest(
-    work_dir: &std::path::Path,
+/// The per-sandbox `sandbox.json` the startup reattach pass re-adopts a
+/// still-live VM from after a host-agent restart (ADR 0044 K2). `create()`
+/// and `restore()` differ only in host-root `network` vs per-VM `netns`,
+/// whether a uffd handler is present, and the migration role.
+fn sandbox_manifest_for(
     sandbox_id: SandboxId,
     state: &SandboxState,
     process_ids: (u32, Option<u32>),
     network: Option<sandbox_manifest::NetworkRecord>,
     netns: Option<sandbox_manifest::NetnsRecord>,
     migration_role: Option<&str>,
-) -> Result<(), SandboxError> {
+) -> sandbox_manifest::SandboxManifest {
     let (fc_pid, uffd_pid) = process_ids;
-    let m = sandbox_manifest::SandboxManifest {
+    sandbox_manifest::SandboxManifest {
         schema_version: sandbox_manifest::SCHEMA_VERSION,
         sandbox_id,
         backend: sandbox_manifest::BACKEND_FIRECRACKER.to_string(),
@@ -4028,10 +3893,7 @@ fn persist_sandbox_manifest(
         uffd_handler: uffd_pid.map(process_record),
         memory_backing: state.memory_backing.clone(),
         migration_role: migration_role.map(str::to_owned),
-    };
-    let path = sandbox_manifest::manifest_path(work_dir, sandbox_id);
-    sandbox_manifest::write_manifest(&path, &m)
-        .map_err(|e| SandboxError::Vm(format!("write sandbox manifest: {e}").into()))
+    }
 }
 
 /// ADR 0044 K2: move the VM's processes (FC + any uffd-handler) into a
@@ -4861,6 +4723,18 @@ enum SocketProbe {
     Accepting,
 }
 
+/// Where a host stages a copy of the memory manifest `r` beside a snapshot,
+/// so the UFFD handler of `sandbox_id` reads it from disk instead of the
+/// blob store. Each restore has its own copy, so restores of one snapshot
+/// never write or remove a file another restore reads.
+pub fn staged_manifest_path(
+    snapshot_dir: &Path,
+    sandbox_id: SandboxId,
+    r: &engram_core::types::manifest::ManifestRef,
+) -> PathBuf {
+    snapshot_dir.join(format!("manifest-{r}.{sandbox_id}.json"))
+}
+
 /// Wait until either:
 ///   - the socket is ready per `probe` (success), OR
 ///   - the spawned process exits (failure — surface its exit status), OR
@@ -4894,7 +4768,9 @@ async fn wait_for_socket(
                 budget
             ));
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // A restore waits on this twice, so the poll is short: each probe
+        // costs one syscall, and a long poll adds its interval to the restore.
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
@@ -4914,6 +4790,10 @@ async fn read_tail(path: &Path, max: u64) -> Option<String> {
 
 #[async_trait]
 impl SandboxBackend for FirecrackerBackend {
+    /// Every capture writes `state.bin` and the guest memory.
+    fn captures_guest_memory(&self) -> bool {
+        true
+    }
     async fn create(&self, sandbox_id: SandboxId, spec: SandboxSpec) -> Result<(), SandboxError> {
         let jail_dir = self.work_dir.join(sandbox_id.to_string());
 
@@ -5086,35 +4966,13 @@ impl SandboxBackend for FirecrackerBackend {
         self.config.track_dirty_pages
     }
 
-    /// ADR 0045 C2 (E2B fold): the per-jail trace dump the spawn wires
-    /// via `--trace-output`.
-    fn working_set_trace_path(&self, id: SandboxId) -> Option<PathBuf> {
+    /// The first-touch record the handler writes in its `--report-dir`.
+    fn first_touch_path(&self, id: SandboxId) -> Option<PathBuf> {
         Some(
             self.work_dir
                 .join(id.to_string())
-                .join(WORKING_SET_TRACE_FILE),
+                .join(engram_chunk_store::FirstTouch::FILE),
         )
-    }
-
-    /// ADR 0019 / telemetry restoration (#526): the per-jail prefault
-    /// stats sibling of `working_set_trace_path`, written by the
-    /// uffd-handler at the end of `prefault_from_trace` (or, for the
-    /// no-trace case, from its own startup path).
-    ///
-    /// `None` unless a uffd-handler actually exists for this sandbox
-    /// (`uffd_pid.is_some()` — populated for `RestoreMode::Uffd`
-    /// restores AND pidfd-reattached Uffd sandboxes, ADR 0044 K2).
-    /// `RestoreMode::File` restores (the default when there's no
-    /// `chunk_store`, and the documented `ENGRAM_FC_RESTORE_MODE=file`
-    /// fleet knob) never spawn a handler, so nothing can ever write
-    /// this file — returning `Some` there would make every File-mode
-    /// resume alarm as `stats_missing`. Trait contract: `None` = "this
-    /// backend/sandbox has no per-sandbox prefault detector" (mirrors
-    /// the VZ/Process default).
-    fn prefault_stats_path(&self, id: SandboxId) -> Option<PathBuf> {
-        let live = self.sandboxes.get(&id)?;
-        live.uffd_pid?;
-        Some(self.work_dir.join(id.to_string()).join(PREFAULT_STATS_FILE))
     }
 
     /// ADR 0045 C2: trait forwarding to the inherent composition (the
@@ -5381,14 +5239,8 @@ impl SandboxBackend for FirecrackerBackend {
         metadata: SnapshotMetadata,
         disks: Option<SessionDisks>,
     ) -> Result<(), SandboxError> {
-        self.restore_with(
-            id,
-            metadata,
-            disks,
-            /*swap_aux_to_current=*/ false,
-            Vec::new(),
-        )
-        .await
+        self.restore_with(id, metadata, disks, /*fresh=*/ false, Vec::new())
+            .await
     }
 
     async fn restore_fresh(
@@ -5401,14 +5253,8 @@ impl SandboxBackend for FirecrackerBackend {
         // ADR 0035 §3 + 0055: fresh creates track the host's current bundle
         // generations AND patch the per-session selected skills into reserved
         // slots; both swaps happen load-paused inside restore_in_jail.
-        self.restore_with(
-            id,
-            metadata,
-            disks,
-            /*swap_aux_to_current=*/ true,
-            selected_mounts,
-        )
-        .await
+        self.restore_with(id, metadata, disks, /*fresh=*/ true, selected_mounts)
+            .await
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -6023,11 +5869,7 @@ impl SandboxBackend for FirecrackerBackend {
     }
 
     fn restore_memory_is_lazy_for(&self, fresh: bool) -> bool {
-        // ADR 0022 Option A: mirror `effective_restore_mode` exactly so
-        // the materialize decision can't drift from the load decision —
-        // base-create under File materializes the (shared) memfile;
-        // resume under UFFD stays lazy.
-        matches!(self.effective_restore_mode(fresh), RestoreMode::Uffd)
+        !fresh
     }
 
     async fn guest_memory_stats(&self) -> Option<engram_core::traits::sandbox::GuestMemoryStats> {
@@ -6552,10 +6394,7 @@ async fn destroy_teardown(
     // holds via SCM_RIGHTS doesn't auto-close — `read_event()`
     // blocks indefinitely. Send SIGTERM so the kernel-default
     // handler kills the process; if that doesn't take effect
-    // within a short window, escalate to SIGKILL. ADR 0014 M1.14
-    // relies on the handler having already flushed `--trace-output`
-    // by the time we get here, so the write must happen earlier
-    // (the runtime dumps after the recorder window closes).
+    // within a short window, escalate to SIGKILL.
     // We own a `Child` for a handler spawned in THIS host-agent
     // generation; for a pidfd-reattached one we only have the pid
     // (`uffd_pid`, ADR 0044 K2). Either way: SIGTERM, then escalate to
@@ -6867,10 +6706,8 @@ impl FirecrackerBackend {
             net: net_snapshot,
             format: MANIFEST_FORMAT_FC.into(),
             memory_manifest,
-            trace_host_hint: self.config.host_id,
-            // Tier 2 (resume-prefault fix): the FC backend is session-
-            // agnostic, so it can't know the session id here; the host-agent
-            // patches this to the session id at snapshot-finish.
+            // The FC backend is session-agnostic; the host-agent patches
+            // this to the session id at snapshot-finish.
             trace_lineage_id: None,
             source_rootfs_canonical,
             source_harness_canonical: None,
@@ -7005,30 +6842,24 @@ impl FirecrackerBackend {
         // client; a failure mid-sequence still tries to resume the
         // VM rather than leaving it stuck Paused.
         // Snapshot duration scales with guest memory (every dirty page is
-        // flushed to memory.bin synchronously), so the timeout scales with
-        // the VM's RAM — a flat 60s tripped on large warm images (dev-brain's
-        // 32 GiB capture). See `snapshot_create_timeout`.
+        // written to the memory file inside the call), so the timeout scales
+        // with the VM's RAM — a flat 60s tripped on large warm images
+        // (dev-brain's 32 GiB capture). See `snapshot_create_timeout`.
         let api = FirecrackerClient::new(&socket)
             .with_timeout(snapshot_create_timeout(spec.memory.max_mib));
+        let state_path = dest.join("state.bin");
+        let mem_path = dest.join(match snapshot_type {
+            client::SnapshotType::Full => "memory.bin",
+            client::SnapshotType::Diff => "memory.diff",
+        });
         let create_result = if hold {
-            let name = match snapshot_type {
-                client::SnapshotType::Full => "memory.bin",
-                client::SnapshotType::Diff => "memory.diff",
-            };
-            api.create_snapshot_held(dest.join("state.bin"), dest.join(name), snapshot_type)
+            api.create_snapshot_held(state_path, mem_path, snapshot_type)
                 .await
         } else {
-            match snapshot_type {
-                client::SnapshotType::Full => api.create_snapshot(&dest).await,
-                client::SnapshotType::Diff => {
-                    api.create_snapshot_at(
-                        dest.join("state.bin"),
-                        dest.join("memory.diff"),
-                        client::SnapshotType::Diff,
-                    )
-                    .await
-                }
-            }
+            // The guest resumes before the files reach the disk; the
+            // caller syncs them (`SandboxBackend::snapshot`'s contract).
+            api.create_snapshot_at(state_path, mem_path, snapshot_type, true)
+                .await
         };
         // The create ran `prepare_save`, which queued a vsock
         // `TRANSPORT_RESET`: every connection open across this point is
@@ -7091,14 +6922,9 @@ impl FirecrackerBackend {
             // in-place after FC returns (the bare backend can't
             // chunk memory.bin without a chunk-store wiring).
             memory_manifest: None,
-            // ADR 0007 Phase 5: snapshotting host's id, so cross-
-            // host restore can request this host's recorded
-            // trace via `--prefault-trace <hint>`. Set from FC
-            // config; falls back to None when not wired.
-            trace_host_hint: self.config.host_id,
             source_swap_canonical,
-            // Tier 2 (resume-prefault fix): patched to the session id by the
-            // host-agent at snapshot-finish (session-agnostic here).
+            // The host-agent patches this to the session id at
+            // snapshot-finish (session-agnostic here).
             trace_lineage_id: None,
             // ADR 0014 M1.11: canonical paths embedded in FC's
             // state.bin. Cross-host restore reads these to recreate
@@ -7444,14 +7270,12 @@ mod tests {
             firecracker_bin: PathBuf::from("/nonexistent/firecracker"),
             uffd_handler_bin: PathBuf::from("/nonexistent/engram-uffd-handler"),
             uffd_base_dir: None,
-            restore_mode: RestoreMode::File,
             track_dirty_pages: false,
             balloon: false,
             net_pool: None,
             egress_proxy_port: None,
             egress_dns_port: None,
             guest_gateway_port: None,
-            host_id: None,
             uffd_cache_root: None,
             uffd_substrate_sock: None,
             uffd_blob_root: None,
@@ -7758,14 +7582,14 @@ mod tests {
             net: None,
             format: MANIFEST_FORMAT_FC.into(),
             memory_manifest: None,
-            trace_host_hint: None,
             trace_lineage_id: None,
             source_rootfs_canonical: None,
             source_swap_canonical: None,
             source_harness_canonical: None,
             source_vsock_canonical: None,
         };
-        // A missing memory file fails before any process or load request.
+        // Setup fails before any load request: a resume has no state.bin, a
+        // post-copy destination (which waits for state.bin) cannot spawn FC.
         for post_copy in [false, true] {
             if post_copy {
                 std::fs::write(work.path().join(MIGRATION_PEER_FILE), b"{}").unwrap();
@@ -7778,9 +7602,8 @@ mod tests {
                     &manifest,
                     RestoreInputs {
                         disks: test_disks().unwrap(),
-                        swap_aux_to_current: false,
+                        fresh: false,
                         selected_mounts: Vec::new(),
-                        restore_mode: RestoreMode::File,
                         base_memory_manifest: None,
                     },
                 )
@@ -7790,7 +7613,6 @@ mod tests {
                 error.to_string().contains("postcopy-never-loaded:"),
                 post_copy
             );
-            assert!(error.to_string().contains("missing"));
         }
     }
 
@@ -7806,7 +7628,6 @@ mod tests {
             }),
             format: MANIFEST_FORMAT_FC.into(),
             memory_manifest: None,
-            trace_host_hint: None,
             trace_lineage_id: None,
             source_rootfs_canonical: None,
             source_swap_canonical: None,
@@ -9024,49 +8845,6 @@ mod tests {
         }
     }
 
-    // ---- effective_restore_mode: fresh = File, resume = restore_mode ----
-
-    #[test]
-    fn effective_restore_mode_fresh_is_file_and_resume_follows_config() {
-        let (mut be, _dir) = backend();
-        be.config.restore_mode = RestoreMode::Uffd;
-        for base_dir in [None, Some(std::path::PathBuf::from("/dev/shm/engram"))] {
-            be.config.uffd_base_dir = base_dir;
-            assert_eq!(
-                be.effective_restore_mode(/*fresh=*/ true),
-                RestoreMode::File,
-                "a fresh create maps the per-image memfile (ADR 0092), substrate or not",
-            );
-            assert_eq!(
-                be.effective_restore_mode(/*fresh=*/ false),
-                RestoreMode::Uffd,
-                "a resume follows restore_mode",
-            );
-        }
-        be.config.restore_mode = RestoreMode::File;
-        assert_eq!(be.effective_restore_mode(false), RestoreMode::File);
-    }
-
-    #[test]
-    fn restore_memory_is_lazy_for_tracks_effective_mode() {
-        // The host-agent restore path keys BOTH its prefetch-block gate and its
-        // memory.bin-materialize gate on `restore_memory_is_lazy_for(fresh)`, so
-        // lock that it mirrors `effective_restore_mode`: lazy iff Uffd.
-        let (mut be, _dir) = backend();
-        be.config.restore_mode = RestoreMode::Uffd;
-        for base_dir in [None, Some(std::path::PathBuf::from("/dev/shm/engram"))] {
-            be.config.uffd_base_dir = base_dir;
-            assert!(
-                !be.restore_memory_is_lazy_for(/*fresh=*/ true),
-                "a File fresh create must materialize memory.bin (not lazy)",
-            );
-            assert!(
-                be.restore_memory_is_lazy_for(/*fresh=*/ false),
-                "a UFFD resume serves memory lazily",
-            );
-        }
-    }
-
     /// The load maps only the base the handler acked. An empty ack (the
     /// canonical/session mismatch fallback) maps none; this is the case
     /// that failed every resume with ENOENT when the load derived the path.
@@ -9160,39 +8938,29 @@ mod tests {
         assert!(be.post_copy_source_view(id).is_none());
     }
 
-    /// Review finding 2 regression test: `prefault_stats_path` must be
-    /// `None` for a sandbox with no live uffd-handler — `RestoreMode::File`
-    /// (the config default, and the documented `ENGRAM_FC_RESTORE_MODE=file`
-    /// fleet knob) never spawns one, so nothing could ever write the file;
-    /// returning `Some` there made every File-mode resume falsely alarm as
-    /// `stats_missing`. Keyed off `uffd_pid` (populated for
-    /// `RestoreMode::Uffd` restores AND pidfd-reattached Uffd sandboxes),
-    /// not the backend's static config — a fleet can run both modes.
-    #[test]
-    fn prefault_stats_path_none_without_a_uffd_handler() {
+    /// A post-copy destination's role is on disk before the sandbox is
+    /// listable, and a failed manifest write never lists it: a host-agent
+    /// restart in between must find the role to keep custody.
+    #[tokio::test]
+    async fn a_committed_sandbox_is_listed_only_after_its_manifest_and_role() {
         let (be, _dir) = backend();
-        let id = SandboxId::new();
-
-        // No entry in `sandboxes` at all (unknown/not-yet-live sandbox).
-        assert_eq!(be.prefault_stats_path(id), None);
-
-        let live_without_uffd = |uffd_pid: Option<u32>| {
+        let live = |id: SandboxId| {
             let (_tx, agent_ready) = tokio::sync::watch::channel(true);
             LiveSandbox {
                 state: SandboxState {
                     spec: spec(),
                     firecracker_socket: be.work_dir.join(id.to_string()).join("fc.sock"),
-                    rootfs_path: be.work_dir.join(id.to_string()).join("rootfs.ext4"),
+                    rootfs_path: be.work_dir.join("rootfs.ext4"),
                     vsock_cid: 3,
                     vsock_uds_path: be.work_dir.join(id.to_string()).join("vsock.sock"),
-                    rootfs_canonical: be.work_dir.join(id.to_string()).join("rootfs.ext4"),
+                    rootfs_canonical: be.work_dir.join("rootfs.ext4"),
                     swap_canonical: None,
                     memory_backing: None,
                 },
                 child: None,
                 fc_pid: None,
                 uffd_handler: None,
-                uffd_pid,
+                uffd_pid: None,
                 net: None,
                 netns: None,
                 guest_endpoints: parking_lot::Mutex::new(None),
@@ -9204,22 +8972,39 @@ mod tests {
                 started_at: None,
             }
         };
+        let record = |id: SandboxId| {
+            sandbox_manifest_for(
+                id,
+                &live(id).state,
+                (std::process::id(), None),
+                None,
+                None,
+                Some(sandbox_manifest::ROLE_POST_COPY_DEST),
+            )
+        };
 
-        // Live, but File-mode restore: no uffd_pid → still None.
-        be.sandboxes.insert(id, live_without_uffd(None));
-        assert_eq!(
-            be.prefault_stats_path(id),
-            None,
-            "File-mode sandboxes never spawn a handler; must not alarm as stats_missing",
-        );
+        let id = SandboxId::new();
+        be.commit_sandbox(id, Some(record(id)), || {
+            let on_disk =
+                sandbox_manifest::read_manifest(&sandbox_manifest::manifest_path(&be.work_dir, id))
+                    .expect("the manifest is written before the entry is built");
+            assert_eq!(
+                on_disk.migration_role.as_deref(),
+                Some(sandbox_manifest::ROLE_POST_COPY_DEST)
+            );
+            live(id)
+        })
+        .expect("commit");
+        assert_eq!(be.list().await.unwrap(), vec![id]);
 
-        // Live Uffd-mode restore (or a pidfd-reattached one): uffd_pid is
-        // Some → the sibling path resolves.
-        be.sandboxes.insert(id, live_without_uffd(Some(4242)));
-        assert_eq!(
-            be.prefault_stats_path(id),
-            Some(be.work_dir.join(id.to_string()).join(PREFAULT_STATS_FILE)),
-        );
+        // A file where the sandbox's directory goes makes the write fail.
+        let blocked = SandboxId::new();
+        std::fs::write(be.work_dir.join(blocked.to_string()), b"").unwrap();
+        be.commit_sandbox(blocked, Some(record(blocked)), || {
+            panic!("a failed manifest write must not build the entry")
+        })
+        .unwrap_err();
+        assert_eq!(be.list().await.unwrap(), vec![id]);
     }
 
     const PROC_STATUS_FIXTURE: &str = "\

@@ -121,11 +121,12 @@ hide a managed record, including one retained after unbind. Supplied fence and
 policy identities must agree with the requested sandbox; the explicit unfenced
 sentinel remains available to ordinary legacy callers.
 
-Until the strict restore producer exists, known managed sessions reject restore,
-base restore, resume, and agent start. The management marker is trusted host
-state, and a corrupt marker does not make the session ordinary. A fresh target
-host has no local marker: coordinator classification and pre-restore fencing are
-still required before cross-host migration can be enabled.
+Known managed sessions reject ordinary restore, base restore, resume, and agent
+start. Explicit disk-only cold recovery uses the durable source authority
+described below. The management marker is trusted host state, and a corrupt
+marker does not make the session ordinary. A fresh target host has no local
+marker: coordinator classification and pre-restore fencing are still required
+before cross-host migration can be enabled.
 
 Fresh create and restore use a durable coordinator pre-start gate at the real
 physical binding epoch. The orchestrator pulls preparation state, compiles and
@@ -337,14 +338,32 @@ writes, then explicit automation writes. Before enabling any stage, run its host
 fixture cases, current-head CI, and operator acceptance. Both Claude and Codex must
 pass the shared protocol path, approval, denial, cancellation, eviction/resume,
 secret containment, and unknown-outcome gates. Require real Firecracker production
-acceptance. VZ proves local parity separately and cannot satisfy that gate. Fork
-runners are not configured yet; runner provisioning is an external prerequisite.
+acceptance. VZ proves local parity separately and cannot satisfy that gate. The
+physical CI workflow requires dedicated self-hosted Linux X64 Firecracker and
+macOS ARM64 VZ runners with operator configuration. Runner access and
+configuration remain unverified; source wiring does not prove runner readiness.
 
-The feature stays disabled until its release gates pass. The baseline QuickJS
-deep-recursion failure is
-recorded in `docs/testing/external-mcp-baseline.md`; do not weaken or skip it.
+The feature stays disabled until its release gates pass. The historical QuickJS
+deep-recursion failure remains in `docs/testing/external-mcp-baseline.md` beside
+its later source-specific results. Do not weaken or skip the regression check.
 This record stays Proposed until the final acceptance review records evidence and
 the implementation commit chain.
+
+### Recorded qualification and remaining gates
+
+On 2026-11-10, the manual Firecracker matrix passed all 24 unique cases at
+`c5dc8e7b19513f33a849da5a06b8e550956697bb`: 12 Claude and 12 Codex,
+with no failed or duplicate cases. Retained evidence passed its integrity checks,
+and owned test cleanup and cloud retirement completed. The earlier VZ 24/24 result
+belongs to `b75b0d7f`. Each result qualifies its recorded source only.
+
+The later upstream integration changes shared disk, lazy-resume, fill, and host
+paths. The merged implementation still requires source checks, current-head
+`CI Gate`, and source-matched physical qualification. Before this integration,
+PR conflicts prevented a current-head workflow result. The source simplification review is complete; it
+is separate from final acceptance review. Managed activation, upgrade, recovery,
+and rollback remain unqualified. Keep the feature disabled and this record
+Proposed until those gates have explicit evidence.
 
 ### Upstream disk and upgrade integration
 
@@ -368,8 +387,9 @@ closed. Proxy replacement can preserve a VM while ending its active proxy
 streams; it does not provide uninterrupted networking.
 
 Changes to host storage, materialization, and the shared wire contract require new
-source-matched builds and physical acceptance. Earlier VZ evidence remains evidence
-for its recorded source; it does not qualify the merged implementation.
+source-matched builds and physical acceptance. Earlier Firecracker and VZ evidence
+remains evidence for its recorded source; it does not qualify the merged
+implementation.
 
 ## Sources
 
@@ -392,11 +412,11 @@ proxy share session connection cancellation and drain.
 A proxy acknowledgement alone does not prove complete guest enforcement. The
 backend must supply a strict network proof tied to the exact host, sandbox,
 physical epoch, guest IP, and network identity before a final binding ACK.
-The default backend proof is absent. The existing Firecracker rules redirect
-TCP 443 and DNS; they do not establish all-port enforcement. The next producer
-slice must install pre-execution host controls for all TCP ports and close
-unobserved UDP paths, including restore. Bootstrap receipts have no final
-binding hash and cannot authorize tool exposure. Local socket tests do not
+The default backend proof is absent. Ordinary Firecracker rules redirect
+TCP 443 and DNS; they do not establish all-port enforcement. The managed cold
+producer described below installs pre-execution controls for all TCP ports and
+closes unobserved UDP paths. Ordinary restore cannot supply that proof. Bootstrap
+receipts have no final binding hash and cannot authorize tool exposure. Local socket tests do not
 establish Firecracker, VZ, or harness compatibility acceptance.
 
 ### Private network transport
@@ -418,12 +438,11 @@ The helper pins gvisor.dev/gvisor at
 The host selects the exact source MAC, guest IPv4 address, and gateway.
 Only IPv4 TCP and DNS at that gateway can reach the private proxy. Established
 stack and DNS parsers own protocol decoding. There is no NAT fallback.
-Firecracker will use an owned per-interface early fence, all-TCP redirection,
-controlled DNS, and drops for other UDP; installed rule ordering still needs
-Linux acceptance. Managed recovery will cold-boot from eligible disk-only
-artifacts. Saved session RAM and device state are not eligible. Backend
-activation, durable boot permits, packaging, and platform acceptance remain
-separate work. This decision remains Proposed.
+Managed Firecracker uses an owned per-interface early fence, all-TCP redirection,
+controlled DNS, and drops for other UDP, as described below. Managed recovery
+cold-boots from eligible disk-only artifacts. Saved session RAM and device state
+are not eligible. Source-matched physical qualification, packaging, and release
+activation remain separate gates. This decision remains Proposed.
 
 A policy drain retains its session lease until the helper returns cleanup EOF
 on the reliable private stream. The helper first closes packet admission and
@@ -448,8 +467,8 @@ Held reservations use the existing queued session row and all existing creation
 satellites. Ordinary queue listing and placement exclude them. No host request
 occurs during reservation. The pinned mTLS policy service alone can read this
 source. Public creation and managed admission stay closed until the operator
-admission and physical boot gate exist. The future boot transition must claim
-the same held row and bind the actual physical epoch; a reservation is not a
+admission and physical boot gates pass. The boot transition claims
+the same held row and binds the actual physical epoch; a reservation is not a
 network receipt or permission to start a harness. Legacy sessions have no source
 and cannot be backfilled from guest state or a current profile.
 
@@ -466,16 +485,17 @@ The VZ producer owns a fresh stopped machine, its exact file-handle network
 attachment, and the helper's reliable channels in one opaque preparation object.
 It is outside the ordinary sandbox map and has no start or resume operation.
 Its receipt means closed preparation only; it is not an enforcement ACK.
-The later durable start producer must bind actual placement, final manifest,
-policy and start intent, check current liveness, and integrate all ordinary
+The separate durable start producer binds actual placement, final manifest,
+policy and start intent, checks current liveness, and enforces the managed
 lifecycle gates. Drop must terminate and reap the helper without running the VM.
 
 VZ uses a host-selected static IPv4 address and gateway in the same /24,
 a fixed unicast MAC on each private point-to-point attachment, and MTU 1500.
-Kernel IP configuration also names that gateway as DNS. The current image init
-still writes legacy fixed resolver addresses and can preserve a pre-existing
-resolver file. A managed init/resolver producer must replace that behavior for
-these selected inputs before release, including existing resolver files.
+Kernel IP configuration also names that gateway as DNS. Managed init replaces
+any existing resolver file with the selected gateway.
+The changed init shim uses materializer layout version 2 and distinct memo keys.
+Earlier memo records, manifests, and disks remain readable; stored data is not
+rewritten.
 Guest configuration supplies functionality; it is not host enforcement proof.
 The backend does not widen the helper's DNS acceptance to old resolver addresses.
 
@@ -607,8 +627,8 @@ state is Not started. It does not load memory or saved device state and has
 no start, resume or ordinary-map conversion. The closed receipt binds the
 exact request, registration, network identity, rules digest and configuration
 digest. It does not certify capture consistency or final policy enforcement.
-The durable start producer must consume the owner, bind placement and final
-policy, then implement the sole release/start operation. Its guest resolver
+The durable start producer consumes the owner, binds placement and final
+policy, and performs the sole release/start operation. Its guest resolver
 must use the selected gateway. Root installed-rule, packet and VM acceptance
 remain required on Linux; local socket fixtures and cross-compilation are not
 that evidence. This decision remains Proposed.
@@ -705,8 +725,8 @@ This additive gRPC method does not change the bincode wire layout.
 The host implementation reads the immutable manifest and content-addressed
 chunks from its configured blob store. The enabled-image materializer publishes
 all chunks before the manifest; the coordinator checks capture recoverability
-before it selects a base. The managed path does not use the ordinary restore
-path's OCI resolver. A missing chunk fails inspection. The reader validates
+before it selects a base. The managed path uses its bounded verified manifest reader instead of the
+ordinary lazy-restore path. A missing chunk fails inspection. The reader validates
 chunk lengths and hashes and hashes every logical disk byte, including sparse
 zero ranges and a short final chunk. A manifest digest is not a disk digest.
 

@@ -1384,6 +1384,20 @@ pub trait MetadataStore: Send + Sync {
         Ok(true)
     }
 
+    /// A fixed-cadence wait, not a failure: requeue as
+    /// [`Self::op_requeue_with_backoff`] does and give back the attempt the
+    /// claim counted, so the wait does not grow a later backoff or spend
+    /// an attempt budget. Fenced.
+    async fn op_requeue_wait(
+        &self,
+        _op_id: i64,
+        _epoch: i64,
+        _delay: std::time::Duration,
+        _reason: &str,
+    ) -> Result<bool, MetaError> {
+        unimplemented!("op_requeue_wait")
+    }
+
     /// Make every QUEUED op of `kind` for this session due now
     /// (`not_before = LEAST(not_before, now)`) and NOTIFY when any such
     /// op exists — INCLUDING ops that are already due. ADR 0079
@@ -3367,6 +3381,15 @@ pub trait MetadataStore: Send + Sync {
     /// is older than the queue timeout is failed with `CapacityTimeout`.
     /// Default: empty.
     async fn list_waiting_capture_jobs(&self) -> Result<Vec<CaptureJobRow>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// The disk manifest of every non-terminal capture job, without
+    /// duplicates — the `HeartbeatAck.capturing_disk_manifests` source.
+    /// Hosts stage these as image volumes while the capture runs, so the
+    /// captured disk stages as a delta over them. Read every heartbeat
+    /// tick. Default: empty.
+    async fn capturing_disk_manifests(&self) -> Result<Vec<ManifestRef>, MetaError> {
         Ok(Vec::new())
     }
 

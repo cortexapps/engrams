@@ -83,8 +83,11 @@ pub mod migration;
 pub mod page_idle;
 pub mod peer_fill;
 pub mod session_epochs;
+pub(crate) mod snapshot_post;
 pub mod substrate_server;
-pub use host_client::LocalHostClient;
+pub use host_client::{IdleEvictionHarness, LocalHostClient};
+#[cfg(target_os = "linux")]
+pub mod blk_source;
 #[cfg(target_os = "linux")]
 pub mod heap_profile;
 pub mod heartbeat;
@@ -96,6 +99,7 @@ pub mod live_attach;
 pub mod materialize;
 pub mod metrics;
 pub mod pooled_backend;
+pub(crate) mod postcopy_finish;
 pub mod proxy_port;
 pub mod proxy_shell;
 pub mod proxyd_client;
@@ -106,7 +110,7 @@ mod time_source;
 pub mod util;
 pub mod warm_progress;
 
-pub use config::HostAgentConfig;
+pub use config::{HostAgentConfig, DEFAULT_DISK_HYDRATION_WINDOW_CHUNKS};
 
 pub struct HostAgent {
     pub cfg: HostAgentConfig,
@@ -118,8 +122,11 @@ pub struct HostAgent {
     /// without one; `None` is for in-process tests and the VZ/Process
     /// backends, whose guests have no internet-facing network.
     pub egress: Option<Arc<egress::HostEgress>>,
-    /// `None` keeps the OCI-pulled `rootfs.ext4` path.
+    /// `None` keeps the OCI-pulled `rootfs.ext4` path. Always
+    /// `fill.store()` when set.
     pub chunk_store: Option<ChunkStore>,
+    /// The host's chunk fill engine, over `chunk_store`.
+    pub fill: Option<engram_fill::FillEngine>,
     /// Per-host OCI image cache. `None` means sessions must arrive with
     /// `spec.rootfs_source` set (the dev-only path).
     pub image_cache: Option<ImageCache>,
@@ -132,8 +139,7 @@ pub struct HostAgent {
     /// Where image and session volumes live. `None` keeps readiness on
     /// the chunk cache alone and leaves the disks to the backend.
     pub session_disk: Option<Arc<dyn engram_host_core::SessionDisk>>,
-    /// This host's stable id, stamped on snapshot trace hints and passed
-    /// to the UFFD handler. `None` generates one at run time.
+    /// This host's stable id. `None` generates one at run time.
     pub host_id: Option<engram_core::HostId>,
     /// The base-shm sweeper's keep-set. The image-prefetch supervisor
     /// publishes into it; inert unless a sweeper holds the same handle.
@@ -154,6 +160,7 @@ impl HostAgent {
             cloud,
             egress: None,
             chunk_store: None,
+            fill: None,
             image_cache: None,
             chunk_cache: None,
             fc_for_reattach: None,
@@ -168,8 +175,17 @@ impl HostAgent {
         self
     }
 
-    pub fn with_chunk_store(mut self, chunk_store: ChunkStore) -> Self {
-        self.chunk_store = Some(chunk_store);
+    /// [`Self::with_fill`] with an engine of default limits.
+    pub fn with_chunk_store(self, chunk_store: ChunkStore) -> Self {
+        self.with_fill(engram_fill::FillEngine::new(
+            chunk_store,
+            engram_fill::Config::default(),
+        ))
+    }
+
+    pub fn with_fill(mut self, fill: engram_fill::FillEngine) -> Self {
+        self.chunk_store = Some(fill.store().clone());
+        self.fill = Some(fill);
         self
     }
 
@@ -196,8 +212,6 @@ impl HostAgent {
         self
     }
 
-    /// Must match the id on `FirecrackerConfig.host_id`: both key the
-    /// trace file `traces/<manifest_id>/<host_id>.json`.
     pub fn with_host_id(mut self, id: engram_core::HostId) -> Self {
         self.host_id = Some(id);
         self
@@ -311,11 +325,6 @@ impl HostAgent {
         }
 
         if let Some(coord_url) = self.cfg.coordinator_endpoint.clone() {
-            // Re-use the host_id that was stamped on the FC
-            // backend at construction time, so trace replay keys
-            // line up. Falls back to a fresh id when the caller
-            // didn't set one — that's the pre-Phase-5 behaviour
-            // (no trace replay).
             let host_id = self.host_id.unwrap_or_default();
             tracing::info!(
                 host_id = %host_id,
@@ -331,13 +340,26 @@ impl HostAgent {
                 if let Some(egress) = self.egress.clone() {
                     p = p.with_egress(egress);
                 }
-                if let Some(cs) = self.chunk_store.clone() {
+                if let Some(fill) = self.fill.clone() {
                     if let Some(disk) = self.session_disk.clone() {
-                        p = p.with_session_volumes(Arc::new(
-                            engram_host_core::SessionVolumes::new(disk, cs.clone()),
-                        ));
+                        let volumes = engram_host_core::SessionVolumes::new(disk, fill.clone());
+                        #[cfg(target_os = "linux")]
+                        let volumes = match blk_source::available() {
+                            Ok(()) => volumes.with_sources(Arc::new(blk_source::UblkSources {
+                                window_ahead: self.cfg.disk_hydration_window_chunks,
+                            })),
+                            Err(error) => {
+                                tracing::error!(
+                                    %error,
+                                    "no ublk control device (is ublk_drv loaded?): every resume \
+                                     writes its whole disk before the guest starts"
+                                );
+                                volumes
+                            }
+                        };
+                        p = p.with_session_volumes(Arc::new(volumes));
                     }
-                    p = p.with_chunk_store(cs);
+                    p = p.with_fill(fill);
                     // ADR 0080 §C: the MaterializeImage scratch root —
                     // gated on the chunk store because a materialize
                     // without one has nowhere durable to land. Same
@@ -353,10 +375,8 @@ impl HostAgent {
                     p = p.with_chunk_cache(cache);
                 }
                 if let Some(ic) = self.image_cache.clone() {
-                    // ADR 0008 Phase 5: also feed the image cache's
-                    // OciClient into the pooled backend so chunked-
-                    // OCI images can fault chunks from the registry
-                    // via the tiered resolver path.
+                    // `MaterializeImage` pulls with the image cache's
+                    // auth resolver.
                     p = p.with_oci_client(ic.oci_client());
                     p = p.with_image_cache(ic);
                 }
@@ -687,8 +707,10 @@ impl HostAgent {
             // injected production clock, constructed once for this sink.
             let events_clock: Arc<dyn engram_core::traits::Clock> =
                 Arc::new(engram_core::traits::SystemClock::new());
+            let pooled_for_events = pooled.clone();
             let event_sink =
                 crate::harness::event_sink_to(move |session_id, sandbox_id, ev, delivery| {
+                    pooled_for_events.note_harness_event(sandbox_id, &ev);
                     let cc = coord_client_for_events.clone();
                     let events_clock = events_clock.clone();
                     async move {
@@ -885,8 +907,11 @@ impl HostAgent {
             pooled.set_upload_sink(upload_sink);
             // ADR 0015 M5: warm-pool retired. LocalHostClient is just
             // the cold-create dispatch wrapper now.
-            let mut local =
-                crate::host_client::LocalHostClient::new(pooled.clone(), harness_hub.clone());
+            let mut local = crate::host_client::LocalHostClient::new(
+                pooled.clone(),
+                harness_hub.clone(),
+                self.cfg.idle_eviction_harness,
+            );
             if let Some(managed) = managed_policy {
                 local = local.with_managed_policy(managed);
             }
@@ -896,8 +921,8 @@ impl HostAgent {
                 let backend = self.managed_backend.clone().ok_or_else(|| {
                     HostAgentError::Config("managed backend is not installed".into())
                 })?;
-                let chunks = self
-                    .chunk_store
+                let fill = self
+                    .fill
                     .as_ref()
                     .ok_or_else(|| {
                         HostAgentError::Config("managed disk storage is not installed".into())
@@ -913,7 +938,7 @@ impl HostAgent {
                     pooled.clone(),
                     self.egress.clone().expect("managed egress checked"),
                     harness_hub.clone(),
-                    chunks,
+                    fill,
                 )
                 .map_err(|e| HostAgentError::Config(e.to_string()))?;
                 let boot = Arc::new(boot);
@@ -976,6 +1001,18 @@ impl HostAgent {
             // lands. Background loop with exponential backoff.
             //
             // The SIGTERM path aborts this task.
+            //
+            // The gRPC listener is bound first: the register POST carries
+            // the `grpc_self_connect` probe, and a probe that runs before
+            // the bind fails, which keeps the host out of placement until
+            // the next heartbeat. The server starts serving it below.
+            let grpc_incoming = self.cfg.grpc_listen_addr.and_then(|addr| {
+                grpc_server::bind(addr)
+                    .inspect_err(|e| {
+                        tracing::error!(addr = %addr, error = %e, "gRPC listener bind failed");
+                    })
+                    .ok()
+            });
             let mut registration_task: Option<tokio::task::JoinHandle<()>> = None;
             if let Some(advertise_addr) = self.cfg.grpc_advertise_addr.clone() {
                 // hostname: prefer the env-supplied value (set by
@@ -1083,39 +1120,29 @@ impl HostAgent {
 
             // ADR 0095: the standing peer-chunk tier — serve state for
             // the gRPC arm (cache-less hosts serve nothing and answer
-            // `unavailable`), plus the background scrubber that drains
-            // the unverified-origin backlog bulk peer pulls create.
+            // `unavailable`).
             let peer_serve = self
                 .chunk_cache
                 .clone()
                 .map(|cache| peer_fill::PeerServe::new(cache, readiness.clone()));
-            let _scrubber_task = self.chunk_cache.as_ref().map(|cache| {
-                let bps = std::env::var("ENGRAM_CHUNK_SCRUB_BPS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|&v| v > 0)
-                    .unwrap_or(256 * 1024 * 1024);
-                cache.spawn_scrubber(bps)
-            });
 
             // ADR 0013: boot the gRPC HostService server. The
             // coord's GrpcHostPool dials this address (populated
             // via /api/hosts/register) to dispatch coord→host
             // RPCs. Required in production; mode=all leaves
             // `grpc_listen_addr=None`.
-            let grpc_task = self.cfg.grpc_listen_addr.map(|addr| {
+            let grpc_task = grpc_incoming.map(|incoming| {
                 let local_for_grpc = local_host.clone();
                 let managed_tls = self.cfg.managed_tls.clone();
                 let peer_for_grpc = peer_serve.clone();
                 // ADR 0079: the per-session fencing-epoch high-water,
                 // durable under work_dir like the binding records.
-                let epochs = session_epochs::SessionEpochStore::open(
-                    self.cfg.work_dir.join("epochs"),
-                )
-                .expect("open session epoch store under work_dir (ADR 0079)");
+                let epochs =
+                    session_epochs::SessionEpochStore::open(self.cfg.work_dir.join("epochs"))
+                        .expect("open session epoch store under work_dir (ADR 0079)");
                 tokio::spawn(async move {
-                    if let Err(e) = grpc_server::boot_with_managed_tls(
-                        addr,
+                    if let Err(e) = grpc_server::serve_with_managed_tls(
+                        incoming,
                         local_for_grpc,
                         epochs,
                         peer_for_grpc,
@@ -1123,7 +1150,7 @@ impl HostAgent {
                     )
                     .await
                     {
-                        tracing::error!(addr = %addr, error = %e, "gRPC server terminated with error");
+                        tracing::error!(error = %e, "gRPC server terminated with error");
                     }
                 })
             });
@@ -1170,10 +1197,12 @@ impl HostAgent {
             // track whether the supervisor spawn below actually happens —
             // derive both from the same pure gate rather than letting
             // `enabled_images_tx.is_some()` implicitly stand in for it.
-            let stages_images =
-                stages_images_gate(self.chunk_store.is_some(), self.chunk_cache.is_some());
-            let enabled_images_tx = match (self.chunk_store.clone(), self.chunk_cache.clone()) {
-                (Some(chunk_store), Some(chunk_cache)) => {
+            let stages_images = stages_images_gate(self.fill.is_some(), self.chunk_cache.is_some());
+            let (enabled_images_tx, image_disks_tx) = match (
+                self.fill.clone(),
+                self.chunk_cache.clone(),
+            ) {
+                (Some(fill), Some(chunk_cache)) => {
                     // ADR 0022 Option A / ADR 0092: a fresh create always
                     // restores on the File backend, so the supervisor
                     // materializes each enabled image's contiguous
@@ -1189,24 +1218,26 @@ impl HostAgent {
                         Some(resolver)
                     };
                     let (tx, _handle) = image_prefetch::spawn_supervisor(
-                        chunk_store.clone(),
+                        fill.clone(),
                         chunk_cache,
                         readiness.clone(),
                         base_memfile_dir,
                         ram_ledger.clone(),
                         self.base_shm_protected.clone(),
                     );
-                    if let Some(disk) = self.session_disk.clone() {
-                        image_volumes::spawn(disk, chunk_store, tx.subscribe());
-                    }
-                    Some(tx)
+                    let disks_tx = session_volumes.as_ref().map(|volumes| {
+                        let (disks_tx, disks_rx) = tokio::sync::watch::channel(Vec::new());
+                        image_volumes::spawn(volumes.images().clone(), disks_rx);
+                        disks_tx
+                    });
+                    (Some(tx), disks_tx)
                 }
                 _ => {
                     tracing::warn!(
                         "image_prefetch supervisor disabled: chunk_store / chunk_cache \
                          missing — host will never report ready_images and coord will 503 every session",
                     );
-                    None
+                    (None, None)
                 }
             };
             debug_assert_eq!(
@@ -1257,21 +1288,11 @@ impl HostAgent {
                 );
             }
 
-            // ADR 0068: the blocking "gRPC readiness gate" (ADR 0050 D)
-            // that used to live here — a synchronous up-to-30s TCP-connect
-            // retry loop with a "heartbeat anyway" optimism escape hatch
-            // once it gave up — is RETIRED, not hardened. The heartbeat
-            // loop below now starts immediately and its every-tick
-            // `capabilities::probe_all` re-runs this exact TCP self-connect
-            // as the `grpc_self_connect` capability; a still-binding
-            // listener just reports `Failed` on this tick (and `Ok` on a
-            // later one) instead of the host racing to heartbeat before it
-            // can actually serve anything. The coordinator's placement
-            // filter (`host_meets_capabilities`, PR 2) requires
-            // `grpc_self_connect: Ok` for ANY placement, so the same
-            // "coord can't dispatch before the listener is up" failure
-            // mode this gate closed is now closed at the scheduler instead
-            // of at host-agent startup.
+            // ADR 0068: every heartbeat tick's `capabilities::probe_all`
+            // re-runs the TCP self-connect as the `grpc_self_connect`
+            // capability, and placement (`host_meets_capabilities`)
+            // requires it `Ok`, so the coordinator places nothing on this
+            // host before its listener answers.
 
             // ADR 0013: HTTP heartbeat loop. Posts
             // {capacity, local_snapshots, running_sandboxes,
@@ -1318,6 +1339,9 @@ impl HostAgent {
             // The first ack always notifies, even when the set is empty, so
             // the supervisors can tell "no images" from "not told yet".
             let mut enabled_acked = false;
+            // The last capturing set a coordinator sent. An ack without the
+            // field (a failed read, or an older coordinator) keeps it.
+            let mut capturing_disks = Vec::new();
             let heartbeat_task = tokio::spawn(async move {
                 let mut tick = engram_core::periodic(heartbeat_interval);
                 // Observed disk/mem/cpu for the fleet view. Holds the
@@ -1566,6 +1590,18 @@ impl HostAgent {
                                     &resp.prestage_images,
                                 );
                                 let first = !std::mem::replace(&mut enabled_acked, true);
+                                if let Some(capturing) = resp.capturing_disk_manifests {
+                                    capturing_disks = capturing;
+                                }
+                                if let Some(disks_tx) = image_disks_tx.as_ref() {
+                                    let disks =
+                                        image_volumes::desired_disks(&union, &capturing_disks);
+                                    disks_tx.send_if_modified(|cur| {
+                                        let changed = first || *cur != disks;
+                                        *cur = disks;
+                                        changed
+                                    });
+                                }
                                 tx.send_if_modified(|cur| {
                                     let changed = first || *cur != union;
                                     *cur = union;

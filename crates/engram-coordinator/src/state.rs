@@ -8,6 +8,7 @@ use engram_harness_proto::{FileChange, HarnessEvent};
 use engram_host_agent::harness::{EventSink, HarnessHub};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+use tracing::Instrument as _;
 
 use crate::config::CoordinatorConfig;
 use crate::host_registry::HostRegistry;
@@ -995,6 +996,9 @@ pub struct AppState {
     /// receiver-less `watch::Sender` is kept alive here; handlers call
     /// `subscribe_shutdown()` for a fresh receiver.
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// The fleet-wide heartbeat-ack reads, shared by the heartbeats this
+    /// replica takes within a short window.
+    pub heartbeat_fleet: crate::api::host_http::FleetReadCache,
 }
 
 impl AppState {
@@ -1076,6 +1080,7 @@ impl AppState {
             preview_conns: Arc::new(PreviewConnLimiter::from_env()),
             integrations: crate::integrations::IntegrationBroker::new(),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            heartbeat_fleet: Default::default(),
         }
     }
 
@@ -1124,9 +1129,12 @@ impl AppState {
         host_id: engram_core::HostId,
         sandbox: Arc<dyn engram_core::traits::SandboxBackend>,
     ) {
-        let client: Arc<dyn engram_core::traits::HostClient> = Arc::new(
-            engram_host_agent::LocalHostClient::new(sandbox, self.harness_hub.clone()),
-        );
+        let client: Arc<dyn engram_core::traits::HostClient> =
+            Arc::new(engram_host_agent::LocalHostClient::new(
+                sandbox,
+                self.harness_hub.clone(),
+                engram_host_agent::IdleEvictionHarness::default(),
+            ));
         self.host_registry.register(host_id, client);
     }
 
@@ -1149,14 +1157,8 @@ impl AppState {
             .meta
             .append_session_event(session, kind, payload)
             .await?;
-        // ADR 0073: ack any outbox row a DIRECTLY-EMITTED confirming event
-        // retires. NOTE: the confirming events (`run_started`/`prompt_queued`/
-        // `tool_call_completed`) are HARNESS events, and those ingest via
-        // `harness_event_sink` → `append_session_event`, NOT this `emit` — so
-        // they ack THERE (see the ack in `harness_event_sink`). This arm is the
-        // defensive catch for any confirming event authored/replayed straight
-        // through `emit`; a confirming event terminally retires the matching
-        // outbox row, and unknown / already-acked ids are no-ops (at-least-once).
+        // Directly emitted confirming events also retire their outbox row.
+        // The harness sink handles normal delivery acknowledgements.
         if let Some(ack_id) = outbox_ack_id(session, &event) {
             match self.services.meta.outbox_ack(&ack_id).await {
                 Ok(true) => {
@@ -1367,11 +1369,7 @@ pub async fn emit_harness_event(
         .await
 }
 
-/// Build the [`EventSink`] that forwards harness events into
-/// `session_events` and triggers Track C.9 auto-checkpoints on
-/// `Idle` / `RunCompleted` for Git sessions. Captures clones of
-/// the bus + meta service + sandbox backend so the closure has no
-/// cycles back into AppState.
+/// Build an event sink with its own duplicate-event state for tests.
 #[cfg(test)]
 fn harness_event_sink(
     events: Arc<SessionEventBus>,
@@ -1387,6 +1385,19 @@ fn harness_event_sink(
         last_kind: DashMap::new(),
     })
     .sink()
+}
+
+/// A step span under the current `coord.ingest_harness_event` span, or no
+/// span when the ingest has none (an unsampled chunk), so that the steps
+/// of an untraced event do not become root spans.
+macro_rules! ingest_step_span {
+    ($name:literal) => {
+        if tracing::Span::current().is_disabled() {
+            tracing::Span::none()
+        } else {
+            tracing::info_span!($name)
+        }
+    };
 }
 
 struct HarnessEventWriter {
@@ -1415,13 +1426,19 @@ impl HarnessEventWriter {
 
     async fn wake_waiting_harness(&self, session_id: SessionId, kind: &str) {
         if matches!(kind, "harness_idle" | "harness_parked" | "harness_busy") {
+            let attach_wake = ingest_step_span!("coord.harness_event.attach_wake");
             // ADR 0108 A8: a harness that just announced Idle can
             // take a prompt NOW — a row waiting out ACK_TIMEOUT
             // from a forward into a dead link has no reason to
             // keep waiting. Without this recall the wake below
             // finds nothing due and no-ops; the row then sits out
             // the full timeout after a fast reattach.
-            if let Err(e) = self.meta.outbox_make_due(session_id).await {
+            if let Err(e) = self
+                .meta
+                .outbox_make_due(session_id)
+                .instrument(attach_wake.clone())
+                .await
+            {
                 tracing::debug!(
                     session_id = %session_id,
                     error = %e,
@@ -1431,6 +1448,7 @@ impl HarnessEventWriter {
             if let Err(e) = self
                 .meta
                 .op_wake_queued_kind(session_id, engram_core::types::session_op::OpKind::Deliver)
+                .instrument(attach_wake)
                 .await
             {
                 tracing::debug!(
@@ -1498,6 +1516,7 @@ impl HarnessEventWriter {
                     &continued,
                     settled_at,
                 )
+                .instrument(ingest_step_span!("coord.harness_event.settle"))
                 .await?;
             if settled.is_some() {
                 if let Err(e) = meta
@@ -1526,11 +1545,6 @@ impl HarnessEventWriter {
                 );
             }
         }
-        // Forward every harness event into session_events for live
-        // SSE / Web UI / Slackbot timeline. ADR 0005 retired the
-        // auto-checkpoint branch this used to trigger on Idle /
-        // RunCompleted; durability moved to hot+cold snapshots,
-        // not git checkpoints.
         let session_event = SessionEvent::from_harness(ev, clock.now_utc());
         let kind = session_event.kind();
 
@@ -1551,18 +1565,9 @@ impl HarnessEventWriter {
             None
         };
 
-        // ADR 0073 fix: harness events are the CONFIRMING events that retire
-        // the durable outbox row (`run_started{prompt_id}` /
-        // `prompt_queued{prompt_id}` / `tool_call_completed{tool_call_id}`),
-        // but they ingest through THIS sink — NOT `AppState::emit`, where the
-        // ack lived — so the ack never fired. An un-acked row is redelivered
-        // forever: the delivery driver re-resumes the session and re-runs the
-        // prompt on every idle cycle (acked_at NULL, attempts climbing;
-        // phantom re-runs + resume/evict churn + a duplicate-turn transcript
-        // the web can't render). Capture the ack id here (before
-        // `session_event` moves into the published frame) and retire the row
-        // with the append for managed sessions, or after it for ordinary
-        // sessions. Unknown / already-acked ids are no-ops.
+        // Managed events retire their outbox row in the append transaction.
+        // Ordinary events acknowledge after publication so the write does not
+        // delay the live frame. Unknown or acknowledged ids are no-ops.
         let ack_id = outbox_ack_id(session_id, &session_event);
 
         // Session titles: a harness-suggested title is materialized onto
@@ -1578,16 +1583,8 @@ impl HarnessEventWriter {
                 None
             };
 
-        // ADR 0108 A3: an Idle/Parked/Busy announcement is the ATTACH
-        // signal — the harness (re)announced its waiting state on a
-        // live connection. Wake any backed-off Deliver op now:
-        // delivery keys on the attach, never on a boot milestone or
-        // a poll cadence (the 2026-07-31 50 s gap was a Deliver op
-        // racing the attach and then waiting out an inflated
-        // backoff). This MUST run before the back-to-back dedupe
-        // below: a re-announce after a reattach is exactly the
-        // signal the incident waited 41 s for, and it is exactly
-        // the shape the dedupe drops from the log.
+        // Ordinary attach signals wake delivery before duplicate suppression.
+        // Managed signals must pass the atomic target check at append first.
         if managed_target.is_none() {
             self.wake_waiting_harness(session_id, kind).await;
         }
@@ -1648,7 +1645,11 @@ impl HarnessEventWriter {
         // correctness — the durable `agent_message` (same message_id) is
         // the authoritative record and supersedes every chunk.
         if delivery.is_none() && kind == "agent_message_chunk" {
-            if let Err(e) = meta.notify_session_delta(session_id, &payload).await {
+            if let Err(e) = meta
+                .notify_session_delta(session_id, &payload)
+                .instrument(ingest_step_span!("coord.harness_event.notify_delta"))
+                .await
+            {
                 tracing::debug!(
                     session_id = %session_id,
                     error = %e,
@@ -1672,6 +1673,7 @@ impl HarnessEventWriter {
                     payload,
                     ack_id: ack_id.clone(),
                 })
+                .instrument(ingest_step_span!("coord.harness_event.append"))
                 .await?;
             if accepted.outbox_acked {
                 metrics::counter!(crate::metrics::OUTBOX_ACKED_TOTAL).increment(1);
@@ -1688,9 +1690,14 @@ impl HarnessEventWriter {
                 kind,
                 payload,
             )
+            .instrument(ingest_step_span!("coord.harness_event.append"))
             .await?
         } else {
-            Some(meta.append_session_event(session_id, kind, payload).await?)
+            Some(
+                meta.append_session_event(session_id, kind, payload)
+                    .instrument(ingest_step_span!("coord.harness_event.append"))
+                    .await?,
+            )
         };
         if let Some(idx) = idx {
             last_kind.insert(session_id, kind);
@@ -1702,6 +1709,7 @@ impl HarnessEventWriter {
             // of it (worst case: the query's full timeout delays
             // every run_started delivery, precisely when a
             // contended Postgres makes that delay most costly).
+            let _publish = ingest_step_span!("coord.harness_event.publish").entered();
             events.publish(
                 session_id,
                 IndexedEvent {
@@ -1724,7 +1732,11 @@ impl HarnessEventWriter {
         // replay is the only retry there is. A failed ack withholds the
         // harness ack so the event is replayed again.
         if let Some(ack_id) = ack_id.as_ref().filter(|_| !managed) {
-            match meta.outbox_ack(ack_id).await {
+            match meta
+                .outbox_ack(ack_id)
+                .instrument(ingest_step_span!("coord.harness_event.outbox_ack"))
+                .await
+            {
                 Ok(true) => {
                     metrics::counter!(crate::metrics::OUTBOX_ACKED_TOTAL).increment(1);
                 }
@@ -1771,7 +1783,11 @@ impl HarnessEventWriter {
             // mixed in, so there's no coordinator/Postgres (or
             // cross-replica) clock skew to bias or drop samples.
             if let Some(pid) = &run_started_prompt_id {
-                match meta.prompt_received_seconds_ago(session_id, pid).await {
+                match meta
+                    .prompt_received_seconds_ago(session_id, pid)
+                    .instrument(ingest_step_span!("coord.harness_event.run_started_metric"))
+                    .await
+                {
                     Ok(Some(secs)) if secs >= 0.0 => {
                         metrics::histogram!(crate::metrics::PROMPT_TO_RUN_STARTED_SECONDS)
                             .record(secs);
@@ -2407,6 +2423,8 @@ pub(crate) mod tests {
         pub(crate) session: PlMutex<Session>,
         pub(crate) events: PlMutex<Vec<PersistedEvent>>,
         binding_epoch: PlMutex<u64>,
+        /// The binding generation whose harness attached last.
+        pub(crate) attached_binding_epoch: PlMutex<u64>,
         next_idx: PlMutex<i64>,
         pub(crate) snapshots: PlMutex<Vec<SnapshotRecord>>,
         /// ADR 0045 C1 tests: host rows for `list_active_hosts` (the
@@ -2501,6 +2519,7 @@ pub(crate) mod tests {
                 session: PlMutex::new(session),
                 events: PlMutex::new(Vec::new()),
                 binding_epoch: PlMutex::new(0),
+                attached_binding_epoch: PlMutex::new(0),
                 next_idx: PlMutex::new(0),
                 snapshots: PlMutex::new(Vec::new()),
                 hosts: PlMutex::new(Vec::new()),
@@ -3391,6 +3410,16 @@ pub(crate) mod tests {
             Ok(self.ops.requeue_with_backoff(op_id, epoch, backoff, error))
         }
 
+        async fn op_requeue_wait(
+            &self,
+            op_id: i64,
+            epoch: i64,
+            delay: std::time::Duration,
+            reason: &str,
+        ) -> Result<bool, MetaError> {
+            Ok(self.ops.requeue_wait(op_id, epoch, delay, reason))
+        }
+
         async fn op_cancel_queued(
             &self,
             session_id: SessionId,
@@ -3532,6 +3561,19 @@ pub(crate) mod tests {
                 );
             }
             Ok(Some((prev, indices)))
+        }
+
+        async fn session_binding_generations(
+            &self,
+            id: SessionId,
+        ) -> Result<(u64, u64), MetaError> {
+            if self.session.lock().id != id {
+                return Err(MetaError::NotFound);
+            }
+            Ok((
+                *self.binding_epoch.lock(),
+                *self.attached_binding_epoch.lock(),
+            ))
         }
 
         async fn rebind_session_guarded(

@@ -1423,15 +1423,20 @@ async fn managed_bridge_driver(pool_capacity: bool) {
         db.managed_boot_selections.insert(sid, selection.clone());
         db.session_secrets.insert(sid, sealed.clone());
     });
+    let hash = state
+        .services
+        .chunk_store
+        .put_chunk(&[7; 4096])
+        .await
+        .unwrap();
     let manifest = engram_chunk_store::Manifest {
         schema_version: 1,
         kind: engram_chunk_store::ManifestKind::Disk,
         chunk_size: engram_chunk_store::ChunkSize::bytes(4096),
         total_bytes: 4096,
-        chunks: vec![],
+        chunks: vec![engram_chunk_store::ChunkRef { offset: 0, hash }],
         parent: None,
-        working_set_trace: None,
-        annotations: serde_json::Value::Null,
+        annotations: serde_json::json!({ "image_tag": "approved" }),
     };
     state
         .services
@@ -1542,8 +1547,11 @@ async fn managed_bridge_driver(pool_capacity: bool) {
         1,
         "one committed private manifest despite a lost PUT reply"
     );
-    assert_eq!(fork.parent, Some(base));
-    assert_eq!(fork.total_bytes, manifest.total_bytes);
+    let expected = engram_chunk_store::Manifest {
+        parent: Some(base),
+        ..manifest
+    };
+    assert_eq!(fork, expected);
     // Replaying the old intent after a lost claim reply does not allocate or fork again.
     let committed = meta
         .read_managed_boot_intent(&q, "initial")

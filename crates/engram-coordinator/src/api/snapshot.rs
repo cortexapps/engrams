@@ -114,8 +114,9 @@ pub(crate) async fn reattach_harness_in_place(
     let session = state.services.meta.get_session(session_id).await?;
     // Re-confirm the session is still bound to the sandbox the caller resolved —
     // a concurrent eviction/resume may have moved it, and we must never re-issue
-    // start_agent against a stale or unbound sandbox.
-    if session.sandbox_id != Some(sandbox_id) {
+    // start_agent against a stale or unbound sandbox. A dev-VM session has no
+    // harness, so there is nothing to rebind.
+    if session.sandbox_id != Some(sandbox_id) || session.mode.is_dev_vm() {
         return Ok(false);
     }
     let epoch = state
@@ -1589,6 +1590,105 @@ pub(crate) async fn base_manifests_for_image(
     }
 }
 
+/// The schedule context of a resume: the session's image, the budget the
+/// resume reserves, and the affinity and capability pins of `record`, the
+/// snapshot it restores. The resume verb and the queue scanner both build
+/// it here, so the scanner dequeues a session only when the resume would
+/// place it.
+pub(crate) async fn resume_context<'a>(
+    state: &SharedState,
+    session: &'a Session,
+    record: Option<&'a SnapshotRecord>,
+) -> ScheduleContext<'a> {
+    let (image_repo, image_tag) = engram_core::types::session::split_image_ref(&session.image);
+    // ADR 0078: feed the tier-0 RAM/CPU veto real budgets instead of
+    // `None` (capacity-blind), so "the snapshot-host is hard-full" is a
+    // real veto rather than a vibe. Best-effort: if the session's spec
+    // can't be resolved (image un-enabled, etc.) we fall back to the
+    // pre-0072 soft `None` posture — the tier-0 DISK veto (the primary
+    // locality signal) still fires regardless.
+    let resume_budget =
+        crate::boot_materializer::resolve_resume_budget(&state.services.meta, session).await;
+    ScheduleContext {
+        repo: image_repo,
+        image_version: image_tag,
+        // ADR 0078: authoritative affinity — the host that holds this
+        // snapshot's chunks (PG `snapshots.host_id`), NOT the dead
+        // `local_snapshots` mirror. `None` if the row's host was deleted.
+        snapshot_host: record.and_then(|r| r.host_id),
+        memory_mib: resume_budget.map(|(mib, _)| mib),
+        cpu_budget_vcpus: resume_budget.map(|(_, vcpus)| vcpus),
+        // Restore from a snapshot reuses an existing in-memory image —
+        // no chunked-rootfs prefetch needed on the resume path. Snapshot
+        // affinity already constrains to a host that has the bytes.
+        required_image_digest: None,
+        exclude_host: None,
+        // ADR 0045 D4 / ADR 0039: soft preference (tier 2) for the host whose
+        // chunk cache + per-image base shm are warm — the capturing
+        // host first, else wherever the session last ran. Ranked below
+        // the authoritative `snapshot_host` tier 0.
+        prefer_host: record.and_then(|r| r.host_id).or(session.host_id),
+        // ADR 0068: a memory-manifest snapshot restores via the FC UFFD
+        // substrate; a candidate host must also match the snapshot's
+        // capture-time `fc_snapshot_version` when both are known — the
+        // cross-`SNAPSHOT_VERSION` restore-corruption class this issue
+        // closes at placement instead of at guest-boot failure.
+        caps: crate::placement::CapabilityRequirements {
+            needs_uffd_substrate: record.is_some_and(|r| r.memory_manifest.is_some()),
+            needs_live_substrate: false,
+            fc_snapshot_version: record.and_then(|r| r.fc_snapshot_version.clone()),
+        },
+        // ADR 0090: prefer hosts already staging the snapshot's pinned
+        // aux generations (soft — see rank_hosts).
+        prefer_bundles: record.map_or(&[], |r| r.aux_bundles.as_slice()),
+    }
+}
+
+/// Whether a resume with `ctx` has a host now.
+pub(crate) enum ResumeFit {
+    /// A schedulable host fits the budget (or the budget is unknown and
+    /// some host is schedulable).
+    Fits,
+    /// Hosts are schedulable, but none fits this budget.
+    NoFit,
+    /// No host is schedulable.
+    NoHost,
+    /// A metadata read failed.
+    Error(String),
+}
+
+/// The one fit check of a resume (ADR 0048 R3, #722): the hard 2D check
+/// (`placement_preview`, ADR 0048 C8; an unmeasured host counts as
+/// fitting) when the budget is known. A budget that could not be resolved
+/// keeps the soft posture: any schedulable host fits, so a spec-resolution
+/// blip never strands a resume. The resume verb queues on `NoFit` /
+/// `NoHost`; the queue scanner dequeues on `Fits`.
+pub(crate) async fn resume_fit(
+    state: &SharedState,
+    ctx: &ScheduleContext<'_>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ResumeFit {
+    let meta = state.services.meta.as_ref();
+    let candidates = match crate::placement::candidates_for(meta, ctx, now).await {
+        Ok(c) => c,
+        Err(e) => return ResumeFit::Error(format!("candidates_for: {e:?}")),
+    };
+    if candidates.hosts.is_empty() {
+        crate::placement::log_empty_candidates(meta, ctx, "resume_fit", now).await;
+        return ResumeFit::NoHost;
+    }
+    let (Some(mib), Some(vcpus)) = (ctx.memory_mib, ctx.cpu_budget_vcpus) else {
+        return ResumeFit::Fits;
+    };
+    match crate::placement::placement_preview(meta, ctx, i64::from(mib), i64::from(vcpus), now)
+        .await
+    {
+        Ok(true) => ResumeFit::Fits,
+        Ok(false) => ResumeFit::NoFit,
+        Err(e) => ResumeFit::Error(format!("placement_preview: {e:?}")),
+    }
+}
+
 async fn resume_from_fc_snapshot(
     op_ctx: &crate::session_ops::OpCtx<'_>,
     session: Session,
@@ -1609,54 +1709,7 @@ async fn resume_from_fc_snapshot(
     // typed SandboxError::Snapshot on missing artifacts, which
     // we map to 410 Gone below.
     let session_for_ctx = session.clone();
-    // ScheduleContext carries `(repo, tag)` for telemetry / future
-    // affinity hooks; the live scheduler currently keys only on
-    // snapshot affinity + capacity. With raw-URI image refs we split
-    // here — `repo` becomes `host[:port]/repo[/path]`, `image_version`
-    // becomes the tag.
-    let (image_repo, image_tag) =
-        engram_core::types::session::split_image_ref(&session_for_ctx.image);
-    // ADR 0078: feed the tier-0 RAM/CPU veto real budgets instead of
-    // `None` (capacity-blind), so "the snapshot-host is hard-full" is a
-    // real veto rather than a vibe. Best-effort: if the session's spec
-    // can't be resolved (image un-enabled, etc.) we fall back to the
-    // pre-0072 soft `None` posture — the tier-0 DISK veto (the primary
-    // locality signal) still fires regardless.
-    let resume_budget =
-        crate::boot_materializer::resolve_resume_budget(&state.services.meta, &session).await;
-    let ctx = ScheduleContext {
-        repo: image_repo,
-        image_version: image_tag,
-        // ADR 0078: authoritative affinity — the host that holds this
-        // snapshot's chunks (PG `snapshots.host_id`), NOT the dead
-        // `local_snapshots` mirror. `None` if the row's host was deleted.
-        snapshot_host: record.host_id,
-        memory_mib: resume_budget.map(|(mib, _)| mib),
-        cpu_budget_vcpus: resume_budget.map(|(_, vcpus)| vcpus),
-        // Restore from a snapshot reuses an existing in-memory image —
-        // no chunked-rootfs prefetch needed on the resume path. Snapshot
-        // affinity already constrains to a host that has the bytes.
-        required_image_digest: None,
-        exclude_host: None,
-        // ADR 0045 D4 / ADR 0039: soft preference (tier 2) for the host whose
-        // chunk cache + per-image base shm are warm — the capturing
-        // host first, else wherever the session last ran. Ranked below
-        // the authoritative `snapshot_host` tier 0.
-        prefer_host: record.host_id.or(session.host_id),
-        // ADR 0068: a memory-manifest snapshot restores via the FC UFFD
-        // substrate; a candidate host must also match the snapshot's
-        // capture-time `fc_snapshot_version` when both are known — the
-        // cross-`SNAPSHOT_VERSION` restore-corruption class this issue
-        // closes at placement instead of at guest-boot failure.
-        caps: crate::placement::CapabilityRequirements {
-            needs_uffd_substrate: record.memory_manifest.is_some(),
-            needs_live_substrate: false,
-            fc_snapshot_version: record.fc_snapshot_version.clone(),
-        },
-        // ADR 0090: prefer hosts already staging the snapshot's pinned
-        // aux generations (soft — see rank_hosts).
-        prefer_bundles: record.aux_bundles.as_slice(),
-    };
+    let ctx = resume_context(state, &session_for_ctx, Some(&record)).await;
 
     // ADR 0048 C7 → R3 (#722): if NO schedulable host FITS this resume's
     // budget, QUEUE it (Idle → queued, resume origin) instead of placing.
@@ -1671,56 +1724,19 @@ async fn resume_from_fc_snapshot(
     // host. Under crash/partition churn a wave of forced resumes onto full
     // survivors drove Σ reserved > allocatable (12/200 faithful chaos
     // seeds, all `pick_from` SOFT-FALLBACK onto a free=0 host). Resume now
-    // honors the SAME hard reserved-budget bound as create: one authority.
-    // `placement_preview` is the HARD 2D fit check (ADR 0048 C8) — an
-    // unmeasured host still counts as fitting (dev / brand-new-host soft
-    // posture, matching `reserve_placement`), and it already returns
-    // `false` for an empty fleet, subsuming the old is_empty() gate. A
-    // budget we couldn't resolve (`None`) keeps the old soft pick — never
-    // strand a resume on a spec-resolution blip.
+    // honors the SAME hard reserved-budget bound as create: one authority,
+    // `resume_fit`, which the queue scanner also asks before it dequeues.
     if matches!(session.status, SessionState::Idle) {
         let now = state.services.clock.now_utc();
-        let no_fitting_host = match (ctx.memory_mib, ctx.cpu_budget_vcpus) {
-            (Some(mib), Some(vcpus)) => {
-                // Budget resolved: HARD 2D fit. `placement_preview` also
-                // returns false for an empty/cordoned fleet (any() over no
-                // ranked hosts), so it subsumes the old is_empty() gate.
-                match crate::placement::placement_preview(
-                    state.services.meta.as_ref(),
-                    &ctx,
-                    i64::from(mib),
-                    i64::from(vcpus),
-                    now,
-                )
-                .await
-                {
-                    // Some host fits → proceed with the placement pick.
-                    Ok(true) => false,
-                    // No host fits (present-but-full, or empty/cordoned) → queue.
-                    Ok(false) => true,
-                    // Read error: don't queue blindly — fall through to the
-                    // restore attempt (which surfaces the real error).
-                    Err(e) => {
-                        tracing::warn!(%id, error = ?e,
-                            "resume: placement_preview failed; attempting restore");
-                        false
-                    }
-                }
+        let no_fitting_host = match resume_fit(state, &ctx, now).await {
+            ResumeFit::Fits => false,
+            ResumeFit::NoFit | ResumeFit::NoHost => true,
+            // Don't queue blindly on a read error: the restore attempt
+            // surfaces the real error.
+            ResumeFit::Error(e) => {
+                tracing::warn!(%id, error = %e, "resume: fit check failed; attempting restore");
+                false
             }
-            // Budget unresolved (image un-enabled, etc.): can't do a fit
-            // check, but the ORIGINAL ADR 0048 C7 gate still applies — queue
-            // when there is NO schedulable host at all rather than error out
-            // of `restore_for_session`.
-            _ => match crate::placement::candidates_for(state.services.meta.as_ref(), &ctx, now)
-                .await
-            {
-                Ok(c) => c.hosts.is_empty(),
-                Err(e) => {
-                    tracing::warn!(%id, error = ?e,
-                        "resume: candidates_for failed; attempting restore");
-                    false
-                }
-            },
         };
         if no_fitting_host {
             // ADR 0079 (0078 re-review finding #4): fenced, like every
@@ -1774,9 +1790,9 @@ async fn resume_from_fc_snapshot(
     // wire-compatible, tell the destination where the chunks are
     // resident. Stamped unconditionally BEFORE placement (the pick
     // happens inside restore_for_session): an affinity-host landing
-    // makes the destination's pre-pass a no-op stat walk, a cross-host
-    // landing pulls the divergent set over the LAN, and a dead/absent
-    // source leaves the hint empty ⇒ the pure-GCS path, unchanged.
+    // finds the chunks local, a cross-host landing fetches the chunks it
+    // lacks from the hinted host before the store, and a dead/absent
+    // source leaves the hint empty ⇒ the pure-GCS path.
     // Best-effort by contract: any lookup failure degrades to no hint.
     let peer_hints = match record.host_id {
         Some(source) => match state.services.meta.list_active_hosts().await {
@@ -2253,16 +2269,24 @@ pub async fn verify_snapshot_recoverable(
 ) -> bool {
     // S4: swap alone cannot restore a guest; root or memory must also exist.
     let any_present = disk.is_some() || memory.is_some();
-    for (kind, reference) in [("disk", disk), ("memory", memory), ("swap", swap)] {
-        if let Some(reference) = reference {
-            if let Err(error) = blob.head(&reference.storage_key()).await {
-                tracing::warn!(kind, manifest_key = %reference.storage_key(), %error,
-                    "manifest HEAD failed; snapshot recorded as not-recoverable");
-                return false;
+    let heads = [("disk", disk), ("memory", memory), ("swap", swap)]
+        .into_iter()
+        .filter_map(|(kind, reference)| reference.map(|r| (kind, r.storage_key())))
+        .map(|(kind, key)| async move {
+            match blob.head(&key).await {
+                Ok(_) => true,
+                Err(error) => {
+                    tracing::warn!(kind, manifest_key = %key, %error,
+                        "manifest HEAD failed; snapshot recorded as not-recoverable");
+                    false
+                }
             }
-        }
-    }
-    any_present
+        });
+    futures::future::join_all(heads)
+        .await
+        .into_iter()
+        .all(|ok| ok)
+        && any_present
 }
 
 /// ADR 0034 durability: resume-time re-verification that a snapshot's
@@ -2292,31 +2316,35 @@ async fn snapshot_artifacts_present(
     // portable state.bin + sidecar blobs the abort path deletes: the
     // manifests can survive while state/sidecar do not, and the row
     // still says recoverable=true.
-    if !verify_snapshot_recoverable(
-        blob,
-        record.disk_manifest.as_ref(),
-        Some(memory),
-        record.swap_manifest.as_ref(),
-    )
-    .await
-    {
-        return false;
-    }
-    for key in [
+    // The HEADs are independent, so they run together.
+    let portable = [
         engram_chunk_store::snapshot_blob::state_blob_key(record.id),
         engram_chunk_store::snapshot_blob::sidecar_blob_key(record.id),
-    ] {
-        if let Err(e) = blob.head(&key).await {
-            tracing::warn!(
-                snapshot_id = %record.id,
-                key = %key,
-                error = %e,
-                "resume: portable snapshot artifact missing in BlobStorage",
-            );
-            return false;
+    ]
+    .map(|key| async move {
+        match blob.head(&key).await {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(
+                    snapshot_id = %record.id,
+                    key = %key,
+                    error = %e,
+                    "resume: portable snapshot artifact missing in BlobStorage",
+                );
+                false
+            }
         }
-    }
-    true
+    });
+    let (manifests, portable) = futures::join!(
+        verify_snapshot_recoverable(
+            blob,
+            record.disk_manifest.as_ref(),
+            Some(memory),
+            record.swap_manifest.as_ref(),
+        ),
+        futures::future::join_all(portable),
+    );
+    manifests && portable.into_iter().all(|ok| ok)
 }
 
 #[cfg(test)]

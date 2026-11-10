@@ -355,7 +355,7 @@ pub struct ManagedBootHost {
     hub: Arc<HarnessHub>,
     bindings: BindingStore,
     directory: PathBuf,
-    chunks: engram_chunk_store::ChunkStore,
+    fill: engram_fill::FillEngine,
     networks: std::sync::Mutex<NetworkSlots>,
     binding_lock: std::sync::Mutex<()>,
     entries: dashmap::DashMap<SandboxId, Arc<Mutex<Entry>>>,
@@ -367,7 +367,7 @@ impl ManagedBootHost {
         ordinary: Arc<dyn SandboxBackend>,
         egress: Arc<HostEgress>,
         hub: Arc<HarnessHub>,
-        chunks: engram_chunk_store::ChunkStore,
+        fill: engram_fill::FillEngine,
     ) -> Result<Self, SandboxError> {
         let ManagedBootHostConfig {
             host_id,
@@ -390,7 +390,7 @@ impl ManagedBootHost {
             bindings: hub.binding_store(),
             hub,
             directory,
-            chunks,
+            fill,
             networks: std::sync::Mutex::new(NetworkSlots::new(512)),
             binding_lock: std::sync::Mutex::new(()),
             entries: Default::default(),
@@ -423,7 +423,7 @@ impl ManagedBootHost {
             ),
         };
         let (kernel_sha256, disk_sha256, disk_size_bytes) = crate::managed_assets::inspect(
-            &self.chunks,
+            self.fill.store(),
             request.disk_manifest,
             kernel,
             bundles,
@@ -724,12 +724,14 @@ impl ManagedBootHost {
                 .tempdir_in(&self.directory)?;
             let rootfs = staging.path().join("selected.ext4");
             let manifest = self
-                .chunks
+                .fill
+                .store()
                 .get_manifest(request.cold.disk.manifest)
                 .await
                 .map_err(invalid)?;
-            self.chunks
-                .materialize_to_file(&manifest, &rootfs)
+            self.fill
+                .store()
+                .materialize_to_file_from(&manifest, &rootfs, &self.fill)
                 .await
                 .map_err(invalid)?;
             spec.rootfs_source = Some(rootfs);
@@ -1443,11 +1445,12 @@ impl ManagedBootHost {
                 }
             }
             let manifest = self
-                .chunks
+                .fill
+                .store()
                 .chunk_file(&path, engram_chunk_store::ManifestKind::Disk, None)
                 .await
                 .map_err(invalid)?;
-            publish_capture_manifest(&self.chunks, progress.manifest, &manifest).await?;
+            publish_capture_manifest(self.fill.store(), progress.manifest, &manifest).await?;
             let cold = &entry.record.request.cold;
             let mut authority = ManagedCaptureAuthority {
                 version: 1,
@@ -2061,9 +2064,12 @@ mod tests {
         let (host, request) = fixture(temp.path());
         let id = request.key.context.target.sandbox_id;
         install_exec_owner(&host, &request);
-        let local =
-            crate::host_client::LocalHostClient::new(host.ordinary.clone(), host.hub.clone())
-                .with_managed_boot(host);
+        let local = crate::host_client::LocalHostClient::new(
+            host.ordinary.clone(),
+            host.hub.clone(),
+            crate::IdleEvictionHarness::default(),
+        )
+        .with_managed_boot(host);
         let mut stream = local
             .exec_stream(id, exec_request())
             .await
@@ -2160,9 +2166,12 @@ mod tests {
                     }
                 }
             }
-            let local =
-                crate::host_client::LocalHostClient::new(host.ordinary.clone(), host.hub.clone())
-                    .with_managed_boot(host.clone());
+            let local = crate::host_client::LocalHostClient::new(
+                host.ordinary.clone(),
+                host.hub.clone(),
+                crate::IdleEvictionHarness::default(),
+            )
+            .with_managed_boot(host.clone());
             assert!(
                 matches!(
                     local.exec_stream(id, exec_request()).await,
@@ -2196,9 +2205,12 @@ mod tests {
         if let Some(Owner::ExecTest(owner)) = &mut entry.lock().await.owner {
             owner.blocked = true;
         }
-        let local =
-            crate::host_client::LocalHostClient::new(host.ordinary.clone(), host.hub.clone())
-                .with_managed_boot(host);
+        let local = crate::host_client::LocalHostClient::new(
+            host.ordinary.clone(),
+            host.hub.clone(),
+            crate::IdleEvictionHarness::default(),
+        )
+        .with_managed_boot(host);
         assert!(matches!(
             local.exec_stream(id, exec_request()).await,
             Err(SandboxError::Unavailable(_))
@@ -2215,6 +2227,9 @@ mod tests {
     struct FileBackendCalls(std::sync::atomic::AtomicUsize, Vec<SandboxId>);
     #[async_trait::async_trait]
     impl SandboxBackend for FileBackendCalls {
+        fn captures_guest_memory(&self) -> bool {
+            false
+        }
         async fn exec_stream(
             &self,
             _: SandboxId,
@@ -2287,8 +2302,12 @@ mod tests {
         host: &Arc<ManagedBootHost>,
         ordinary: &Arc<FileBackendCalls>,
     ) -> crate::host_client::LocalHostClient {
-        crate::host_client::LocalHostClient::new(ordinary.clone(), host.hub.clone())
-            .with_managed_boot(host.clone())
+        crate::host_client::LocalHostClient::new(
+            ordinary.clone(),
+            host.hub.clone(),
+            crate::IdleEvictionHarness::default(),
+        )
+        .with_managed_boot(host.clone())
     }
     #[tokio::test]
     async fn inventory_propagates_unknown_managed_binding_state() {
@@ -2605,7 +2624,11 @@ mod tests {
             local.write_file(id, file_spec(), file_bytes()).await,
             Err(SandboxError::InvalidSpec(_))
         ));
-        let no_boot = crate::host_client::LocalHostClient::new(ordinary.clone(), host.hub.clone());
+        let no_boot = crate::host_client::LocalHostClient::new(
+            ordinary.clone(),
+            host.hub.clone(),
+            crate::IdleEvictionHarness::default(),
+        );
         assert!(matches!(
             no_boot.read_file(id, file_spec().path).await,
             Err(SandboxError::InvalidSpec(_))
@@ -2953,7 +2976,7 @@ mod tests {
                 ordinary,
                 egress,
                 hub,
-                chunks,
+                engram_fill::FillEngine::new(chunks, engram_fill::Config::default()),
             )
             .unwrap(),
         );
@@ -3158,7 +3181,8 @@ mod tests {
         // other slot, even after more attempts than the capacity.
         host.networks.lock().unwrap().slots.truncate(2);
         let held = host.networks.lock().unwrap().reserve().unwrap();
-        host.chunks
+        host.fill
+            .store()
             .put_manifest(
                 request.cold.disk.manifest,
                 &engram_chunk_store::Manifest::empty(engram_chunk_store::ManifestKind::Disk, 4),
@@ -3370,14 +3394,15 @@ mod tests {
         manifest.chunks = vec![
             ChunkRef {
                 offset: 4,
-                hash: host.chunks.put_chunk(b"abcd").await.unwrap(),
+                hash: host.fill.store().put_chunk(b"abcd").await.unwrap(),
             },
             ChunkRef {
                 offset: 12,
-                hash: host.chunks.put_chunk(b"xyz").await.unwrap(),
+                hash: host.fill.store().put_chunk(b"xyz").await.unwrap(),
             },
         ];
-        host.chunks
+        host.fill
+            .store()
             .put_manifest(boot.cold.disk.manifest, &manifest)
             .await
             .unwrap();
@@ -3391,9 +3416,12 @@ mod tests {
             disk_manifest: boot.cold.disk.manifest,
             aux_ro_drives: drives,
         };
-        let client =
-            crate::host_client::LocalHostClient::new(host.ordinary.clone(), host.hub.clone())
-                .with_managed_boot(host.clone());
+        let client = crate::host_client::LocalHostClient::new(
+            host.ordinary.clone(),
+            host.hub.clone(),
+            crate::IdleEvictionHarness::default(),
+        )
+        .with_managed_boot(host.clone());
         let receipt = client
             .read_managed_cold_assets(request.clone())
             .await
@@ -3703,9 +3731,12 @@ mod tests {
             agent: None,
         }));
         host.entries.insert(id, entry.clone());
-        let local =
-            crate::host_client::LocalHostClient::new(host.ordinary.clone(), host.hub.clone())
-                .with_managed_boot(host.clone());
+        let local = crate::host_client::LocalHostClient::new(
+            host.ordinary.clone(),
+            host.hub.clone(),
+            crate::IdleEvictionHarness::default(),
+        )
+        .with_managed_boot(host.clone());
         let guard = entry.lock().await;
         let inventory = tokio::time::timeout(std::time::Duration::from_millis(100), local.list())
             .await
@@ -3734,9 +3765,12 @@ mod tests {
             authority: None,
         });
         host.persist(&record).unwrap();
-        let local =
-            crate::host_client::LocalHostClient::new(host.ordinary.clone(), host.hub.clone())
-                .with_managed_boot(host.clone());
+        let local = crate::host_client::LocalHostClient::new(
+            host.ordinary.clone(),
+            host.hub.clone(),
+            crate::IdleEvictionHarness::default(),
+        )
+        .with_managed_boot(host.clone());
         let mut ordinary: engram_core::types::sandbox::SandboxSpec =
             serde_json::from_str(&request.sandbox_spec_json).unwrap();
         ordinary.rootfs_manifest = Some(ManifestRef::new());
@@ -3821,9 +3855,12 @@ mod tests {
             id.to_string().as_bytes(),
         )
         .unwrap();
-        let local =
-            crate::host_client::LocalHostClient::new(host.ordinary.clone(), host.hub.clone())
-                .with_managed_boot(host.clone());
+        let local = crate::host_client::LocalHostClient::new(
+            host.ordinary.clone(),
+            host.hub.clone(),
+            crate::IdleEvictionHarness::default(),
+        )
+        .with_managed_boot(host.clone());
         assert!(matches!(
             host.read(key.clone()).await.unwrap(),
             ManagedBootHostState::Failed { .. }
@@ -3900,12 +3937,14 @@ mod tests {
         });
         host.persist(&record).unwrap();
         let manifest = host
-            .chunks
+            .fill
+            .store()
             .chunk_file(&path, engram_chunk_store::ManifestKind::Disk, None)
             .await
             .unwrap();
         // The prior call wrote the manifest, then lost its reply before receipt persistence.
-        host.chunks
+        host.fill
+            .store()
             .put_manifest(capture.disk_manifest(), &manifest)
             .await
             .unwrap();
@@ -3956,7 +3995,8 @@ mod tests {
             durable_write(&path, b"new").unwrap();
             assert!(host.capture(capture.clone()).await.is_err());
             assert!(host
-                .chunks
+                .fill
+                .store()
                 .get_manifest(capture.disk_manifest())
                 .await
                 .is_err());

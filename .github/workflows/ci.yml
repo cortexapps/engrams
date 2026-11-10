@@ -796,18 +796,23 @@ jobs:
       - uses: pnpm/action-setup@v6
         with:
           version: 9
-      # Node 24 ("Krypton") is the newest LTS line: LTS since 2025-10-28,
-      # maintenance 2026-10-20, EOL 2028-04-30. Only even majors ever go LTS.
+      # Node 26 ("Lithium") is the newest Active LTS line: LTS since
+      # 2026-10-28, maintenance 2027-10-20, EOL 2029-04-30. Node 26 is the
+      # last release under the two-per-year model; from Node 27 every annual
+      # major becomes LTS (no odd/even distinction). Node 24 moved to
+      # Maintenance LTS on 2026-10-20.
       #
-      # This major is pinned in THREE places that must move together:
+      # This major is pinned in FIVE places that must move together:
       #   - here (the web lane)
+      #   - the site lane below (same `setup-node` version)
+      #   - .github/workflows/site-deploy.yml
       #   - docker/web.Dockerfile   (`FROM node:<major>-alpine`)
       #   - flake.nix               (`nodejs_<major>`, the `nix develop` shell)
       # They had drifted to 20 / 24 / 22 respectively; Node 20 went EOL
       # 2026-04-30, so CI was building on an unsupported runtime.
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 26
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
 
@@ -859,7 +864,7 @@ jobs:
           version: 9
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 26
           cache: pnpm
           cache-dependency-path: site/pnpm-lock.yaml
 
@@ -1242,7 +1247,6 @@ jobs:
             --test lifecycle \
             --test reattach_detach \
             --test snapshot \
-            --test snapshot_uffd \
             --test exec \
             --test exec_real_vm \
             --test agentd_bundle_reexec \
@@ -1369,6 +1373,8 @@ jobs:
 
       # The disk over the pool, then the session disk under a real guest
       # over the same pool (`session_disk` reads ENGRAM_TEST_THIN_POOL).
+      # The ublk source's tests run in `test-ublk-root`: this runner's
+      # kernel has no ublk driver.
       - name: dm-thin session-disk tests (root)
         env:
           ENGRAM_TEST_THIN_POOL: engram-pool
@@ -1376,6 +1382,7 @@ jobs:
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-disk-thin \
             --test thin_pool \
+            --test clone \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
@@ -1430,6 +1437,86 @@ jobs:
         if: always()
         run: |
           sudo chown -R "$USER":"$USER" target/ ~/.cargo ~/.docker 2>/dev/null || true
+
+  # ------------------------------------------------------------------
+  # The ublk source of a hydrating session volume (ADR 0125), as root
+  # over a dm-thin pool. No guest boots, so no KVM. It runs on a
+  # GitHub-hosted runner because the Blacksmith kernel is built without
+  # `CONFIG_BLK_DEV_UBLK`; Ubuntu's kernel has `ublk_drv` as a module,
+  # as the production node image does.
+  # ------------------------------------------------------------------
+  test-ublk-root:
+    name: tests (ublk source, root)
+    needs: detect
+    if: needs.detect.outputs.test_fc == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc and the pool tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            protobuf-compiler thin-provisioning-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ublk-root
+      - uses: taiki-e/install-action@nextest
+      - name: Build the dm-thin pool and load ublk
+        run: |
+          sudo env POOL_DIR=/var/lib/engram/thin POOL_DATA_SIZE=4G POOL_META_SIZE=128M \
+            sh deploy/helm/engram-host-fleet/files/thin-pool.sh
+          # Some Ubuntu kernels keep `ublk_drv` in a separate package.
+          if ! sudo modprobe ublk_drv; then
+            sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
+            sudo modprobe ublk_drv
+          fi
+          test -e /dev/ublk-control
+      - name: ublk source and lazy restore tests (root)
+        env:
+          ENGRAM_TEST_THIN_POOL: engram-pool
+          ENGRAM_TEST_UBLK: "1"
+        run: |
+          sudo -E env "PATH=$PATH" cargo nextest run \
+            -p engram-host-agent \
+            --test blk_source \
+            --test lazy_restore \
+            --run-ignored ignored-only \
+            --no-fail-fast \
+            --test-threads=1 &
+          run=$!
+          # A thread blocked in the kernel on a ublk device cannot be
+          # killed, so a hung test never ends: show where it waits.
+          for _ in $(seq 1 120); do
+            kill -0 "$run" 2>/dev/null || break
+            sleep 5
+          done
+          if kill -0 "$run" 2>/dev/null; then
+            echo "::error::the ublk tests did not end in 10 minutes"
+            for exe in /proc/[0-9]*/exe; do
+              case "$(sudo readlink "$exe" 2>/dev/null)" in
+                */deps/blk_source-*|*/deps/lazy_restore-*) ;;
+                *) continue ;;
+              esac
+              pid=${exe#/proc/}; pid=${pid%/exe}
+              for task in /proc/"$pid"/task/*; do
+                echo "== pid $pid task ${task##*/} $(cat "$task/comm") $(cut -d' ' -f3 "$task/stat")"
+                sudo cat "$task/stack" 2>/dev/null || true
+              done
+            done
+            for dev in /sys/block/ublkb*; do
+              [ -e "$dev" ] && echo "$dev inflight: $(cat "$dev/inflight") holders: $(ls "$dev/holders")"
+            done
+            sudo dmsetup ls || true
+            sudo dmesg | tail -60
+            exit 1
+          fi
+          wait "$run"
+      - name: Restore ownership after sudo tests
+        if: always()
+        run: |
+          sudo chown -R "$USER":"$USER" target/ ~/.cargo 2>/dev/null || true
 
   test-fc-e2e:
     name: tests (firecracker true-e2e, Linux + KVM)
@@ -1889,10 +1976,12 @@ jobs:
           # egress daemon (fail-closed), so the stack ships the daemon
           # binary beside it. `engram-cli` is the `engrams` binary the
           # e2e lane drives enable/registry/session with (ENGRAMS_BIN).
+          # Every resume spawns `engram-uffd-handler` beside the host agent.
           cargo build --release \
               -p engram-coordinator \
               -p engram-host-agent \
               -p engram-egress-proxyd \
+              -p engram-uffd-handler \
               -p engram-publish-builtin-harness \
               -p engram-cli
 
@@ -1909,6 +1998,7 @@ jobs:
             target/release/engram-coordinator
             target/release/engram-host-agent
             target/release/engram-egress-proxyd
+            target/release/engram-uffd-handler
             target/release/engram-publish-builtin-harness
             target/release/engrams
             target/x86_64-unknown-linux-musl/release/engram-agentd
@@ -2072,14 +2162,26 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends \
               musl-tools jq bc python3
 
-      - name: Install firecracker (v1.16.0)
+      # The forked firecracker the host image ships, as in the fc-setup
+      # action: keyed by the submodule's gitlink SHA, and an error when the
+      # artifact is missing.
+      - uses: oras-project/setup-oras@v2
+        with:
+          version: 1.3.0
+
+      - name: Install forked firecracker
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          FC_VER=v1.16.0
-          curl -fL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VER}/firecracker-${FC_VER}-x86_64.tgz" \
-            -o /tmp/fc.tgz
-          tar -xzf /tmp/fc.tgz -C /tmp
-          sudo install -m 0755 "/tmp/release-${FC_VER}-x86_64/firecracker-${FC_VER}-x86_64" \
-              /usr/local/bin/firecracker
+          set -euo pipefail
+          FC_SHA="$(git ls-tree HEAD third_party/firecracker | awk '{print $3}')"
+          echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          mkdir -p "$HOME/fc-fork"
+          if ! oras pull "ghcr.io/${{ github.repository }}/firecracker:$FC_SHA" --output "$HOME/fc-fork"; then
+            echo "::error::forked firecracker artifact firecracker:$FC_SHA is not published; dispatch bake-images on this branch to build it"
+            exit 1
+          fi
+          sudo install -m 0755 "$HOME/fc-fork/firecracker" /usr/local/bin/firecracker
           firecracker --version
 
       - name: Cache FC kernel + rootfs artifacts
@@ -2125,10 +2227,10 @@ jobs:
 
       - name: Mark e2e binaries executable
         run: |
-          chmod +x target/release/engram-{coordinator,host-agent,egress-proxyd,publish-builtin-harness}
+          chmod +x target/release/engram-{coordinator,host-agent,egress-proxyd,uffd-handler,publish-builtin-harness}
           chmod +x target/release/engrams
           chmod +x target/x86_64-unknown-linux-musl/release/engram-agentd
-          ls -l target/release/engram-{coordinator,host-agent,egress-proxyd,publish-builtin-harness} \
+          ls -l target/release/engram-{coordinator,host-agent,egress-proxyd,uffd-handler,publish-builtin-harness} \
                 target/release/engrams \
                 target/x86_64-unknown-linux-musl/release/engram-agentd
 
@@ -2745,6 +2847,7 @@ jobs:
       - test-fc-unprivileged
       - test-fc-pooled
       - test-fc-root
+      - test-ublk-root
       - test-fc-e2e
       - vz
       - test-macos

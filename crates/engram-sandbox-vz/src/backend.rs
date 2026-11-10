@@ -791,6 +791,10 @@ fn warn_vz_soft_egress_once(network: &engram_core::types::NetworkPolicy) {
 
 #[async_trait]
 impl SandboxBackend for VzBackend {
+    /// A VZ snapshot clones the disk and cold-boots on restore.
+    fn captures_guest_memory(&self) -> bool {
+        false
+    }
     fn bundle_dir(&self) -> &std::path::Path {
         &self.cfg.bundle_dir
     }

@@ -568,6 +568,9 @@ mod live_tests {
     }
     #[async_trait::async_trait]
     impl SandboxBackend for EndpointFixture {
+        fn captures_guest_memory(&self) -> bool {
+            false
+        }
         async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
             Err(invalid("unused fixture"))
         }

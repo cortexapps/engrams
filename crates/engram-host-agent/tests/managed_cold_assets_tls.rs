@@ -201,12 +201,17 @@ async fn cold_assets_actual_files_require_pinned_mutual_tls() {
                 None,
             )),
             hub.clone(),
-            chunks,
+            engram_fill::FillEngine::new(chunks, engram_fill::Config::default()),
         )
         .unwrap(),
     );
     let local = Arc::new(
-        engram_host_agent::host_client::LocalHostClient::new(ordinary, hub).with_managed_boot(boot),
+        engram_host_agent::host_client::LocalHostClient::new(
+            ordinary,
+            hub,
+            engram_host_agent::IdleEvictionHarness::default(),
+        )
+        .with_managed_boot(boot),
     );
     let expected = local
         .read_managed_cold_assets(request.clone())

@@ -21,8 +21,13 @@ pub const MANAGED_PROTOCOL_METADATA_KEY: &str = "x-engram-managed-protocol";
 /// other's VMs; raise it in any change that stops a new build from adopting
 /// the previous build's VMs, and an upgrade across it drains every host
 /// first. 1: the session disk is a kernel-owned thin volume (ADR 0125); a
-/// build that reports nothing counts as 0.
-pub const REATTACH_GENERATION: u32 = 1;
+/// build that reports nothing counts as 0. 2: the uffd handler speaks only
+/// substrate protocol version 2 and later, a post-copy `DrainDone` carries
+/// the hot-set fields, a snapshot create always sends `defer_sync`, and a
+/// migration item always carries its hash. 3: a session disk hydrates
+/// behind the running guest from a ublk device the host-agent serves,
+/// which an earlier build cannot serve again after a restart.
+pub const REATTACH_GENERATION: u32 = 3;
 
 /// Ordinary wire version on coordinator-to-host requests. Ordinary HTTP/2
 /// tolerates an absent header; authenticated managed requests require it.

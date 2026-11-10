@@ -1,24 +1,16 @@
-//! ADR 0075 integration: the REAL `PopulateClient` (the uffd handler's
-//! miss path) against the REAL `SubstrateServer` (the host-agent's
-//! writer) over a real UDS — fd passing, framing, Hello probes, the
-//! pin-around-open sequence, and the pinned-chunk-survives-pressure
-//! property that was unrepresentable pre-0069 (the handler's own sweep
-//! couldn't see the writer's pins).
-//!
-//! Linux-gated where fd passing is involved (SCM_RIGHTS); runs in the
-//! standard Linux lanes and the FC lane — no VM needed, because the
-//! property under test is the socket contract, not virtualization (the
-//! FC spawn's contribution is one `--substrate-sock` argv string; the
-//! end-to-end VM path is dev-vm-validated per the CI test-sizing rule).
+//! ADR 0075 integration: the real `PopulateClient` (the uffd handler's
+//! miss path) against the real `SubstrateServer` (the host-agent's
+//! writer) over a real UDS: framing, Hello probes, slot delivery, and
+//! pinned chunks that survive cache pressure. The property under test
+//! is the socket contract, so no VM is needed.
 
 use std::sync::Arc;
 
-use engram_chunk_store::cache::ChunkCacheConfig;
-use engram_chunk_store::{ChunkCache, ChunkStore};
+use engram_chunk_store::cache::{ChunkCacheConfig, FillSource};
+use engram_chunk_store::{ChunkCache, ChunkSource as _, ChunkStore, Class};
 use engram_core::traits::BlobStorage;
 use engram_host_agent::substrate_server::SubstrateServer;
 use engram_storage_local::LocalBlobStorage;
-#[cfg(target_os = "linux")]
 use engram_uffd_handler::populate_client::PopulateClient;
 
 fn fixture(
@@ -36,41 +28,50 @@ fn fixture(
     }
     let cache = ChunkCache::new(cfg);
     let store = Arc::new(ChunkStore::new(blob).with_chunk_cache(cache.clone()));
-    let server = SubstrateServer::new(cache.clone(), store.clone(), dir.join("shm"));
+    let fill = engram_fill::FillEngine::new((*store).clone(), engram_fill::Config::default());
+    let server = SubstrateServer::new(cache.clone(), fill, Some(dir.join("shm")));
     (server, cache, store)
 }
 
-#[cfg(target_os = "linux")]
+/// The real client against the real server speaks version 2: chunks
+/// arrive in the slot, the slot is reused once a reply's bytes drop,
+/// and bytes still held keep their connection out of the pool, so a
+/// second request on another connection cannot overwrite them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_client_populates_via_real_server_with_fd_passing() {
+async fn real_client_gets_chunks_through_the_slot() {
     let dir = tempfile::tempdir().unwrap();
     let (server, cache, store) = fixture(dir.path(), 0);
-    let bytes = bytes::Bytes::from(vec![0x42u8; 4096]);
-    let hash = store.put_chunk(&bytes).await.unwrap();
-    cache.evict_on_disk_for_test(hash);
+    let first = bytes::Bytes::from(vec![0x42u8; 4096]);
+    let second = bytes::Bytes::from(vec![0x17u8; 8192]);
+    let first_hash = store.put_chunk(&first).await.unwrap();
+    let second_hash = store.put_chunk(&second).await.unwrap();
+    cache.evict_on_disk_for_test(first_hash);
+    cache.evict_on_disk_for_test(second_hash);
 
     let sock = dir.path().join("substrate.sock");
     let _accept = server.spawn(sock.clone()).unwrap();
 
-    let client = PopulateClient::new(sock);
-    let (tmpfs_ok, cache_writable) = tokio::task::spawn_blocking(move || {
-        let got = client.hello(None, None).expect("hello");
-        let bytes_back = client.request(hash).expect("populate");
-        (got, bytes_back)
+    let client = Arc::new(PopulateClient::new(sock));
+    let (_tmpfs_ok, cache_writable) = tokio::task::spawn_blocking(move || {
+        let probes = client.hello(None, None, 2).expect("hello");
+        let held = client.request(first_hash).expect("populate first");
+        let other = client.request(second_hash).expect("populate second");
+        assert_eq!(held, first, "slot bytes must match the chunk");
+        assert_eq!(other, second, "a held reply must not be overwritten");
+        drop(held);
+        drop(other);
+        let again = client.request(first_hash).expect("populate again");
+        assert_eq!(again, first);
+        probes
     })
     .await
-    .map(|((t, w), b)| {
-        assert_eq!(b, bytes.to_vec(), "fd-passed bytes must match the chunk");
-        (t, w)
-    })
     .unwrap();
-    // /dev/... tempdir is not tmpfs necessarily — the honest assertion
-    // is that the probe ANSWERED; writability must hold for a tempdir.
-    let _ = tmpfs_ok;
+    // A tempdir is not always tmpfs; the probe answered, and a tempdir
+    // must probe writable.
     assert!(cache_writable);
     assert!(
-        cache.contains_on_disk(hash),
-        "populate must write-through to the cache dir (the writer wrote, not the client)",
+        cache.contains_on_disk(first_hash),
+        "the writer, not the client, writes the cache",
     );
 }
 
@@ -86,14 +87,8 @@ async fn pinned_chunks_survive_populate_pressure() {
     let (server, cache, store) = fixture(dir.path(), 256 * 1024);
     let _ = &server;
 
-    // The "session" chunk, pinned the way a Hello pins it: PIN FIRST,
-    // then populate — the ADR 0075 pin-around-open ordering. (The
-    // previous populate-then-pin ordering left a window where the
-    // populate's own debounced background sweep snapshotted an empty
-    // pin map and — under real host disk pressure via the statvfs
-    // floor — evicted the chunk before/after the pin landed. That
-    // interleaving is a REAL bug the sweep now guards with a
-    // delete-time pin re-check; the test orders like production.)
+    // The "session" chunk, pinned the way a Hello pins it: pin first,
+    // then populate, as production orders it.
     let pinned_bytes = bytes::Bytes::from(vec![0xAAu8; 64 * 1024]);
     let pinned_hash = store.put_chunk(&pinned_bytes).await.unwrap();
     cache.pin(pinned_hash);
@@ -102,10 +97,12 @@ async fn pinned_chunks_survive_populate_pressure() {
     // best-effort by design).
     let s2 = store.clone();
     cache
-        .get(
-            pinned_hash,
-            || async move { s2.get_chunk(pinned_hash).await },
-        )
+        .fill_with(pinned_hash, Class::Demand, None, |_| async move {
+            Ok((
+                s2.chunk(pinned_hash, Class::Demand).await?,
+                FillSource::BlobStorage,
+            ))
+        })
         .await
         .unwrap();
     assert!(cache.contains_on_disk(pinned_hash));
@@ -117,7 +114,12 @@ async fn pinned_chunks_survive_populate_pressure() {
         let h = store.put_chunk(&fresh).await.unwrap();
         let store2 = store.clone();
         let _ = cache
-            .get(h, || async move { store2.get_chunk(h).await })
+            .fill_with(h, Class::Demand, None, |_| async move {
+                Ok((
+                    store2.chunk(h, Class::Demand).await?,
+                    FillSource::BlobStorage,
+                ))
+            })
             .await;
     }
     cache.sweep_for_test().await;

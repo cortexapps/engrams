@@ -352,6 +352,28 @@ impl Dm {
         ready
     }
 
+    /// Load a new single-target table as the inactive table of `name`;
+    /// `resume` makes it live. A failed load leaves the active table.
+    pub async fn load(
+        &self,
+        name: &str,
+        length_sectors: u64,
+        kind: &str,
+        params: &str,
+    ) -> io::Result<()> {
+        let mut load = Request::new(name, 0)?;
+        load.push_target(length_sectors, kind, params);
+        self.call(
+            "load",
+            name,
+            load,
+            DM_TABLE_LOAD_CMD,
+            io::ErrorKind::ResourceBusy,
+        )
+        .await
+        .map(drop)
+    }
+
     pub async fn remove(&self, name: &str) -> io::Result<()> {
         self.call(
             "remove",
@@ -396,6 +418,21 @@ impl Dm {
         )
         .await
         .map(drop)
+    }
+
+    /// Whether `name` is suspended: the kernel sets `DM_SUSPEND_FLAG` in
+    /// every reply about a suspended device.
+    pub async fn suspended(&self, name: &str) -> io::Result<bool> {
+        let reply = self
+            .call(
+                "status",
+                name,
+                Request::new(name, 0)?,
+                DM_DEV_STATUS_CMD,
+                io::ErrorKind::ResourceBusy,
+            )
+            .await?;
+        Ok(reply.flags() & DM_SUSPEND_FLAG != 0)
     }
 
     pub async fn resume(&self, name: &str) -> io::Result<()> {
@@ -484,6 +521,23 @@ impl Dm {
 pub async fn device_path(devno: DevNo) -> io::Result<PathBuf> {
     let uevent = tokio::fs::read_to_string(format!("{}/uevent", devno.sysfs_path())).await?;
     Ok(PathBuf::from("/dev").join(parse::devname(&uevent)?))
+}
+
+/// The device number of the block device node at `path`.
+pub fn devno_of(path: &Path) -> io::Result<DevNo> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let meta = std::fs::metadata(path)?;
+    if !meta.file_type().is_block_device() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a block device", path.display()),
+        ));
+    }
+    let rdev = meta.rdev();
+    Ok(DevNo {
+        major: libc::major(rdev),
+        minor: libc::minor(rdev),
+    })
 }
 
 /// Create a block device node, replacing one that points elsewhere.

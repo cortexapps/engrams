@@ -157,8 +157,12 @@ async fn managed_host_requires_pinned_mutual_tls() {
         bindings.clone(),
     ));
     let local = Arc::new(
-        engram_host_agent::host_client::LocalHostClient::new(backend.clone(), hub)
-            .with_managed_policy(managed),
+        engram_host_agent::host_client::LocalHostClient::new(
+            backend.clone(),
+            hub,
+            engram_host_agent::IdleEvictionHarness::default(),
+        )
+        .with_managed_policy(managed),
     );
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -706,6 +710,9 @@ struct EndpointFixture {
 }
 #[async_trait::async_trait]
 impl engram_core::traits::SandboxBackend for EndpointFixture {
+    fn captures_guest_memory(&self) -> bool {
+        false
+    }
     async fn start_agent(
         &self,
         _: engram_core::SandboxId,

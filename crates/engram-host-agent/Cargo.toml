@@ -34,6 +34,7 @@ engram-host-core.workspace = true
 engram-disk-thin.workspace = true
 engram-protocol.workspace = true
 engram-chunk-store.workspace = true
+engram-fill.workspace = true
 engram-substrate-proto.workspace = true
 engram-migrate-proto.workspace = true
 engram-storage-local.workspace = true
@@ -105,6 +106,10 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 # linux5_13: `RegisterMode::MINOR` — the exact ioctl mode the probe
 # exercises.
 userfaultfd = { version = "0.9", features = ["linux5_13"] }
+# The ublk device `blk_source` serves; `io-uring` for the eventfd read
+# that wakes its queue thread.
+libublk = "0.4.8"
+io-uring = "0.7"
 # #1003: jemalloc as the global allocator (prod is musl-static; musl
 # mallocng retained 23 GB of ~48 MiB groups under chunk-buffer churn)
 # + the sampled heap profiler (SIGUSR2 → pprof dump) + allocator
@@ -130,10 +135,3 @@ engram-sandbox-process.workspace = true
 # (Mke2fsPacker in lib.rs); every remaining use is test-fixture image
 # packing in tests/*.rs, so this only needs to build for `cargo test`.
 tempfile = "3"
-# ADR 0008 Phase 5: the chunked-OCI fault integration test spins
-# up a loopback fake-registry that speaks just enough of the OCI
-# Distribution Spec for `OciChunkResolver` to fault chunks.
-# axum + tokio TcpListener bound to 127.0.0.1:0 keeps the test
-# self-contained — no docker, no external registry.
-axum = { workspace = true }
-http = { workspace = true }

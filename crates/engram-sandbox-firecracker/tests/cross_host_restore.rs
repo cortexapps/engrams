@@ -107,6 +107,7 @@ async fn restore_succeeds_with_different_work_dir_than_source() {
     let metadata = source.snapshot(source_id).await.expect("snapshot");
     let source_snap_dir = source.snapshot_path_for(metadata.id);
     assert!(source_snap_dir.join("manifest.json").exists());
+    common::chunk_memory(&source_snap_dir, shared.path()).await;
 
     // Verify the bake-side manifest stamped its canonical path.
     // The receiver needs this field to recreate the symlink
@@ -131,16 +132,16 @@ async fn restore_succeeds_with_different_work_dir_than_source() {
     // this restore would fail because FC's load_snapshot opens
     // the embedded source path and finds nothing.
     //
-    // Copy state.bin + memory.bin + manifest.json into the
-    // receiver's snapshot dir (the real coord materializer
-    // downloads them from BlobStorage; here we shortcut by
-    // copying directly).
+    // Copy state.bin + manifest.json into the receiver's snapshot dir
+    // (the real coord materializer downloads them from BlobStorage;
+    // here we shortcut by copying directly). memory.bin stays behind:
+    // a resume faults its pages from the chunk store.
     let receiver_snap_dir = receiver_work
         .path()
         .join("snapshots")
         .join(metadata.id.to_string());
     tokio::fs::create_dir_all(&receiver_snap_dir).await.unwrap();
-    for f in ["state.bin", "memory.bin", "manifest.json"] {
+    for f in ["state.bin", "manifest.json"] {
         tokio::fs::copy(source_snap_dir.join(f), receiver_snap_dir.join(f))
             .await
             .unwrap();
@@ -149,6 +150,7 @@ async fn restore_succeeds_with_different_work_dir_than_source() {
     let mut receiver_cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
     receiver_cfg.net_pool = None;
     receiver_cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
+    common::resume_through_uffd(&mut receiver_cfg, shared.path());
     let receiver = FirecrackerBackend::new(receiver_work.path(), receiver_cfg);
 
     let restored_id = SandboxId::new();

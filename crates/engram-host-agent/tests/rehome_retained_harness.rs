@@ -19,9 +19,7 @@ use engram_host_agent::bindings::BindingStore;
 use engram_host_agent::harness::{EventDelivery, EventSink, HarnessHub};
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
-use engram_sandbox_firecracker::{
-    FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
-};
+use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use futures::StreamExt;
 use parking_lot::Mutex;
 use tokio::time::timeout;
@@ -118,9 +116,7 @@ async fn non_drained_resume_reattaches_the_live_harness_and_finishes_its_run() {
     let mut config = FirecrackerConfig::with_kernel(kernel);
     config.net_pool = None;
     config.bundle_dir = staged.bundle_dir.clone();
-    config.restore_mode = RestoreMode::File;
-    config.uffd_handler_bin = target.join("debug/engram-uffd-handler");
-    config.uffd_blob_root = Some(blob_root);
+    common::resume_through_uffd(&mut config, &blob_root);
     config.uffd_cache_root = Some(work.path().join("chunk-cache"));
     config.track_dirty_pages = true;
     config.default_boot_args =

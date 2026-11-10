@@ -92,6 +92,19 @@ impl Interceptor for TraceparentInjector {
     }
 }
 
+/// Parent `span` on the W3C `traceparent` in `req`'s metadata: the
+/// server side of [`TraceparentInjector`]. A no-op when the request has
+/// none (OTLP disabled, or a caller that does not propagate).
+pub fn link_remote_parent<T>(span: &tracing::Span, req: &tonic::Request<T>) {
+    if let Some(tp) = req
+        .metadata()
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+    {
+        engram_telemetry::set_parent_from_traceparent(span, tp);
+    }
+}
+
 /// ADR 0079: build the shared fenced request for the
 /// `SandboxIdMessage`-shaped lifecycle RPCs. `SessionFence::unfenced()`
 /// encodes epoch 0 (interim "verb not yet migrated" — the host allows
@@ -497,14 +510,24 @@ impl GrpcHostClient {
         use futures::StreamExt;
         Ok(resp
             .map(|frame| {
-                frame
-                    .map(|f| engram_core::types::snapshot::MigrationFrame {
-                        item_idx: f.item_idx,
-                        offset: f.offset,
-                        data: bytes::Bytes::from(f.data),
-                        last: f.last,
-                    })
-                    .map_err(grpc_to_sandbox_err)
+                let f = frame.map_err(grpc_to_sandbox_err)?;
+                let item_hash = match f.last {
+                    false => None,
+                    true => Some(f.item_hash.as_slice().try_into().map_err(|_| {
+                        SandboxError::Snapshot(format!(
+                            "migration item {} hash is {} bytes, not 32",
+                            f.item_idx,
+                            f.item_hash.len()
+                        ))
+                    })?),
+                };
+                Ok(engram_core::types::snapshot::MigrationFrame {
+                    item_idx: f.item_idx,
+                    offset: f.offset,
+                    data: bytes::Bytes::from(f.data),
+                    last: f.last,
+                    item_hash,
+                })
             })
             .boxed())
     }

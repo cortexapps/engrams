@@ -487,15 +487,20 @@ async fn main() -> Result<(), CoordinatorError> {
     let host_registry = Arc::new(HostRegistry::new(meta_arc.clone()));
 
     // ADR 0044 K4: emit the fleet-demand gauges on a tick (the node-pool
-    // autoscaler scales on these). Also wires HOSTS_READY, defined in
-    // metrics.rs but previously never emitted.
+    // autoscaler scales on these), with HOSTS_READY and the Postgres pool
+    // gauges.
     {
         let meta = meta_arc.clone();
         let clock = clock.clone();
+        let pool = pg.pool().clone();
         tokio::spawn(async move {
             let mut tick = engram_core::periodic(std::time::Duration::from_secs(15));
             loop {
                 tick.tick().await;
+                ::metrics::gauge!(engram_coordinator::metrics::PG_POOL_CONNECTIONS)
+                    .set(f64::from(pool.size()));
+                ::metrics::gauge!(engram_coordinator::metrics::PG_POOL_IDLE_CONNECTIONS)
+                    .set(pool.num_idle() as f64);
                 // ADR 0047: counts from the hosts rows (replica-consistent).
                 // Leave gauges at their last value on a transient query error.
                 if let Ok(m) =

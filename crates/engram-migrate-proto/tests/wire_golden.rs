@@ -27,8 +27,8 @@
 //! cargo test -p engram-migrate-proto --test wire_golden -- --ignored regen_golden
 //! ```
 //!
-//! A change to an EXISTING golden is a red flag unless `PROTO_VERSION` was bumped.
-//! Review every changed fixture with the corresponding version change.
+//! A change to an EXISTING golden is a red flag unless `PROTO_VERSION` was bumped,
+//! or the change appends fields that both builds read.
 
 use std::path::PathBuf;
 
@@ -275,6 +275,8 @@ fn handler_control_golden_and_variant_indices() {
         fault_us: 55_000,
         fault_max_us: 9_000,
         fault_around_chunks_installed: 0,
+        hot_leading: 3,
+        hot_hint_received: true,
     };
     let peer_lost = HandlerControl::PeerLost {
         remaining: 3,
@@ -292,6 +294,10 @@ fn handler_control_golden_and_variant_indices() {
     assert_variant_index(&peer_lost, 3, "HandlerControl::PeerLost");
 }
 
+/// Both builds of a `DrainDone` during a host-agent roll: the previous
+/// build's frame (pinned bytes, no hot fields) decodes with the hot fields
+/// at zero, and the previous build's reader takes the current frame's
+/// leading fields.
 #[test]
 fn seal_bitmap_payload_golden() {
     // `SealBitmap` is a struct (no variant index) but it rides
@@ -421,6 +427,8 @@ fn regen_golden() {
             fault_us: 55_000,
             fault_max_us: 9_000,
             fault_around_chunks_installed: 0,
+            hot_leading: 3,
+            hot_hint_received: true,
         },
     );
     write(

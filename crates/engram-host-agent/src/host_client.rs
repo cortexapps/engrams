@@ -33,21 +33,65 @@ use engram_core::types::{SandboxId, SessionId};
 
 use crate::harness::{HarnessError, HarnessHub};
 
+/// What the idle-eviction capture ([`HostClient::snapshot_begin`]) does
+/// with the in-guest harness.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IdleEvictionHarness {
+    /// Capture the live harness and its agent. On resume agentd reattaches
+    /// to them, as after a live teleport, so the agent keeps its process
+    /// and its in-memory state.
+    #[default]
+    Keep,
+    /// Stop the harness before the capture ([`HarnessHub::drain`]). On
+    /// resume agentd spawns a new harness, which starts the agent again
+    /// from its on-disk transcript.
+    Drain,
+}
+
+impl std::fmt::Display for IdleEvictionHarness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Keep => "keep",
+            Self::Drain => "drain",
+        })
+    }
+}
+
+impl std::str::FromStr for IdleEvictionHarness {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "keep" => Ok(Self::Keep),
+            "drain" => Ok(Self::Drain),
+            other => Err(format!(
+                "invalid idle-eviction harness mode `{other}`: expected `keep` or `drain`"
+            )),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct LocalHostClient {
     sandbox: Arc<dyn SandboxBackend>,
     harness_hub: Arc<HarnessHub>,
     managed: Option<Arc<crate::managed_policy::ManagedPolicyHost>>,
     boot: Option<Arc<crate::managed_boot::ManagedBootHost>>,
+    idle_eviction_harness: IdleEvictionHarness,
 }
 
 impl LocalHostClient {
-    pub fn new(sandbox: Arc<dyn SandboxBackend>, harness_hub: Arc<HarnessHub>) -> Self {
+    pub fn new(
+        sandbox: Arc<dyn SandboxBackend>,
+        harness_hub: Arc<HarnessHub>,
+        idle_eviction_harness: IdleEvictionHarness,
+    ) -> Self {
         Self {
             sandbox,
             harness_hub,
             managed: None,
             boot: None,
+            idle_eviction_harness,
         }
     }
 
@@ -149,7 +193,7 @@ impl LocalHostClient {
             crate::harness::event_sink_to(|_, _, _, _| async { Ok(()) }),
             bindings,
         ));
-        Self::new(sandbox, hub)
+        Self::new(sandbox, hub, IdleEvictionHarness::default())
     }
 }
 
@@ -299,27 +343,16 @@ impl HostClient for LocalHostClient {
         _fence: SessionFence,
     ) -> Result<engram_core::types::SnapshotId, SandboxError> {
         self.ordinary_only(id)?;
-        // ADR 0052 Phase 2 (clean-idle-shutdown). The two-phase
-        // `snapshot_begin` is the IDLE-eviction capture entry: the
-        // coordinator starts capture and waits for durable finalize for
-        // `target_state == Idle` (live teleport goes through
-        // `migration_capture_postcopy`; periodic + manual checkpoints through
-        // `snapshot`). So this is exactly where "gate strictly to the idle
-        // path" lands — no `CheckpointReason` plumbing needed.
-        //
-        // Before pausing+capturing, gracefully stop the in-guest `claude`
-        // so the snapshot holds NO live agent: `drain` sends
-        // `Shutdown { grace }` (closing claude's stdin → it drains the
-        // in-flight turn to a final `result` and exits 0, then the harness
-        // exits) and waits for the harness vsock to drop. On resume agentd
-        // respawns the harness, which `--resume`s into the same on-disk
-        // session (decision 1: respawn-with-resume). Best-effort: an
-        // un-drained harness still gets captured (and reattached on
-        // resume) — we never block an eviction on a stuck agent.
-        if !self
-            .harness_hub
-            .drain(id, crate::harness::IDLE_DRAIN_GRACE_SECS)
-            .await
+        // The coordinator calls this only for an idle eviction (target
+        // `Idle`); live teleport and checkpoints capture through other
+        // methods and never drain. A drain is best-effort: a harness that
+        // stays attached past the grace is captured live and reattached on
+        // resume, so an eviction never waits on a stuck agent.
+        if self.idle_eviction_harness == IdleEvictionHarness::Drain
+            && !self
+                .harness_hub
+                .drain(id, crate::harness::IDLE_DRAIN_GRACE_SECS)
+                .await
         {
             tracing::warn!(
                 sandbox_id = %id,
@@ -876,5 +909,105 @@ fn harness_err_to_sandbox(e: HarnessError) -> SandboxError {
         | HarnessError::CheckpointAlreadyInFlight
         | HarnessError::CommandTimeout
         | HarnessError::WriterClosed => SandboxError::Vm(format!("{e}").into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
+    use super::*;
+    use engram_harness_proto::{
+        read_msg, write_msg, HarnessAttach, HarnessAttachAck, HarnessCommand, HarnessFrame,
+    };
+
+    /// Attach a fake harness, run the idle-eviction capture in `mode`, then
+    /// interrupt the harness if it is still attached. Returns whether it
+    /// stayed attached through the capture and the first command it read.
+    async fn idle_capture(mode: IdleEvictionHarness) -> (bool, HarnessCommand) {
+        let work = tempfile::tempdir().expect("tempdir");
+        let hub = Arc::new(HarnessHub::new(
+            crate::harness::event_sink_to(|_, _, _, _| async { Ok(()) }),
+            crate::bindings::BindingStore::open(work.path().join("bindings"))
+                .expect("binding store"),
+        ));
+        let session_id = SessionId::new();
+        let sandbox_id = SandboxId::new();
+        hub.bind_session(session_id, sandbox_id, 1).expect("bind");
+        let (host_side, harness_side) = tokio::io::duplex(1 << 16);
+        hub.accept_connection(sandbox_id, Some(session_id), host_side);
+
+        // The fake harness exits after its first command, as the real one
+        // does on `Shutdown`.
+        let harness = tokio::spawn(async move {
+            let (mut r, mut w) = tokio::io::split(harness_side);
+            write_msg(
+                &mut w,
+                &HarnessAttach {
+                    session_id,
+                    sandbox_id,
+                    binding_epoch: 1,
+                    harness_version: "test/0.1".into(),
+                },
+            )
+            .await
+            .expect("attach");
+            let ack: HarnessAttachAck = read_msg(&mut r).await.expect("ack");
+            assert!(ack.ok, "attach rejected: {:?}", ack.message);
+            match read_msg::<_, HarnessFrame>(&mut r).await.expect("frame") {
+                HarnessFrame::Command(cmd) => cmd,
+                other => panic!("expected a command, got {other:?}"),
+            }
+        });
+        for _ in 0..100 {
+            if hub.is_attached(sandbox_id) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(hub.is_attached(sandbox_id), "harness never attached");
+
+        // The process backend has no split capture: the call returns
+        // `InvalidSpec` after the harness step.
+        let backend = Arc::new(engram_sandbox_process::ProcessBackend::new(
+            work.path().join("sandboxes"),
+        ));
+        let client = LocalHostClient::new(backend, hub.clone(), mode);
+        let err = client
+            .snapshot_begin(sandbox_id, SessionFence::unfenced())
+            .await
+            .expect_err("process backend has no split capture");
+        assert!(matches!(err, SandboxError::InvalidSpec(_)), "{err:?}");
+
+        let attached = hub.is_attached(sandbox_id);
+        if attached {
+            hub.interrupt(sandbox_id).await.expect("interrupt");
+        }
+        (attached, harness.await.expect("harness task"))
+    }
+
+    #[tokio::test]
+    async fn keep_captures_the_live_harness_without_a_shutdown() {
+        let (attached, first) = idle_capture(IdleEvictionHarness::Keep).await;
+        assert!(attached);
+        assert!(matches!(first, HarnessCommand::Interrupt), "{first:?}");
+    }
+
+    #[tokio::test]
+    async fn drain_shuts_the_harness_down_before_the_capture() {
+        let (attached, first) = idle_capture(IdleEvictionHarness::Drain).await;
+        assert!(!attached);
+        assert!(
+            matches!(first, HarnessCommand::Shutdown { .. }),
+            "{first:?}"
+        );
+    }
+
+    #[test]
+    fn mode_round_trips_through_its_setting_string() {
+        for mode in [IdleEvictionHarness::Keep, IdleEvictionHarness::Drain] {
+            assert_eq!(mode.to_string().parse::<IdleEvictionHarness>(), Ok(mode));
+        }
+        assert!("off".parse::<IdleEvictionHarness>().is_err());
     }
 }

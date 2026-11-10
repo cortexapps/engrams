@@ -33,6 +33,7 @@ use std::time::Duration;
 use tokio_util::io::ReaderStream;
 
 /// Retry only transport failures and server errors. The final failure reaches the hub.
+/// Each try records its number in the current span's `attempt` field.
 async fn retry_harness_event<F, Fut>(mut send: F) -> Result<(), CoordError>
 where
     F: FnMut() -> Fut,
@@ -40,6 +41,7 @@ where
 {
     let mut delay = Duration::from_millis(200);
     for attempt in 1..=5 {
+        tracing::Span::current().record("attempt", attempt);
         match send().await {
             Ok(()) => return Ok(()),
             Err(error) => {
@@ -245,8 +247,12 @@ impl HttpCoordClient {
     ) -> Result<(), CoordError> {
         let url = self.endpoint(&format!("/sessions/{session_id}/harness-events"));
         retry_harness_event(|| async {
+            let mut builder = self.http.post(&url);
+            if let Some(tp) = engram_telemetry::current_traceparent() {
+                builder = builder.header("traceparent", tp);
+            }
             let resp = self
-                .auth(self.http.post(&url), req)
+                .auth(builder, req)
                 .send()
                 .await
                 .map_err(|e| CoordError::Transport(e.to_string()))?;
@@ -573,6 +579,13 @@ pub struct HeartbeatResponse {
     /// pre-fix behavior.
     #[serde(default)]
     pub prestage_images: Vec<engram_protocol::heartbeat::EnabledImageRef>,
+    /// The disk manifests of images whose capture is in flight. The host
+    /// stages them as image volumes during the capture, so the captured
+    /// version stages as a delta over them. `None` (the field is absent:
+    /// the coordinator's read failed, or the coordinator is older) means
+    /// unknown, not empty.
+    #[serde(default)]
+    pub capturing_disk_manifests: Option<Vec<engram_core::types::manifest::ManifestRef>>,
     /// ADR 0035 §5: the coord's bundle pin set (every generation some
     /// snapshot row references). The host's bundle supervisor
     /// prefetches missing pinned generations and sweeps staged files

@@ -390,10 +390,11 @@ dev-fc profile='fc-dev' mac_docker_context='colima':
     ENGRAM_FC_COLIMA_PROFILE={{profile}} DOCKER_HOST="$mac_host" tilt up
 
 # ADR 0082: create/update the named Colima VM (aarch64 Ubuntu, nested
-# virt, /dev/kvm, Firecracker + the aarch64 guest kernel, NBD/UFFD host
-# prep, the localhost→Mac DNAT unit engram-dev-fwd) — everything `dev-fc` needs
-# before its first run. Idempotent; safe to re-run after a Colima
-# upgrade or a provisioning-script change.
+# virt, /dev/kvm, the forked Firecracker and the aarch64 guest kernel (both
+# built in the VM), NBD/UFFD host prep, the localhost→Mac DNAT unit
+# engram-dev-fwd) — everything `dev-fc` needs before its first run.
+# Idempotent; safe to re-run after a Colima upgrade, a provisioning-script
+# change, or a third_party/firecracker bump.
 fc-colima-provision profile='fc-dev':
     bash deploy/dev/fc-colima-provision.sh {{profile}}
 

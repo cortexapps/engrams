@@ -201,3 +201,14 @@ When `ENGRAM_FC_COLIMA_PROFILE` is set, the Tiltfile:
   `fc-colima-provision.sh` now installs `engram-dev-fwd.service` (a boot-time
   oneshot running the DNAT) and retires any pre-existing `engram-fwd-*` socat
   units.
+- P4: **the rig runs the forked Firecracker.** The host-agent's Firecracker
+  client sends the fork's snapshot API (`defer_sync` on `PUT /snapshot/create`)
+  with no fallback for stock Firecracker, which rejects the unknown field, so
+  every capture on the stock aarch64 release binary fails. The fork is published to GHCR for
+  x86_64 only. `fc-colima-provision.sh` now builds the fork for
+  `aarch64-unknown-linux-musl` inside the VM from the `third_party/firecracker`
+  gitlink SHA, with the fork's pinned toolchain, and records that SHA in
+  `/opt/engram-dev/firecracker.sha`; a re-run builds again only when the gitlink
+  moves. This keeps the gitlink as the one version source and adds no CI work.
+  The "prod FC fork binary" item in Consequences is now in reach of the rig,
+  for aarch64.

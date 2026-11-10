@@ -39,6 +39,7 @@ use engram_protocol::grpc::{
     SendHarnessToolResultRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
     UnbindHarnessSessionRequest,
 };
+use engram_protocol::grpc_client::link_remote_parent;
 use engram_protocol::wire::WireExecRequest;
 use futures::Stream;
 use std::pin::Pin;
@@ -47,20 +48,6 @@ use tonic::{Request, Response, Status};
 use tracing::Instrument;
 
 use crate::session_epochs::{EpochError, SessionEpochStore};
-
-/// Link a handler span to the caller's distributed trace (ADR 0019) by
-/// reading the W3C `traceparent` the coord's [`TraceparentInjector`] put
-/// in the request metadata. No-op when absent (OTLP disabled, or a caller
-/// that doesn't propagate).
-fn link_remote_parent<T>(span: &tracing::Span, req: &Request<T>) {
-    if let Some(tp) = req
-        .metadata()
-        .get("traceparent")
-        .and_then(|v| v.to_str().ok())
-    {
-        engram_telemetry::set_parent_from_traceparent(span, tp);
-    }
-}
 
 /// Concrete `HostService` impl. Holds the in-proc
 /// `Arc<dyn HostClient>` (typically a `LocalHostClient` wrapping
@@ -182,22 +169,55 @@ impl HostServiceImpl {
     }
 }
 
-/// Boot a tonic `Server` bound to `listen_addr` and serve the
-/// `HostService` until the caller drops the returned future. The
-/// JoinHandle terminates with `Err` on bind failure or panic; a
-/// clean Ctrl-C just drops the future, which the runtime collects.
+/// Bind the `HostService` listener. Connections queue in the kernel
+/// until [`serve`] runs, so a self-connect probe passes from here on.
+pub fn bind(
+    listen_addr: std::net::SocketAddr,
+) -> std::io::Result<tonic::transport::server::TcpIncoming> {
+    let incoming = tonic::transport::server::TcpIncoming::bind(listen_addr)?;
+    tracing::info!(addr = %listen_addr, "gRPC HostService listening");
+    Ok(incoming.with_nodelay(Some(true)))
+}
+
+/// Bind `listen_addr` and serve the `HostService` until the caller drops
+/// the returned future.
 pub async fn boot(
     listen_addr: std::net::SocketAddr,
     inner: Arc<dyn HostClient>,
     epochs: SessionEpochStore,
     peer: Option<Arc<crate::peer_fill::PeerServe>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let incoming = bind(listen_addr)?;
+    Ok(serve(incoming, inner, epochs, peer).await?)
+}
+
+/// Serve the `HostService` on a bound listener until the caller drops
+/// the returned future. Ends with `Err` on a server error; a clean
+/// Ctrl-C just drops the future, which the runtime collects.
+pub async fn serve(
+    incoming: tonic::transport::server::TcpIncoming,
+    inner: Arc<dyn HostClient>,
+    epochs: SessionEpochStore,
+    peer: Option<Arc<crate::peer_fill::PeerServe>>,
 ) -> Result<(), tonic::transport::Error> {
-    serve(listen_addr, inner, epochs, peer, None).await
+    serve_inner(incoming, inner, epochs, peer, None).await
 }
 
 /// Serve one authenticated listener for all lifecycle operations in managed mode.
 pub async fn boot_with_managed_tls(
     listen_addr: std::net::SocketAddr,
+    inner: Arc<dyn HostClient>,
+    epochs: SessionEpochStore,
+    peer: Option<Arc<crate::peer_fill::PeerServe>>,
+    tls: Option<crate::managed_tls::ManagedHostTls>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let incoming = bind(listen_addr)?;
+    serve_with_managed_tls(incoming, inner, epochs, peer, tls).await
+}
+
+/// Serve the bound lifecycle listener with optional managed authentication.
+pub async fn serve_with_managed_tls(
+    incoming: tonic::transport::server::TcpIncoming,
     inner: Arc<dyn HostClient>,
     epochs: SessionEpochStore,
     peer: Option<Arc<crate::peer_fill::PeerServe>>,
@@ -209,12 +229,11 @@ pub async fn boot_with_managed_tls(
             Ok::<_, std::io::Error>((server, config.coordinator_pins))
         })
         .transpose()?;
-    serve(listen_addr, inner, epochs, peer, tls).await?;
-    Ok(())
+    Ok(serve_inner(incoming, inner, epochs, peer, tls).await?)
 }
 
-async fn serve(
-    listen_addr: std::net::SocketAddr,
+async fn serve_inner(
+    incoming: tonic::transport::server::TcpIncoming,
     inner: Arc<dyn HostClient>,
     epochs: SessionEpochStore,
     peer: Option<Arc<crate::peer_fill::PeerServe>>,
@@ -263,7 +282,6 @@ async fn serve(
             }
             Ok(req)
         });
-    tracing::info!(addr = %listen_addr, "gRPC HostService listening");
     server
         // ADR 0013: HTTP/2 multiplexes many concurrent streams over
         // one TCP connection per coord pod. 256 is well above the
@@ -279,7 +297,7 @@ async fn serve(
         .initial_connection_window_size(Some(32 * 1024 * 1024))
         .http2_adaptive_window(Some(true))
         .add_service(authenticated)
-        .serve(listen_addr)
+        .serve_with_incoming(incoming)
         .await
 }
 
@@ -545,6 +563,7 @@ impl HostService for HostServiceImpl {
                     offset: f.offset,
                     data: f.data.to_vec(),
                     last: f.last,
+                    item_hash: f.item_hash.map(|h| h.to_vec()).unwrap_or_default(),
                 })
                 .map_err(sandbox_to_status)
         });
@@ -658,6 +677,8 @@ impl HostService for HostServiceImpl {
         &self,
         req: Request<FencedSandboxRequest>,
     ) -> Result<Response<MigrationPresetupResponse>, Status> {
+        let span = tracing::info_span!("host.migration_presetup");
+        link_remote_parent(&span, &req);
         check_wire_version(&req)?;
         let r = req.into_inner();
         let id = decode_sandbox_id(&r.uuid)?;
@@ -665,6 +686,7 @@ impl HostService for HostServiceImpl {
         let out = self
             .inner
             .migration_presetup(id, fence)
+            .instrument(span)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(MigrationPresetupResponse {
@@ -1017,13 +1039,22 @@ impl HostService for HostServiceImpl {
         &self,
         req: Request<SendHarnessPromptRequest>,
     ) -> Result<Response<Empty>, Status> {
-        let r = req.into_inner();
-        let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
-        self.inner
-            .send_prompt(sandbox_id, r.prompt_id, r.text, r.harness_mode)
-            .await
-            .map_err(sandbox_to_status)?;
-        Ok(Response::new(Empty {}))
+        let span = tracing::info_span!(
+            "host.send_harness_prompt",
+            prompt_id = %req.get_ref().prompt_id,
+        );
+        link_remote_parent(&span, &req);
+        async move {
+            let r = req.into_inner();
+            let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
+            self.inner
+                .send_prompt(sandbox_id, r.prompt_id, r.text, r.harness_mode)
+                .await
+                .map_err(sandbox_to_status)?;
+            Ok(Response::new(Empty {}))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn edit_harness_queued_prompt(
@@ -1404,7 +1435,7 @@ impl HostService for HostServiceImpl {
             _ => {
                 return Err(Status::invalid_argument(
                     "first file frame must be metadata",
-                ))
+                ));
             }
         };
         let sandbox_id = decode_sandbox_id(&metadata.sandbox_id)?;

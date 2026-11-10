@@ -9,8 +9,7 @@
 //!    references an un-uploaded chunk; a retry after the fault clears
 //!    converges.
 //! 2. **Truncated get** — a silently short-read chunk is caught by the
-//!    resolver's hash verification (never served as short bytes), and a
-//!    tiered resolver falls through to the next tier.
+//!    resolver's hash verification (never served as short bytes).
 //! 3. **Missing chunk on cold read** — a `NotFound` on a manifest-
 //!    referenced chunk surfaces a typed, retryable error promptly (no hang,
 //!    no panic).
@@ -25,8 +24,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use engram_chunk_store::error::ChunkStoreError;
 use engram_chunk_store::manifest::{ChunkHash, ChunkRef, Manifest, ManifestKind, ManifestRef};
-use engram_chunk_store::resolver::{BlobStorageResolver, ChunkResolver, TieredChunkResolver};
+use engram_chunk_store::resolver::{BlobStorageResolver, ChunkResolver};
 use engram_chunk_store::store::ChunkStore;
+use engram_chunk_store::{ChunkSource as _, Class};
 use engram_core::error::BlobError;
 use engram_core::traits::BlobStorage;
 use engram_storage_local::LocalBlobStorage;
@@ -120,12 +120,12 @@ async fn flush_put_failure_never_publishes_partial_manifest() {
     assert_eq!(got_ref.version, 1);
     assert_eq!(got, published);
     for cr in &got.chunks {
-        let bytes = clean_store.get_chunk(cr.hash).await.unwrap();
+        let bytes = clean_store.chunk(cr.hash, Class::Prefix).await.unwrap();
         assert_eq!(ChunkHash::of(&bytes), cr.hash, "referenced chunk resolves");
     }
 }
 
-/// Property 2a: a silently truncated get (short read, no error) is caught by
+/// Property 2: a silently truncated get (short read, no error) is caught by
 /// the resolver's hash verification — it errors `HashMismatch` rather than
 /// serving short bytes.
 #[tokio::test]
@@ -155,40 +155,6 @@ async fn truncated_get_is_caught_by_resolver_hash_check() {
         other => panic!("expected HashMismatch on a short read, got {other:?}"),
     }
     assert_eq!(counters.gets_truncated(), 1);
-}
-
-/// Property 2b: a `TieredChunkResolver` whose primary tier returns a
-/// truncated (hash-mismatched) chunk falls through to the next tier and
-/// serves the correct bytes.
-#[tokio::test]
-async fn tiered_resolver_falls_through_past_truncated_tier() {
-    let dir = tempfile::tempdir().unwrap();
-    let backing: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
-
-    let body = Bytes::from_static(b"correct bytes served by the fallback tier");
-    let hash = ChunkHash::of(&body);
-    backing
-        .put(&hash.storage_key(), body.clone())
-        .await
-        .unwrap();
-
-    // Tier 0 reads through a truncating wrapper over the SAME backing; tier 1
-    // reads it cleanly.
-    let plan = FaultPlan::new().with_get(GetFault {
-        key: KeyMatch::Exact(hash.storage_key()),
-        when: When::Always,
-        kind: GetFaultKind::TruncateCleanEof { after_bytes: 4 },
-    });
-    let (faulty, _c) = FaultyBlobStorage::arc(backing.clone(), plan);
-    let tier0: Arc<dyn ChunkResolver> = Arc::new(BlobStorageResolver::new(faulty));
-    let tier1: Arc<dyn ChunkResolver> = Arc::new(BlobStorageResolver::new(backing.clone()));
-
-    let tiered = TieredChunkResolver::new(vec![tier0, tier1], None);
-    let got = tiered
-        .fetch_chunk(hash)
-        .await
-        .expect("tiered resolver must fall through the truncated tier");
-    assert_eq!(got, body, "fallback tier served the correct, full chunk");
 }
 
 /// Property 3: a `NotFound` on a manifest-referenced chunk during a cold
@@ -229,9 +195,12 @@ async fn missing_chunk_on_cold_read_errors_promptly() {
     let missing = cold_m.chunks[0].hash;
 
     // Bounded wait proves promptness (no hang).
-    let result = tokio::time::timeout(Duration::from_secs(5), faulted.get_chunk(missing))
-        .await
-        .expect("get_chunk must return promptly, never hang");
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        faulted.chunk(missing, Class::Prefix),
+    )
+    .await
+    .expect("a chunk read must return promptly, never hang");
 
     match result {
         Err(ChunkStoreError::Blob(BlobError::NotFound)) => {}

@@ -327,34 +327,8 @@ async fn unknown_layer_media_type_fails_loud_before_any_download() {
 }
 
 // ---------------------------------------------------------------
-// Full pipeline: determinism + scratch discipline (needs mke2fs).
+// Full pipeline: determinism + scratch discipline.
 // ---------------------------------------------------------------
-
-/// ADR 0036 byte-determinism hinges on SOURCE_DATE_EPOCH, honored by
-/// e2fsprogs >= 1.47.1 (the same >=1.47.1 e2fsprogs determinism
-/// gate). Older/missing mke2fs → skip with a note, never flake.
-fn deterministic_mke2fs_available() -> Option<String> {
-    let on_path = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).any(|dir| dir.join("mke2fs").is_file()))
-        .unwrap_or(false);
-    if !on_path {
-        return None;
-    }
-    let out = std::process::Command::new("mke2fs")
-        .arg("-V")
-        .output()
-        .ok()?;
-    // `mke2fs -V` prints e.g. "mke2fs 1.47.2 (1-Jan-2025)" to stderr.
-    let text = String::from_utf8_lossy(&out.stderr).into_owned();
-    let ver = text.split_whitespace().find_map(|tok| {
-        let mut it = tok.split('.');
-        let a: u32 = it.next()?.parse().ok()?;
-        let b: u32 = it.next()?.parse().ok()?;
-        let c: u32 = it.next()?.parse().ok()?;
-        Some((a, b, c))
-    });
-    matches!(ver, Some(v) if v >= (1, 47, 1)).then_some(text)
-}
 
 fn materializer() -> Materializer {
     Materializer::new(
@@ -373,15 +347,6 @@ fn materializer() -> Materializer {
 /// every run scrubs its scratch, success or not.
 #[tokio::test]
 async fn materialize_is_deterministic_and_scrubs_scratch() {
-    let Some(ver) = deterministic_mke2fs_available() else {
-        eprintln!(
-            "mke2fs missing or < 1.47.1 (no SOURCE_DATE_EPOCH); skipping determinism test \
-             (use the flake-pinned mke2fs: `nix develop`)"
-        );
-        return;
-    };
-    eprintln!("using {}", ver.trim());
-
     let fx = publish_fixture(None).await;
     let store_dir = tempfile::tempdir().unwrap();
     let chunk_store = engram_chunk_store::ChunkStore::new(Arc::new(
@@ -456,12 +421,17 @@ async fn materialize_is_deterministic_and_scrubs_scratch() {
         .await
         .expect("manifest committed to the store");
 
+    // A second store has no memo, so this run packs again.
+    let other_dir = tempfile::tempdir().unwrap();
+    let other_store = engram_chunk_store::ChunkStore::new(Arc::new(
+        engram_storage_local::LocalBlobStorage::new(other_dir.path().to_path_buf()),
+    ));
     let second = m
         .materialize(
             &fx.uri,
             Platform::LinuxArm64,
             scratch.path(),
-            &chunk_store,
+            &other_store,
             0,
             None,
         )
@@ -473,6 +443,99 @@ async fn materialize_is_deterministic_and_scrubs_scratch() {
          (fixed FS UUID + hash_seed + SOURCE_DATE_EPOCH + mtime clamp)"
     );
     assert_eq!(first.ext4_size_bytes, second.ext4_size_bytes);
+    assert_eq!(
+        first.disk_manifest.to_string(),
+        PINNED_ARM64_DISK_MANIFEST,
+        "the packed output changed: increase memo::LAYOUT_VERSION, then update the pin"
+    );
+}
+
+/// The disk manifest of the arm64 fixture. A memo hit returns the
+/// output of an earlier materialize, so a change to the packed bytes
+/// must come with a new `memo::LAYOUT_VERSION`.
+const PINNED_ARM64_DISK_MANIFEST: &str = "8724d704-ec4e-87fb-bf7c-670134aacb2e@v1";
+
+/// A second materialize of unchanged layers into the same store reads
+/// the memo: the same result, and no layer blob is downloaded.
+#[tokio::test]
+async fn unchanged_layers_skip_the_download() {
+    let fx = publish_fixture(None).await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let chunk_store = engram_chunk_store::ChunkStore::new(Arc::new(
+        engram_storage_local::LocalBlobStorage::new(store_dir.path().to_path_buf()),
+    ));
+    let scratch = tempfile::tempdir().unwrap();
+    let m = materializer();
+    let first = m
+        .materialize(
+            &fx.uri,
+            Platform::LinuxArm64,
+            scratch.path(),
+            &chunk_store,
+            0,
+            None,
+        )
+        .await
+        .expect("first materialize");
+    let gets_after_first = fx.reg.blob_gets.load(Ordering::Relaxed);
+
+    let second = m
+        .materialize(
+            &fx.uri,
+            Platform::LinuxArm64,
+            scratch.path(),
+            &chunk_store,
+            0,
+            None,
+        )
+        .await
+        .expect("memoized materialize");
+    assert_eq!(first.disk_manifest, second.disk_manifest);
+    assert_eq!(first.ext4_size_bytes, second.ext4_size_bytes);
+    assert_eq!(first.manifest_digest, second.manifest_digest);
+    assert_eq!(first.oci_defaults, second.oci_defaults);
+    assert_eq!(
+        fx.reg.blob_gets.load(Ordering::Relaxed) - gets_after_first,
+        1,
+        "only the config blob is fetched on a memo hit"
+    );
+
+    // A different size floor is a different input: the memo misses.
+    let floored = m
+        .materialize(
+            &fx.uri,
+            Platform::LinuxArm64,
+            scratch.path(),
+            &chunk_store,
+            first.ext4_size_bytes * 2,
+            None,
+        )
+        .await
+        .expect("materialize with a floor");
+    assert_ne!(floored.disk_manifest, first.disk_manifest);
+
+    // A memo whose chunks the store lost is a miss, and the
+    // materialize puts the chunks back.
+    let manifest = chunk_store.get_manifest(first.disk_manifest).await.unwrap();
+    let blob = chunk_store.blob_storage();
+    blob.delete(&manifest.chunks[0].hash.storage_key())
+        .await
+        .unwrap();
+    let gets_before_repair = fx.reg.blob_gets.load(Ordering::Relaxed);
+    let repaired = m
+        .materialize(
+            &fx.uri,
+            Platform::LinuxArm64,
+            scratch.path(),
+            &chunk_store,
+            0,
+            None,
+        )
+        .await
+        .expect("materialize after a lost chunk");
+    assert_eq!(repaired.disk_manifest, first.disk_manifest);
+    assert!(fx.reg.blob_gets.load(Ordering::Relaxed) - gets_before_repair > 1);
+    assert!(chunk_store.all_chunks_stored(&manifest).await.unwrap());
 }
 
 /// Scrub-on-error: a failing materialize (unknown layer mediaType)
@@ -568,7 +631,13 @@ async fn image_from_store(
     let image = tempfile::tempfile().unwrap();
     image.set_len(manifest.total_bytes).unwrap();
     for c in &manifest.chunks {
-        let bytes = chunk_store.get_chunk(c.hash).await.unwrap();
+        let bytes = engram_chunk_store::ChunkSource::chunk(
+            chunk_store,
+            c.hash,
+            engram_chunk_store::Class::Prefix,
+        )
+        .await
+        .unwrap();
         image.write_all_at(&bytes, c.offset).unwrap();
     }
     let fs = mkext4::reader::Fs::open(&image).unwrap();

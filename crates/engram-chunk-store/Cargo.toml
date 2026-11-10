@@ -29,7 +29,7 @@ parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "sync", "macros"] }
+tokio = { workspace = true, features = ["fs", "io-util", "sync", "macros", "rt"] }
 tracing.workspace = true
 uuid.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
