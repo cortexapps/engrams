@@ -274,6 +274,10 @@ spec:
               value: /opt/engram/firecracker
             - name: ENGRAM_THIN_POOL
               value: {{ .Values.thinPool.name | quote }}
+            - name: ENGRAM_DISK_HYDRATION_WINDOW_CHUNKS
+              value: {{ .Values.thinPool.hydration.windowChunks | quote }}
+            - name: ENGRAM_DISK_HYDRATION_IN_FLIGHT_REGIONS
+              value: {{ .Values.thinPool.hydration.inFlightRegions | quote }}
             {{- if .Values.coordinator.tokenSecretName }}
             - name: ENGRAM_COORDINATOR_TOKEN
               valueFrom:
