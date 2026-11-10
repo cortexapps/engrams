@@ -164,17 +164,12 @@ fn map_http_err(e: GcsHttpError) -> BlobError {
     // Both shapes mean the same thing: object doesn't exist.
     // Collapse them so callers downstream of `get_streaming` get
     // the same `BlobError::NotFound` that callers of `head` do.
-    let is_404 = match &e {
-        GcsHttpError::Response(resp) => resp.code == 404,
-        GcsHttpError::HttpClient(rq) | GcsHttpError::RawResponse(rq, _) => {
-            rq.status().is_some_and(|s| s.as_u16() == 404)
-        }
-        _ => false,
-    };
-    if is_404 {
-        BlobError::NotFound
-    } else {
-        BlobError::Sdk(Box::new(e))
+    // GCS answers 429 when a bucket's write rate grows faster than it
+    // redistributes load, and 503 when a backend is busy.
+    match http_status(&e) {
+        Some(404) => BlobError::NotFound,
+        Some(429 | 503) => BlobError::Throttled(Box::new(e)),
+        _ => BlobError::Sdk(Box::new(e)),
     }
 }
 
@@ -401,6 +396,42 @@ mod tests {
     use super::*;
 
     use engram_testkit::blob_conformance;
+
+    fn json_error(code: u16, message: &str) -> GcsHttpError {
+        GcsHttpError::Response(gcloud_storage::http::error::ErrorResponse {
+            code,
+            errors: Vec::new(),
+            message: message.to_string(),
+        })
+    }
+
+    #[test]
+    fn status_codes_map_to_blob_errors() {
+        let rate_limited = json_error(
+            429,
+            "Your request distribution is too uneven across the key-ranges in your bucket.",
+        );
+        assert!(matches!(
+            map_http_err(rate_limited),
+            BlobError::Throttled(_)
+        ));
+        assert!(matches!(
+            map_http_err(json_error(503, "backendError")),
+            BlobError::Throttled(_)
+        ));
+        assert!(matches!(
+            map_http_err(json_error(404, "No such object")),
+            BlobError::NotFound
+        ));
+        assert!(matches!(
+            map_http_err(json_error(500, "internal")),
+            BlobError::Sdk(_)
+        ));
+        assert!(matches!(
+            map_http_err(json_error(403, "forbidden")),
+            BlobError::Sdk(_)
+        ));
+    }
 
     /// Pins the rustls CryptoProvider contract for this crate's clients.
     ///

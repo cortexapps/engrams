@@ -252,6 +252,9 @@ pub enum BlobError {
     NotFound,
     /// Underlying SDK or HTTP error.
     Sdk(BoxError),
+    /// The store refused the request because of load (HTTP 429, or 503
+    /// and S3 `SlowDown`). The request can succeed after a backoff.
+    Throttled(BoxError),
     /// Configuration was invalid or missing (no creds, bad endpoint).
     Config(String),
     /// Backend returned an unexpected response shape.
@@ -269,6 +272,7 @@ impl fmt::Display for BlobError {
         match self {
             Self::NotFound => write!(f, "blob not found"),
             Self::Sdk(e) => write!(f, "blob sdk error: {e}"),
+            Self::Throttled(e) => write!(f, "blob store throttled the request: {e}"),
             Self::Config(msg) => write!(f, "blob config error: {msg}"),
             Self::Protocol(msg) => write!(f, "blob protocol error: {msg}"),
             Self::Io(e) => write!(f, "blob io error: {e}"),
@@ -282,7 +286,7 @@ impl fmt::Display for BlobError {
 impl StdError for BlobError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            Self::Sdk(e) => Some(&**e),
+            Self::Sdk(e) | Self::Throttled(e) => Some(&**e),
             Self::Io(e) => Some(e),
             _ => None,
         }
