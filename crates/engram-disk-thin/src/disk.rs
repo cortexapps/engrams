@@ -578,13 +578,13 @@ impl SessionDisk for ThinPoolDisk {
         let device = self.device_name(name);
         let hydrating = async {
             let params = format!(
-                "{} {} {} {region_sectors} 2 no_hydration no_discard_passdown \
-                 4 hydration_threshold {} \
+                "{metadata} {dest} {source} {region_sectors} 2 no_hydration \
+                 no_discard_passdown 4 hydration_threshold {in_flight} \
                  hydration_batch_size {HYDRATION_BATCH_REGIONS}",
-                self.hydration_in_flight,
-                dm::devno_of(&metadata)?,
-                dm::devno_of(&dest.path)?,
-                dm::devno_of(source)?,
+                metadata = dm::devno_of(&metadata)?,
+                dest = dm::devno_of(&dest.path)?,
+                source = dm::devno_of(source)?,
+                in_flight = self.hydration_in_flight,
             );
             self.dm.create(&device, sectors, "clone", &params).await?;
             let volume = self.volume(name, sectors).await?;
