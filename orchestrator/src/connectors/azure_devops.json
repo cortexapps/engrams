@@ -21,19 +21,19 @@
     },
     {
       "grants": ["code:read"],
-      "match": { "method": "GET", "path": "/*/_git/*/info/refs?service=git-upload-pack" }
+      "match": { "method": "GET", "path": "path-query:/*/_git/*/info/refs?service=git-upload-pack" }
     },
     {
       "grants": ["code:read"],
-      "match": { "method": "POST", "path": "/*/_git/*/git-upload-pack" }
+      "match": { "method": "POST", "path": "path-query:/*/_git/*/git-upload-pack" }
     },
     {
       "grants": ["code:write"],
-      "match": { "method": "GET", "path": "/*/_git/*/info/refs?service=git-receive-pack" }
+      "match": { "method": "GET", "path": "path-query:/*/_git/*/info/refs?service=git-receive-pack" }
     },
     {
       "grants": ["code:write"],
-      "match": { "method": "POST", "path": "/*/_git/*/git-receive-pack" }
+      "match": { "method": "POST", "path": "path-query:/*/_git/*/git-receive-pack" }
     },
     {
       "grants": ["pull_requests:write"],

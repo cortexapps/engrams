@@ -210,7 +210,7 @@ async fn forge_git_credential_needs_a_capability_for_the_host() {
     let resp = get(format!("{uri}?host=GitHub.com")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let resp = get(format!("{uri}?host=gitlab.com")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     // The mint is clamped to the session's own capabilities.
     let minted = forge.recorded_mint_caps();

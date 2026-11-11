@@ -40,6 +40,8 @@ use crate::state::SharedState;
 /// A git forge the session may use: a provider among the session's
 /// capabilities whose integration serves a git host.
 pub(crate) struct SessionForge {
+    /// The capability provider this forge was resolved for.
+    pub provider: String,
     pub integration: Arc<dyn Integration>,
     pub host: String,
 }
@@ -57,10 +59,39 @@ pub(crate) async fn session_forges(state: &SharedState, caps: &[Capability]) -> 
             continue;
         };
         if let Some(host) = integration.git_forge_host() {
-            forges.push(SessionForge { integration, host });
+            forges.push(SessionForge {
+                provider: provider.to_string(),
+                integration,
+                host,
+            });
         }
     }
     forges
+}
+
+/// Why the session got no git credential.
+enum GitCredentialError {
+    /// The session holds no capability for a forge that serves the host.
+    NoForge(&'static str),
+    Failed(String),
+}
+
+impl GitCredentialError {
+    fn into_message(self) -> String {
+        match self {
+            Self::NoForge(message) => message.to_string(),
+            Self::Failed(message) => message,
+        }
+    }
+}
+
+impl From<GitCredentialError> for ApiError {
+    fn from(error: GitCredentialError) -> Self {
+        match error {
+            GitCredentialError::NoForge(message) => ApiError::Forbidden(message.into()),
+            GitCredentialError::Failed(message) => ApiError::Internal(message),
+        }
+    }
 }
 
 /// A git credential: the username and password git sends as HTTP Basic.
@@ -79,22 +110,27 @@ async fn fetch_git_credential(
     session: SessionId,
     host: Option<String>,
     owner: Option<String>,
-) -> Result<GitCredential, String> {
+) -> Result<GitCredential, GitCredentialError> {
+    use GitCredentialError::{Failed, NoForge};
     let host = host.filter(|s| !s.is_empty());
     let caps = state
         .services
         .meta
         .get_session_capabilities(session)
         .await
-        .map_err(|e| format!("read session capabilities: {e}"))?;
+        .map_err(|e| Failed(format!("read session capabilities: {e}")))?;
     let mut forges = session_forges(state, &caps).await;
     if let Some(host) = &host {
         forges.retain(|forge| forge.host.eq_ignore_ascii_case(host));
     }
     let forge = match forges.as_slice() {
         [forge] => forge,
-        [] => return Err("this session has no git forge for that host".into()),
-        _ => return Err("this session has more than one git forge; name the host".into()),
+        [] => return Err(NoForge("this session has no git forge for that host")),
+        _ => {
+            return Err(NoForge(
+                "this session has more than one git forge; name the host",
+            ))
+        }
     };
     let hint = CredentialHint {
         served_host: host,
@@ -110,11 +146,11 @@ async fn fetch_git_credential(
             password,
             expires_at,
         }),
-        Ok(_) => Err(format!(
+        Ok(_) => Err(Failed(format!(
             "{} minted a credential git cannot send as HTTP Basic",
-            forge.integration.provider()
-        )),
-        Err(e) => Err(format!("mint git credential: {e}")),
+            forge.provider
+        ))),
+        Err(e) => Err(Failed(format!("mint git credential: {e}"))),
     }
 }
 
@@ -152,9 +188,7 @@ pub async fn git_credential(
             "invalid or missing forge token".into(),
         ));
     }
-    let cred = fetch_git_credential(&state, id, q.host, q.owner)
-        .await
-        .map_err(ApiError::Internal)?;
+    let cred = fetch_git_credential(&state, id, q.host, q.owner).await?;
     Ok(Json(GitCredentialResponse {
         username: cred.username,
         password: cred.password,
@@ -237,7 +271,9 @@ async fn process_request(state: &SharedState, req: ForgeRequest) -> ForgeRespons
                     username: cred.username,
                     password: cred.password,
                 },
-                Err(message) => ForgeResponse::Error { message },
+                Err(error) => ForgeResponse::Error {
+                    message: error.into_message(),
+                },
             }
         }
         ForgeOp::FetchOAuthCredential => match state.oauth.fetch_session(req.session_id).await {

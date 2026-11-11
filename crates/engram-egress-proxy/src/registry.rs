@@ -89,7 +89,7 @@ pub struct SecretEntry {
 /// ADR 0056 (Plane B): a credential the proxy injects host-side. The
 /// guest holds no placeholder; on an outbound request matching `allow`
 /// (SNI) AND `policy` (method + path), the proxy adds
-/// `header_name: <header_template with "{}" → secret>`. The secret lives
+/// `header_name: <header_template rendered with the secret>`. The secret lives
 /// only in this struct, on the host.
 ///
 /// The credential is refreshable. A minted entry (`mint_source` present)
@@ -342,7 +342,9 @@ impl RequestPolicy {
     }
 
     /// Glob path match over the whole path; empty `path_globs` = any path.
-    /// An internal `segment:` prefix makes each `*` stop at `/`.
+    /// A `path-query:` prefix matches the path and the query apart (see
+    /// [`path_query_match`]). An internal `segment:` prefix makes each `*`
+    /// stop at `/`.
     /// `segment-path:` also excludes the query string from matching. Google
     /// Cloud policies use the latter form because API clients add transport
     /// parameters such as `alt=json`, while the permission boundary is the
@@ -350,7 +352,9 @@ impl RequestPolicy {
     pub fn path_matches(&self, path: &str) -> bool {
         self.path_globs.is_empty()
             || self.path_globs.iter().any(|pattern| {
-                if let Some(pattern) = pattern.strip_prefix("segment-path:") {
+                if let Some(pattern) = pattern.strip_prefix("path-query:") {
+                    path_query_match(pattern, path)
+                } else if let Some(pattern) = pattern.strip_prefix("segment-path:") {
                     segment_glob_match(pattern, path.split_once('?').map_or(path, |(path, _)| path))
                 } else if let Some(pattern) = pattern.strip_prefix("segment:") {
                     segment_glob_match(pattern, path)
@@ -367,6 +371,27 @@ impl RequestPolicy {
 /// nothing else.
 fn glob_match(pattern: &str, text: &str) -> bool {
     glob_match_with(pattern, text, true)
+}
+
+/// Match `PATH[?QUERY]` against a request target whose permission depends on
+/// the query (git smart HTTP: `info/refs?service=…` is a fetch or a push). The
+/// pattern's path globs the request path only, so a `*` cannot reach into the
+/// query; the query must equal the pattern's exactly, and a pattern with no
+/// query takes a request with none. A path that a server could resolve to
+/// another one (a `%` escape or a `..`) never matches.
+fn path_query_match(pattern: &str, target: &str) -> bool {
+    fn split(s: &str) -> (&str, Option<&str>) {
+        match s.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (s, None),
+        }
+    }
+    let (pattern_path, pattern_query) = split(pattern);
+    let (path, query) = split(target);
+    !path.contains('%')
+        && !path.contains("..")
+        && query == pattern_query
+        && glob_match(pattern_path, path)
 }
 
 /// Google resource-path glob: `*` matches within one `/`-delimited segment.
@@ -648,6 +673,35 @@ mod tests {
 
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn path_query_glob_keeps_the_query_out_of_the_path_match() {
+        let policy = |glob: &str| RequestPolicy {
+            methods: vec![],
+            path_globs: vec![glob.into()],
+            graphql: None,
+        };
+        let fetch_refs = policy("path-query:/*.git/info/refs?service=git-upload-pack");
+        let fetch = policy("path-query:/*.git/git-upload-pack");
+
+        assert!(fetch_refs.path_matches("/g/sub/p.git/info/refs?service=git-upload-pack"));
+        assert!(fetch.path_matches("/g/p.git/git-upload-pack"));
+
+        // A push dressed as a fetch: the fetch suffix sits in the query.
+        assert!(!fetch.path_matches("/g/p.git/git-receive-pack?x=/git-upload-pack"));
+        assert!(!fetch_refs.path_matches(
+            "/g/p.git/info/refs?service=git-receive-pack&x=/info/refs?service=git-upload-pack"
+        ));
+        // The query is exact: no extra parameter, none missing.
+        assert!(!fetch_refs.path_matches("/g/p.git/info/refs?service=git-upload-pack&x=1"));
+        assert!(!fetch_refs.path_matches("/g/p.git/info/refs"));
+        assert!(!fetch.path_matches("/g/p.git/git-upload-pack?x=1"));
+        // A path the server could resolve to another one.
+        assert!(!fetch.path_matches("/g/p.git/git-receive-pack/%2e%2e/git-upload-pack"));
+        assert!(!fetch.path_matches("/g/p.git/x/../git-upload-pack"));
+        // Not a repository path.
+        assert!(!fetch.path_matches("/api/v4/projects/1/git-upload-pack"));
+    }
 
     fn state() -> SessionState {
         SessionState {

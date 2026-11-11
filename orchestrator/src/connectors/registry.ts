@@ -2032,13 +2032,16 @@ function parseActionIdempotency(where: string, raw: unknown): ActionIdempotency 
   }
 }
 
-/** A header template names the secret as `{}` or as `{basic:USER}`. */
+/** A header template names the secret as `{}` or as `{basic:USER}`. The
+ * renderer reads a `{basic:` up to the next `}`, so one that is not a whole
+ * placeholder is refused. */
 const TEMPLATE_PLACEHOLDER_RE = /\{\}|\{basic:[A-Za-z0-9_.-]*\}/;
+const MALFORMED_BASIC_RE = /\{basic:(?![A-Za-z0-9_.-]*\})/;
 
 function assertHeaderTemplate(where: string, field: string, value: unknown): asserts value is string {
   if (typeof value !== "string") fail(where, `"${field}" must be a string`);
   if (/[\r\n]/.test(value)) fail(where, `"${field}" must not contain newlines`);
-  if (!TEMPLATE_PLACEHOLDER_RE.test(value)) {
+  if (!TEMPLATE_PLACEHOLDER_RE.test(value) || MALFORMED_BASIC_RE.test(value)) {
     fail(where, `"${field}" must contain the "{}" or "{basic:USER}" value placeholder`);
   }
 }
@@ -2162,8 +2165,9 @@ export function parseConnector(
     }
     if (op.template !== undefined) {
       assertHeaderTemplate(opWhere, "template", op.template);
-      if (credential.source !== "inject" || !match || isGraphqlMatch(match)) {
-        fail(opWhere, '"template" needs an inject credential and an HTTP match');
+      // One template cannot render two different headers.
+      if (credential.source !== "inject" || credential.injects.length !== 1 || !match || isGraphqlMatch(match)) {
+        fail(opWhere, '"template" needs an inject credential with one header and an HTTP match');
       }
     }
     let asset: AssetSpec | undefined;

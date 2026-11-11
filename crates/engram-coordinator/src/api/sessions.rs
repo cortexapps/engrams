@@ -1818,11 +1818,7 @@ pub(crate) async fn inject_forge_env(
     let forges = crate::api::forge::session_forges(state, &caps).await;
     let git_caps: Vec<&engram_core::types::Capability> = caps
         .iter()
-        .filter(|c| {
-            forges
-                .iter()
-                .any(|f| f.integration.provider() == c.provider)
-        })
+        .filter(|c| forges.iter().any(|f| f.provider == c.provider))
         .collect();
     if git_caps.is_empty() {
         return Ok(());
