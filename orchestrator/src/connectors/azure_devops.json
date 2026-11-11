@@ -1,0 +1,95 @@
+{
+  "provider": "azure_devops",
+  "protocol": "http",
+  "display": {
+    "name": "Azure DevOps",
+    "category": "Source control",
+    "blurb": "Clone and push Azure Repos, open and review pull requests, and work with work items and pipelines — authenticated with a brokered personal access token.",
+    "icon": { "mono": "AZ", "color": "#0078d4" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Authorization", "template": "Basic {basic:}", "secretRef": "azure_devops.pat" }
+    ]
+  },
+  "hosts": ["dev.azure.com"],
+  "operations": [
+    {
+      "grants": ["code:read"],
+      "match": { "method": "GET", "path": "/*/_apis/git/*" }
+    },
+    {
+      "grants": ["code:read"],
+      "match": { "method": "GET", "path": "/*/_git/*/info/refs?service=git-upload-pack" }
+    },
+    {
+      "grants": ["code:read"],
+      "match": { "method": "POST", "path": "/*/_git/*/git-upload-pack" }
+    },
+    {
+      "grants": ["code:write"],
+      "match": { "method": "GET", "path": "/*/_git/*/info/refs?service=git-receive-pack" }
+    },
+    {
+      "grants": ["code:write"],
+      "match": { "method": "POST", "path": "/*/_git/*/git-receive-pack" }
+    },
+    {
+      "grants": ["pull_requests:write"],
+      "match": { "method": "POST", "path": "/*/_apis/git/repositories/*/pullrequests*" }
+    },
+    {
+      "grants": ["pull_requests:write"],
+      "match": { "method": "PATCH", "path": "/*/_apis/git/repositories/*/pullrequests/*" }
+    },
+    {
+      "grants": ["pull_requests:write"],
+      "match": { "method": "POST", "path": "/*/_apis/git/repositories/*/pullRequests/*/threads*" }
+    },
+    {
+      "grants": ["work_items:read"],
+      "match": { "method": "GET", "path": "/*/_apis/wit/*" }
+    },
+    {
+      "grants": ["work_items:read"],
+      "match": { "method": "POST", "path": "/*/_apis/wit/wiql*" }
+    },
+    {
+      "grants": ["work_items:write"],
+      "match": { "method": "POST", "path": "/*/_apis/wit/workitems/*" }
+    },
+    {
+      "grants": ["work_items:write"],
+      "match": { "method": "PATCH", "path": "/*/_apis/wit/workitems/*" }
+    },
+    {
+      "grants": ["pipelines:read"],
+      "match": { "method": "GET", "path": "/*/_apis/build/*" }
+    },
+    {
+      "grants": ["pipelines:read"],
+      "match": { "method": "GET", "path": "/*/_apis/pipelines*" }
+    },
+    {
+      "grants": ["pipelines:write"],
+      "match": { "method": "POST", "path": "/*/_apis/build/builds*" }
+    },
+    {
+      "grants": ["pipelines:write"],
+      "match": { "method": "POST", "path": "/*/_apis/pipelines/*/runs*" }
+    },
+    {
+      "grants": [
+        "code:read",
+        "code:write",
+        "pull_requests:write",
+        "work_items:read",
+        "work_items:write",
+        "pipelines:read",
+        "pipelines:write"
+      ],
+      "match": { "method": "GET", "path": "/*/_apis/projects*" }
+    }
+  ]
+}

@@ -477,6 +477,24 @@ describe("compileIntegrationPolicy", () => {
     expect(readOnly.injects.some((i) => i.path_globs.some((p) => p.includes("receive-pack")))).toBe(false);
   });
 
+  test("Azure DevOps sends its token as a Basic password on the API and on git", () => {
+    const policy = compileIntegrationPolicy(["azure_devops:code:read"], connectorRegistry());
+    expect(policy.injects.map((i) => [i.methods[0], i.path_globs[0]])).toEqual([
+      ["GET", "/*/_apis/git/*"],
+      ["GET", "/*/_git/*/info/refs?service=git-upload-pack"],
+      ["POST", "/*/_git/*/git-upload-pack"],
+      ["GET", "/*/_apis/projects*"],
+    ]);
+    for (const inject of policy.injects) {
+      expect(inject).toMatchObject({
+        hosts: ["dev.azure.com"],
+        header_name: "Authorization",
+        header_template: "Basic {basic:}",
+        secret_ref: "azure_devops.pat",
+      });
+    }
+  });
+
   test("a template names the secret as {} or {basic:USER}, and only on an inject connector's HTTP match", () => {
     const withOp = (operation: Record<string, unknown>, raw: Record<string, unknown> = datadogRaw) =>
       parseConnector({ ...raw, operations: [operation] }, "t");
