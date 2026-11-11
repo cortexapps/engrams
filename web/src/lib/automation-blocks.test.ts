@@ -199,18 +199,18 @@ describe("state + probe blocks in the palette (ADR 0119 D10/D11)", () => {
     ]) {
       const spec = blockKind(kind);
       expect(spec.description).not.toBe("Unknown block kind.");
-      expect(insertableBlockKinds(new Set()).some((s) => s.kind === kind)).toBe(true);
+      expect(insertableBlockKinds(false).some((s) => s.kind === kind)).toBe(true);
     }
   });
 
   it("a built-in-only kind renders with its own label and is never offered", () => {
     expect(blockKind("slack_choice").label).toBe("Slack choice");
     expect(blockKind("slack_choice").inspector).toBe("readonly");
-    expect(insertableBlockKinds(new Set()).some((s) => s.kind === "slack_choice")).toBe(false);
+    expect(insertableBlockKinds(false).some((s) => s.kind === "slack_choice")).toBe(false);
   });
 
   it("groups the insertable kinds by purpose, the internals under Advanced; the agent is not a block", () => {
-    const groups = groupedBlockKinds(new Set(["openrouter"]));
+    const groups = groupedBlockKinds(true);
     expect(groups.map((g) => g.id)).toEqual(["flow", "sessions", "integrations", "advanced"]);
     expect(groups.flatMap((g) => g.kinds.map((k) => k.kind))).not.toContain("run_agent");
     const advanced = groups.find((g) => g.id === "advanced")!.kinds.map((k) => k.kind);
@@ -220,20 +220,18 @@ describe("state + probe blocks in the palette (ADR 0119 D10/D11)", () => {
     // Every insertable kind is in exactly one group.
     const all = groups.flatMap((g) => g.kinds.map((k) => k.kind));
     expect(new Set(all).size).toBe(all.length);
-    expect(all.length).toBe(insertableBlockKinds(new Set(["openrouter"])).length);
+    expect(all.length).toBe(insertableBlockKinds(true).length);
   });
 
-  it("a router-backed kind is insertable only while its router has a key", () => {
-    expect(insertableBlockKinds(new Set()).some((s) => s.kind === "decide")).toBe(false);
-    expect(insertableBlockKinds(new Set(["openrouter"])).some((s) => s.kind === "decide")).toBe(
-      true,
-    );
+  it("a decision kind is insertable only while a model router can decide", () => {
+    expect(insertableBlockKinds(false).some((s) => s.kind === "decide")).toBe(false);
+    expect(insertableBlockKinds(true).some((s) => s.kind === "decide")).toBe(true);
     // An existing block still renders with its own inspector.
     expect(blockKind("decide").inspector).toBe("decide");
   });
 
   it("defaults satisfy the summary renderers", () => {
-    for (const spec of insertableBlockKinds(new Set(["openrouter"]))) {
+    for (const spec of insertableBlockKinds(true)) {
       expect(() => spec.summary(spec.defaults())).not.toThrow();
     }
   });
@@ -381,10 +379,10 @@ describe("the agent with ways in", () => {
   });
 
   it("with an agent the menu offers no wait blocks: waiting is the agent's session", () => {
-    const all = groupedBlockKinds(new Set()).flatMap((g) => g.kinds.map((k) => k.kind));
+    const all = groupedBlockKinds(false).flatMap((g) => g.kinds.map((k) => k.kind));
     expect(all).toContain("wait_session");
     expect(all).toContain("wait_event");
-    const withAgent = groupedBlockKinds(new Set(), { withAgent: true }).flatMap((g) =>
+    const withAgent = groupedBlockKinds(false, { withAgent: true }).flatMap((g) =>
       g.kinds.map((k) => k.kind),
     );
     expect(withAgent).not.toContain("wait_session");

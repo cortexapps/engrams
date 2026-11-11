@@ -1,9 +1,8 @@
-/** Slack smart routing: where no channel override decides, a decision model
- * (Jev, through OpenRouter) picks the profile from the thread and asks in
- * the thread when it is not sure. Offered only while OpenRouter has a key;
- * without one the section is absent, unless smart routing was already on —
- * then it says it is paused (threads use the default profile) and offers
- * the switch back. */
+/** Smart routing: where no channel override decides, a decision model picks
+ * the profile from the thread and asks in the thread when it is not sure.
+ * Offered only while a model router can decide; otherwise the section is
+ * absent, unless smart routing is on — then it says it is paused (threads
+ * use the default profile) and offers the switch back. */
 
 import { Link } from "@tanstack/react-router";
 import { AlertTriangle } from "lucide-react";
@@ -20,7 +19,7 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { useSetInputValue } from "@/hooks/useAutomations";
-import { useConnectedRouters } from "@/hooks/useConnectedRouters";
+import { useCanDecide } from "@/hooks/useCanDecide";
 import { errorMessage } from "@/lib/errors";
 
 export type SlackRouting = "default" | "smart";
@@ -36,7 +35,7 @@ export function routingOf(inputs: Record<string, unknown>): SlackRouting {
 }
 
 export function SmartRouting({ automationId, inputs, profiles }: SmartRoutingProps) {
-  const connected = useConnectedRouters().has("openrouter");
+  const connected = useCanDecide();
   const setInput = useSetInputValue();
   const routing = routingOf(inputs);
   const threshold =
@@ -73,9 +72,10 @@ export function SmartRouting({ automationId, inputs, profiles }: SmartRoutingPro
         >
           <AlertTriangle className="mt-0.5 size-4 shrink-0 text-instrument-caution" aria-hidden />
           <span className="flex-1">
-            Smart routing is paused: there is no OpenRouter key, so threads use the default profile.{" "}
+            Smart routing is paused: no model router has a key and a decision model, so threads use
+            the default profile.{" "}
             <Link to="/settings/model-routers" className="underline underline-offset-2">
-              Connect OpenRouter
+              Set up a model router
             </Link>{" "}
             to turn it back on.
           </span>

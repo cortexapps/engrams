@@ -92,6 +92,7 @@ export function registerModelRouters(router: ConnectRouter, deps?: ModelRouterSe
       defaultModel: roles.default ?? "",
       titleModel: roles.title ?? "",
       decisionModel: roles.decision ?? "",
+      connector: definition.connector,
     };
   }
 

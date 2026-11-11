@@ -8,6 +8,7 @@ const updatePolicy = vi.hoisted(() => vi.fn());
 const refresh = vi.hoisted(() => vi.fn());
 const putSecret = vi.hoisted(() => vi.fn());
 const invalidate = vi.hoisted(() => vi.fn());
+const updateSettings = vi.hoisted(() => vi.fn());
 
 vi.mock("@/hooks/useModelRouters", () => ({
   useModelRouters: () => ({
@@ -21,6 +22,10 @@ vi.mock("@/hooks/useModelRouters", () => ({
           credentialSecret: "openrouter.api_key",
           credentialConfigured: true,
           egressHosts: ["us.openrouter.ai"],
+          connector: "openrouter",
+          defaultModel: "",
+          titleModel: "",
+          decisionModel: "jev",
           availableModelCount: 270,
           enabledModelCount: 3,
           modelCount: 270,
@@ -54,6 +59,7 @@ vi.mock("@/hooks/useModelRouters", () => ({
   }),
   useRefreshRouterModels: () => ({ mutate: refresh, isPending: false, error: null }),
   useUpdateRouterModelPolicy: () => ({ mutate: updatePolicy, isPending: false }),
+  useUpdateModelRouterSettings: () => ({ mutate: updateSettings, isPending: false, error: null }),
   useInvalidateRouter: () => invalidate,
 }));
 
@@ -67,6 +73,7 @@ afterEach(() => {
   refresh.mockClear();
   putSecret.mockClear();
   invalidate.mockClear();
+  updateSettings.mockClear();
 });
 
 describe("ModelRoutersPanel", () => {
@@ -89,5 +96,25 @@ describe("ModelRoutersPanel", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Refresh catalog" }));
     expect(refresh).toHaveBeenCalledWith({ routerId: "openrouter" });
+  });
+
+  test("a role model saves when it changes, and an empty value clears it", async () => {
+    render(<ModelRoutersPanel />);
+
+    const title = screen.getByLabelText("Title model");
+    await userEvent.type(title, "deepseek/deepseek-v4-pro-0813{Enter}");
+    expect(updateSettings).toHaveBeenCalledWith({
+      routerId: "openrouter",
+      titleModel: "deepseek/deepseek-v4-pro-0813",
+    });
+
+    const decision = screen.getByLabelText("Decision model");
+    expect((decision as HTMLInputElement).value).toBe("jev");
+    await userEvent.click(decision);
+    await userEvent.tab();
+    expect(updateSettings).toHaveBeenCalledTimes(1);
+    await userEvent.clear(decision);
+    await userEvent.tab();
+    expect(updateSettings).toHaveBeenLastCalledWith({ routerId: "openrouter", decisionModel: "" });
   });
 });

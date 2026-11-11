@@ -474,9 +474,9 @@ export interface BlockKindSpec {
     | "integration_action"
     | "decide"
     | "readonly";
-  /** The model router the block calls. It is offered for insertion only
-   * while that router has a key; an existing block still renders. */
-  requiresRouter?: string;
+  /** The block asks a decision model. It is offered for insertion only while
+   * a model router can decide; an existing block still renders. */
+  requiresDecisions?: true;
   /** Whether this kind nests child lists (branch: then/else; loop: body). */
   nests?: "branch" | "loop";
   /** Fresh default config when inserted. */
@@ -1242,10 +1242,10 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
     outputs: ["decided", "answers"],
     label: "Decide",
     description:
-      "Ask a decision model (Jev, through OpenRouter) typed questions about a state: pick an option, rate on levels, or yes / no. Answers carry a calibrated confidence a branch can gate on. Without OpenRouter it outputs decided: false.",
+      "Ask a decision model typed questions about a state: pick an option, rate on levels, or yes / no. Answers carry a confidence a branch can gate on. Without a model router that has a decision model it outputs decided: false.",
     icon: Scale,
     inspector: "decide",
-    requiresRouter: "openrouter",
+    requiresDecisions: true,
     summary: (c) => {
       const questions =
         typeof c["questions"] === "object" && c["questions"] !== null
@@ -1373,15 +1373,10 @@ export function blockKind(kind: string): BlockKindSpec {
 }
 
 /** Kinds a user may insert: every kind a hand-built automation may place,
- * except one whose model router has no key (`connectedRouters` = the routers
- * that have one). */
-export function insertableBlockKinds(
-  connectedRouters: ReadonlySet<string>,
-): readonly BlockKindSpec[] {
+ * except a decision kind while no model router can decide. */
+export function insertableBlockKinds(canDecide: boolean): readonly BlockKindSpec[] {
   return BLOCK_KINDS.filter(
-    (spec) =>
-      spec.insertable !== false &&
-      (spec.requiresRouter === undefined || connectedRouters.has(spec.requiresRouter)),
+    (spec) => spec.insertable !== false && (!spec.requiresDecisions || canDecide),
   );
 }
 
@@ -1393,10 +1388,10 @@ const WAIT_KINDS: ReadonlySet<string> = new Set(["wait_session", "wait_event"]);
 /** The insert menu's shape: the insertable kinds by group, in group order,
  * empty groups left out. */
 export function groupedBlockKinds(
-  connectedRouters: ReadonlySet<string>,
+  canDecide: boolean,
   options: { withAgent?: boolean } = {},
 ): ReadonlyArray<{ id: BlockGroup; label: string; kinds: readonly BlockKindSpec[] }> {
-  const kinds = insertableBlockKinds(connectedRouters).filter(
+  const kinds = insertableBlockKinds(canDecide).filter(
     (spec) => !options.withAgent || !WAIT_KINDS.has(spec.kind),
   );
   return BLOCK_GROUPS.map((group) => ({

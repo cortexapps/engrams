@@ -36,6 +36,8 @@ message ModelRouter {
   string default_model = 13;
   string title_model = 14;
   string decision_model = 15;
+  // The connector that holds the router's key and host.
+  string connector = 16;
 }
 
 message RouterModel {
