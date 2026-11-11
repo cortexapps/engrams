@@ -116,6 +116,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 import { auth } from "./better-auth.ts";
 import { config } from "../config.ts";
+import { chatSpecs } from "../chat/registry.ts";
 import { declaredIngress } from "../connectors/registry.ts";
 import { extractApiKey } from "./api-key-header.ts";
 
@@ -158,7 +159,6 @@ import { extractApiKey } from "./api-key-header.ts";
  */
 const PUBLIC_PATHS: ReadonlySet<string> = new Set([
   "/healthz",
-  "/api/v1/integrations/slack/interactivity",
   "/api/auth/device/code",
   "/api/auth/device/token",
 ]);
@@ -169,14 +169,17 @@ const PUBLIC_GET_PATHS: ReadonlySet<string> = new Set([
 ]);
 
 const EVENT_PATH_RE = /^\/api\/v1\/integrations\/([a-z0-9_]+)\/events$/;
+const INTERACTIVITY_PATH_RE = /^\/api\/v1\/integrations\/([a-z0-9_]+)\/interactivity$/;
 const HOOK_PATH_RE = /^\/api\/v1\/hooks\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 /** Pure seam for exact-path public ingress tests (query strings are ignored). */
 export function isIapPublicPath(url: string, method = "GET"): boolean {
   const path = url.split("?", 1)[0] ?? "/";
   const eventProvider = EVENT_PATH_RE.exec(path)?.[1];
+  const chatProvider = INTERACTIVITY_PATH_RE.exec(path)?.[1];
   return PUBLIC_PATHS.has(path) ||
     (eventProvider !== undefined && declaredIngress(eventProvider) !== undefined) ||
+    chatSpecs().some((spec) => spec.provider === chatProvider && spec.interactivity) ||
     (method === "GET" && PUBLIC_GET_PATHS.has(path)) ||
     (method === "POST" && HOOK_PATH_RE.test(path));
 }

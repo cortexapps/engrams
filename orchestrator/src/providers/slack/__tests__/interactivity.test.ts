@@ -10,8 +10,8 @@
 
 import { expect, test, describe } from "bun:test";
 import { createHmac } from "node:crypto";
-import { answerDelivery, makeSlackInteractivityRoute } from "../routes/slack-interactivity.ts";
-import { ACTION_ANSWER, ACTION_OPEN } from "../integrations/slack-blocks.ts";
+import { answerDelivery, makeSlackInteractivityRoute } from "../interactivity.ts";
+import { ACTION_ANSWER, ACTION_OPEN } from "../blocks.ts";
 
 const SECRET = "test-signing-secret";
 const PATH = "/api/v1/integrations/slack/interactivity";

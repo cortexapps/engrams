@@ -1,10 +1,9 @@
-/** The slack_choice block: ask the person in a Slack thread to pick one
- * option, and wait for the click.
+/** The `slack_choice` block: ask the person in a chat thread to pick one
+ * option, and wait for the click. The type name is in saved definitions.
  *
- * The data half posts a card (one button per option) through the relay's
- * Slack policy, with this run's id in every button's route, so the
- * interactivity endpoint delivers the click to this run as a `slack_answer`
- * signal. The wait half consumes the answer whose id is this block's.
+ * The data half posts a card (one button per option) through the chat
+ * provider's policy, with this run's id in every button's route, so the
+ * interactivity endpoint delivers the click to this run as a signal. The wait half consumes the answer whose id is this block's.
  * Nothing time-based fails the run: at the deadline the block records
  * `outcome: "deadline"` and the graph takes its own fallback. The card is
  * the graph's to close (an `update_message` on `message_ts`), so the thread
@@ -18,11 +17,12 @@ import { z } from "zod";
 
 import { MAX_WAIT_DEADLINE_S } from "../definition.ts";
 import type { RunContext } from "../context.ts";
-import { CHOICE_ID_PREFIX, SLACK_ANSWER_SIGNAL } from "../../session-relay.ts";
-import { slackRelayPolicy } from "./relay.ts";
+import { requireChat } from "../../../chat/registry.ts";
+import { CHOICE_ANSWER_SIGNAL, CHOICE_ID_PREFIX } from "../../session-relay.ts";
+import { chatProviderSchema } from "./relay.ts";
 import { registerBlock } from "./registry.ts";
 
-export const SLACK_CHOICE_TYPE = "slack_choice";
+export const CHOICE_TYPE = "slack_choice";
 
 /** Slack allows 25 buttons in one actions block; a choice past ten is a
  * dropdown's job, not a card's. */
@@ -31,23 +31,23 @@ export const MAX_CHOICE_BUTTONS = 10;
  * and the thread route, and Slack caps a button value at 2,000
  * characters. These caps keep the worst case near 1,000. A label is also
  * the button's text, which Slack shows up to 75 characters of. */
-export const SLACK_CHOICE_QUESTION_MAX = 500;
-export const SLACK_CHOICE_LABEL_MAX = 75;
+export const CHOICE_QUESTION_MAX = 500;
+export const CHOICE_LABEL_MAX = 75;
 
-export const slackChoiceConfigSchema = z.object({
-  provider: z.enum(["slack"]).default("slack"),
+export const choiceConfigSchema = z.object({
+  provider: chatProviderSchema,
   team: z.string().min(1),
   channel: z.string().min(1),
   threadTs: z.string().min(1),
   /** The question on the card. */
-  question: z.string().min(1).max(SLACK_CHOICE_QUESTION_MAX),
+  question: z.string().min(1).max(CHOICE_QUESTION_MAX),
   /** value = what the block outputs; label = the button text (default:
    * value). From a `$ref` (a code block shaping the candidates) or inline. */
   options: z
     .array(
       z.object({
         value: z.string().min(1),
-        label: z.string().min(1).max(SLACK_CHOICE_LABEL_MAX).optional(),
+        label: z.string().min(1).max(CHOICE_LABEL_MAX).optional(),
       }),
     )
     .min(1)
@@ -56,7 +56,7 @@ export const slackChoiceConfigSchema = z.object({
   /** A deadline is a normal outcome, never a failed run (fixed). */
   onDeadline: z.literal("continue").default("continue"),
 });
-export type SlackChoiceConfig = z.infer<typeof slackChoiceConfigSchema>;
+export type ChoiceConfig = z.infer<typeof choiceConfigSchema>;
 
 const DEFAULT_CHOICE_DEADLINE_S = 600;
 
@@ -69,18 +69,18 @@ function choiceId(ctx: RunContext): string {
 
 const labelOf = (option: { value: string; label?: string }) => option.label ?? option.value;
 
-export function registerSlackChoiceBlock(): void {
-  registerBlock<SlackChoiceConfig>({
-    type: SLACK_CHOICE_TYPE,
+export function registerChoiceBlock(): void {
+  registerBlock<ChoiceConfig>({
+    type: CHOICE_TYPE,
     outputs: ["outcome", "value", "label", "message_ts"],
-    configSchema: slackChoiceConfigSchema,
+    configSchema: choiceConfigSchema,
     async execute(config, ctx) {
       const labels = config.options.map(labelOf);
-      if (labels.some((label) => label.length > SLACK_CHOICE_LABEL_MAX)) {
+      if (labels.some((label) => label.length > CHOICE_LABEL_MAX)) {
         return {
           kind: "error",
           code: "slack_choice_config_invalid",
-          message: `an option label (or a value without a label) is longer than ${SLACK_CHOICE_LABEL_MAX} characters`,
+          message: `an option label (or a value without a label) is longer than ${CHOICE_LABEL_MAX} characters`,
           retryable: false,
         };
       }
@@ -98,7 +98,8 @@ export function registerSlackChoiceBlock(): void {
           outputs: { dry_run: true, would_ask: { question: config.question, options: labels } },
         };
       }
-      const ts = await slackRelayPolicy(ctx.runId).onChoice(
+      // The run id rides the card: its click is this run's answer.
+      const ts = await requireChat(config.provider).policy({ runId: ctx.runId }).onChoice(
         {
           team: config.team,
           channel: config.channel,
@@ -114,7 +115,7 @@ export function registerSlackChoiceBlock(): void {
     wait: {
       deadlineSeconds: (config) => config.deadlineSeconds ?? DEFAULT_CHOICE_DEADLINE_S,
       matches(msg, config, ctx) {
-        if (msg.kind !== "signal" || msg.name !== SLACK_ANSWER_SIGNAL) return null;
+        if (msg.kind !== "signal" || msg.name !== CHOICE_ANSWER_SIGNAL) return null;
         if (msg.payload?.["toolCallId"] !== choiceId(ctx)) return null;
         const answers = msg.payload["answers"];
         const picked =

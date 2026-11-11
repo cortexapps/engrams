@@ -1,27 +1,23 @@
 /** The session relay (ADR 0119 contract 5): a session mirrored into a place
- * (a Slack thread), bound to the SESSION, not to a run.
+ * (a chat thread), bound to the session, not to a run.
  *
- * Until contract 4 the relay was a message handler installed in a run: the
- * run had to stay alive for as long as the conversation, which is why the
- * Slack built-in looped `wait_event → send_prompt` for hours. Now a run
- * installs the relay (one `automation_session_relay` row) and ends; the
- * automation consumer renders every later curated event of the session
- * straight into the place, with no run live, and the session's end removes
- * the row. A later run re-points the relay at a new mention (⏳/✅ land on
- * the message that started that turn, a fresh bubble opens) and ends again.
+ * A run installs the relay (one `automation_session_relay` row) and ends.
+ * The automation consumer renders every later curated event of the session
+ * into the place, with no run live, and the session's end removes the row.
+ * A later run re-points the relay at a new mention: the reactions land on
+ * the message that started that turn, and a fresh bubble opens.
  *
- * The rendering itself is unchanged: the Slack `CommunicationPolicy`
- * (`integrations/slack-policy.ts`) and the pure `routeSessionEvent`
- * (`workflows/communication-policy.ts`). The render state (open bubble,
- * posted questions, assets, last text) lives in the row and every write
- * CASes on its version, so a re-point racing a render never loses state.
+ * The chat provider's `CommunicationPolicy` renders; the pure
+ * `routeSessionEvent` decides what to render. The render state (open
+ * bubble, posted questions, assets, last text) lives in the row and every
+ * write CASes on its version, so a re-point racing a render loses no state.
  *
- * Delivery failures never throw out of here: a Slack outage drops the
- * message and keeps the conversation alive (the retired loop's posture).
+ * A delivery failure does not throw out of a render: the message is dropped
+ * and the conversation continues.
  */
 
 import type { CuratedEvent, TerminalOutcome } from "../control-plane/session-events.ts";
-import { makeSlackPolicy } from "../integrations/slack-policy.ts";
+import { requireChat } from "../chat/registry.ts";
 import { sessionWebUrl as defaultSessionWebUrl } from "../links.ts";
 import { log as rootLog } from "../log.ts";
 import { tools as defaultTools } from "../tools/registry.ts";
@@ -40,21 +36,23 @@ import { makeSessionRelayStore, type SessionRelayRow, type SessionRelayStore } f
 
 const log = rootLog.child({ component: "session-relay" });
 
-/** Signal name the interactivity route sends a `slack_choice` click as. */
-export const SLACK_ANSWER_SIGNAL = "slack_answer";
+/** The signal a chat provider's interactivity route sends a choice card's
+ * click as. The name is in live runs' inboxes. */
+export const CHOICE_ANSWER_SIGNAL = "slack_answer";
 
-/** Every slack_choice card's answer id starts with this: such a click is
- * the run's (the choice block waits for it), never a session question. */
+/** Every choice card's answer id starts with this: such a click is the
+ * run's (the choice block waits for it), never a session question. */
 export const CHOICE_ID_PREFIX = "choice:";
 
-/** Cap an assistant bubble's accumulated text (the retired workflow's cap). */
+/** The cap on an assistant bubble's accumulated text. */
 export const MAX_BUBBLE_CHARS = 8000;
 
 const ANSWER_FAIL_MSG = "I couldn't record that answer — the session may have ended.";
 const LEGACY_QUESTION_MSG = "This question predates an upgrade and can no longer be answered.";
 const CAS_ATTEMPTS = 3;
 
-export const SLACK_RELAY_PROVIDER = "slack";
+/** What a failed session's thread reads. */
+export const SESSION_FAILED_MSG = "The session hit an error and the thread cannot continue.";
 
 /** The render state held in `automation_session_relay.state`: plain JSON. */
 export interface RelayRenderState extends Record<string, unknown> {
@@ -120,12 +118,17 @@ function mentionOf(row: SessionRelayRow): SourceMention {
 
 export interface SessionRelayDeps {
   store: SessionRelayStore;
-  /** The policy for one session; `sessionId` rides every Block Kit route so
-   * an answer comes back to the session (see slack-interactivity). */
-  policy(sessionId: string): CommunicationPolicy;
+  /** The chat provider's renderer for one session. The session id rides
+   * every card, so an answer comes back to the session. */
+  policy(provider: string, sessionId: string): CommunicationPolicy;
   completeToolCall(sessionId: string, toolCallId: string, result: unknown): Promise<void>;
   sessionWebUrl(sessionId: string): string;
 }
+
+const sessionRelayPolicyDeps: Pick<SessionRelayDeps, "policy" | "sessionWebUrl"> = {
+  policy: (provider, sessionId) => requireChat(provider).policy({ sessionId }),
+  sessionWebUrl: defaultSessionWebUrl,
+};
 
 let runtimeDeps: SessionRelayDeps | null = null;
 
@@ -137,10 +140,9 @@ export function sessionRelayDeps(): SessionRelayDeps {
   if (runtimeDeps) return runtimeDeps;
   runtimeDeps = {
     store: makeSessionRelayStore(),
-    policy: (sessionId) => makeSlackPolicy({ routeExtras: { sessionId } }),
+    ...sessionRelayPolicyDeps,
     completeToolCall: (sessionId, toolCallId, result) =>
       defaultTools.complete(sessionId, toolCallId, result),
-    sessionWebUrl: defaultSessionWebUrl,
   };
   return runtimeDeps;
 }
@@ -152,6 +154,8 @@ export function sessionRelayDeps(): SessionRelayDeps {
 export interface InstallSessionRelayInput {
   sessionId: string;
   automationId: string;
+  /** The chat provider of the place. */
+  provider: string;
   target: SourceMention;
 }
 
@@ -169,7 +173,7 @@ export async function installSessionRelay(
   const installed = await deps.store.install({
     sessionId: input.sessionId,
     automationId: input.automationId,
-    provider: SLACK_RELAY_PROVIDER,
+    provider: input.provider,
     target,
     state: freshRelayState(),
   });
@@ -200,7 +204,7 @@ export async function installSessionRelay(
     await deps.store.install({
       sessionId: input.sessionId,
       automationId: input.automationId,
-      provider: SLACK_RELAY_PROVIDER,
+      provider: input.provider,
       target,
       state: freshRelayState(),
     });
@@ -231,7 +235,7 @@ export async function renderSessionEvent(
 ): Promise<"rendered" | "no_relay"> {
   let row = await deps.store.get(sessionId);
   if (row === null) return "no_relay";
-  const pol = deps.policy(sessionId);
+  const pol = deps.policy(row.provider, sessionId);
   const session: StartedSession = { id: sessionId, webUrl: deps.sessionWebUrl(sessionId) };
   const mention = mentionOf(row);
   const before = stateOf(row);
@@ -293,9 +297,50 @@ function mergeRenderState(
   };
 }
 
-/** The session ended: post the closing message and remove the relay. A
- * NEUTRAL end (the sandbox reclaimed — a kept thread session swept after
- * days of quiet) posts nothing: to the people in the thread nothing
+/** How a relayed thread closes. `silent` posts nothing. */
+export type RelayClosing =
+  | { kind: "complete" }
+  | { kind: "fail"; message: string }
+  | { kind: "neutral"; message: string }
+  | { kind: "silent" };
+
+/** Settle the thread, post its closing message, and remove the relay. The
+ * relay goes even when the post fails; the failure is the caller's. */
+export async function closeRelay(
+  row: SessionRelayRow,
+  closing: RelayClosing,
+  deps: Pick<SessionRelayDeps, "store"> & Partial<Pick<SessionRelayDeps, "policy" | "sessionWebUrl">>,
+): Promise<void> {
+  const defaults = deps.policy && deps.sessionWebUrl ? null : sessionRelayPolicyDeps;
+  const pol = (deps.policy ?? defaults!.policy)(row.provider, row.sessionId);
+  const mention = mentionOf(row);
+  const st = stateOf(row);
+  try {
+    await settleMentions(pol, mention, st);
+    switch (closing.kind) {
+      case "complete":
+        await pol.onComplete(
+          mention,
+          { id: row.sessionId, webUrl: (deps.sessionWebUrl ?? defaults!.sessionWebUrl)(row.sessionId) },
+          { lastMessage: st.lastAssistantText, assets: st.assets },
+        );
+        break;
+      case "fail":
+        await pol.onFail(mention, closing.message);
+        break;
+      case "neutral":
+        await pol.onNeutralClose(mention, closing.message);
+        break;
+      case "silent":
+        break;
+    }
+  } finally {
+    await deps.store.remove(row.sessionId);
+  }
+}
+
+/** The session ended: close its relay. A neutral end (the sandbox reclaimed
+ * after days of quiet) posts nothing: to the people in the thread nothing
  * happened, and the next mention starts a fresh session there. */
 export async function closeSessionRelay(
   sessionId: string,
@@ -304,19 +349,17 @@ export async function closeSessionRelay(
 ): Promise<"closed" | "no_relay"> {
   const row = await deps.store.get(sessionId);
   if (row === null) return "no_relay";
-  const pol = deps.policy(sessionId);
-  const facts = relayFactsOf(row, deps);
+  const closing: RelayClosing =
+    outcome === "completed"
+      ? { kind: "complete" }
+      : outcome === "failed"
+        ? { kind: "fail", message: SESSION_FAILED_MSG }
+        : { kind: "silent" };
   try {
-    await settleMentions(pol, facts.mention, stateOf(row));
-    if (outcome === "completed") {
-      await pol.onComplete(facts.mention, facts.session, facts.summary);
-    } else if (outcome === "failed") {
-      await pol.onFail(facts.mention, "The session hit an error and the thread cannot continue.");
-    }
+    await closeRelay(row, closing, deps);
   } catch (err) {
     log.error({ sessionId, outcome, err }, "session relay: failed to post the closing message");
   }
-  await deps.store.remove(sessionId);
   return "closed";
 }
 
@@ -330,7 +373,7 @@ export async function deliverSessionAnswer(
 ): Promise<"delivered" | "legacy" | "failed" | "no_relay"> {
   const row = await deps.store.get(sessionId);
   if (row === null) return "no_relay";
-  const pol = deps.policy(sessionId);
+  const pol = deps.policy(row.provider, sessionId);
   const mention = mentionOf(row);
   const via = stateOf(row).questionProtocols[answer.toolCallId] ?? "legacy";
   if (via === "legacy") {
@@ -347,30 +390,13 @@ export async function deliverSessionAnswer(
   }
 }
 
-export interface SessionRelayFacts {
-  mention: SourceMention;
-  session: StartedSession;
-  summary: ClosingSummary;
-}
-
-/** What a closing message needs: the thread route, the session, and the
- * summary of what it said and produced. */
-export function relayFactsOf(row: SessionRelayRow, deps: Pick<SessionRelayDeps, "sessionWebUrl">): SessionRelayFacts {
-  const st = stateOf(row);
-  return {
-    mention: mentionOf(row),
-    session: { id: row.sessionId, webUrl: deps.sessionWebUrl(row.sessionId) },
-    summary: { lastMessage: st.lastAssistantText, assets: [...st.assets] },
-  };
-}
-
 /** Settle the mentions a re-point left mid-turn: each gets its ✅. */
 async function settleMentions(pol: CommunicationPolicy, m: SourceMention, st: RelayRenderState): Promise<void> {
   for (const ts of st.settle) await pol.onIdle({ ...m, ts });
   st.settle = [];
 }
 
-/** The legacy `dispatchSessionEvent`, verbatim in effect. */
+/** Render one event through the policy and advance the render state. */
 async function dispatch(
   pol: CommunicationPolicy,
   m: SourceMention,

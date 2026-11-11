@@ -5,7 +5,7 @@ import {
   listSlackChannelOptions,
   type SlackChannelInfo,
   type SlackChannelPages,
-} from "../rpc/automations.ts";
+} from "../channels.ts";
 
 function pagedClient(pages: Array<{ channels: Array<{ id: string; name?: string }>; next?: string }>) {
   const calls: Array<Record<string, unknown>> = [];

@@ -298,9 +298,11 @@ function productionEngineDeps(): EngineDeps {
       recordInstanceHandle: (input) => makeAutomationInstanceStore().recordInstanceHandle(input),
     },
     relays: makeSessionRelayStore(),
-    async announceStarted(sessionId, target) {
+    async announceStarted(sessionId, provider, target) {
       const deps = sessionRelayDeps();
-      await deps.policy(sessionId).onStarted(target, { id: sessionId, webUrl: deps.sessionWebUrl(sessionId) });
+      await deps
+        .policy(provider, sessionId)
+        .onStarted(target, { id: sessionId, webUrl: deps.sessionWebUrl(sessionId) });
     },
     async startQueuedRun(runId) {
       const run = await store.getRun(runId);

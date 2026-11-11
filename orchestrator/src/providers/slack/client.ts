@@ -10,8 +10,8 @@
  */
 
 import { WebClient } from "@slack/web-api";
-import { registerIntegrationClient, asBearer, getIntegrationClient } from "./clients.ts";
-import type { RunOpDeps } from "./run-op.ts";
+import { registerIntegrationClient, asBearer, getIntegrationClient } from "../../integrations/clients.ts";
+import type { RunOpDeps } from "../../integrations/run-op.ts";
 
 export const SLACK_PROVIDER = "slack";
 

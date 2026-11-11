@@ -8,9 +8,9 @@
  */
 
 import { expect, test, describe } from "bun:test";
-import { makeSlackPolicy, type SlackPolicyClient } from "../integrations/slack-policy.ts";
-import type { SourceMention } from "../workflows/communication-policy.ts";
-import type { CuratedEvent } from "../control-plane/session-events.ts";
+import { makeSlackPolicy, type SlackPolicyClient } from "../policy.ts";
+import type { SourceMention } from "../../../workflows/communication-policy.ts";
+import type { CuratedEvent } from "../../../control-plane/session-events.ts";
 
 const M: SourceMention = {
   team: "T1",

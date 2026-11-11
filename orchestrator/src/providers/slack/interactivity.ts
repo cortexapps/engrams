@@ -23,22 +23,22 @@ import { Hono } from "hono";
 import { DBOS } from "@dbos-inc/dbos-sdk";
 import type { ModalView } from "@slack/types";
 
-import { log as rootLog } from "../log.ts";
-import { getSlackClient } from "../integrations/slack.ts";
-import { parseInteractivity, type ThreadRoute } from "../integrations/slack-blocks.ts";
-import type { SourceAnswer } from "../workflows/communication-policy.ts";
+import { log as rootLog } from "../../log.ts";
+import { getSlackClient } from "./client.ts";
+import { parseInteractivity, type ThreadRoute } from "./blocks.ts";
+import type { SourceAnswer } from "../../workflows/communication-policy.ts";
 import {
   AUTOMATION_TOPIC,
   assertIdempotencyKey,
   type AutomationInbox,
-} from "../automations/engine/inbox.ts";
+} from "../../automations/engine/inbox.ts";
 import {
   makeVerificationSecretResolver,
   verifyIngress,
   type VerificationSecretResolver,
-} from "../automations/verify.ts";
-import { declaredIngress } from "../connectors/registry.ts";
-import { CHOICE_ID_PREFIX, SLACK_ANSWER_SIGNAL, deliverSessionAnswer } from "../automations/session-relay.ts";
+} from "../../automations/verify.ts";
+import { declaredIngress } from "../../connectors/registry.ts";
+import { CHOICE_ID_PREFIX, CHOICE_ANSWER_SIGNAL, deliverSessionAnswer } from "../../automations/session-relay.ts";
 
 export interface SlackInteractivityDeps {
   secrets?: VerificationSecretResolver;
@@ -73,7 +73,7 @@ export function answerDelivery(
       runId: route.runId,
       message: {
         kind: "signal",
-        name: SLACK_ANSWER_SIGNAL,
+        name: CHOICE_ANSWER_SIGNAL,
         payload: { toolCallId: answer.toolCallId, answers: answer.answers },
       },
       idempotencyKey: `slack-answer:${answer.toolCallId}`,
@@ -157,5 +157,3 @@ export function makeSlackInteractivityRoute(deps: SlackInteractivityDeps = {}): 
 
   return app;
 }
-
-export default makeSlackInteractivityRoute();

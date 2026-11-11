@@ -287,7 +287,7 @@ export interface EngineDeps {
   /** Tell the relayed place a NEW session started (the link into the
    * thread). The agent step calls it once per session it starts. Absent =
    * silent. */
-  announceStarted?(sessionId: string, target: SourceMention): Promise<void>;
+  announceStarted?(sessionId: string, provider: string, target: SourceMention): Promise<void>;
   prRefs?: EnginePrRefLookup;
   code?: CodeBlockRuntime;
   integrationActions?: IntegrationActionRuntime;

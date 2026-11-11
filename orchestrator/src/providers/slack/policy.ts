@@ -1,19 +1,11 @@
-/**
- * Slack CommunicationPolicy (ADR 0060 P2.10) — the provider-mechanics impl
- * behind the relay block's policy seam (ADR 0119). Outbound Block Kit shaping
- * lives in slack-blocks.ts; this module is the thin layer that drives the
- * Slack WebClient (reactions, posts, updates, uploads). Every method is
- * invoked by the framework as a checkpointed DBOS step, so it runs once per
- * effect.
- *
- * The Slack client is injected (default = the authed WebClient from slack.ts),
- * which keeps the policy unit-testable without a network or the engine.
- */
+/** Slack's `CommunicationPolicy`: reactions, posts, updates and uploads
+ * through the Slack WebClient. `blocks.ts` shapes the Block Kit. The client
+ * is injected, so the policy is testable without a network. */
 
 import type { KnownBlock } from "@slack/types";
 
-import { log as rootLog } from "../log.ts";
-import { getSlackClient } from "./slack.ts";
+import { log as rootLog } from "../../log.ts";
+import { getSlackClient } from "./client.ts";
 import {
   parseUserQuestion,
   parseQuestionAnswers,
@@ -23,14 +15,14 @@ import {
   buildClosingBlocks,
   buildMessageBlocks,
   type ThreadRoute,
-} from "./slack-blocks.ts";
+} from "./blocks.ts";
 import {
   summarizeAsset,
   type CommunicationPolicy,
   type SourceMention,
   type StartedSession,
-} from "../workflows/communication-policy.ts";
-import { fetchArtifactBytes, type FetchedArtifact } from "../control-plane/artifact-fetch.ts";
+} from "../../workflows/communication-policy.ts";
+import { fetchArtifactBytes, type FetchedArtifact } from "../../control-plane/artifact-fetch.ts";
 
 const log = rootLog.child({ component: "slack" });
 

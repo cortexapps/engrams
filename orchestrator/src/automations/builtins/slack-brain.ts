@@ -45,9 +45,9 @@ import {
 import type { BuiltinAutomation } from "../engine/builtins.ts";
 import { LOOKUP_INSTANCE_SESSION_TYPE } from "../engine/blocks/instance-session.ts";
 import { RESOLVE_USER_TYPE } from "../engine/blocks/resolve-user.ts";
-import { SLACK_CHOICE_LABEL_MAX, SLACK_CHOICE_TYPE } from "../engine/blocks/slack-choice.ts";
+import { CHOICE_LABEL_MAX, CHOICE_TYPE } from "../engine/blocks/choice.ts";
 import { profileRouteQuestions } from "../profile-cards.ts";
-import { NO_USER_MSG } from "../../integrations/slack-identity.ts";
+import { NO_USER_MSG } from "../../chat/identity.ts";
 import { DEFAULT_CONNECTION_PLACEHOLDER } from "./pr-review.ts";
 
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
@@ -307,7 +307,7 @@ export default ({ steps, inputs }) => {
     return order
       .filter((id) => labelOf.has(id))
       .slice(0, 5)
-      .map((id) => ({ value: id, label: String(labelOf.get(id)).slice(0, ${SLACK_CHOICE_LABEL_MAX}) }));
+      .map((id) => ({ value: id, label: String(labelOf.get(id)).slice(0, ${CHOICE_LABEL_MAX}) }));
   };
   if (options.length === 0) return { ask: false, options: [] };
   if (!route.decided) {
@@ -489,7 +489,7 @@ const smartRoute: BlockDef = {
       then: [
         {
           id: "ask",
-          type: SLACK_CHOICE_TYPE,
+          type: CHOICE_TYPE,
           tunable: ["question"],
           config: {
             provider: "slack",

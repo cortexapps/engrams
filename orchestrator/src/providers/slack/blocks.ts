@@ -17,13 +17,13 @@
 
 import type { ModalView, KnownBlock } from "@slack/types";
 
-import { AnswersSchema, QuestionsSchema } from "../tools/builtin.ts";
+import { AnswersSchema, QuestionsSchema } from "../../tools/builtin.ts";
 import type {
   AssetSummary,
   ClosingSummary,
   StartedSession,
   SourceAnswer,
-} from "../workflows/communication-policy.ts";
+} from "../../workflows/communication-policy.ts";
 
 /** Inline single-select option button (one per option). The concrete buttons
  *  carry a per-option index suffix (`auq_answer:<i>`) for Slack action_id

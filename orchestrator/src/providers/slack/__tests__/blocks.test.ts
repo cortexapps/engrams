@@ -23,7 +23,7 @@ import {
   CALLBACK_SUBMIT,
   MODAL_ACTION,
   type CompactQuestion,
-} from "../integrations/slack-blocks.ts";
+} from "../blocks.ts";
 
 /** Find the first actions block and return its button elements. */
 function buttons(blocks: unknown[]) {

@@ -8,7 +8,7 @@
  */
 
 import { expect, test, describe } from "bun:test";
-import { replyText } from "../integrations/slack-message-text.ts";
+import { replyText } from "../message-text.ts";
 
 describe("replyText()", () => {
   test("an app that summarizes in `text` and details in an attachment keeps BOTH", () => {

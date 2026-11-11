@@ -13,8 +13,8 @@ import { makeCodeBlockRuntime } from "../../code/runtime.ts";
 import { makeFakeRelayStore, type FakeRelayStore } from "../../engine/__tests__/fake-relay-store.ts";
 import { registerEngineBlocks } from "../../engine/blocks/index.ts";
 import { setResolveUserDeps } from "../../engine/blocks/resolve-user.ts";
-import { NO_USER_MSG } from "../../../integrations/slack-identity.ts";
-import { setSlackPolicyFactoryForTest } from "../../../integrations/slack-policy.ts";
+import { NO_USER_MSG } from "../../../chat/identity.ts";
+import { setSlackPolicyFactoryForTest } from "../../../providers/slack/policy.ts";
 import type { RunSnapshot } from "../../engine/context.ts";
 import type { EngineDeps, EngineSessionOps, EngineStepRecord } from "../../engine/deps.ts";
 import type { AutomationInbox } from "../../engine/inbox.ts";
@@ -274,7 +274,7 @@ function harness(options: {
     },
     sessions: sessionOps,
     relays,
-    announceStarted: async (sessionId, target) =>
+    announceStarted: async (sessionId, _provider, target) =>
       policy.onStarted(target, { id: sessionId, webUrl: `${config.baseUrl}/sessions/${sessionId}` }),
     clock: { nowMs: () => (clock += options.clockStepMs ?? 1000) },
     code: makeCodeBlockRuntime(),

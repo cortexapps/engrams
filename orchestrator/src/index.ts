@@ -16,7 +16,7 @@ import adminRoute from "./routes/admin.ts";
 import integrationOpRoute from "./routes/integration-op.ts";
 import integrationOauthRoute from "./routes/integration-oauth.ts";
 import integrationEventsRoute from "./routes/integration-events.ts";
-import slackInteractivityRoute from "./routes/slack-interactivity.ts";
+import { chatSpecs } from "./chat/registry.ts";
 import hooksRoute from "./routes/hooks.ts";
 import reviewsDispatchRoute from "./routes/reviews-dispatch.ts";
 import { makeGoogleOidcRoute } from "./routes/google-oidc.ts";
@@ -25,7 +25,6 @@ import { makeOidcKeyAdminRoute } from "./routes/oidc-key-admin.ts";
 import { startOidcKeyRotation } from "./integrations/oidc-key-rotation.ts";
 import { makeIntegrationOidcKeyStore } from "./db/integration-oidc-keys.ts";
 // Importing registers the Slack adapter on the generic SDK seam.
-import "./integrations/slack.ts";
 import { makeShellUpgradeHandler } from "./routes/shell.ts";
 import { makeVncUpgradeHandler } from "./routes/vnc.ts";
 import { makeIdeRoute, makeIdeUpgradeHandler } from "./routes/ide.ts";
@@ -440,7 +439,9 @@ app.route("/", integrationOpRoute);
 app.route("/", integrationOauthRoute);
 // Provider event webhooks, verified against each connector's declared ingress.
 app.route("/", integrationEventsRoute);
-app.route("/", slackInteractivityRoute);
+for (const spec of chatSpecs()) {
+  if (spec.interactivity) app.route("/", spec.interactivity());
+}
 // ADR 0102: dynamically registered webhooks verify their own registration
 // secret and dispatch one-shot AutomationRunWorkflow occurrences.
 app.route("/", hooksRoute);

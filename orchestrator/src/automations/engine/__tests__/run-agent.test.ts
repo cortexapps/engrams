@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { setSlackPolicyFactoryForTest } from "../../../integrations/slack-policy.ts";
+import { setSlackPolicyFactoryForTest } from "../../../providers/slack/policy.ts";
 import type { CommunicationPolicy } from "../../../workflows/communication-policy.ts";
 import { registerEngineBlocks } from "../blocks/index.ts";
 import { CLOSE_AGENT_TYPE, RUN_AGENT_TYPE, closeAgentConfigSchema, runAgentConfigSchema } from "../blocks/agent.ts";
@@ -80,7 +80,7 @@ function harness(options: {
     sessions,
     clock: { nowMs: () => 0 },
     relays: store,
-    announceStarted: async (sessionId, target) => {
+    announceStarted: async (sessionId, _provider, target) => {
       announced.push({ sessionId, ts: target.ts });
     },
     instances: {

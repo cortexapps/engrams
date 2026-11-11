@@ -8,21 +8,21 @@
 import { expect, test, describe, beforeEach } from "bun:test";
 import { create } from "@bufbuild/protobuf";
 
-import { parseConnector, connectorRegistry, invalidateRegistry } from "../connectors/registry.ts";
-import { makeIntegrationOauthRoute } from "../routes/integration-oauth.ts";
-import { getSlackClient } from "../integrations/slack.ts";
-import { invalidateIntegrationClient } from "../integrations/clients.ts";
+import { parseConnector, connectorRegistry, invalidateRegistry } from "../../../connectors/registry.ts";
+import { makeIntegrationOauthRoute } from "../../../routes/integration-oauth.ts";
+import { getSlackClient } from "../client.ts";
+import { invalidateIntegrationClient } from "../../../integrations/clients.ts";
 import {
   ResolveIntegrationCredentialResponseSchema,
   ResolvedCredentialSchema,
-} from "../gen/engram/app/v1/integration_op_pb.ts";
-import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
+} from "../../../gen/engram/app/v1/integration_op_pb.ts";
+import { OauthSubjectKind } from "../../../gen/engram/app/v1/oauth_pb.ts";
 import type {
   BeginRedirectFlowRequest,
   CompleteRedirectFlowRequest,
   GrantClientCredentialsRequest,
   GrantServiceAccountRequest,
-} from "../gen/engram/app/v1/oauth_pb.ts";
+} from "../../../gen/engram/app/v1/oauth_pb.ts";
 import { ConnectError, Code } from "@connectrpc/connect";
 
 const emptySource = { list: async () => [] };

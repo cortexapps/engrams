@@ -14,12 +14,12 @@ import { registerInstanceCloseBlock } from "./instance-close.ts";
 import { registerClaimHandleBlock } from "./claim-handle.ts";
 import { registerIntegrationActionBlock } from "./integration-action.ts";
 import { registerReviewBlocks } from "./review.ts";
-import { registerSlackRelayBlock } from "./relay.ts";
+import { registerRelayBlock } from "./relay.ts";
 import { registerRelayCloseBlock } from "./relay-close.ts";
 import { registerResolveUserBlock } from "./resolve-user.ts";
 import { registerDecideBlock } from "./decide.ts";
 import { registerListProfilesBlock } from "./profiles.ts";
-import { registerSlackChoiceBlock } from "./slack-choice.ts";
+import { registerChoiceBlock } from "./choice.ts";
 import { registerRunAgentBlock } from "./agent.ts";
 import { getBlock, listBlockTypes } from "./registry.ts";
 
@@ -40,12 +40,12 @@ export function registerEngineBlocks(): void {
   registerClaimHandleBlock();
   registerIntegrationActionBlock();
   registerReviewBlocks();
-  registerSlackRelayBlock();
+  registerRelayBlock();
   registerRelayCloseBlock();
   registerResolveUserBlock();
   registerDecideBlock();
   registerListProfilesBlock();
-  registerSlackChoiceBlock();
+  registerChoiceBlock();
   registerRunAgentBlock();
 }
 
