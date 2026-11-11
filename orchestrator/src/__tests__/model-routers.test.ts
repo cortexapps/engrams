@@ -3,7 +3,7 @@ import { Code, ConnectError, createClient, createRouterTransport } from "@connec
 
 import type { ModelRouterStore, RouterModelInput } from "../db/model-routers.ts";
 import { refreshRouterCatalog } from "../model-routers/catalog.ts";
-import { parseOpenRouterCatalog } from "../model-routers/openrouter.ts";
+import { parseOpenRouterCatalog } from "../providers/openrouter/router.ts";
 import { registerModelRouters } from "../rpc/model-routers.ts";
 import {
   ModelRouterService,

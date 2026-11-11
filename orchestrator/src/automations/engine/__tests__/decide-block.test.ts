@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { DecisionsApiError, type DecisionsRequest, type DecisionsResponse } from "../../../integrations/openrouter-decisions.ts";
+import { DecisionsApiError, type DecisionsRequest, type DecisionsResponse } from "../../../model-routers/decisions.ts";
 import type { ProfileCard } from "../../profile-cards.ts";
 import { profileOptions } from "../../profile-cards.ts";
 import type { RunSnapshot } from "../context.ts";
@@ -103,8 +103,8 @@ function harness(
   const requests: DecisionsRequest[] = [];
   const replies = [...(opts.replies ?? [])];
   const decisions: DecisionsRuntime = {
-    connected: async () => opts.connected ?? true,
     async decide(request) {
+      if (opts.connected === false) return null;
       requests.push(request);
       const next = replies.shift();
       if (next === undefined) throw new Error("fake decisions exhausted");
@@ -177,7 +177,8 @@ describe("decide block", () => {
     expect(result.status).toBe("completed");
     expect(h.requests).toHaveLength(1);
     const wire = h.requests[0]!;
-    expect(wire.model).toBe("typesafe/jev-1.13");
+    // No model in the block: the router applies its own default.
+    expect(wire.model).toBeUndefined();
     expect(wire.state).toEqual({ message: "the deploy pipeline is stuck on terraform apply" });
     expect(wire.questions["profile"]).toEqual({
       type: "choice",

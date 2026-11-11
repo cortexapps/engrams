@@ -48,7 +48,7 @@ import { inputErrorField, validateInputValues } from "../automations/inputs.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import { makeModelRouterStore, type ModelRouterStore } from "../db/model-routers.ts";
-import { getModelRouterDefinition, selectRouterProtocol } from "../model-routers/registry.ts";
+import { resolveRouterSelection } from "../model-routers/registry.ts";
 import { harnessCatalog as defaultHarnessCatalog } from "../control-plane/client.ts";
 import { log as rootLog } from "../log.ts";
 import type { HarnessCatalogClient } from "./task-create.ts";
@@ -740,25 +740,17 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
                 : undefined;
             const effort = typeof config["effort"] === "string" ? config["effort"] : undefined;
             if (routerId !== undefined) {
-              const router = getModelRouterDefinition(routerId);
-              if (!router) {
+              const selection = await resolveRouterSelection({
+                routerId,
+                harness,
+                harnessProtocols: descriptor.routerProtocols ?? [],
+                ...(model !== undefined
+                  ? { model: { id: model, exists: async (r, m) => (await modelRouters().getModel(r, m)) !== null } }
+                  : {}),
+              });
+              if (!selection.ok) {
                 throw new BlockValidationError([
-                  blockError(where, "modelRouter", "unknown_router", `model router "${routerId}" is not registered`),
-                ]);
-              }
-              if (!selectRouterProtocol(router, descriptor.routerProtocols ?? [])) {
-                throw new BlockValidationError([
-                  blockError(
-                    where,
-                    "modelRouter",
-                    "unsupported_router",
-                    `harness "${harness}" does not support model router "${router.id}"`,
-                  ),
-                ]);
-              }
-              if (model !== undefined && !(await modelRouters().getModel(router.id, model))) {
-                throw new BlockValidationError([
-                  blockError(where, "model", "unknown_model", `model "${model}" is not in router "${router.id}"`),
+                  blockError(where, selection.field, selection.code, selection.message),
                 ]);
               }
             } else if (model !== undefined && !(descriptor.models ?? []).some((m) => m.id === model)) {

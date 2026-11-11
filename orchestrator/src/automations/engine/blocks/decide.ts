@@ -36,13 +36,10 @@ import type {
   DecisionQuestion,
   DecisionsResponse,
   DecisionText,
-} from "../../../integrations/openrouter-decisions.ts";
+} from "../../../model-routers/decisions.ts";
 import { registerBlock, type BlockOutcome } from "./registry.ts";
 import { errorMessage } from "../errors.ts";
 
-/** Pinned so a model release never silently changes a graph's thresholds;
- * an author opts into a newer one through `model`. */
-export const DEFAULT_DECISION_MODEL = "typesafe/jev-1.13";
 export const MAX_DECIDE_QUESTIONS = 16;
 export const MAX_CHOICE_OPTIONS = 255;
 
@@ -259,7 +256,7 @@ function message(error: unknown): string {
 export function registerDecideBlock(): void {
   registerBlock<DecideConfig>({
     type: "decide",
-    requiresRouter: "openrouter",
+    requiresDecisions: true,
     outputs: ["decided", "reason", "model", "answers", "cost"],
     configSchema: decideConfigSchema,
     async execute(config, ctx): Promise<BlockOutcome> {
@@ -276,15 +273,12 @@ export function registerDecideBlock(): void {
       if (!prepared.ok) {
         return { kind: "error", code: "decide_config_invalid", message: prepared.error, retryable: false };
       }
-      if (!(await runtime.connected())) {
-        return { kind: "ok", outputs: { decided: false, reason: "router_not_connected" } };
-      }
       const request = {
-        model: config.model ?? DEFAULT_DECISION_MODEL,
+        ...(config.model !== undefined ? { model: config.model } : {}),
         state: config.state,
         questions: prepared.value.questions,
       };
-      let response: DecisionsResponse;
+      let response: DecisionsResponse | null;
       try {
         try {
           response = await runtime.decide(request);
@@ -302,6 +296,9 @@ export function registerDecideBlock(): void {
           message: message(error),
           retryable: isRetryable(error),
         };
+      }
+      if (!response) {
+        return { kind: "ok", outputs: { decided: false, reason: "router_not_connected" } };
       }
       const answers = mapAnswers(prepared.value, response.answers);
       if (!answers.ok) {

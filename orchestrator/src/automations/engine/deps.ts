@@ -10,7 +10,7 @@ import type { AutomationInbox } from "./inbox.ts";
 import type { RunSnapshot } from "./context.ts";
 import type { SessionRelayStore } from "../../db/session-relays.ts";
 import type { SourceMention } from "../../workflows/communication-policy.ts";
-import type { DecisionsRequest, DecisionsResponse } from "../../integrations/openrouter-decisions.ts";
+import type { DecisionsRequest, DecisionsResponse } from "../../model-routers/decisions.ts";
 import type { ProfileCard } from "../profile-cards.ts";
 
 /** DBOS.runStep, injected. Retries are an ENGINE loop (attempt-scoped step
@@ -261,12 +261,11 @@ export interface EnginePrRefLookup {
   } | null>;
 }
 
-/** The decide block's seam: the OpenRouter Decisions API in production, a
- * fake in tests and the simulator. */
+/** The decide block's seam: a connected model router in production, a fake
+ * in tests and the simulator. */
 export interface DecisionsRuntime {
-  /** Whether the org has an OpenRouter key (isRouterConnected). */
-  connected(): Promise<boolean>;
-  decide(request: DecisionsRequest): Promise<DecisionsResponse>;
+  /** Null when no connected model router can answer. */
+  decide(request: DecisionsRequest): Promise<DecisionsResponse | null>;
 }
 
 export interface EngineDeps {

@@ -59,7 +59,6 @@ import type { SpecPromptContext } from "../prompts/spec-mode.ts";
 import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 import {
   oauthCredential as defaultOAuthCredential,
-  orgSecret as defaultOrgSecret,
 } from "../control-plane/client.ts";
 import {
   makeIntegrationConnectionStore,
@@ -80,10 +79,8 @@ import {
   providerGuestServices,
 } from "../integrations/providers/index.ts";
 import { makeModelRouterStore, type ModelRouterStore } from "../db/model-routers.ts";
-import {
-  getModelRouterDefinition,
-  selectRouterProtocol,
-} from "../model-routers/registry.ts";
+import { connectedRouters, type SecretNameClient } from "../model-routers/connected.ts";
+import { resolveRouterSelection } from "../model-routers/registry.ts";
 
 const log = rootLog.child({ component: "task" });
 
@@ -192,11 +189,6 @@ export interface HarnessCatalogClient {
   }>;
 }
 
-/** Name-only slice of OrgSecretService. Secret values never cross this seam. */
-export interface OrgSecretNameClient {
-  listSecrets(req: Record<string, never>): Promise<{ secrets: Array<{ name: string }> }>;
-}
-
 export interface SessionCompileDeps {
   images: ImagesClient;
   connectors: CustomConnectorSource;
@@ -214,7 +206,7 @@ export interface SessionCompileDeps {
   resolveAllUserTokens: () => Promise<Record<string, string>>;
   /** Name-only org-secret lookup used to reject unresolved descriptor refs.
    *  Production uses the control-plane client; tests may inject a fake. */
-  orgSecret?: OrgSecretNameClient;
+  orgSecret?: SecretNameClient;
   /** Resolve whether the human owner has a live provider connection. */
   hasOAuthCredential?: (provider: string) => Promise<boolean>;
   oauthSubject?: { kind: OauthSubjectKind; id: string };
@@ -333,22 +325,26 @@ export async function compileSessionCreateInput(
   if (!descriptor) {
     throw new ConnectError(`harness \`${selectedHarness}\` is not in the catalog`, Code.FailedPrecondition);
   }
-  const router = selectedRouterId ? getModelRouterDefinition(selectedRouterId) : null;
-  if (selectedRouterId && !router) {
-    throw new ConnectError(`model router \`${selectedRouterId}\` is not registered`, Code.InvalidArgument);
+  const selection = selectedRouterId
+    ? await resolveRouterSelection({
+        routerId: selectedRouterId,
+        harness: selectedHarness,
+        harnessProtocols: descriptor.routerProtocols ?? [],
+      })
+    : null;
+  if (selection && !selection.ok) {
+    throw new ConnectError(
+      selection.message,
+      selection.code === "unknown_router" ? Code.InvalidArgument : Code.FailedPrecondition,
+    );
   }
-  const routerHost = router ? await resolveIntegrationHost(router.catalog.provider, {
+  const router = selection?.router ?? null;
+  const routerProtocol = selection?.protocol ?? null;
+  const routerHost = router ? await resolveIntegrationHost(router.connector, {
     connectors: deps.connectors,
     settingsFor: async (provider) =>
       storedSettingsOf((await deps.connections.getDefault(provider))?.config),
   }) : undefined;
-  const routerProtocol = router ? selectRouterProtocol(router, descriptor.routerProtocols ?? []) : null;
-  if (router && !routerProtocol) {
-    throw new ConnectError(
-      `harness \`${selectedHarness}\` has no protocol adapter for model router \`${router.id}\``,
-      Code.FailedPrecondition,
-    );
-  }
   const modelId =
     opts.model ??
     profile.model ??
@@ -364,14 +360,9 @@ export async function compileSessionCreateInput(
   let routedModel;
   if (router) {
     if (!modelId) throw new ConnectError("a routed launch requires a model", Code.InvalidArgument);
-    // Independent reads (DB + control plane); the policy checks below
-    // keep their original order over the resolved results.
-    const secretClient: OrgSecretNameClient = deps.orgSecret ?? defaultOrgSecret;
-    const [routed, availableSecrets] = await Promise.all([
+    const [routed, connected] = await Promise.all([
       (deps.modelRouters ?? makeModelRouterStore()).getModel(router.id, modelId),
-      secretClient
-        .listSecrets({})
-        .then((r) => new Set(r.secrets.map((secret) => secret.name))),
+      connectedRouters(deps.orgSecret),
     ]);
     routedModel = routed;
     if (!routedModel || !routedModel.available) {
@@ -384,7 +375,7 @@ export async function compileSessionCreateInput(
     if (!routedModel.supportedParameters.includes("reasoning") && !routedModel.supportedParameters.includes("reasoning_effort")) {
       effortId = undefined;
     }
-    if (!availableSecrets.has(router.credentialSecret)) {
+    if (!connected.some((candidate) => candidate.id === router.id)) {
       throw new ConnectError(
         `${router.label} is not connected — an admin must save the ${router.credentialSecret} key under Settings before routed launches work`,
         Code.FailedPrecondition,
@@ -798,7 +789,7 @@ export interface CreateTaskDeps {
   users?: UserIdentityStore;
   connections?: IntegrationConnectionStore;
   modelRouters?: ModelRouterStore;
-  orgSecret?: OrgSecretNameClient;
+  orgSecret?: SecretNameClient;
 }
 
 export interface CreateTaskParams {

@@ -1,79 +1,22 @@
-/**
- * OpenRouter Decisions API client (`POST /api/alpha/decisions`).
+/** OpenRouter Decisions API client (`POST /api/alpha/decisions`).
  *
- * The Decisions API serves System One models (TypeSafe's Jev): a `state`
- * plus typed `questions` in, calibrated typed answers out. It is NOT a chat
- * model, so the AI SDK provider in ./openrouter.ts cannot call it; this is a
- * thin `fetch` client on the same `openrouter.api_key` credential.
+ * The API serves System One models, which are not chat models, so the AI SDK
+ * provider cannot call it.
  *
  * Wire reference: openrouter.ai/docs/api/api-reference/alphadecisions.
  */
 
-import { z } from "zod";
+import {
+  DecisionsApiError,
+  decisionsResponseSchema,
+  type DecisionsClient,
+} from "../../model-routers/decisions.ts";
 
-/** A JSON value the API accepts as `state`, `instructions` or a criterion. */
-export type DecisionText = string | Record<string, unknown> | unknown[];
-
-export type DecisionQuestion =
-  | { type: "noul"; instructions: DecisionText; criteria?: { true: DecisionText; false: DecisionText } }
-  | { type: "choice"; instructions: DecisionText; criteria: Record<string, DecisionText | null> }
-  | { type: "score"; instructions: DecisionText; criteria: DecisionText[] };
-
-export interface DecisionsRequest {
-  model: string;
-  state: DecisionText;
-  questions: Record<string, DecisionQuestion>;
-}
-
-const answerSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("noul"), noul: z.number() }),
-  z.object({
-    type: z.literal("choice"),
-    choice: z.string(),
-    confidence: z.number().optional(),
-    probabilities: z.record(z.string(), z.number()).optional(),
-  }),
-  z.object({
-    type: z.literal("score"),
-    score: z.number(),
-    confidence: z.number().optional(),
-    probabilities: z.record(z.string(), z.number()).optional(),
-    legend: z.record(z.string(), z.unknown()).optional(),
-  }),
-]);
-export type DecisionAnswer = z.infer<typeof answerSchema>;
-
-const responseSchema = z.object({
-  id: z.string().optional(),
-  model: z.string(),
-  answers: z.record(z.string(), answerSchema),
-  usage: z.object({
-    input_tokens: z.number(),
-    output_tokens: z.number(),
-    cost: z.number().optional(),
-  }),
-});
-export type DecisionsResponse = z.infer<typeof responseSchema>;
-
-/** A failed decisions call. `retryable` follows the documented status codes:
- * rate limits, upstream/provider failures and timeouts are worth a retry; a
- * bad request, a bad key, no credits or a too-large payload are not. */
-export class DecisionsApiError extends Error {
-  constructor(
-    message: string,
-    readonly status: number | null,
-    readonly retryable: boolean,
-  ) {
-    super(message);
-    this.name = "DecisionsApiError";
-  }
-}
+/** Pinned so a model release never changes a graph's thresholds; an author
+ * opts into a newer one through the request's `model`. */
+const DEFAULT_MODEL = "typesafe/jev-1.13";
 
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 524, 529]);
-
-export interface DecisionsClient {
-  decide(request: DecisionsRequest): Promise<DecisionsResponse>;
-}
 
 export interface DecisionsClientOptions {
   apiKey: string;
@@ -101,7 +44,7 @@ export function makeDecisionsClient(options: DecisionsClientOptions): DecisionsC
             Authorization: `Bearer ${options.apiKey}`,
             "Content-Type": "application/json",
           },
-          body: JSON.stringify(request),
+          body: JSON.stringify({ ...request, model: request.model ?? DEFAULT_MODEL }),
           signal: AbortSignal.timeout(timeoutMs),
         });
         // The body read is part of the transport: a reset or the abort after
@@ -130,7 +73,7 @@ export function makeDecisionsClient(options: DecisionsClientOptions): DecisionsC
         // fault, not a bad request.
         throw new DecisionsApiError("decisions API returned a non-JSON body", res.status, true);
       }
-      const parsed = responseSchema.safeParse(body);
+      const parsed = decisionsResponseSchema.safeParse(body);
       if (!parsed.success) {
         const issue = parsed.error.issues[0];
         throw new DecisionsApiError(

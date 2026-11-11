@@ -1,10 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
-import {
-  DecisionsApiError,
-  makeDecisionsClient,
-  type DecisionsRequest,
-} from "../integrations/openrouter-decisions.ts";
+import { DecisionsApiError, type DecisionsRequest } from "../model-routers/decisions.ts";
+import { makeDecisionsClient } from "../providers/openrouter/decisions.ts";
 
 const REQUEST: DecisionsRequest = {
   model: "typesafe/jev-1.13",
@@ -52,6 +49,18 @@ describe("decisions client", () => {
     expect(seen[0]!.url).toBe("https://openrouter.ai/api/alpha/decisions");
     expect(seen[0]!.headers.get("authorization")).toBe("Bearer k-test");
     expect(await seen[0]!.json()).toEqual(REQUEST);
+  });
+
+  test("a request without a model uses the pinned default", async () => {
+    const seen: Request[] = [];
+    const body = JSON.stringify({
+      model: "typesafe/jev-1.13",
+      answers: {},
+      usage: { input_tokens: 1, output_tokens: 1 },
+    });
+    const { model: _model, ...request } = REQUEST;
+    await clientReturning(200, body, seen).decide(request);
+    expect(((await seen[0]!.json()) as { model: string }).model).toBe("typesafe/jev-1.13");
   });
 
   test("rate limits and provider failures are retryable", async () => {

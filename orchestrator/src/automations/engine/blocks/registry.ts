@@ -47,11 +47,10 @@ export interface BlockExecutor<C = unknown> {
   refusesDryRun?: boolean;
   /** Documented for the UI/catalog; not enforced at runtime. */
   outputs?: readonly string[];
-  /** The model router (registry id) the block calls. Authoring surfaces
-   * (the composer catalog, the builder palette) offer the block only while
-   * that router has a key; the engine still runs it either way, so a saved
-   * graph keeps working when the key goes (the block degrades itself). */
-  requiresRouter?: string;
+  /** The block asks a model router for a decision. Authoring surfaces offer
+   * it only while a connected router can answer; the engine runs it either
+   * way, and the block reports `decided: false` when none can. */
+  requiresDecisions?: true;
   configSchema: z.ZodType<C>;
   /** Data half: runs inside one DBOS step. Absent for pure waits. */
   execute?(config: C, ctx: RunContext): Promise<BlockOutcome>;

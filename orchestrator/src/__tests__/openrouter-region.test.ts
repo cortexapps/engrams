@@ -1,8 +1,8 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { create } from "@bufbuild/protobuf";
-import type { OpenRouterProvider } from "@openrouter/ai-sdk-provider";
-import type { DecisionsClient } from "../integrations/openrouter-decisions.ts";
-import "../integrations/openrouter.ts";
+import type { LanguageModelV3 } from "@ai-sdk/provider";
+import type { DecisionsClient } from "../model-routers/decisions.ts";
+import "../model-routers/client.ts";
 import { getIntegrationClient, invalidateIntegrationClient } from "../integrations/clients.ts";
 import { runIntegrationOp, type RunOpDeps } from "../integrations/run-op.ts";
 import { compileIntegrationPolicy, connectorRegistry } from "../connectors/registry.ts";
@@ -66,8 +66,8 @@ test("SDK and Decisions requests follow a region change while the credential is 
   try {
     for (const configured of [undefined, "us.openrouter.ai", "eu.openrouter.ai"]) {
       host = configured;
-      const clients = await getIntegrationClient<{ sdk: OpenRouterProvider; decisions: DecisionsClient }>("openrouter", deps);
-      await clients.sdk.chat("test-model").doGenerate({
+      const clients = await getIntegrationClient<{ chat(modelId: string): LanguageModelV3; decisions: DecisionsClient }>("openrouter", deps);
+      await clients.chat("test-model").doGenerate({
         prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
       });
       await clients.decisions.decide({ model: "test-model", state: "hello", questions: {} });

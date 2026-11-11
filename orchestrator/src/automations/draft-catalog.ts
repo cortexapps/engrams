@@ -44,10 +44,9 @@ function jsonSchemaOf(schema: z.ZodType): unknown {
   }
 }
 
-/** The block + definition catalog. Pure: derived from code, no I/O.
- * `connectedRouters` are the model routers with a key; a block that needs
- * another router is left out, so the agent never drafts one that cannot
- * decide anything. */
+/** The block + definition catalog. Pure: derived from code, no I/O. Without
+ * `decisionsAvailable` the decide block is left out, so the agent never
+ * drafts one that cannot decide anything. */
 /** The condition group a filter or a branch takes. Its zod schema is an
  * opaque refinement, so the JSON schema says nothing; this note does. */
 const CONDITIONS_NOTE =
@@ -55,15 +54,14 @@ const CONDITIONS_NOTE =
   'path is a scope path ("event.raw.pull_request.user.type", "steps.facts.value.ok"); op is one of equals, not_equals, contains, matches, in, is_empty, gt, lt, is_true, is_false. ' +
   'Example: {"mode":"all","conditions":[{"path":"event.raw.pull_request.user.type","op":"not_equals","value":"Bot"}]}.';
 
-export function draftBlockCatalog(connectedRouters: ReadonlySet<string> = new Set()): Record<string, unknown> {
+export function draftBlockCatalog(decisionsAvailable = false): Record<string, unknown> {
   registerEngineBlocks();
   const blocks = listBlockTypes()
     .filter((type) => {
       // The agent is a part of the definition, never a block in a list;
       // its close step comes from a way in's `close` role.
       if (type === AGENT_BLOCK_TYPE || type === AGENT_CLOSE_BLOCK_TYPE) return false;
-      const router = getBlock(type)!.requiresRouter;
-      return router === undefined || connectedRouters.has(router);
+      return decisionsAvailable || !getBlock(type)!.requiresDecisions;
     })
     .map((type) => {
       const executor = getBlock(type)!;
@@ -112,9 +110,9 @@ export function draftBlockCatalog(connectedRouters: ReadonlySet<string> = new Se
       'Prose fields render Liquid with ${{ }}; structured values use {"$ref": "steps.<id>.<output>"}.',
       'Missing variables are render errors. `x | default: y` tolerates a missing x but NOT a missing y (the argument is strict); to pick the first present of several paths use `${{ event.raw | coalesce: "pull_request.number", "issue.number" }}`.',
       "At most one cron trigger per automation; extra entrypoints take integration, cron, or manual triggers.",
-      ...(connectedRouters.has("openrouter")
+      ...(decisionsAvailable
         ? [
-            'decide asks a decision model typed questions in one call; gate on its answers with a branch (`steps.<id>.answers.<question>.confidence`, `.value`, `.yes`). It outputs decided: false when the org has no OpenRouter key, so give the graph a fallback. list_profiles.options feeds a choice question directly (value = profile id).',
+            'decide asks a decision model typed questions in one call; gate on its answers with a branch (`steps.<id>.answers.<question>.confidence`, `.value`, `.yes`). It outputs decided: false when no connected model router can answer, so give the graph a fallback. list_profiles.options feeds a choice question directly (value = profile id).',
           ]
         : []),
       'create_session.profileId takes a profile id. Profile ids differ per org, so a portable definition reads it from a string input (`${{ inputs.profile }}`) the org fills in; an empty value fails the block.',

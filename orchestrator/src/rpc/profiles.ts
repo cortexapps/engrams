@@ -71,7 +71,7 @@ import {
 } from "./profile-discover.ts";
 import { sessions as defaultSessions } from "../control-plane/client.ts";
 import { makeModelRouterStore, type ModelRouterStore } from "../db/model-routers.ts";
-import { getModelRouterDefinition, selectRouterProtocol } from "../model-routers/registry.ts";
+import { resolveRouterSelection } from "../model-routers/registry.ts";
 
 /** Subset of ImageService client used here (catalog validation). */
 export interface ImagesClient {
@@ -349,20 +349,15 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       throw new ConnectError(`harness "${harness}" is not in the catalog`, Code.InvalidArgument);
     }
     if (modelRouter) {
-      const router = getModelRouterDefinition(modelRouter);
-      if (!router) throw new ConnectError(`model router "${modelRouter}" is not registered`, Code.InvalidArgument);
-      if (!selectRouterProtocol(router, descriptor.routerProtocols ?? [])) {
-        throw new ConnectError(
-          `harness "${harness}" does not support model router "${modelRouter}"`,
-          Code.InvalidArgument,
-        );
-      }
-      if (model != null && !(await modelRouters().getModel(modelRouter, model))) {
-        throw new ConnectError(
-          `model "${model}" is not in router "${modelRouter}"`,
-          Code.InvalidArgument,
-        );
-      }
+      const selection = await resolveRouterSelection({
+        routerId: modelRouter,
+        harness,
+        harnessProtocols: descriptor.routerProtocols ?? [],
+        ...(model != null
+          ? { model: { id: model, exists: async (r, m) => (await modelRouters().getModel(r, m)) !== null } }
+          : {}),
+      });
+      if (!selection.ok) throw new ConnectError(selection.message, Code.InvalidArgument);
     } else if (model != null && !(descriptor.models ?? []).some((m) => m.id === model)) {
       throw new ConnectError(
         `model "${model}" is not valid for harness "${harness}"`,

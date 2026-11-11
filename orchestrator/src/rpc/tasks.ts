@@ -80,7 +80,8 @@ import {
   makePendingToolCallStore,
   type PendingToolCallStore,
 } from "../tools/pending-tool-calls.ts";
-import { createTaskWithSession, type Db, type HarnessCatalogClient, type OrgSecretNameClient } from "./task-create.ts";
+import { createTaskWithSession, type Db, type HarnessCatalogClient } from "./task-create.ts";
+import type { SecretNameClient } from "../model-routers/connected.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
 import type { ModelRouterStore } from "../db/model-routers.ts";
@@ -159,7 +160,7 @@ export interface TaskDeps {
   users?: UserIdentityStore;
   connections?: IntegrationConnectionStore;
   modelRouters?: ModelRouterStore;
-  orgSecret?: OrgSecretNameClient;
+  orgSecret?: SecretNameClient;
   /** Register a session for stream-listener scanner discovery. */
   db?: Db;
   /** ADR 0107: the pending-tool-call ledger, for the awaiting_review derivation. */

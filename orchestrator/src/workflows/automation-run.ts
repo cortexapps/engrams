@@ -50,8 +50,7 @@ import { makeIntegrationActionRuntime } from "../automations/actions/runtime.ts"
 import { makeAutomationInstanceStore } from "../db/automation-instances.ts";
 import { makeSessionRelayStore } from "../db/session-relays.ts";
 import { sessionRelayDeps } from "../automations/session-relay.ts";
-import { isRouterConnected } from "../model-routers/connected.ts";
-import { getOpenRouterDecisions } from "../integrations/openrouter.ts";
+import { decide } from "../model-routers/client.ts";
 import { loadProfileCards } from "../automations/profile-cards.ts";
 
 export interface AutomationRunWorkflowInput {
@@ -290,10 +289,7 @@ function productionEngineDeps(): EngineDeps {
       },
     },
     integrationActions: makeIntegrationActionRuntime(),
-    decisions: {
-      connected: () => isRouterConnected("openrouter"),
-      decide: async (request) => (await getOpenRouterDecisions()).decide(request),
-    },
+    decisions: { decide },
     profileCards: () => loadProfileCards(),
     instances: {
       closeInstance: (input) => makeAutomationInstanceStore().closeInstance(input),
