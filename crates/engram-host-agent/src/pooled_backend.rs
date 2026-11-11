@@ -980,9 +980,6 @@ fn progress_line_detail(line: &crate::warm_progress::WarmProgressLine) -> Option
     }
 }
 
-/// Record `engram_warm_hook_stage_seconds` for every CLOSED stage in a
-/// `[warm]`-hook stage history (the still-open stage, if any — `outcome:
-/// Running` — has no duration to record).
 /// ADR 0088 addendum (adversarial-review fix): the pre-seed balloon
 /// inflate with rollback-safe cleanup. Returns:
 ///
@@ -1040,6 +1037,7 @@ async fn balloon_inflate_for_seed(
     }
 }
 
+/// Record the duration of each completed warm-hook stage.
 fn record_warm_stage_metrics(stages: &[engram_core::types::WarmStageRecord]) {
     use engram_core::types::WarmStageOutcome;
     for stage in stages {
@@ -6651,11 +6649,7 @@ impl SandboxBackend for PooledBackend {
                 warm_stages: Vec::new(),
             };
             let _ = progress.try_send(snapshot_event.clone());
-            // Finding 1: pause/flush/chunk memory + upload a multi-GB
-            // state blob to BlobStorage has historically run many minutes
-            // on dev-brain with zero progress traffic once the warm hook
-            // (if any) is done — same lease-staleness risk as the boot
-            // leg above.
+            // Keep the capture lease current while the snapshot uploads.
             let snapshot_keepalive = spawn_leg_keepalive(progress.clone(), snapshot_event);
             // Capture: pause → flush disk → chunk memory + upload
             // state.bin/sidecar to BlobStorage. This is the portable
