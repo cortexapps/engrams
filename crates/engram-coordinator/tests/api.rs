@@ -1,12 +1,5 @@
-//! Integration test for the coordinator HTTP API.
-//!
-//! Wires the real `axum` router against an in-memory `MetadataStore`,
-//! a `MockCloud`, a `LocalStorage` blob backend, and `ProcessBackend`
-//! (the dev-loop SandboxBackend that runs commands as host
-//! subprocesses), then drives the surface via
-//! `tower::ServiceExt::oneshot`. The goal is to lock down the public
-//! contract — status codes, JSON error envelope, the routing table —
-//! while exercising real exec round-trips end-to-end.
+//! HTTP API tests for routing, status, authentication, broker access,
+//! and heartbeat persistence against the real router and simulated metadata.
 
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
@@ -508,15 +501,6 @@ async fn healthz_returns_ok_status_and_version() {
     assert!(v["version"].is_string());
 }
 
-// ---------------------------------------------------------------------
-// End-to-end exec wiring (POST /sessions → registry → sandbox.exec)
-//
-// The registry is in-process state owned by AppState. Tests that need
-// create→exec to share state must reuse the *same* `axum::Router`
-// across requests (cloning the Router is fine — it shares the
-// Arc<AppState> internally).
-// ---------------------------------------------------------------------
-
 #[tokio::test]
 async fn unknown_route_returns_404() {
     let app = build_app(sim_meta()).await;
@@ -527,13 +511,7 @@ async fn unknown_route_returns_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
-/// Issue #231 regression: the heartbeat handler must NOT swallow a
-/// `touch_host_heartbeat` persist failure into a 200. If it does, the
-/// host's `last_heartbeat_at` row goes stale while the host keeps
-/// getting 200-acks (so it never retries/backs off), and a sibling
-/// coord pod's dead-host detector then orphans every session on a host
-/// that is alive and loaded. The contract: persist failure ⇒ 5xx so
-/// the host's loop backs off and the failure is visible.
+/// Heartbeat persistence failures return 5xx so the host retries.
 #[tokio::test]
 async fn heartbeat_persist_failure_returns_5xx_not_swallowed_200() {
     let store = sim_meta();
@@ -545,12 +523,6 @@ async fn heartbeat_persist_failure_returns_5xx_not_swallowed_200() {
         "capacity": { "total_mib": 16384u64, "used_mib": 0u64, "running_sandboxes": 0u32 },
     });
 
-    // Persist fails (a saturated pool / PG outage) → the handler must
-    // return a 5xx, NOT a 200. This is the regression: pre-fix the error
-    // was only logged and the handler fell through to a 200 ack. The
-    // faithful store models this as a whole-store outage window (the
-    // retired mock had a per-method `touch_host_heartbeat` fail flag);
-    // either way the heartbeat handler's single persist errors.
     store.set_outage(true);
     let resp = app
         .clone()
@@ -567,9 +539,7 @@ async fn heartbeat_persist_failure_returns_5xx_not_swallowed_200() {
         resp.status()
     );
 
-    // Control: with the persist healthy, the *same* request acks 200 —
-    // proving the 5xx above is caused specifically by the persist
-    // failure, not by an unrelated handler error.
+    // A healthy store accepts the same heartbeat.
     store.set_outage(false);
     let resp = app
         .oneshot(json_request(

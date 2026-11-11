@@ -2,13 +2,6 @@
 //! chunked-OCI image cache / session volumes / egress proxy, runs the
 //! snapshot manager and resource governor, and heartbeats the
 //! coordinator with capacity + local-snapshot state.
-//!
-//! Phase 1 wires create/exec/destroy through the SandboxBackend trait —
-//! currently `engram-sandbox-process` for fast dev loops, with
-//! `engram-sandbox-firecracker` filling in the production path. Phase 2
-//! lights up the snapshot manager. Phase 3 turns heartbeats into a real
-//! gRPC channel; today they go through an in-process trait object so
-//! the `--mode=all` single-binary path works.
 
 use std::sync::Arc;
 
@@ -1400,13 +1393,7 @@ impl HostAgent {
                         ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_PARKED_RSS_BYTES)
                             .set(mem.parked_rss_bytes as f64);
                     }
-                    // Issue #540: one RAM-ledger snapshot per tick — the
-                    // meminfo read, the guest-PSS running/parked split
-                    // above, and this ledger's own pending base-shm
-                    // charges. Both `UtilizationProbe::sample` (below) and
-                    // the idle-evictor's pressure gate (via the watch
-                    // channel) derive their numbers from THIS snapshot, so
-                    // the two can never disagree.
+                    // The heartbeat and RAM gauges use this same ledger snapshot.
                     let ram_snapshot = ram_ledger_for_heartbeat.sample(
                         base_shm_dir_for_heartbeat.as_deref(),
                         &guest_mem.unwrap_or_default(),
@@ -1747,20 +1734,8 @@ impl HostAgent {
                 }
             });
 
-            // ADR 0073 phase 4: no host-side idle detection. The
-            // coordinator's PG-derived idle detector (idle_detector.rs)
-            // is the ONLY detection plane — same soft/hard TTL
-            // semantics, sourced from the durable event log instead of
-            // hub memory (which went amnesiac on every detach/restart;
-            // the reason the L3 backstop existed). The disk-pressure
-            // brake and pressure-aware gating moved with it, reading
-            // the heartbeat-persisted hosts.utilization.
-            // Issue #540 note: the RAM ledger still feeds the heartbeat's
-            // allocatable_mib (its watch channel is consumed by the
-            // heartbeat tick above); the deleted eviction tick was its
-            // OTHER consumer, and that pressure gate now lives in the
-            // coordinator's detector reading hosts.utilization — the
-            // same ledger numbers, one hop later.
+            // The coordinator's idle detector reads the durable event log.
+            // Its pressure gate reads host utilization from heartbeats.
 
             shutdown_signal().await;
             // Quiesce captures first. From here no capture may START —
@@ -1865,8 +1840,6 @@ fn stages_images_gate(has_chunk_store: bool, has_chunk_cache: bool) -> bool {
     has_chunk_store && has_chunk_cache
 }
 
-/// Await either SIGINT (ctrl-c) or SIGTERM (Kubernetes shutdown).
-/// On non-unix platforms, falls back to ctrl-c only.
 /// ADR 0116 A-D2: the SIGTERM ladder's handoff declaration. Writes the
 /// durable marker first (atomic tmp+rename+fsync in the bindings dir —
 /// the successor adopts and reports it), then makes ONE bounded (2 s)
@@ -1952,6 +1925,8 @@ fn adopt_handoff_marker(
     Some(marker)
 }
 
+/// Await either SIGINT (ctrl-c) or SIGTERM (Kubernetes shutdown).
+/// On non-unix platforms, falls back to ctrl-c only.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
