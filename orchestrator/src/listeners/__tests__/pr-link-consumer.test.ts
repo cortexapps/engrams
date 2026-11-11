@@ -122,19 +122,43 @@ describe("PR-link consumer", () => {
     expect(recorder.upserts[0]?.title).toBe("Record authored pull requests");
   });
 
-  test("a repository name and number that another forge holds is skipped, not retried", async () => {
+  const duplicateKey = () => Object.assign(new Error("duplicate key"), { code: "23505" });
+
+  test("a repository name and number that another forge holds is skipped after one more attempt", async () => {
     const recorder = prRefRecorder();
+    let attempts = 0;
     const consumer = makePrLinkConsumer({
       prRefs: {
         ...recorder.store,
         upsert: async () => {
-          throw Object.assign(new Error("duplicate key"), { code: "23505" });
+          attempts += 1;
+          throw duplicateKey();
         },
       },
       findTaskId: async () => "task-1",
     });
 
     await consumer.handle(pullRequestAsset(), { sessionId: "session-1" });
+    expect(attempts).toBe(2);
+  });
+
+  test("a concurrent first insert of the same pull request is recorded on the second attempt", async () => {
+    const recorder = prRefRecorder();
+    let attempts = 0;
+    const consumer = makePrLinkConsumer({
+      prRefs: {
+        ...recorder.store,
+        upsert: async (input) => {
+          attempts += 1;
+          if (attempts === 1) throw duplicateKey();
+          return recorder.store.upsert(input);
+        },
+      },
+      findTaskId: async () => "task-1",
+    });
+
+    await consumer.handle(pullRequestAsset(), { sessionId: "session-1" });
+    expect(recorder.upserts).toHaveLength(1);
   });
 
   test("a store failure that is not a key conflict reaches the listener's retry", async () => {

@@ -81,9 +81,15 @@ function isPermanentError(error: unknown): boolean {
   return error.status === 401 || error.status === 404 || error.status === 410;
 }
 
+/** The id of a review that is posted. A body that cannot be read gives no
+ * id; it must not fail the post. */
 function reviewIdFrom(result: IntegrationOpResult): string | undefined {
-  if (result.body.length === 0) return undefined;
-  const value = parseJson(result, "create pull request review");
+  let value: unknown;
+  try {
+    value = JSON.parse(decodeBody(result.body));
+  } catch {
+    return undefined;
+  }
   if (!isObject(value)) return undefined;
   const id = value["id"];
   return typeof id === "string" || typeof id === "number" ? String(id) : undefined;
@@ -147,12 +153,12 @@ export function makeGithubForge(
       if (!succeeded(response)) throw responseError("get pull request", response);
       const value = parseJson(response, "get pull request");
       if (!isObject(value) || !isObject(value["head"]) || !isObject(value["base"])) {
-        throw new Error("get pull request response is missing head/base");
+        throw unusable("get pull request", response, "no head/base");
       }
       const headSha = value["head"]["sha"];
       const baseSha = value["base"]["sha"];
       if (typeof headSha !== "string" || typeof baseSha !== "string") {
-        throw new Error("get pull request response is missing head/base SHAs");
+        throw unusable("get pull request", response, "no head/base SHAs");
       }
       return { headSha, baseSha, pr: readPrContext(value) };
     },

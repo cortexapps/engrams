@@ -133,8 +133,8 @@ export function makePrLinkConsumer(deps: PrLinkConsumerDeps): SessionConsumer {
       }
 
       const taskId = await deps.findTaskId(ctx.sessionId);
-      try {
-        await deps.prRefs.upsert({
+      const upsert = () =>
+        deps.prRefs.upsert({
           provider,
           repo,
           prNumber,
@@ -146,10 +146,18 @@ export function makePrLinkConsumer(deps: PrLinkConsumerDeps): SessionConsumer {
           baseBranch: data.base_branch ?? "",
           observedAt: new Date(at),
         });
-      } catch (error) {
+      try {
         // The upsert resolves its own key, so a unique violation is the
-        // (repo, number) index the previous build still needs: another forge
-        // holds this repository name and number. A retry cannot succeed.
+        // (repo, number) index the previous build still needs. A concurrent
+        // first insert of the same pull request also trips it; the second
+        // attempt then finds that row and updates it.
+        await upsert().catch((error: unknown) => {
+          if (!isUniqueViolation(error)) throw error;
+          return upsert();
+        });
+      } catch (error) {
+        // Another forge holds this repository name and number. A retry
+        // cannot succeed.
         if (!isUniqueViolation(error)) throw error;
         log.warn(
           { sessionId: ctx.sessionId, provider, repo, prNumber },

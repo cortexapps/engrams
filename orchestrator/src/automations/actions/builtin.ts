@@ -66,7 +66,7 @@ async function hasReviewWithMarker(
     if (!(error instanceof ForgeRequestError)) throw error;
     const { status } = error;
     throw new IntegrationActionError(
-      `list pull request reviews returned ${status}`,
+      status >= 400 ? `list pull request reviews returned ${status}` : error.message,
       status >= 400 && status < 500 && status !== 429,
       status,
     );

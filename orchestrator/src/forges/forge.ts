@@ -6,10 +6,10 @@ import type { runIntegrationOp } from "../integrations/run-op.ts";
 import type { PrContext } from "./pr-context.ts";
 
 /** A repository path that is safe inside a shell command and a URL path:
- * two or more `/`-separated names, none of them `.` or `..`. It is a charset
- * rule, not a forge's own naming rule. */
+ * two or more `/`-separated names. No name is `.` or `..`, and none starts
+ * with `-`. It is a charset rule, not a forge's own naming rule. */
 export const SAFE_REPO_PATH =
-  /^(?!\.{1,2}(?:\/|$))[A-Za-z0-9._-]+(?:\/(?!\.{1,2}(?:\/|$))[A-Za-z0-9._-]+)+$/;
+  /^(?!-|\.{1,2}(?:\/|$))[A-Za-z0-9._-]+(?:\/(?!-|\.{1,2}(?:\/|$))[A-Za-z0-9._-]+)+$/;
 
 export interface InlineComment {
   findingId: string;

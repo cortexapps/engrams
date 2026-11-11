@@ -406,7 +406,7 @@ describe("the GitHub forge", () => {
     for (const repo of ["acme/app", "acme/group/app", "a.b/c_d-e", "acme/.config"]) {
       expect(SAFE_REPO_PATH.test(repo)).toBe(true);
     }
-    for (const repo of ["acme", "acme/..", "../acme/app", "acme/./app", "acme/app/..", "acme/a b"]) {
+    for (const repo of ["acme", "acme/..", "../acme/app", "acme/./app", "acme/app/..", "acme/a b", "-rf/app", "acme/-app"]) {
       expect(SAFE_REPO_PATH.test(repo)).toBe(false);
     }
   });
