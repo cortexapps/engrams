@@ -4611,6 +4611,16 @@ impl MetadataStore for SimMetadataStore {
         panic!("SimMeta: latest_capture_job_for_enable not implemented — add it plus a conformance case (ADR 0098 D4)")
     }
 
+    async fn session_budget(&self, id: SessionId) -> Result<Option<(i64, i32)>, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        Ok(db
+            .sessions
+            .get(&id)
+            .map(|r| (r.mem_budget_mib, r.cpu_budget_vcpus))
+            .filter(|(mem, _)| *mem > 0))
+    }
+
     async fn list_resident_assignments_with_budgets_on_host(
         &self,
         host_id: HostId,

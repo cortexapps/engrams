@@ -390,16 +390,30 @@ pub(crate) async fn materialize_snapshot_resume(
     })
 }
 
-/// The placement-budget slice of the cold-boot shape, for callers that
-/// need `(memory_mib, vcpus)` and nothing else (the resume verb's
-/// `ScheduleContext`, ADR 0078). Best-effort by contract: `None` on any
-/// miss keeps the pre-0072 capacity-soft posture — deliberately NOT
-/// `materialize_cold_boot`, which does per-session slot resolution this
-/// caller would throw away.
+/// The `(memory_mib, vcpus)` a resume, a queued resume, or a move of
+/// `session` reserves: the budget the session records
+/// (`MetadataStore::session_budget`). That budget is the size of the VM
+/// its snapshot restores and the figure the host accounting holds for the
+/// session. The image's current config decides only for a session with no
+/// recorded budget: a config that changed after the create does not
+/// resize the VM. `None` when neither source resolves; the caller then
+/// places without a capacity check.
 pub(crate) async fn resolve_resume_budget(
     meta: &std::sync::Arc<dyn engram_core::traits::MetadataStore>,
     session: &Session,
 ) -> Option<(u32, u32)> {
+    match meta.session_budget(session.id).await {
+        Ok(Some((mem_mib, vcpus))) => {
+            if let (Ok(mem_mib), Ok(vcpus)) = (u32::try_from(mem_mib), u32::try_from(vcpus)) {
+                return Some((mem_mib, vcpus));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(session_id = %session.id, error = %e,
+                "session budget lookup failed; the image config decides the resume budget");
+        }
+    }
     match meta.get_enabled_image(&session.image).await {
         Ok(Some(row)) => {
             let config = row.effective_config();
@@ -685,6 +699,26 @@ mod readiness_tests {
             services,
         ));
         (state, meta, host, session, sandbox)
+    }
+
+    /// A resume reserves what the session records, not what the image's
+    /// config says now: the two differ after an image config change, and
+    /// the host accounting holds the recorded figure.
+    #[tokio::test]
+    async fn the_resume_budget_is_the_sessions_recorded_budget() {
+        let (state, meta, _host, session, _sandbox) = fixture().await;
+        let from_image = resolve_resume_budget(&state.services.meta, &session).await;
+        assert_ne!(from_image, Some((24_576, 6)));
+
+        meta.with_db_mut(|db| {
+            let row = db.sessions.get_mut(&session.id).expect("session row");
+            row.mem_budget_mib = 24_576;
+            row.cpu_budget_vcpus = 6;
+        });
+        assert_eq!(
+            resolve_resume_budget(&state.services.meta, &session).await,
+            Some((24_576, 6))
+        );
     }
 
     #[tokio::test]

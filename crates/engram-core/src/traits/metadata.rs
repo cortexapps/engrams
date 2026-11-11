@@ -736,6 +736,14 @@ pub trait MetadataStore: Send + Sync {
             .collect())
     }
 
+    /// The `(mem_budget_mib, cpu_budget_vcpus)` the session reserves: the
+    /// figures its VM was created with, which every later restore of that
+    /// VM keeps. `None` when the row records no memory budget. The default
+    /// is `None` (mocks carry no budgets).
+    async fn session_budget(&self, _id: SessionId) -> Result<Option<(i64, i32)>, MetaError> {
+        Ok(None)
+    }
+
     /// ADR 0048 C8: the RESIDENT assignments on `host_id` WITH their
     /// reservation budgets, for the admin drain (the don't-strand guard
     /// pre-checks that some survivor fits each session's budgets before

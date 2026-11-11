@@ -2754,6 +2754,20 @@ impl MetadataStore for PostgresStore {
         Ok(out)
     }
 
+    async fn session_budget(&self, id: SessionId) -> Result<Option<(i64, i32)>, MetaError> {
+        let row: Option<(i64, i32)> = sqlx::query_as(
+            r#"
+            SELECT COALESCE(mem_budget_mib, 0)::BIGINT, COALESCE(cpu_budget_vcpus, 0)
+            FROM sessions WHERE id = $1
+            "#,
+        )
+        .bind(id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.filter(|(mem, _)| *mem > 0))
+    }
+
     async fn list_resident_assignments_with_budgets_on_host(
         &self,
         host_id: HostId,
