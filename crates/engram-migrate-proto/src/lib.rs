@@ -70,6 +70,11 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 /// v6: ordered fault windows and fault-around installation accounting.
 pub const PROTO_VERSION: u32 = 6;
 
+/// How long the source holds a `Hello` for an export that is not there yet.
+/// The destination dials before the source pauses the guest, and the capture
+/// registers the export. When the budget ends the source answers `Error`.
+pub const EXPORT_PARK_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Bound a demand window to limit request and response work.
 pub const MAX_FAULT_AROUND_CHUNKS: usize = 256;
 

@@ -142,6 +142,13 @@ fn managed_request<T>(message: T) -> tonic::Request<T> {
     request
 }
 
+/// The largest `HostService` message either side decodes or encodes.
+/// tonic's 4 MiB default is below a move's restore request, which carries
+/// the memory manifest of the VM (about 6 MB for 32 GiB of guest RAM),
+/// and below a peer chunk frame. The cap is a limit check; it allocates
+/// nothing.
+pub const HOST_RPC_MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
+
 /// Coord-side client wrapping a `tonic::transport::Channel` to one
 /// host. Cheap to clone (tonic clients hold an `Arc<Channel>`
 /// internally); one instance per host is the steady-state shape.
@@ -161,12 +168,11 @@ impl GrpcHostClient {
     /// Every RPC carries the caller's `traceparent` via
     /// [`TraceparentInjector`] (ADR 0019 distributed tracing).
     ///
-    /// The 32 MiB decode cap permits peer chunk frames with 4 MiB of data
-    /// plus framing overhead. It does not allocate memory before a reply.
+    /// The client decodes replies up to [`HOST_RPC_MAX_MESSAGE_BYTES`].
     pub fn new(channel: Channel) -> Self {
         Self {
             inner: HostServiceClient::with_interceptor(channel, TraceparentInjector)
-                .max_decoding_message_size(32 * 1024 * 1024),
+                .max_decoding_message_size(HOST_RPC_MAX_MESSAGE_BYTES),
             managed_transport: false,
         }
     }

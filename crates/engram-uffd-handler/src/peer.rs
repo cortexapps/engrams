@@ -55,6 +55,13 @@ const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 pub(crate) const PEER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the first dial waits for `HelloAck`. The handler dials before
+/// the source pauses the guest, and the source holds the `Hello` until the
+/// capture registers the export. The source answers with an `Error` when
+/// its own budget ends, so this wait is longer than that budget.
+const CAPTURE_WAIT: Duration =
+    engram_migrate_proto::EXPORT_PARK_BUDGET.saturating_add(PEER_READ_TIMEOUT);
+
 /// First response from a new worker: each attempt can connect, send Hello,
 /// read HelloAck and Seal, send NeedWindow, then read the first page.
 /// Include the initial attempt and every redial, plus reconnect backoff.
@@ -358,6 +365,17 @@ fn connect_with_socket(
     Err(last_error.into())
 }
 
+/// A connected socket with the page-channel options set.
+fn connect_with_sockopts(
+    addr: &str,
+    connected: &impl Fn(Option<&TcpStream>) -> Result<bool, PeerError>,
+) -> Result<TcpStream, PeerError> {
+    let stream = connect_with_socket(addr, connected)?;
+    stream.set_nodelay(true)?;
+    apply_peer_sockopts(&stream)?;
+    Ok(stream)
+}
+
 fn dial_with_socket(
     addr: &str,
     export_id: &str,
@@ -367,15 +385,36 @@ fn dial_with_socket(
     purpose: engram_migrate_proto::ConnPurpose,
     connected: impl Fn(Option<&TcpStream>) -> Result<bool, PeerError>,
 ) -> Result<(TcpStream, SealBitmap), PeerError> {
-    let mut stream = connect_with_socket(addr, &connected)?;
-    stream.set_nodelay(true)?;
-    apply_peer_sockopts(&stream)?;
+    let mut stream = connect_with_sockopts(addr, &connected)?;
     // Register worker sockets before any blocking handshake read or write.
     if !connected(Some(&stream))? {
         return Err(PeerError::Lost("connection canceled".into()));
     }
-    write_frame(
+    let seal = handshake(
         &mut stream,
+        export_id,
+        token,
+        expect_chunk_size,
+        expect_total_bytes,
+        purpose,
+        PEER_READ_TIMEOUT,
+    )?;
+    Ok((stream, seal))
+}
+
+/// `Hello`, `HelloAck`, `Seal`. `ack_wait` bounds the read of `HelloAck`
+/// only; the source sends `Seal` directly after it.
+fn handshake(
+    stream: &mut TcpStream,
+    export_id: &str,
+    token: &str,
+    expect_chunk_size: u64,
+    expect_total_bytes: u64,
+    purpose: engram_migrate_proto::ConnPurpose,
+    ack_wait: Duration,
+) -> Result<SealBitmap, PeerError> {
+    write_frame(
+        stream,
         &ToSource::Hello {
             version: PROTO_VERSION,
             export_id: export_id.to_string(),
@@ -383,7 +422,10 @@ fn dial_with_socket(
             purpose,
         },
     )?;
-    match read_frame::<_, FromSource>(&mut stream)? {
+    stream.set_read_timeout(Some(ack_wait))?;
+    let ack = read_frame::<_, FromSource>(stream);
+    stream.set_read_timeout(Some(PEER_READ_TIMEOUT))?;
+    match ack? {
         FromSource::HelloAck {
             version,
             chunk_size,
@@ -408,7 +450,7 @@ fn dial_with_socket(
             )));
         }
     }
-    let seal = match read_frame::<_, FromSource>(&mut stream)? {
+    let seal = match read_frame::<_, FromSource>(stream)? {
         FromSource::Seal { bitmap } => bitmap,
         FromSource::Error { message, .. } => return Err(PeerError::Server(message)),
         other => return Err(PeerError::Server(format!("expected Seal, got {other:?}"))),
@@ -421,13 +463,14 @@ fn dial_with_socket(
             "seal bitmap geometry != manifest geometry".into(),
         ));
     }
-    Ok((stream, seal))
+    Ok(seal)
 }
 
 impl PeerSession {
-    /// Connect, authenticate, and BLOCK until the source's `Seal`
-    /// arrives. Geometry is validated against the manifest's view
-    /// before any fault can be served.
+    /// Connect, authenticate, and block until the source's `Seal`
+    /// arrives, which is after its capture ([`CAPTURE_WAIT`]). Geometry
+    /// is validated against the manifest's view before any fault can be
+    /// served.
     pub fn connect(
         addr: String,
         export_id: String,
@@ -435,13 +478,15 @@ impl PeerSession {
         expect_chunk_size: u64,
         expect_total_bytes: u64,
     ) -> Result<Self, PeerError> {
-        let (stream, seal) = dial(
-            &addr,
+        let mut stream = connect_with_sockopts(&addr, &|_| Ok(true))?;
+        let seal = handshake(
+            &mut stream,
             &export_id,
             &token,
             expect_chunk_size,
             expect_total_bytes,
             engram_migrate_proto::ConnPurpose::Fault,
+            CAPTURE_WAIT,
         )?;
         tracing::info!(
             addr,
@@ -1424,6 +1469,54 @@ pub(crate) mod tests {
             let expected: Vec<_> = (first..end).filter(|&i| bits[i].0 && !bits[i].1).take(limit).map(|i| i as u64 * 4096).collect();
             proptest::prop_assert_eq!(got, expected);
         }
+    }
+
+    /// A source that sends `HelloAck` and `Seal` `delay` after `Hello`.
+    fn slow_ack_source(delay: Duration) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let _ = read_frame::<_, ToSource>(&mut s);
+                    std::thread::sleep(delay);
+                    let _ = write_frame(
+                        &mut s,
+                        &FromSource::HelloAck {
+                            version: PROTO_VERSION,
+                            chunk_size: CHUNK,
+                            total_bytes: TOTAL,
+                        },
+                    );
+                    let bitmap = SealBitmap::new(CHUNK, TOTAL / CHUNK);
+                    let _ = write_frame(&mut s, &FromSource::Seal { bitmap });
+                    // Hold the connection open for the client's checks.
+                    let _ = read_frame::<_, ToSource>(&mut s);
+                });
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn the_ack_wait_bounds_only_the_wait_for_hello_ack() {
+        let addr = slow_ack_source(Duration::from_millis(300)).to_string();
+        let shake = |ack_wait| {
+            let mut stream = TcpStream::connect(&addr).unwrap();
+            let purpose = engram_migrate_proto::ConnPurpose::Fault;
+            handshake(&mut stream, "e", "tok", CHUNK, TOTAL, purpose, ack_wait).map(|_| stream)
+        };
+        let err = shake(Duration::from_millis(50)).expect_err("the ack is later than the wait");
+        assert!(matches!(err, PeerError::Io(_)), "{err}");
+        let stream = shake(Duration::from_secs(10)).expect("the ack is inside the wait");
+        assert_eq!(stream.read_timeout().unwrap(), Some(PEER_READ_TIMEOUT));
+    }
+
+    /// The source answers a `Hello` whose export never registers when its
+    /// budget ends; the first dial must still be reading then.
+    #[test]
+    fn the_first_dial_outlasts_the_source_park_budget() {
+        assert!(CAPTURE_WAIT > engram_migrate_proto::EXPORT_PARK_BUDGET);
     }
 
     #[test]

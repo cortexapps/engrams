@@ -1286,7 +1286,14 @@ async fn scanner_advance_one(
             engram_core::types::session_op::OpState::Queued => {
                 return Ok(());
             }
-            engram_core::types::session_op::OpState::Done => {
+            // An op that finished before this nomination began (a park, or
+            // an eviction the session has since returned from) says nothing
+            // about this one. `last_active_at` is the nomination's stamp.
+            engram_core::types::session_op::OpState::Done
+                if prior
+                    .finished_at
+                    .is_some_and(|t| t >= session.last_active_at) =>
+            {
                 let within_grace = prior.finished_at.is_some_and(|t| {
                     state
                         .services
@@ -3478,6 +3485,57 @@ mod tests {
             "within the settle grace the scanner must not re-mint an evict op \
              (the terminal-op/dedup churn shape)",
         );
+    }
+
+    /// A session that parked or evicted, came back, and is nominated again
+    /// still holds the earlier nomination's Done evict op. The scanner can
+    /// see the new nomination before the detector queues its op; the op the
+    /// scanner then mints must allow the park.
+    #[tokio::test]
+    async fn an_earlier_nominations_done_op_does_not_disable_the_park() {
+        let session_id = engram_core::SessionId::new();
+        let session = evicting_session(session_id);
+        let earlier_nomination = session.last_active_at;
+        let sandbox_root = TempDir::new().unwrap();
+        let (state, meta, _stashed) = d5_state(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
+            .await
+            .unwrap();
+        let key = format!("evict:{}", earlier_nomination.timestamp_millis());
+        let op = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(
+                session_id,
+                OpKind::Evict,
+                serde_json::json!({ "target": "idle", "allow_park": true, "nominated": true }),
+                Some(&key),
+                "test-pod",
+            )
+            .await
+            .expect("enqueue+claim")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("op lane busy: {other:?}"),
+        };
+        crate::session_ops::drive_claimed(&state, op).await;
+
+        // The new nomination begins after that op finished.
+        {
+            let mut session = meta.session.lock();
+            session.status = SessionState::Evicting;
+            session.last_active_at = chrono::Utc::now() + chrono::Duration::seconds(1);
+        }
+        let ops_before = meta.ops.all().len();
+        scanner_run_once(&state).await.expect("tick");
+        let ops = meta.ops.all();
+        assert_eq!(ops.len(), ops_before + 1, "the new nomination gets its op");
+        let minted = ops.iter().max_by_key(|op| op.id).unwrap();
+        assert_eq!(minted.payload["allow_park"], true, "{:?}", minted.payload);
     }
 
     /// ADR 0101 C (engrams review, #836 round 3): the suppression must be

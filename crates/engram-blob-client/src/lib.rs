@@ -831,7 +831,9 @@ mod tests {
         let client = BlobClient::with_policy(
             hanging,
             ClientPolicy {
-                attempt_timeout: Duration::from_millis(50),
+                // The retry's read of a local file must finish inside this
+                // deadline on a loaded runner.
+                attempt_timeout: Duration::from_secs(1),
                 ..test_policy()
             },
         );

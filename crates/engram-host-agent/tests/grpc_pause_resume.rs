@@ -1,4 +1,4 @@
-//! Real gRPC lifecycle, cancellation, and predecessor wire 38 compatibility tests.
+//! Real gRPC lifecycle, cancellation, message size, and wire compatibility tests.
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
 
@@ -22,6 +22,7 @@ struct FakeHost {
     calls: Mutex<Vec<(&'static str, SandboxId)>>,
     starts: Mutex<Vec<StartCall>>,
     file_drop: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    prompt_bytes: Mutex<Vec<usize>>,
 }
 
 struct StartCall {
@@ -126,10 +127,11 @@ impl HostClient for FakeHost {
         &self,
         _: SandboxId,
         _: String,
-        _: String,
+        text: String,
         _: Option<String>,
     ) -> Result<(), SandboxError> {
-        unreachable!()
+        self.prompt_bytes.lock().push(text.len());
+        Ok(())
     }
     async fn proxy_shell(&self, _: SandboxId) -> Result<ShellTunnel, SandboxError> {
         unreachable!()
@@ -360,4 +362,20 @@ async fn predecessor_38_caller_reaches_new_host_with_exact_policy_and_fence() {
         .insert("x-engram-wire-version", "38".parse().unwrap());
     client.pause_sandbox(pause).await.unwrap();
     assert_eq!(*host.calls.lock(), vec![("pause", expected.sandbox_id)]);
+}
+
+/// The host accepts requests larger than tonic's 4 MiB default decode limit.
+#[tokio::test]
+async fn the_host_accepts_a_request_above_the_tonic_default_limit() {
+    let host = Arc::new(FakeHost::default());
+    let addr = boot_grpc_server(host.clone()).await;
+    let client = connect_grpc_client(addr).await;
+
+    let text = "x".repeat(6 * 1024 * 1024);
+    client
+        .send_prompt(SandboxId::new(), "p1".into(), text.clone(), None)
+        .await
+        .expect("a 6 MiB request reaches the host");
+
+    assert_eq!(*host.prompt_bytes.lock(), vec![text.len()]);
 }
