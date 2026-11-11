@@ -21,9 +21,12 @@ import type { AutomationInbox } from "../../engine/inbox.ts";
 import { interpretAutomation } from "../../engine/interpreter.ts";
 import type { CommunicationPolicy } from "../../../workflows/communication-policy.ts";
 import { config } from "../../../config.ts";
-import { SLACK_BRAIN_DEFINITION } from "../slack-brain.ts";
+import { chatThreadsDefinition } from "../chat-threads.ts";
+import { SLACK_THREADS } from "../../../providers/slack/threads-variant.ts";
 import type { DecisionsRequest, DecisionsResponse } from "../../../model-routers/decisions.ts";
 import type { ProfileCard } from "../../profile-cards.ts";
+
+const SLACK_BRAIN_DEFINITION = chatThreadsDefinition(SLACK_THREADS);
 
 const card = (id: string, name: string, description: string): ProfileCard => ({
   id,

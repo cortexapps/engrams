@@ -4,6 +4,7 @@
 
 import type { Hono } from "hono";
 
+import type { ThreadsVariant } from "../automations/builtins/threads-variant.ts";
 import type { CommunicationPolicy, SourceMention } from "../workflows/communication-policy.ts";
 
 /** Where the answer to an interactive card goes: the run that asked, or the
@@ -41,4 +42,6 @@ export interface ChatProviderSpec {
    * `/api/v1/integrations/<provider>/interactivity`. The path takes requests
    * with no login, so the app verifies the sender. */
   interactivity?: () => Hono;
+  /** The provider's chat-threads built-in. */
+  threads?: ThreadsVariant;
 }

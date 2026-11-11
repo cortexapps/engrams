@@ -36,7 +36,8 @@ import {
 } from "../engine/builtins.ts";
 import { reviewVariants } from "../../forges/registry.ts";
 import { reviewBuiltin } from "./review.ts";
-import { SLACK_BRAIN_BUILTIN } from "./slack-brain.ts";
+import { chatThreadsBuiltin } from "./chat-threads.ts";
+import { threadsVariants } from "../../chat/registry.ts";
 
 const log = rootLog.child({ component: "builtin-seed" });
 
@@ -313,7 +314,7 @@ export function registerShippedBuiltins(): void {
   if (registered) return;
   registered = true;
   for (const variant of reviewVariants()) registerBuiltinAutomation(reviewBuiltin(variant));
-  registerBuiltinAutomation(SLACK_BRAIN_BUILTIN);
+  for (const variant of threadsVariants()) registerBuiltinAutomation(chatThreadsBuiltin(variant));
 }
 
 /** Production wiring; fire-and-forget at boot next to the reviewer-profile seed. */

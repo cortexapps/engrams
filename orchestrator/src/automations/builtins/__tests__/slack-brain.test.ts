@@ -10,13 +10,11 @@ import {
   walkBlocks,
 } from "../../engine/definition.ts";
 import { evaluateCode } from "../../code/sandbox.ts";
-import {
-  SLACK_BRAIN_BUILTIN,
-  SLACK_BRAIN_DEFINITION,
-  SLACK_FACTS_SOURCE,
-  SLACK_RESOLVE_SOURCE,
-  SLACK_TRIAGE_SOURCE,
-} from "../slack-brain.ts";
+import { RESOLVE_SOURCE, TRIAGE_SOURCE, chatThreadsBuiltin, chatThreadsDefinition } from "../chat-threads.ts";
+import { SLACK_THREADS, SLACK_FACTS_SOURCE } from "../../../providers/slack/threads-variant.ts";
+
+const SLACK_BRAIN_BUILTIN = chatThreadsBuiltin(SLACK_THREADS);
+const SLACK_BRAIN_DEFINITION = chatThreadsDefinition(SLACK_THREADS);
 
 registerEngineBlocks();
 
@@ -223,7 +221,7 @@ describe("Slack thread brain — smart routing code", () => {
   });
   const triage = async (route: unknown, inputs: Record<string, unknown> = { default_profile: "p-d" }) => {
     const out = await evaluateCode(
-      SLACK_TRIAGE_SOURCE,
+      TRIAGE_SOURCE,
       { inputs, steps: { route, candidates: { options } } },
       "value",
     );
@@ -247,7 +245,7 @@ describe("Slack thread brain — smart routing code", () => {
   });
 
   const resolve = async (steps: Record<string, unknown>) => {
-    const out = await evaluateCode(SLACK_RESOLVE_SOURCE, { steps }, "value");
+    const out = await evaluateCode(RESOLVE_SOURCE, { steps }, "value");
     return out.ok ? (out.value as { profile_id: string; label: string; card: string }) : undefined;
   };
   const smartFacts = { value: { smart: true, profile_id: "p-d" } };

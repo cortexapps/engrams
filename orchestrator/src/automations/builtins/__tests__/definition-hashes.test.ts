@@ -9,7 +9,10 @@ import { expect, test } from "bun:test";
 import { reviewDefinition } from "../review.ts";
 import { GITHUB_REVIEW } from "../../../providers/github/review-variant.ts";
 import { definitionContentHash } from "../seed.ts";
-import { SLACK_BRAIN_DEFINITION } from "../slack-brain.ts";
+import { chatThreadsDefinition } from "../chat-threads.ts";
+import { SLACK_THREADS } from "../../../providers/slack/threads-variant.ts";
+
+const SLACK_BRAIN_DEFINITION = chatThreadsDefinition(SLACK_THREADS);
 
 const PR_REVIEW_DEFINITION = reviewDefinition(GITHUB_REVIEW);
 

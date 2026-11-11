@@ -22,8 +22,6 @@ const IMPORT = new RegExp(`from\\s+"[^"]*/(${PROVIDERS})[^"/]*"`);
 const FILENAME = new RegExp(`(^|/)(${PROVIDERS})[^/]*\\.ts$`);
 
 const ALLOWED: string[] = [
-  "automations/builtins/seed.ts",
-  "automations/builtins/slack-brain.ts",
   "automations/draft-catalog.ts",
   "automations/profile-cards.ts",
   "automations/retire-provider-webhooks.ts",

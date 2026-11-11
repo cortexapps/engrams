@@ -5,6 +5,7 @@ import { describeSlackChannels, listSlackChannelOptions } from "./channels.ts";
 import { getSlackClient } from "./client.ts";
 import { makeSlackInteractivityRoute } from "./interactivity.ts";
 import { makeSlackPolicy } from "./policy.ts";
+import { SLACK_THREADS } from "./threads-variant.ts";
 
 const PROVIDER = "slack";
 
@@ -24,4 +25,5 @@ export const SLACK_CHAT: ChatProviderSpec = {
     threadHandle: (place) => `${PROVIDER}:${place.channel}:${place.threadRoot}`,
   }),
   interactivity: makeSlackInteractivityRoute,
+  threads: SLACK_THREADS,
 };
