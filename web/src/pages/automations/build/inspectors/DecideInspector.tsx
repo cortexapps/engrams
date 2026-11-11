@@ -19,7 +19,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { useCanDecide } from "@/hooks/useCanDecide";
+import { useCanDecide, useHasRouterKey } from "@/hooks/useCanDecide";
 import {
   isTunable,
   setPath,
@@ -119,6 +119,9 @@ const ON_ERROR_FIELD: FieldSpec = {
 export function DecideInspector(props: DecideInspectorProps) {
   const { block, onChange, builtin, errors, sessionSources, variablePaths, variableValues } = props;
   const canDecide = useCanDecide();
+  const hasRouterKey = useHasRouterKey();
+  // A block with its own model needs only a router with a key.
+  const cannotRun = block.config["model"] ? hasRouterKey === false : canDecide === false;
   const pinned = (key: string) => builtin && !isTunable(block, key);
   const update = (key: string, value: unknown) =>
     onChange({ ...block, config: setPath(block.config, key, value) });
@@ -159,10 +162,12 @@ export function DecideInspector(props: DecideInspectorProps) {
 
   return (
     <div className="flex flex-col gap-3">
-      {canDecide === false && !block.config["model"] && (
+      {cannotRun && (
         <p className="rounded-md border border-instrument-caution/40 bg-instrument-caution/10 p-2 text-xs">
-          No model router has a key and a decision model: this block outputs{" "}
-          <code>decided: false</code> and the graph takes its fallback.{" "}
+          {block.config["model"]
+            ? "No model router has a key"
+            : "No model router has a key and a decision model"}
+          : this block outputs <code>decided: false</code> and the graph takes its fallback.{" "}
           <Link to="/settings/model-routers" className="underline underline-offset-2">
             Set up a model router
           </Link>{" "}

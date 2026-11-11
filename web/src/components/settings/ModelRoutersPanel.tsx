@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { ExternalLink, KeyRound, RefreshCw, Route, Search } from "lucide-react";
 
@@ -156,9 +156,8 @@ function RouterCard({ router }: { router: ModelRouter }) {
                 help={help}
                 stored={router[field]}
                 models={models}
-                saving={settings.isPending}
-                onSave={(model, onSaved) =>
-                  settings.mutate({ routerId: router.id, [field]: model }, { onSuccess: onSaved })
+                onSave={(model, done) =>
+                  settings.mutate({ routerId: router.id, [field]: model }, done)
                 }
               />
             ))}
@@ -231,15 +230,15 @@ const ROLE_FIELDS = [
 ] as const;
 
 /** One role's model id. It saves on blur or Enter, and keeps the typed
- * value until the save succeeds. An empty value clears the stored choice.
- * The listed models are suggestions: the server checks the id. */
+ * value until the save succeeds. Escape drops the typed value. An empty
+ * value clears the stored choice. The listed models are suggestions: the
+ * server checks the id. */
 function RoleModelField({
   id,
   label,
   help,
   stored,
   models,
-  saving,
   onSave,
 }: {
   id: string;
@@ -247,16 +246,26 @@ function RoleModelField({
   help: string;
   stored: string;
   models: RouterModel[];
-  /** A save is in flight: a blur after Enter must not send it again. */
-  saving: boolean;
-  onSave: (model: string, onSaved: () => void) => void;
+  onSave: (model: string, done: { onSuccess: () => void; onSettled: () => void }) => void;
 }) {
   const [draft, setDraft] = useState<string | null>(null);
+  // The value of this field's save in flight: a blur after Enter must not
+  // send it again. Another field, or a newer value, saves on its own.
+  const sent = useRef<string | null>(null);
   const commit = () => {
-    if (saving) return;
     const next = draft?.trim();
-    if (next === undefined || next === stored) setDraft(null);
-    else onSave(next, () => setDraft(null));
+    if (next === undefined || next === sent.current) return;
+    if (next === stored) {
+      setDraft(null);
+      return;
+    }
+    sent.current = next;
+    onSave(next, {
+      onSuccess: () => setDraft((now) => (now?.trim() === next ? null : now)),
+      onSettled: () => {
+        if (sent.current === next) sent.current = null;
+      },
+    });
   };
   return (
     <div className="space-y-1">
@@ -272,6 +281,7 @@ function RoleModelField({
         onBlur={commit}
         onKeyDown={(event) => {
           if (event.key === "Enter") commit();
+          if (event.key === "Escape") setDraft(null);
         }}
         className="bg-background/80 font-mono text-xs"
       />
