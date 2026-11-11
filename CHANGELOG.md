@@ -10,6 +10,8 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-11
+
 ### Upgrade notes
 
 - **The upgrade drains every host.** The new host agent cannot adopt a VM from an earlier
@@ -297,7 +299,8 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 The first tagged release. See the
 [release notes](https://github.com/cortexapps/engrams/releases/tag/v0.10.0).
 
-[Unreleased]: https://github.com/cortexapps/engrams/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/cortexapps/engrams/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/cortexapps/engrams/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/cortexapps/engrams/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/cortexapps/engrams/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/cortexapps/engrams/releases/tag/v0.10.0
