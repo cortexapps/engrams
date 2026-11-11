@@ -17,35 +17,37 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
   is unset. An install that relied on the old defaults sets `blob.backend: gcs`,
   `kek.provider: gcp-kms` and `secrets.backend: gcp` (`engram`), and `blob.backend: gcs`
   and `egress.caSource: gcp-secret-manager` (`engram-host-fleet`). The example overlays
-  set all of them.
+  set all of them. ([#1793])
 - **Upgrade the hosts before the control plane to use GitLab or Azure DevOps git.** A
   session clones and pushes to them through the egress proxy of the new host agent.
+  ([#1793])
 - **A rollback past this release** makes a profile routed to LiteLLM, and the GitLab
-  review, fail until you upgrade again. Nothing else changes back.
+  review, fail until you upgrade again. Nothing else changes back. ([#1793])
 
 ### Added
 
 - **LiteLLM is a model router.** Point engrams at your own LiteLLM proxy and route Claude
   Code and Codex sessions, titles and decisions through it. An admin picks the model for
-  each of those roles on Settings → Model routers.
+  each of those roles on Settings → Model routers. ([#1793])
 - **GitLab merge request review.** GitLab is a git forge: sessions clone and push with the
   organization's token, which stays out of the VM, and a second review built-in reviews
   merge requests. It needs GitLab 17.4 or later. An organization can use GitHub and GitLab
-  together.
+  together. ([#1793])
 - An Azure DevOps connector: git over HTTPS, pull requests, work items and pipelines. It
-  has no review built-in.
+  has no review built-in. ([#1793])
 
 ### Changed
 
 - **Git forges, chat services and model routers are roles.** GitHub, Slack and OpenRouter
   are implementations of them, and a new provider that fills a role gets the features built
   on it. The pull request review and the Slack thread bot are unchanged. The site's "Add a
-  provider" page says what a provider implements.
+  provider" page says what a provider implements. ([#1793])
 - A Decide block and smart routing work with any connected router that has a decision
   model. A router with no decisions endpoint answers with a structured chat completion.
-- A session gets git credentials only for a forge that its profile grants.
+  ([#1793])
+- A session gets git credentials only for a forge that its profile grants. ([#1793])
 - Every provider's webhooks arrive at `/api/v1/integrations/<provider>/events`. The URLs of
-  the existing providers are the same.
+  the existing providers are the same. ([#1793])
 
 ## [0.13.0] - 2026-11-11
 
@@ -426,3 +428,4 @@ The first tagged release. See the
 [#1784]: https://github.com/cortexapps/engrams/pull/1784
 [#1788]: https://github.com/cortexapps/engrams/pull/1788
 [#1789]: https://github.com/cortexapps/engrams/pull/1789
+[#1793]: https://github.com/cortexapps/engrams/pull/1793
