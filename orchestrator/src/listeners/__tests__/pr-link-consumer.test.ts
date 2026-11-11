@@ -18,7 +18,7 @@ function integrationAsset(payload: unknown): CuratedEvent {
 
 function pullRequestAsset(): CuratedEvent {
   return integrationAsset({
-    provider: "forge",
+    provider: "github",
     asset_kind: "pull_request",
     surface: "asset",
     data: {
@@ -77,6 +77,7 @@ describe("PR-link consumer", () => {
 
     expect(recorder.upserts).toEqual([
       {
+        provider: "github",
         repo: "openai/engrams",
         prNumber: 97,
         authoringTaskId: "task-1",
@@ -149,6 +150,7 @@ describe("PR-link consumer", () => {
 
     expect(recorder.upserts).toEqual([
       {
+        provider: "github",
         repo: "openai/engrams",
         prNumber: 858,
         authoringTaskId: "task-1",
@@ -221,7 +223,7 @@ describe("PR-link consumer", () => {
 
     await consumer.handle(
       integrationAsset({
-        provider: "forge",
+        provider: "github",
         asset_kind: "pull_request",
         surface: "asset",
         data: { repo: "openai/engrams", number: 98 },
@@ -233,6 +235,7 @@ describe("PR-link consumer", () => {
 
     expect(recorder.upserts).toEqual([
       {
+        provider: "github",
         repo: "openai/engrams",
         prNumber: 98,
         authoringTaskId: "task-1",

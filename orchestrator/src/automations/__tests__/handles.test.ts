@@ -8,7 +8,7 @@ import { describe, expect, test } from "bun:test";
 import { connectorRegistry } from "../../connectors/registry.ts";
 import { loadEventSample } from "../../connectors/samples.ts";
 import {
-  canonicalHandle,
+  canonicalIdentifier,
   extractHandleCandidates,
   renderHandleParts,
 } from "../handles.ts";
@@ -39,10 +39,10 @@ describe("renderHandleParts", () => {
   });
 });
 
-describe("canonicalHandle", () => {
+describe("canonicalIdentifier", () => {
   test("github handles fold case; slack handles stay exact", () => {
-    expect(canonicalHandle("github", "github:Acme/Engrams#41")).toBe("github:acme/engrams#41");
-    expect(canonicalHandle("slack", "slack:C0AAAAAAA:1.2")).toBe("slack:C0AAAAAAA:1.2");
+    expect(canonicalIdentifier("github", "github:Acme/Engrams#41")).toBe("github:acme/engrams#41");
+    expect(canonicalIdentifier("slack", "slack:C0AAAAAAA:1.2")).toBe("slack:C0AAAAAAA:1.2");
   });
 });
 

@@ -809,6 +809,8 @@ export const prRef = pgTable(
   "pr_ref",
   {
     id: text("id").primaryKey(), // uuid string (crypto.randomUUID())
+    /** The forge's connector provider. */
+    provider: text("provider").notNull().default("github"),
     repo: text("repo").notNull(),
     prNumber: integer("pr_number").notNull(),
     authoringTaskId: text("authoring_task_id").references(() => task.id, {
@@ -822,7 +824,7 @@ export const prRef = pgTable(
     observedAt: timestamp("observed_at", { withTimezone: true }).notNull(),
   },
   (t) => [
-    uniqueIndex("pr_ref_repo_pr_number_unique").on(t.repo, t.prNumber),
+    uniqueIndex("pr_ref_provider_repo_pr_number_unique").on(t.provider, t.repo, t.prNumber),
     index("pr_ref_authoring_task_idx").on(t.authoringTaskId),
     index("pr_ref_session_idx").on(t.sessionId),
   ],

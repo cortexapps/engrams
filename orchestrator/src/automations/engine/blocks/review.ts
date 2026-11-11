@@ -15,8 +15,8 @@
  *   - review_stage       — stage a worker session for a phase and compose
  *                          its prompt (returned as an output for send_prompt)
  *   - review_settle      — decision + finding settlement; returns the payload
- *                          for the generic github.post_pr_review action
- *   - review_record_post — write the GitHub review id the post action
+ *                          for the forge's post_pr_review action
+ *   - review_record_post — write the forge's review id the post action
  *                          returned onto the pass (the dossier's link)
  *   - review_close_pass  — the finalize-hook arm (contract 2): mark the pass
  *                          failed/halted with the sticky status comment +
@@ -36,6 +36,8 @@ import {
   type ReviewControlPlane,
   type ReviewPostPayload,
 } from "../../../reviews/control-plane.ts";
+import { SAFE_REPO_PATH, type PullRequestHeads } from "../../../forges/forge.ts";
+import { defaultForgeProvider } from "../../../forges/registry.ts";
 import { isCompletePrContext, type PrContext } from "../../../reviews/pr-context.ts";
 import { REVIEW_CATEGORIES, type ReviewCategory } from "../../../reviewers/render.ts";
 import { isHumanReviewTrigger } from "../../../reviews/review-trigger.ts";
@@ -117,7 +119,7 @@ export const prContextConfigSchema = z.object({
 
 /** A SHA that a template may have rendered EMPTY (a comment command carries
  * no pull_request object): empty means absent, and absent means "resolve
- * from GitHub". */
+ * from the forge". */
 const optionalSha = z
   .string()
   .optional()
@@ -125,8 +127,8 @@ const optionalSha = z
   .pipe(z.string().regex(/^[0-9a-fA-F]{7,40}$/).optional());
 
 export const openReviewPassConfigSchema = z.object({
-  provider: z.string().min(1).default("github"),
-  repo: z.string().regex(/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/),
+  provider: z.string().min(1).default(defaultForgeProvider),
+  repo: z.string().regex(SAFE_REPO_PATH),
   prNumber: z.coerce.number().int().positive(),
   trigger: z.enum(["opened", "synchronize", "ready_for_review", "command", "retry", "dispatch"]),
   headSha: optionalSha,
@@ -159,14 +161,14 @@ async function executeOpenReviewPass(
 ): Promise<BlockOutcome> {
   const cp = deps().controlPlane();
 
-  // Same gate as review-ingress: resolve from GitHub ONLY when the trigger
-  // did not carry complete facts (comment commands, retries).
+  // Ask the forge only when the trigger did not carry complete facts
+  // (comment commands, retries).
   const sentPr = config.pr ? prContextFromConfig(config.pr) : undefined;
-  let resolved: { headSha: string; baseSha: string; pr: PrContext };
+  let resolved: PullRequestHeads;
   if (config.headSha && config.baseSha && sentPr && isCompletePrContext(sentPr)) {
     resolved = { headSha: config.headSha, baseSha: config.baseSha, pr: sentPr };
   } else {
-    resolved = await cp.resolvePrHeads(config.repo, config.prNumber);
+    resolved = await cp.resolvePrHeads(config.provider, config.repo, config.prNumber);
   }
   const { headSha, baseSha, pr } = resolved;
   if (pr.providerId === null) {
@@ -239,7 +241,7 @@ async function executeOpenReviewPass(
 // Why a block and not write_files + Liquid: the staged files are
 // product logic, not templates — reviewer markdown rendered from the lens
 // catalog, prior-findings.json assembled from the review record AND the
-// author's GitHub replies, candidates.json from the findings table — and the
+// author's replies on the forge, candidates.json from the findings table — and the
 // finder prompt depends on review-record reads (re-review scoping after a
 // push, prior-pass context). Pushing that through Liquid would re-implement
 // the control plane in a template. The block stages (the clone is the
@@ -252,7 +254,7 @@ export const reviewStageConfigSchema = z.object({
   phase: z.enum(["finder", "verifier"]),
   reviewId: z.string().min(1),
   sessionId: z.string().min(1),
-  repo: z.string().regex(/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/),
+  repo: z.string().regex(SAFE_REPO_PATH),
   prNumber: z.coerce.number().int().positive(),
   headSha: z.string().regex(/^[0-9a-fA-F]{7,40}$/),
   baseSha: z.string().regex(/^[0-9a-fA-F]{7,40}$/).optional(),
@@ -272,20 +274,16 @@ function isReviewCategory(value: string): value is ReviewCategory {
 async function executeReviewStage(config: ReviewStageConfig): Promise<BlockOutcome> {
   const cp = deps().controlPlane();
   const categories = config.enabledCategories?.filter(isReviewCategory);
-  const common = {
+  const staging = {
     reviewId: config.reviewId,
-    repo: config.repo,
-    prNumber: config.prNumber,
-    headSha: config.headSha,
     ...(categories && categories.length > 0 ? { enabledCategories: categories } : {}),
     ...(config.orgInstructions !== undefined && config.orgInstructions !== ""
       ? { orgInstructions: config.orgInstructions }
       : {}),
-    skipClone: true,
   };
 
   if (config.phase === "finder") {
-    await cp.bootstrapFinderSession(config.sessionId, common);
+    await cp.bootstrapFinderSession(config.sessionId, staging);
     const { prompt, mergeBase } = await cp.composeFinderPrompt(config.sessionId, {
       reviewId: config.reviewId,
       repo: config.repo,
@@ -298,7 +296,7 @@ async function executeReviewStage(config: ReviewStageConfig): Promise<BlockOutco
     return { kind: "ok", outputs: { phase: "finder", prompt, merge_base: mergeBase } };
   }
 
-  await cp.bootstrapVerifierSession(config.sessionId, common);
+  await cp.bootstrapVerifierSession(config.sessionId, staging);
   const { prompt } = cp.composeVerifierPrompt({ repo: config.repo, prNumber: config.prNumber });
   await cp.markPhasePrompted(config.reviewId, "verifier");
   return { kind: "ok", outputs: { phase: "verifier", prompt, merge_base: "" } };
@@ -329,11 +327,12 @@ async function executeReviewPolicyGate(config: ReviewPolicyGateConfig): Promise<
 
 export const reviewRecordPostConfigSchema = z.object({
   reviewId: z.string().min(1),
-  /** The `github_review_id` output of github.post_pr_review. Empty when the
-   * action found its marker already posted (a replay) — nothing to record. */
+  /** The `github_review_id` output of the forge's post_pr_review: the
+   * forge's id for the review. Empty when the action found its marker
+   * already posted (a replay) — nothing to record. */
   githubReviewId: z.string().optional(),
-  /** The `inline_posted` output of github.post_pr_review, rendered through a
-   * template ("true"/"false"). "false" = GitHub refused the inline anchors
+  /** The `inline_posted` output of post_pr_review, rendered through a
+   * template ("true"/"false"). "false" = the forge refused the inline anchors
    * and the action posted the fallback summary: the findings move to
    * `ui_only` and the pass summary becomes the fallback body. Absent or
    * anything else = the inline comments landed (or a replay). */

@@ -12,7 +12,7 @@ import { z } from "zod";
 
 import { makeSlackPolicy } from "../../../integrations/slack-policy.ts";
 import type { CommunicationPolicy, SourceMention } from "../../../workflows/communication-policy.ts";
-import { canonicalHandle } from "../../handles.ts";
+import { canonicalIdentifier } from "../../handles.ts";
 import { installSessionRelay } from "../../session-relay.ts";
 import { sessionRefSchema } from "../definition.ts";
 import type { RunContext } from "../context.ts";
@@ -79,7 +79,7 @@ export async function installRelayForSession(
   // rebind and never a failed turn.
   let handle: string | undefined;
   if (ctx.instanceId !== "" && ctx.deps.instances?.recordInstanceHandle) {
-    handle = canonicalHandle("slack", `slack:${mention.channel}:${mention.threadRoot}`);
+    handle = canonicalIdentifier("slack", `slack:${mention.channel}:${mention.threadRoot}`);
     const result = await ctx.deps.instances.recordInstanceHandle({
       automationId: ctx.automationId,
       handle,

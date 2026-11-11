@@ -275,8 +275,8 @@ function productionEngineDeps(): EngineDeps {
     code: makeCodeBlockRuntime(),
     state: makeAutomationStateStore(),
     prRefs: {
-      getByPr: async (repo, prNumber) => {
-        const row = await makePrRefStore().getByPr(repo, prNumber);
+      getByPr: async (provider, repo, prNumber) => {
+        const row = await makePrRefStore().getByPr(provider, repo, prNumber);
         return row
           ? {
               sessionId: row.sessionId,

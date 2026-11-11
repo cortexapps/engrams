@@ -8,7 +8,7 @@ import type {
   ReviewStore,
   ReviewVerdictRow,
 } from "../../db/reviews.ts";
-import type { GithubReviewPoster } from "../github-review.ts";
+import type { GitForge } from "../../forges/forge.ts";
 import type { PrContext } from "../pr-context.ts";
 import {
   makeReviewControlPlane,
@@ -18,6 +18,26 @@ import {
 
 /** A PR whose descriptive context is unavailable — what every review recorded
  *  before ADR 0100 decision 9 looks like, and what a junk payload degrades to. */
+/** A forge over the given methods; any other call fails the test. */
+function fakeForge(methods: Partial<GitForge>): () => GitForge {
+  const unexpected = (name: string) => () => {
+    throw new Error(`unexpected forge call: ${name}`);
+  };
+  return () => ({
+    provider: "github",
+    caseInsensitiveRepos: true,
+    pullRequestUrl: unexpected("pullRequestUrl"),
+    parsePullRequestUrl: unexpected("parsePullRequestUrl"),
+    isPermanentError: unexpected("isPermanentError"),
+    fetchPullRequest: unexpected("fetchPullRequest"),
+    listReviewComments: unexpected("listReviewComments"),
+    postReview: unexpected("postReview"),
+    hasReviewWithMarker: unexpected("hasReviewWithMarker"),
+    findCommentWithMarker: unexpected("findCommentWithMarker"),
+    ...methods,
+  });
+}
+
 const NO_PR_CONTEXT: PrContext = {
   providerId: null,
   url: null,
@@ -259,13 +279,8 @@ describe("ReviewControlPlane", () => {
     ]);
   });
 
-  test("creates a pass through the atomic store seam and touches GitHub zero times", async () => {
+  test("creates a pass through the atomic store seam and never calls the forge", async () => {
     const passInputs: unknown[] = [];
-    let githubCalls = 0;
-    const counting = (): never => {
-      githubCalls++;
-      throw new Error("GitHub must not be reached from createReviewPass");
-    };
     const cp = makeReviewControlPlane({
       reviews: {
         ...reviewStoreStub,
@@ -279,12 +294,7 @@ describe("ReviewControlPlane", () => {
           };
         },
       },
-      githubPoster: {
-        fetchPrContext: async () => counting(),
-        alreadyPosted: async () => counting(),
-        listReviewComments: async () => counting(),
-        postReview: async () => counting(),
-      },
+      forge: fakeForge({}),
     });
     const input = {
       provider: "github",
@@ -310,10 +320,9 @@ describe("ReviewControlPlane", () => {
     expect(passInputs).toEqual([input]);
     // `beginReviewPass` is a single, non-idempotent transaction, and the
     // review_open_pass block runs it as a retryable step — DBOS re-invokes
-    // the whole callback on any throw. A GitHub call after the commit would
-    // therefore turn its first transient error into a second pass. The
-    // built-in's own `ack` block posts the status comment instead.
-    expect(githubCalls).toBe(0);
+    // the whole callback on any throw. A forge call after the commit would
+    // therefore turn its first transient error into a second pass, so the
+    // fake forge throws on any call.
   });
 
   test("failReview tears down the worker session", async () => {
@@ -366,26 +375,16 @@ describe("ReviewControlPlane", () => {
     expect(events).toEqual([]);
   });
 
-  test("bootstraps with an idempotent clone, checkout, and rendered finder files", async () => {
+  test("stages the rendered finder files", async () => {
     const sessions = fakeSessions();
     const cp = makeReviewControlPlane({ sessions });
 
     await cp.bootstrapFinderSession("finder-session", {
       reviewId: active.id,
-      repo: active.repo,
-      prNumber: 41,
-      headSha: active.headSha,
       enabledCategories: ["functional-correctness"],
     });
 
-    expect(sessions.execCalls).toEqual([{
-      sessionId: "finder-session",
-      command: `rm -rf /workspace/engrams && git clone https://github.com/${active.repo}.git /workspace/engrams && (git -C /workspace/engrams checkout ${active.headSha} || (git -C /workspace/engrams fetch origin +refs/pull/41/head && git -C /workspace/engrams checkout ${active.headSha}))`,
-      execId: "exec:finder-session:bootstrap-clone",
-      stdoutOffset: 0n,
-      stderrOffset: 0n,
-      wake: true,
-    }]);
+    expect(sessions.execCalls).toEqual([]);
     expect(sessions.writeCalls).toHaveLength(2);
     expect(sessions.writeCalls.map((file) => file.path)).toEqual([
       "/workspace/.review/finder.md",
@@ -397,49 +396,32 @@ describe("ReviewControlPlane", () => {
     );
   });
 
-  test("rejects a repo or head SHA that could inject into the bootstrap shell", async () => {
+  test("rejects a repo or SHA that could inject into the merge-base shell", async () => {
     const sessions = fakeSessions();
-    const cp = makeReviewControlPlane({ sessions });
-
-    await expect(
-      cp.bootstrapFinderSession("finder-session", { reviewId: active.id, repo: "openai/engrams; rm -rf /", prNumber: 41, headSha: "" }),
-    ).rejects.toBeInstanceOf(ReviewSetupError);
-    await expect(
-      cp.bootstrapFinderSession("finder-session", { reviewId: active.id, repo: active.repo, prNumber: 41, headSha: "$(touch pwned)" }),
-    ).rejects.toBeInstanceOf(ReviewSetupError);
-    // The PR number lands in the fallback fetch ref; a non-integer must
-    // never reach the shell.
-    await expect(
-      cp.bootstrapFinderSession("finder-session", {
-        reviewId: active.id,
-        repo: active.repo,
-        prNumber: 41.5,
-        headSha: active.headSha,
-      }),
-    ).rejects.toBeInstanceOf(ReviewSetupError);
-    // Nothing was executed for the rejected inputs.
-    expect(sessions.execCalls).toEqual([]);
-  });
-
-  test("a clone failure or failed staged file throws ReviewSetupError", async () => {
-    const cloneFailure = makeReviewControlPlane({
-      sessions: fakeSessions({ exitStatus: 1, stderr: "clone denied" }),
-    });
-    await expect(cloneFailure.bootstrapFinderSession("finder-session", {
+    const cp = makeReviewControlPlane({ sessions, reviews: reviewStoreStub });
+    const input = {
       reviewId: active.id,
       repo: active.repo,
       prNumber: 41,
-      headSha: "",
-    })).rejects.toThrow(/clone denied/);
+      headSha: "a".repeat(40),
+      baseSha: "b".repeat(40),
+    };
 
+    await expect(
+      cp.composeFinderPrompt("finder-session", { ...input, repo: "openai/engrams; rm -rf /" }),
+    ).rejects.toBeInstanceOf(ReviewSetupError);
+    await expect(
+      cp.composeFinderPrompt("finder-session", { ...input, headSha: "$(touch pwned)" }),
+    ).rejects.toBeInstanceOf(ReviewSetupError);
+    expect(sessions.execCalls).toEqual([]);
+  });
+
+  test("a failed staged file throws ReviewSetupError", async () => {
     const writeFailure = makeReviewControlPlane({
       sessions: fakeSessions({ writeFailure: "disk full" }),
     });
     await expect(writeFailure.bootstrapFinderSession("finder-session", {
       reviewId: active.id,
-      repo: active.repo,
-      prNumber: 41,
-      headSha: "",
     })).rejects.toThrow(/disk full/);
   });
 
@@ -459,19 +441,8 @@ describe("ReviewControlPlane", () => {
 
     await cp.bootstrapVerifierSession("verifier-session", {
       reviewId: active.id,
-      repo: active.repo,
-      prNumber: 41,
-      headSha: active.headSha,
     });
 
-    expect(sessions.execCalls[0]).toEqual({
-      sessionId: "verifier-session",
-      command: `rm -rf /workspace/engrams && git clone https://github.com/${active.repo}.git /workspace/engrams && (git -C /workspace/engrams checkout ${active.headSha} || (git -C /workspace/engrams fetch origin +refs/pull/41/head && git -C /workspace/engrams checkout ${active.headSha}))`,
-      execId: "exec:verifier-session:bootstrap-clone",
-      stdoutOffset: 0n,
-      stderrOffset: 0n,
-      wake: true,
-    });
     const files = sessions.writeCalls;
     // The verifier gets the lens files too — it enforces each lens's
     // "Do not report" bar on the candidates.
@@ -519,9 +490,7 @@ describe("ReviewControlPlane", () => {
         ...reviewStoreStub,
         listPriorPasses: async () => [priorPass],
       },
-      githubPoster: {
-        fetchPrContext: async () => ({ headSha: "h", baseSha: "b", pr: NO_PR_CONTEXT }),
-        alreadyPosted: async () => false,
+      forge: fakeForge({
         // A root comment whose first line quotes the finding title, plus the
         // author's reply threaded onto it — the reply must ride along, matched
         // to the finding by that title.
@@ -548,15 +517,11 @@ describe("ReviewControlPlane", () => {
             path: null,
           },
         ],
-        postReview: async () => ({ posted: true, inlinePosted: true, summaryMd: "" }),
-      },
+      }),
     });
 
     await cp.bootstrapFinderSession("finder-session", {
       reviewId: active.id,
-      repo: active.repo,
-      prNumber: 41,
-      headSha: active.headSha,
       enabledCategories: ["functional-correctness"],
     });
 
@@ -608,19 +573,13 @@ describe("ReviewControlPlane", () => {
           findings: [finding("prior-1")],
         }],
       },
-      githubPoster: {
-        fetchPrContext: async () => ({ headSha: "h", baseSha: "b", pr: NO_PR_CONTEXT }),
-        alreadyPosted: async () => false,
+      forge: fakeForge({
         listReviewComments: async () => { throw new Error("GitHub down"); },
-        postReview: async () => ({ posted: true, inlinePosted: true, summaryMd: "" }),
-      },
+      }),
     });
 
     await cp.bootstrapFinderSession("finder-session", {
       reviewId: active.id,
-      repo: active.repo,
-      prNumber: 41,
-      headSha: active.headSha,
       enabledCategories: ["functional-correctness"],
     });
 
@@ -636,9 +595,6 @@ describe("ReviewControlPlane", () => {
 
     await cp.bootstrapFinderSession("finder-session", {
       reviewId: active.id,
-      repo: active.repo,
-      prNumber: 41,
-      headSha: active.headSha,
       enabledCategories: ["functional-correctness"],
     });
 
@@ -861,7 +817,6 @@ describe("ReviewControlPlane", () => {
     const findingUpdates: Array<{ id: string; state: string }> = [];
     const finalizations: Array<Parameters<ReviewStore["finalizeReview"]>[1]> = [];
     const events: string[] = [];
-    let postCalls = 0;
     let fetchCalls = 0;
     const sessions = fakeSessions();
     const cp = makeReviewControlPlane({
@@ -881,18 +836,12 @@ describe("ReviewControlPlane", () => {
           events.push(kind);
         },
       },
-      githubPoster: {
-        fetchPrContext: async () => {
+      forge: fakeForge({
+        fetchPullRequest: async () => {
           fetchCalls++;
           return { headSha: "live", baseSha: "live", pr: NO_PR_CONTEXT };
         },
-        alreadyPosted: async () => false,
-        listReviewComments: async () => [],
-        async postReview() {
-          postCalls++;
-          throw new Error("must not post");
-        },
-      },
+      }),
     });
 
     const payload = await cp.decideReviewResults(reviewed.id, { sessionId: "verifier-session" });
@@ -900,7 +849,6 @@ describe("ReviewControlPlane", () => {
     // The verifier worker was retired first (best-effort), GitHub was never
     // posted to, and no live fetch was needed with both SHAs stored.
     expect(sessions.deletedIds).toEqual(["verifier-session"]);
-    expect(postCalls).toBe(0);
     expect(fetchCalls).toBe(0);
     // Findings settled as on the inline-posted path; review finalized posted.
     expect(findingUpdates).toEqual([

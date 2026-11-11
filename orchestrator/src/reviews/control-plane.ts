@@ -1,6 +1,6 @@
 /** Durable review-record and worker-session operations: the review product's
- * control plane, behind the ADR 0119 review blocks (automations/engine/blocks/
- * review.ts). The PR-review built-in is the only driver since phase 4.7. */
+ * control plane, behind the review blocks (automations/engine/blocks/
+ * review.ts). */
 
 import { Code, ConnectError } from "@connectrpc/connect";
 
@@ -8,9 +8,7 @@ import { getDb } from "../db/client.ts";
 import {
   defaultRunExecRuntime,
   runExec,
-  RunExecError,
   type DurableExecClient,
-  type RunExecResult,
   type RunExecRuntime,
 } from "../exec/durable-exec.ts";
 import { stageFiles, type FileStagingClient } from "../exec/stage-files.ts";
@@ -26,13 +24,9 @@ import { config } from "../config.ts";
 import { log as rootLog } from "../log.ts";
 import { sessions as defaultSessions } from "../control-plane/client.ts";
 import type { TaskSessionsClient } from "../rpc/task-create.ts";
-import {
-  buildInlineCommentBody,
-  buildReviewSummary,
-  makeGithubReviewPoster,
-  type GithubReviewPoster,
-} from "./github-review.ts";
-import type { PrContext } from "./pr-context.ts";
+import { SAFE_REPO_PATH, type GitForge, type PullRequestHeads } from "../forges/forge.ts";
+import { requireForge } from "../forges/registry.ts";
+import { buildInlineCommentBody, buildReviewSummary } from "./summary.ts";
 import { buildDecision, type PolicyDecision } from "./policy-gate.ts";
 import {
   renderReviewer as defaultRenderReviewer,
@@ -55,30 +49,22 @@ export interface ResolveReviewTargetInput {
   providerUpdatedAt: Date | null;
 }
 
+export interface ReviewStagingInput {
+  reviewId: string;
+  enabledCategories?: readonly ReviewCategory[];
+  orgInstructions?: string;
+}
+
 export interface ReviewControlPlane {
-  /** The heads a pass pins itself to, plus the PR context recorded on the
-   *  review record. */
-  resolvePrHeads(repo: string, prNumber: number): Promise<{
-    headSha: string;
-    baseSha: string;
-    pr: PrContext;
-  }>;
+  resolvePrHeads(provider: string, repo: string, prNumber: number): Promise<PullRequestHeads>;
   /** Find or create the row for the change under review, and return its id.
    *  Refreshes the title/state, so a rename lands everywhere at once. */
   resolveReviewTarget(input: ResolveReviewTargetInput): Promise<{ targetId: string }>;
   /** Atomically decide whether this request deduplicates or creates a pass. The
    *  transaction and nothing else — see the implementation's warning. */
   createReviewPass(input: BeginReviewPassInput): Promise<BeginReviewPassResult>;
-  bootstrapFinderSession(sessionId: string, input: {
-    reviewId: string;
-    repo: string;
-    prNumber: number;
-    headSha: string;
-    enabledCategories?: readonly ReviewCategory[];
-    orgInstructions?: string;
-    /** Stage files only; the caller already cloned (phase 4.3). */
-    skipClone?: boolean;
-  }): Promise<void>;
+  /** Stage the finder's files in a session that holds the clone. */
+  bootstrapFinderSession(sessionId: string, input: ReviewStagingInput): Promise<void>;
   /** The finder prompt (merge-base resolution in the clone + re-review
    *  scoping + prior-pass context), returned as text for a generic
    *  send_prompt block. */
@@ -90,15 +76,7 @@ export interface ReviewControlPlane {
     baseSha: string;
     focus?: string;
   }): Promise<{ prompt: string; mergeBase: string }>;
-  bootstrapVerifierSession(sessionId: string, input: {
-    repo: string;
-    prNumber: number;
-    headSha: string;
-    reviewId: string;
-    enabledCategories?: readonly ReviewCategory[];
-    orgInstructions?: string;
-    skipClone?: boolean;
-  }): Promise<void>;
+  bootstrapVerifierSession(sessionId: string, input: ReviewStagingInput): Promise<void>;
   /** The verifier prompt text, for a generic send_prompt block. */
   composeVerifierPrompt(input: { repo: string; prNumber: number }): { prompt: string };
   /** The status bookkeeping that follows a phase prompt (status transition
@@ -107,13 +85,13 @@ export interface ReviewControlPlane {
   markPhasePrompted(reviewId: string, role: "finder" | "verifier"): Promise<void>;
   /** The decision + persistence half of posting: settles every finding into
    *  its decided state, finalizes the review, and returns the payload the
-   *  generic `github.post_pr_review` action posts. Retires the verifier
+   *  forge's `post_pr_review` action posts. Retires the verifier
    *  worker first (best-effort) when a session id is given. */
   decideReviewResults(
     reviewId: string,
     opts?: { sessionId?: string },
   ): Promise<ReviewPostPayload>;
-  /** GitHub refused the inline anchors and the post action fell back to the
+  /** The forge refused the inline anchors and the post action fell back to the
    *  summary-only review. Re-settle the inline findings as `ui_only` (they
    *  are on the Reviews page, not the diff) and store the fallback summary
    *  as the pass summary, so the dossier says what the PR shows. */
@@ -147,11 +125,9 @@ interface ReviewControlPlaneStore extends Pick<
   | "recordEvent"
 > {}
 
-// The review control plane knows nothing about exec transport mechanics
-// (severance, replay offsets, backoff) — that is `DurableExecClient` /
-// `runExec`'s job, in ../exec/durable-exec.ts — nor about WriteFile framing,
-// which lives in ../exec/stage-files.ts. Reviews only decide WHAT to run
-// (clone, merge-base), the files to stage, the ticket name, and the deadline.
+// Exec transport (../exec/durable-exec.ts) and WriteFile framing
+// (../exec/stage-files.ts) are not this module's: it decides the command to
+// run (merge-base), the files to stage, and the deadline.
 export interface ReviewSessionsClient extends TaskSessionsClient, DurableExecClient, FileStagingClient {
   sendPrompt(req: { sessionId: string; promptId: string; text: string }): Promise<unknown>;
 }
@@ -161,23 +137,23 @@ export interface ReviewControlPlaneDeps {
   reviews?: ReviewControlPlaneStore;
   db?: ReturnType<typeof getDb>;
   sessions?: ReviewSessionsClient;
-  githubPoster?: GithubReviewPoster;
+  /** The forge for a review's provider. */
+  forge?: (provider: string) => GitForge;
   renderReviewer?: RenderReviewer;
   /** Deterministic retry/deadline scheduler for durable-exec tests. */
   execRuntime?: RunExecRuntime;
 }
 
-/** What the built-in's GitHub action posts (ADR 0119 phase 4). The summary
- * carries the `<!-- engrams-review:<id> -->` marker so the action's
- * already-posted scan is crash-safe. */
+/** What the built-in's post action posts. The summary carries the
+ * `<!-- engrams-review:<id> -->` marker that the action scans for. */
 export interface ReviewPostPayload {
   review_id: string;
   repo: string;
   pr_number: number;
   commit_id: string;
   summary_md: string;
-  /** The body to post when GitHub refuses the inline anchors (422): it
-   * re-quotes every finding so none is lost to a summary-only review. */
+  /** The body to post when the forge refuses the inline anchors: it quotes
+   * every finding. */
   fallback_summary_md: string;
   comments: Array<{
     finding_id: string;
@@ -244,12 +220,8 @@ export const VERIFIER_SYSTEM_PROMPT = [
   "Read /workspace/.review/verifier.md and follow it. Refute each finding; confirm only what you can reproduce from code you read, and report every judgment through submit_verdict.",
 ].join("\n");
 
-// GitHub's own charset limits (owner + repo are [A-Za-z0-9._-]); enforced here
-// so a repo/SHA can never carry shell metacharacters into the bootstrap `sh -c`
-// — defense in depth on top of the signature check + enrollment gate.
-const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+// A SHA is checked, like the repository path, before it reaches `sh -c`.
 const SHA_RE = /^[0-9a-fA-F]{7,40}$/;
-const BOOTSTRAP_CLONE_DEADLINE_MS = 5 * 60_000;
 const MERGE_BASE_DEADLINE_MS = 60_000;
 
 // Cross-round context (prior-findings.json): how many earlier passes ride
@@ -263,13 +235,8 @@ function clipPriorText(text: string): string {
   return `${text.slice(0, PRIOR_TEXT_MAX)}…`;
 }
 
-// Security clamp: reviewer workers may read only the reviewed repo, while the
-// orchestrator remains the sole GitHub writer. Direct clone/codeload hosts are
-// explicit because the GitHub connector itself declares only api.github.com.
-export const REVIEW_CAPABILITIES = (repo: string): readonly string[] => [
-  "engram:pr_review",
-  `github:contents:read@${repo}`,
-];
+// Review workers reach only the forge. The clone and codeload hosts are
+// listed because the GitHub connector declares only api.github.com.
 export const REVIEW_NETWORK: ProfileNetwork = {
   default: "deny",
   allowHosts: ["github.com", "codeload.github.com", "api.github.com"],
@@ -277,7 +244,7 @@ export const REVIEW_NETWORK: ProfileNetwork = {
 };
 
 function assertSafeRepo(repo: string): void {
-  if (!REPO_RE.test(repo)) throw new ReviewSetupError(`invalid repository: ${repo}`);
+  if (!SAFE_REPO_PATH.test(repo)) throw new ReviewSetupError(`invalid repository: ${repo}`);
 }
 
 function repoName(repo: string): string {
@@ -285,60 +252,6 @@ function repoName(repo: string): string {
   const name = repo.split("/").at(-1);
   if (!name) throw new ReviewSetupError(`invalid repository: ${repo}`);
   return name;
-}
-
-/** The one coarse clone step both phases share: `rm -rf` the target (so a
- *  retried step is safe) then clone (+ checkout when a head SHA is known).
- *  The checkout falls back to fetching the PR's immutable ref: a merged PR's
- *  branch is deleted, so the head SHA is unreachable in a fresh clone, but
- *  GitHub keeps `refs/pull/<n>/head` forever — a review must survive its PR
- *  being merged mid-flight (live: engrams#1353, #1364, #1376). repo, headSha,
- *  and prNumber are validated before reaching the `sh -c` — injection defense
- *  in depth. Throws ReviewSetupError on a non-zero/absent exit, carrying
- *  stderr. */
-async function cloneRepo(
-  sessions: ReviewSessionsClient,
-  sessionId: string,
-  repo: string,
-  prNumber: number,
-  headSha: string,
-  phase: string,
-  execRuntime: RunExecRuntime,
-): Promise<void> {
-  const name = repoName(repo);
-  if (headSha !== "" && !SHA_RE.test(headSha)) {
-    throw new ReviewSetupError(`invalid head SHA: ${headSha}`);
-  }
-  if (!Number.isInteger(prNumber) || prNumber <= 0) {
-    throw new ReviewSetupError(`invalid PR number: ${prNumber}`);
-  }
-  const workspace = `/workspace/${name}`;
-  let command = `rm -rf ${workspace} && git clone https://github.com/${repo}.git ${workspace}`;
-  if (headSha !== "") {
-    command +=
-      ` && (git -C ${workspace} checkout ${headSha}` +
-      ` || (git -C ${workspace} fetch origin +refs/pull/${prNumber}/head` +
-      ` && git -C ${workspace} checkout ${headSha}))`;
-  }
-
-  let result: RunExecResult;
-  try {
-    result = await runExec(sessions, sessionId, command, {
-      execId: `exec:${sessionId}:bootstrap-clone`,
-      deadlineMs: BOOTSTRAP_CLONE_DEADLINE_MS,
-    }, execRuntime);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const stderr = error instanceof RunExecError ? error.stderr.trim() : "";
-    throw new ReviewSetupError(
-      `${phase} clone failed: ${message}${stderr === "" ? "" : `: ${stderr}`}`,
-    );
-  }
-  const { exitStatus, stderr } = result;
-  if (exitStatus !== 0) {
-    const detail = stderr.trim() || "exec stream ended without a successful exit status";
-    throw new ReviewSetupError(`${phase} clone failed: ${detail}`);
-  }
 }
 
 /** Resolve the TRUE merge base (fork point) of the base and head commits in
@@ -350,8 +263,7 @@ async function cloneRepo(
  *  the finder the real anchor so it cannot mis-scope even with a two-dot
  *  `git diff`. The full clone always contains the fork point, so this is a
  *  local computation — no network, no API. Throws rather than fall back to the
- *  wrong anchor. Both SHAs are validated before reaching `sh -c` (injection
- *  defense in depth, as in cloneRepo). */
+ *  wrong anchor. Both SHAs are validated before reaching `sh -c`. */
 async function resolveMergeBase(
   sessions: ReviewSessionsClient,
   sessionId: string,
@@ -392,7 +304,7 @@ export function makeReviewControlPlane(
   const sessions = deps.sessions ?? defaultSessions;
   const execRuntime = deps.execRuntime ?? defaultRunExecRuntime;
   const renderReviewer = deps.renderReviewer ?? defaultRenderReviewer;
-  const githubPoster = deps.githubPoster ?? makeGithubReviewPoster();
+  const forge = deps.forge ?? requireForge;
 
   // The Reviews page, linked from the posted summary.
   const reviewsPageUrl = `${config.baseUrl.replace(/\/$/, "")}/reviews`;
@@ -452,7 +364,7 @@ export function makeReviewControlPlane(
   // Cross-round review context: everything earlier passes of this pull request
   // reported, with verdict reasons and the author's inline replies. Best-effort
   // by construction — a re-review must still run when the history read or
-  // GitHub fails, so every failure degrades to "no context file", never a
+  // the forge fails, so every failure degrades to "no context file", never a
   // throw. Returns null on a first review, which is the common case.
   const buildPriorFindingsFile = async (
     reviewId: string,
@@ -460,7 +372,7 @@ export function makeReviewControlPlane(
     try {
       const detail = await reviews().getReview(reviewId);
       if (!detail) return null;
-      const { targetId, repo, prNumber } = detail.review;
+      const { targetId, provider, repo, prNumber } = detail.review;
       const passes: PriorReviewPass[] = await reviews().listPriorPasses(targetId, {
         excludeReviewId: reviewId,
         limit: PRIOR_PASS_LIMIT,
@@ -470,7 +382,7 @@ export function makeReviewControlPlane(
       const priorTitles = new Set(
         passes.flatMap((pass) => pass.findings.map((finding) => finding.title)),
       );
-      // Author replies live only on GitHub. A posted finding carries no thread
+      // Author replies live only on the forge. A posted finding carries no thread
       // id, so a reply is matched to its finding through the parent comment's
       // first line, which quotes the finding title verbatim.
       const authorReplies: Array<{
@@ -479,7 +391,7 @@ export function makeReviewControlPlane(
         body: string;
       }> = [];
       try {
-        const comments = await githubPoster.listReviewComments(repo, prNumber);
+        const comments = await forge(provider).listReviewComments(repo, prNumber);
         const roots = new Map(comments.map((comment) => [comment.id, comment]));
         for (const comment of comments) {
           if (comment.inReplyToId === null) continue;
@@ -549,8 +461,8 @@ export function makeReviewControlPlane(
   };
 
   const plane: ReviewControlPlane = {
-    async resolvePrHeads(repo, prNumber) {
-      return githubPoster.fetchPrContext(repo, prNumber);
+    resolvePrHeads(provider, repo, prNumber) {
+      return forge(provider).fetchPullRequest(repo, prNumber);
     },
 
     async resolveReviewTarget(input) {
@@ -586,7 +498,7 @@ export function makeReviewControlPlane(
      * would turn its first transient error into a double-create — no crash
      * required.
      *
-     * Nothing else touches GitHub here (the built-in's own `ack` block posts
+     * Nothing else calls the forge here (the built-in's own `ack` block posts
      * the status comment), so a throw can only come from the transaction
      * itself, and that means it rolled back and created nothing. Logging
      * below is a synchronous, infallible write, not an effect.
@@ -618,21 +530,6 @@ export function makeReviewControlPlane(
     },
 
     async bootstrapFinderSession(sessionId, input) {
-      // ADR 0119 phase 4.3: the built-in clones through a visible, property-
-      // editable run_command block and asks only for the staging half.
-      if (!input.skipClone) {
-        await recordEvent(input.reviewId, "cloning", "finder");
-        await cloneRepo(
-          sessions,
-          sessionId,
-          input.repo,
-          input.prNumber,
-          input.headSha,
-          "finder",
-          execRuntime,
-        );
-      }
-
       const encoder = new TextEncoder();
       const priorFindings = await buildPriorFindingsFile(input.reviewId);
       const files = [
@@ -761,19 +658,6 @@ export function makeReviewControlPlane(
     },
 
     async bootstrapVerifierSession(sessionId, input) {
-      if (!input.skipClone) {
-        await recordEvent(input.reviewId, "cloning", "verifier");
-        await cloneRepo(
-          sessions,
-          sessionId,
-          input.repo,
-          input.prNumber,
-          input.headSha,
-          "verifier",
-          execRuntime,
-        );
-      }
-
       const review = await reviews().getReview(input.reviewId);
       if (!review) {
         throw new ReviewSetupError(`review not found: ${input.reviewId}`);
@@ -837,10 +721,10 @@ export function makeReviewControlPlane(
       await cleanupWorkerSession(opts.sessionId);
       const detail = await reviews().getReview(reviewId);
       if (!detail) throw new Error(`review not found: ${reviewId}`);
-      const { repo, prNumber } = detail.review;
+      const { provider, repo, prNumber } = detail.review;
       let { headSha, baseSha } = detail.review;
       if (headSha === "" || baseSha === "") {
-        const live = await githubPoster.fetchPrContext(repo, prNumber);
+        const live = await forge(provider).fetchPullRequest(repo, prNumber);
         if (headSha === "") headSha = live.headSha;
         if (baseSha === "") baseSha = live.baseSha;
         await reviews().finalizeReview(reviewId, {
@@ -919,7 +803,7 @@ export function makeReviewControlPlane(
       await recordEvent(
         reviewId,
         "inline_fallback",
-        `GitHub refused the inline anchors; ${decision.toPost.length} finding${decision.toPost.length === 1 ? "" : "s"} posted in the summary instead`,
+        `The inline anchors were refused; ${decision.toPost.length} finding${decision.toPost.length === 1 ? "" : "s"} posted in the summary instead`,
       );
     },
 

@@ -11,6 +11,8 @@
 import { makeConnectorStore } from "../../db/connectors.ts";
 import { getDb } from "../../db/client.ts";
 import { loadRegistry, type ActionSpec, type Connector } from "../../connectors/registry.ts";
+import { SAFE_REPO_PATH } from "../../forges/forge.ts";
+import { forgeFor } from "../../forges/registry.ts";
 import { coerceFieldValue, validateFieldValue } from "../../connectors/field-schema.ts";
 import {
   runIntegrationOp as defaultRunIntegrationOp,
@@ -345,20 +347,19 @@ export async function executeIntegrationAction(
   }
 }
 
-const SAFE_REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
-
 type MarkerGuardOutcome =
   | { kind: "exists"; outputs: Record<string, unknown> }
   | { kind: "proceed"; params: Record<string, unknown> };
 
-/** marker_comment for HTTP comment creators: pre-scan the newest 100 issue
- * comments for the marker; found → short-circuit with the existing comment's
- * mapped outputs; else append the marker to the body param. Actions without
- * comment-shaped params (repo + number + body) just get the marker appended —
- * the pre-scan is a crash-window optimization, not a correctness gate. That
- * second shape is also how a pinned comment survives an EDIT: an update
- * action carrying the same key marker rewrites the body with the marker
- * re-appended, so the next run's scan still finds the comment. */
+/** marker_comment for HTTP comment creators on a forge: look for the marker
+ * in the pull request's newest comments; found → short-circuit with the
+ * existing comment's mapped outputs; else append the marker to the body param.
+ * Actions without comment-shaped params (repo + number + body) just get the
+ * marker appended — the scan is a crash-window optimization, not a
+ * correctness gate. That second shape is also how a pinned comment survives
+ * an EDIT: an update action carrying the same key marker rewrites the body
+ * with the marker re-appended, so the next run's scan still finds the
+ * comment. */
 async function commentMarkerGuard(
   runOp: RunIntegrationOp,
   config: IntegrationActionConfigInput,
@@ -375,29 +376,12 @@ async function commentMarkerGuard(
       ...(typeof body === "string" ? { body: `${body}\n\n${marker}` } : {}),
     },
   });
-  if (typeof repo !== "string" || !SAFE_REPO_RE.test(repo) || typeof number !== "number") {
+  const forge = forgeFor(config.provider, { runIntegrationOp: runOp });
+  if (!forge || typeof repo !== "string" || !SAFE_REPO_PATH.test(repo) || typeof number !== "number") {
     return proceed();
   }
-  const result = await runOp(config.provider, {
-    method: "GET",
-    path: `/repos/${repo}/issues/${number}/comments?per_page=100&sort=created&direction=desc`,
-    contentType: "application/json",
-  });
-  if (result.status >= 200 && result.status < 300) {
-    const parsed = decodeJson(result, `${config.provider}.${config.actionId} marker scan`);
-    if (Array.isArray(parsed)) {
-      for (const comment of parsed) {
-        const record = comment as { body?: unknown };
-        if (typeof record.body === "string" && record.body.includes(marker)) {
-          return {
-            kind: "exists",
-            outputs: mapOutputs(action, comment as Record<string, unknown>, {
-              status: result.status,
-            }),
-          };
-        }
-      }
-    }
-  }
-  return proceed();
+  const comment = await forge.findCommentWithMarker(repo, number, marker);
+  return comment
+    ? { kind: "exists", outputs: mapOutputs(action, comment, { status: 200 }) }
+    : proceed();
 }

@@ -18,7 +18,7 @@
 
 import { z } from "zod";
 
-import { canonicalHandle } from "../../handles.ts";
+import { canonicalIdentifier } from "../../handles.ts";
 import { registerBlock } from "./registry.ts";
 
 export const claimHandleConfigSchema = z.object({
@@ -44,7 +44,7 @@ export function registerClaimHandleBlock(): void {
         };
       }
       const provider = config.handle.split(":", 1)[0] ?? "";
-      const handle = canonicalHandle(provider, config.handle);
+      const handle = canonicalIdentifier(provider, config.handle);
       if (ctx.dryRun) {
         return {
           kind: "ok",

@@ -20,6 +20,7 @@ const OBSERVED_AT = new Date("2026-07-16T18:19:20.123Z");
 function row(overrides: Partial<PrRefRow> = {}): PrRefRow {
   return {
     id: "pr-ref-1",
+    provider: "github",
     repo: "openai/engrams",
     prNumber: 97,
     authoringTaskId: "task-1",

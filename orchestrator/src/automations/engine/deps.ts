@@ -252,7 +252,7 @@ export interface EngineInstanceOps {
 /** PR → authoring-session lookup (the pr_ref ledger the link consumer
  * maintains). Read-only; the `lookup_pr_session` block's seam. */
 export interface EnginePrRefLookup {
-  getByPr(repo: string, prNumber: number): Promise<{
+  getByPr(provider: string, repo: string, prNumber: number): Promise<{
     sessionId: string;
     taskId: string | null;
     headBranch: string;

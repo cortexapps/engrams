@@ -7,11 +7,8 @@
  * network or the coordinator.
  */
 
-import {
-  makeGithubReviewPoster,
-  type GithubReviewPoster,
-  type InlineComment,
-} from "../../reviews/github-review.ts";
+import { ForgeRequestError, type GitForge, type InlineComment } from "../../forges/forge.ts";
+import { forgeProviders, requireForge } from "../../forges/registry.ts";
 import {
   runIntegrationOp as defaultRunIntegrationOp,
   type RunOpDeps,
@@ -65,8 +62,7 @@ export interface BuiltinActionContext {
 }
 
 export interface BuiltinActionDeps {
-  runOp: RunIntegrationOp;
-  githubPoster(): GithubReviewPoster;
+  forge(provider: string): GitForge;
   slackClient(): Promise<SlackChatClient>;
   linearClient(): LinearIssueClient;
 }
@@ -82,8 +78,7 @@ export type BuiltinActionTable = Record<string, BuiltinActionFn>;
 export function defaultBuiltinActionDeps(runOpDeps?: RunOpDeps): BuiltinActionDeps {
   const runOp: RunIntegrationOp = (provider, req) => defaultRunIntegrationOp(provider, req, runOpDeps);
   return {
-    runOp,
-    githubPoster: () => makeGithubReviewPoster({ runIntegrationOp: runOp }),
+    forge: (provider) => requireForge(provider, { runIntegrationOp: runOp }),
     slackClient: () => getSlackClient(runOpDeps),
     linearClient: () => makeLinearIssueClient({ runIntegrationOp: runOp }),
   };
@@ -102,40 +97,23 @@ function optionalString(params: Record<string, unknown>, key: string): string | 
   return typeof value === "string" && value !== "" ? value : undefined;
 }
 
-const REVIEW_SCAN_PAGES = 3;
-const REVIEW_SCAN_PER_PAGE = 50;
-
-/** Scan the PR's reviews for a marker string — the crash-window guard between
- * a posted review and its checkpoint (generalizes the review product's
- * alreadyPosted, which hardcodes its own marker shape). */
-async function markerAlreadyPosted(
-  runOp: RunIntegrationOp,
+async function hasReviewWithMarker(
+  forge: GitForge,
   repo: string,
   prNumber: number,
   marker: string,
 ): Promise<boolean> {
-  for (let page = 1; page <= REVIEW_SCAN_PAGES; page += 1) {
-    const response = await runOp("github", {
-      method: "GET",
-      path: `/repos/${repo}/pulls/${prNumber}/reviews?per_page=${REVIEW_SCAN_PER_PAGE}&page=${page}`,
-      contentType: "application/json",
-    });
-    if (response.status < 200 || response.status >= 300) {
-      throw new IntegrationActionError(
-        `list pull request reviews returned ${response.status}`,
-        response.status >= 400 && response.status < 500 && response.status !== 429,
-        response.status,
-      );
-    }
-    const value: unknown = JSON.parse(new TextDecoder().decode(response.body));
-    if (!Array.isArray(value)) return false;
-    for (const review of value) {
-      const body = (review as { body?: unknown }).body;
-      if (typeof body === "string" && body.includes(marker)) return true;
-    }
-    if (value.length < REVIEW_SCAN_PER_PAGE) return false;
+  try {
+    return await forge.hasReviewWithMarker(repo, prNumber, marker);
+  } catch (error) {
+    if (!(error instanceof ForgeRequestError)) throw error;
+    const { status } = error;
+    throw new IntegrationActionError(
+      `list pull request reviews returned ${status}`,
+      status >= 400 && status < 500 && status !== 429,
+      status,
+    );
   }
-  return false;
 }
 
 function readComments(params: Record<string, unknown>): InlineComment[] {
@@ -153,7 +131,7 @@ function readComments(params: Record<string, unknown>): InlineComment[] {
       throw new IntegrationActionError(`comments[${i}] needs path, line, body`, true);
     }
     // A caller with a findings ledger (the PR-review built-in's review_settle
-    // output) names each comment's finding so the ledger row and the GitHub
+    // output) names each comment's finding so the ledger row and the posted
     // comment stay linked; a caller without one gets a positional id.
     const findingId = typeof record["finding_id"] === "string" ? record["finding_id"] : `automation:${i}`;
     const startLine = typeof record["start_line"] === "number" ? record["start_line"] : undefined;
@@ -168,27 +146,28 @@ function readComments(params: Record<string, unknown>): InlineComment[] {
   });
 }
 
-export const BUILTIN_ACTIONS: BuiltinActionTable = {
-  "github.post_pr_review": async (params, ctx, deps) => {
+/** Post a review on a pull request of `provider`'s forge. */
+function postPrReview(provider: string): BuiltinActionFn {
+  return async (params, ctx, deps) => {
+    const forge = deps.forge(provider);
     const repo = requireString(params, "repo");
     const prNumber = params["prNumber"];
     if (typeof prNumber !== "number") {
       throw new IntegrationActionError(`missing required integer "prNumber"`, true);
     }
     const summary = requireString(params, "summary");
-    // The body for the 422 fallback (GitHub refused an inline anchor): a
-    // caller with a findings ledger passes one that re-quotes every finding,
-    // so a summary-only review loses nothing. Without it the summary is the
-    // body either way.
+    // The body for a review the forge takes only without its inline
+    // comments: a caller with a findings ledger passes one that quotes every
+    // finding. Without it the summary is the body either way.
     const fallbackSummary = optionalString(params, "fallbackSummary") ?? summary;
     const marker = ctx.marker ?? `<!-- engrams-automation:${ctx.runId}:${ctx.stepPath} -->`;
-    if (await markerAlreadyPosted(deps.runOp, repo, prNumber, marker)) {
+    // The guard for a crash between a posted review and its checkpoint.
+    if (await hasReviewWithMarker(forge, repo, prNumber, marker)) {
       return { posted: false, already_posted: true };
     }
-    const poster = deps.githubPoster();
     const commitId =
-      optionalString(params, "commitId") ?? (await poster.fetchPrContext(repo, prNumber)).headSha;
-    const result = await poster.postReview({
+      optionalString(params, "commitId") ?? (await forge.fetchPullRequest(repo, prNumber)).headSha;
+    const result = await forge.postReview({
       repo,
       prNumber,
       commitId,
@@ -199,9 +178,16 @@ export const BUILTIN_ACTIONS: BuiltinActionTable = {
       posted: result.posted,
       inline_posted: result.inlinePosted,
       already_posted: false,
-      ...(result.githubReviewId !== undefined ? { github_review_id: result.githubReviewId } : {}),
+      // The output name is in stored automations; it is the forge's review id.
+      ...(result.providerReviewId !== undefined ? { github_review_id: result.providerReviewId } : {}),
     };
-  },
+  };
+}
+
+export const BUILTIN_ACTIONS: BuiltinActionTable = {
+  ...Object.fromEntries(
+    forgeProviders().map((provider) => [`${provider}.post_pr_review`, postPrReview(provider)]),
+  ),
 
   "slack.post_message": async (params, _ctx, deps) => {
     const client = await deps.slackClient();

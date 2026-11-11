@@ -155,7 +155,7 @@ import {
 } from "./automations/builtins/seed.ts";
 import { retireProviderWebhookSchemes } from "./automations/retire-provider-webhooks.ts";
 import { makeAutomationStore } from "./db/automations.ts";
-import { makeGithubReviewPoster } from "./reviews/github-review.ts";
+import { forgeFor } from "./forges/registry.ts";
 import { DEFAULT_TARGET_HYDRATOR_CONFIG, TargetHydrator } from "./reviews/target-hydrator.ts";
 
 const app = new Hono();
@@ -677,7 +677,7 @@ if (!config.sweepDisabled) {
 const targetHydrator = new TargetHydrator({
   config: DEFAULT_TARGET_HYDRATOR_CONFIG,
   store: makeReviewTargetHydrationStore(getDb()),
-  github: makeGithubReviewPoster(),
+  forge: forgeFor,
   now: () => new Date(),
   log: log.child({ component: "review-target-hydrator" }),
 });

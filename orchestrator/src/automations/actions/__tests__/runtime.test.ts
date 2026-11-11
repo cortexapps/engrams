@@ -46,10 +46,7 @@ function slackPostDeps(ledger: ReturnType<typeof fakeLedger>) {
   // slack client seam, not the generic HTTP op. Built from scratch (the
   // execute.test.ts precedent) so a test only reaches seams it provides.
   const builtinDeps: BuiltinActionDeps = {
-    runOp: async () => {
-      throw new Error("not used by slack.post_message");
-    },
-    githubPoster: () => {
+    forge: () => {
       throw new Error("not used");
     },
     linearClient: () => {

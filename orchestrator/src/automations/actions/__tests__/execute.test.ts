@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 
 import { invalidateRegistry } from "../../../connectors/registry.ts";
 import type { IntegrationOpRequest, IntegrationOpResult } from "../../../integrations/run-op.ts";
-import { makeGithubReviewPoster } from "../../../reviews/github-review.ts";
+import { requireForge } from "../../../forges/registry.ts";
 import { actionClientId } from "../client-id.ts";
 import { defaultBuiltinActionDeps, type BuiltinActionDeps } from "../builtin.ts";
 import { IntegrationActionError } from "../errors.ts";
@@ -293,8 +293,7 @@ describe("executeIntegrationAction — builtins", () => {
     overrides: Partial<BuiltinActionDeps> = {},
   ): BuiltinActionDeps {
     return {
-      runOp,
-      githubPoster: () => makeGithubReviewPoster({ runIntegrationOp: runOp }),
+      forge: (provider) => requireForge(provider, { runIntegrationOp: runOp }),
       slackClient: async () => {
         throw new Error("slack client not provided in this test");
       },

@@ -23,7 +23,7 @@ import {
 } from "../db/automations.ts";
 import type { AutomationRunTrigger, AutomationTrigger } from "../db/schema.ts";
 import type { IntegrationEventDispatchInput } from "./integration-ingress.ts";
-import { CASE_INSENSITIVE_HANDLE_PROVIDERS, extractHandleCandidates } from "./handles.ts";
+import { canonicalIdentifier, extractHandleCandidates } from "./handles.ts";
 import {
   instanceConcurrencyKey,
   resolveInstance,
@@ -827,14 +827,6 @@ export interface DispatchIntegrationResult {
   builtins: Record<string, AdmitOutcome>;
 }
 
-/** Providers whose scope noun compares case-insensitively (GitHub owner/repo).
- * Slack channel ids and Linear team keys are exact. One shared rule with
- * instance handles (automations/handles.ts) so a write and a later match
- * never disagree by case. */
-function normalizeScope(provider: string, value: string): string {
-  return CASE_INSENSITIVE_HANDLE_PROVIDERS.has(provider) ? value.toLowerCase() : value;
-}
-
 /** Resolve a {fromInput} scope binding against the automation's input values
  * (schema defaults already overlaid): a map-typed input contributes its keys,
  * a list input its string elements, a non-empty string input itself (one
@@ -873,8 +865,8 @@ export function matchesIntegrationTrigger(
   // An unresolved input binding narrows to nothing: never fire on a scope the
   // author has not spelled out.
   if (values === undefined || event.scopeValue === undefined) return false;
-  const scoped = normalizeScope(event.provider, event.scopeValue);
-  return values.some((value) => normalizeScope(event.provider, value) === scoped);
+  const scoped = canonicalIdentifier(event.provider, event.scopeValue);
+  return values.some((value) => canonicalIdentifier(event.provider, value) === scoped);
 }
 
 /** Route one verified, ledgered integration delivery to every enabled

@@ -1,6 +1,6 @@
 /** Reviews reached from outside a webhook (ADR 0119 phase 4.4).
  *
- * The GitHub webhook spine admits the PR-review built-in on its own. Three
+ * The forge's webhook admits the PR-review built-in on its own. Three
  * other doors into a review exist, and each one admits a built-in run the
  * same way:
  *
@@ -13,7 +13,7 @@
  *   coordinate. It admits a run under the synthetic `review.dispatch` event
  *   key with a minimal payload; the built-in's admission arm accepts it for
  *   any mapped repo (an explicit dispatch is a request, like a comment
- *   command), and `open_review_pass` resolves the heads from GitHub because
+ *   command), and `open_review_pass` resolves the heads from the forge because
  *   the payload carries no SHAs. The payload does carry the canonical PR
  *   url, because the built-in's supersede concurrency key is that url: a
  *   dispatch must supersede the same PR's in-flight pass exactly as a
@@ -48,6 +48,7 @@ import {
   type AutomationStore,
 } from "../db/automations.ts";
 import { makeReviewStore, type ReviewStore } from "../db/reviews.ts";
+import { requireForge } from "../forges/registry.ts";
 import { log as rootLog } from "../log.ts";
 
 const log = rootLog.child({ component: "automation-review" });
@@ -173,6 +174,8 @@ export async function retryAutomationReview(
 }
 
 export interface ReviewCoordinate {
+  /** The forge's connector provider. */
+  provider: string;
   repo: string;
   prNumber: number;
 }
@@ -197,7 +200,7 @@ export async function dispatchAutomationReview(
       repository: { full_name: input.repo, name: input.repo.split("/")[1] ?? "" },
       pull_request: {
         number: input.prNumber,
-        html_url: `https://github.com/${input.repo}/pull/${input.prNumber}`,
+        html_url: requireForge(input.provider).pullRequestUrl(input.repo, input.prNumber),
       },
     },
   };
@@ -244,7 +247,7 @@ export async function stopAutomationReview(
   const sender = deps.sender ?? defaultAutomationSender;
   const randomUUID = deps.randomUUID ?? (() => crypto.randomUUID());
 
-  const active = await reviews.getActiveReviewByCoordinate("github", input.repo, input.prNumber);
+  const active = await reviews.getActiveReviewByCoordinate(input.provider, input.repo, input.prNumber);
   if (!active) return { stopped: false, reason: "no_active_review" };
   if (!active.automationRunId) return { stopped: false, reason: "not_on_engine" };
   const run: AutomationRunRow | null = await runs.getRun(active.automationRunId);
@@ -255,6 +258,6 @@ export async function stopAutomationReview(
     { kind: "stop", reason: "stopped by @mention command" },
     inboxKeys.stop(run.id, randomUUID()),
   );
-  log.info({ repo: input.repo, prNumber: input.prNumber, runId: run.id }, "github stop command halted the built-in review run");
+  log.info({ ...input, runId: run.id }, "stop command halted the built-in review run");
   return { stopped: true, runId: run.id };
 }

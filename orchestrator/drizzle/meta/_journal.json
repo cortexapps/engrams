@@ -715,6 +715,13 @@
       "when": 1794414748842,
       "tag": "0101_router_settings",
       "breakpoints": true
+    },
+    {
+      "idx": 102,
+      "version": "7",
+      "when": 1794417795024,
+      "tag": "0102_pr_ref_provider",
+      "breakpoints": true
     }
   ]
 }

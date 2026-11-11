@@ -6,6 +6,7 @@ import { Hono } from "hono";
 import { getSessionFromHeaders } from "../auth/session.ts";
 import { makeAutomationStore } from "../db/automations.ts";
 import { getDb } from "../db/client.ts";
+import { defaultForgeProvider } from "../forges/registry.ts";
 import { dispatchAutomationReview, type ReviewCoordinate } from "../reviews/automation-review.ts";
 import { makeEnrolledRepos, type EnrolledRepos } from "../reviews/enrolled-repos.ts";
 
@@ -54,7 +55,7 @@ export function makeReviewsDispatchRoute(
       return c.json({ error: "repo is not enrolled" }, 404);
     }
     // The run id is the DBOS workflow id, so the response shape holds.
-    const runId = await dispatchAutomation({ repo, prNumber });
+    const runId = await dispatchAutomation({ provider: defaultForgeProvider(), repo, prNumber });
     return c.json({ workflow_id: runId });
   });
 

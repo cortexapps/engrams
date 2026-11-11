@@ -138,7 +138,7 @@ describe("retryAutomationReview", () => {
 describe("dispatchAutomationReview", () => {
   test("admits a built-in run under review.dispatch with a coordinate-only payload", async () => {
     const h = harness(null);
-    const runId = await dispatchAutomationReview({ repo: "engrams/engrams", prNumber: 42 }, h.deps);
+    const runId = await dispatchAutomationReview({ provider: "github", repo: "engrams/engrams", prNumber: 42 }, h.deps);
     expect(runId).toBe("autorun:b1:main:i-ai_pr:dispatch:uuid-1");
     expect(h.opened).toEqual([{ key: "engrams/engrams#42", openedBy: "review:dispatch:uuid-1" }]);
     expect(h.admitted).toHaveLength(1);
@@ -158,7 +158,7 @@ describe("dispatchAutomationReview", () => {
 });
 
 describe("stopAutomationReview", () => {
-  const coordinate = { repo: "engrams/engrams", prNumber: 7 };
+  const coordinate = { provider: "github", repo: "engrams/engrams", prNumber: 7 };
   function stopHarness(options: { active?: { automationRunId: string | null } | null; runStatus?: string }) {
     const sent: Array<{ runId: string; message: unknown; key: string }> = [];
     const deps = {

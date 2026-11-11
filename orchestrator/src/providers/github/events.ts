@@ -12,10 +12,6 @@ import {
   type ReviewStore,
   type UpsertReviewTargetInput,
 } from "../../db/reviews.ts";
-import {
-  classifyGithubEvent,
-  parseReviewCommand,
-} from "../../integrations/github-webhook.ts";
 import type { IntegrationEventSource } from "../../automations/integration-ingress.ts";
 import { ownPath } from "../../automations/paths.ts";
 import { log as rootLog } from "../../log.ts";
@@ -24,6 +20,7 @@ import {
   type ReviewCoordinate,
   type StopAutomationReviewResult,
 } from "../../reviews/automation-review.ts";
+import { classifyGithubEvent, parseReviewCommand } from "./webhook.ts";
 
 const log = rootLog.child({ component: "github-webhook" });
 const AUTHORIZED_COMMENT_ASSOCIATIONS: ReadonlySet<string> = new Set([
@@ -153,7 +150,11 @@ export function githubEventSource(deps: GithubEventsDeps = {}): IntegrationEvent
           // The built-in's filter admits the review comment from the dispatch.
           break;
         case "stop": {
-          const result = await stopAutomation({ repo: event.repo, prNumber: event.prNumber });
+          const result = await stopAutomation({
+            provider: "github",
+            repo: event.repo,
+            prNumber: event.prNumber,
+          });
           log.info({ ...where, ...result }, "github stop command halted the built-in run");
           break;
         }

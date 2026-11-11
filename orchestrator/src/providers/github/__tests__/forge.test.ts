@@ -1,19 +1,17 @@
 import { describe, expect, test } from "bun:test";
 
-import type { ReviewFindingRow } from "../../db/reviews.ts";
+import type { ReviewFindingRow } from "../../../db/reviews.ts";
+import { ForgeRequestError } from "../../../forges/forge.ts";
 import {
   runIntegrationOp,
   type IntegrationOpRequest,
   type IntegrationOpResult,
-} from "../../integrations/run-op.ts";
-import {
-  buildInlineCommentBody,
-  buildReviewSummary,
-  GithubRequestError,
-  isPermanentGithubFailure,
-  makeGithubReviewPoster,
-} from "../github-review.ts";
-import type { PolicyDecision } from "../policy-gate.ts";
+} from "../../../integrations/run-op.ts";
+import type { PolicyDecision } from "../../../reviews/policy-gate.ts";
+import { buildInlineCommentBody, buildReviewSummary } from "../../../reviews/summary.ts";
+import { makeGithubForge } from "../forge.ts";
+
+const { isPermanentError } = makeGithubForge();
 
 interface RecordedCall {
   provider: string;
@@ -66,7 +64,7 @@ function finding(overrides: Partial<ReviewFindingRow> = {}): ReviewFindingRow {
   };
 }
 
-describe("GithubReviewPoster", () => {
+describe("the GitHub forge", () => {
   test("listReviewComments pages, tolerates junk entries, and keeps thread links", async () => {
     const fullPage = Array.from({ length: 100 }, (_, index) => ({
       id: index + 1,
@@ -82,9 +80,9 @@ describe("GithubReviewPoster", () => {
         { body: "no id — dropped" },
       ]),
     ]);
-    const poster = makeGithubReviewPoster({ runIntegrationOp: fake.run });
+    const forge = makeGithubForge({ runIntegrationOp: fake.run });
 
-    const comments = await poster.listReviewComments("openai/engrams", 100);
+    const comments = await forge.listReviewComments("openai/engrams", 100);
 
     expect(fake.calls.map((call) => call.request.path)).toEqual([
       "/repos/openai/engrams/pulls/100/comments?per_page=100&page=1",
@@ -109,19 +107,19 @@ describe("GithubReviewPoster", () => {
 
   test("listReviewComments surfaces a GitHub failure with its status", async () => {
     const fake = fakeRunOp([response(502, { message: "bad gateway" })]);
-    const poster = makeGithubReviewPoster({ runIntegrationOp: fake.run });
+    const forge = makeGithubForge({ runIntegrationOp: fake.run });
 
-    await expect(poster.listReviewComments("openai/engrams", 100))
+    await expect(forge.listReviewComments("openai/engrams", 100))
       .rejects.toThrow(/list pull request review comments failed with GitHub status 502/);
   });
 
-  test("fetchPrContext decodes the byte response and reads head/base SHAs", async () => {
+  test("fetchPullRequest decodes the byte response and reads head/base SHAs", async () => {
     const fake = fakeRunOp([
       response(200, { head: { sha: "head-sha" }, base: { sha: "base-sha" } }),
     ]);
-    const poster = makeGithubReviewPoster({ runIntegrationOp: fake.run });
+    const forge = makeGithubForge({ runIntegrationOp: fake.run });
 
-    expect(await poster.fetchPrContext("openai/engrams", 100)).toEqual({
+    expect(await forge.fetchPullRequest("openai/engrams", 100)).toEqual({
       headSha: "head-sha",
       baseSha: "base-sha",
       pr: {
@@ -148,7 +146,7 @@ describe("GithubReviewPoster", () => {
     }]);
   });
 
-  test("fetchPrContext captures the PR's descriptive context (ADR 0100 d9)", async () => {
+  test("fetchPullRequest captures the PR's descriptive context (ADR 0100 d9)", async () => {
     const fake = fakeRunOp([
       response(200, {
         id: 2158810101,
@@ -167,9 +165,9 @@ describe("GithubReviewPoster", () => {
         base: { sha: "base-sha", ref: "main" },
       }),
     ]);
-    const poster = makeGithubReviewPoster({ runIntegrationOp: fake.run });
+    const forge = makeGithubForge({ runIntegrationOp: fake.run });
 
-    const { pr } = await poster.fetchPrContext("openai/engrams", 881);
+    const { pr } = await forge.fetchPullRequest("openai/engrams", 881);
     expect(pr).toEqual({
       providerId: "2158810101",
       url: "https://github.com/openai/engrams/pull/881",
@@ -198,13 +196,13 @@ describe("GithubReviewPoster", () => {
     const fake = fakeRunOp([
       response(200, { ...flags, head: { sha: "h" }, base: { sha: "b" } }),
     ]);
-    const poster = makeGithubReviewPoster({ runIntegrationOp: fake.run });
+    const forge = makeGithubForge({ runIntegrationOp: fake.run });
 
-    const { pr } = await poster.fetchPrContext("openai/engrams", 1);
+    const { pr } = await forge.fetchPullRequest("openai/engrams", 1);
     expect(pr.state).toBe(expected);
   });
 
-  test("fetchPrContext still resolves heads when descriptive fields are junk", async () => {
+  test("fetchPullRequest still resolves heads when descriptive fields are junk", async () => {
     const fake = fakeRunOp([
       response(200, {
         title: 42,
@@ -215,11 +213,11 @@ describe("GithubReviewPoster", () => {
         base: { sha: "base-sha" },
       }),
     ]);
-    const poster = makeGithubReviewPoster({ runIntegrationOp: fake.run });
+    const forge = makeGithubForge({ runIntegrationOp: fake.run });
 
     // A review must never fail over a descriptive field: the SHAs come through
     // and every unusable field degrades to null on its own.
-    const result = await poster.fetchPrContext("openai/engrams", 1);
+    const result = await forge.fetchPullRequest("openai/engrams", 1);
     expect(result.headSha).toBe("head-sha");
     expect(result.baseSha).toBe("base-sha");
     expect(result.pr).toEqual({
@@ -238,42 +236,42 @@ describe("GithubReviewPoster", () => {
   });
 
   test("classifies permanent failures without treating GitHub throttles as permanent", () => {
-    expect(isPermanentGithubFailure(
-      new GithubRequestError(
+    expect(isPermanentError(
+      new ForgeRequestError(
         403,
         "primary limit",
         JSON.stringify({ message: "API Rate Limit exceeded for installation" }),
       ),
     )).toBe(false);
-    expect(isPermanentGithubFailure(
-      new GithubRequestError(
+    expect(isPermanentError(
+      new ForgeRequestError(
         403,
         "secondary limit",
         JSON.stringify({ message: "You have exceeded a secondary rate limit" }),
       ),
     )).toBe(false);
-    expect(isPermanentGithubFailure(
-      new GithubRequestError(403, "forbidden", JSON.stringify({ message: "Forbidden" })),
+    expect(isPermanentError(
+      new ForgeRequestError(403, "forbidden", JSON.stringify({ message: "Forbidden" })),
     )).toBe(true);
-    expect(isPermanentGithubFailure(
-      new GithubRequestError(403, "not JSON", "gateway rejected the request"),
+    expect(isPermanentError(
+      new ForgeRequestError(403, "not JSON", "gateway rejected the request"),
     )).toBe(true);
     for (const status of [401, 404, 410]) {
-      expect(isPermanentGithubFailure(
-        new GithubRequestError(status, "permanent", JSON.stringify({ message: "rate limit" })),
+      expect(isPermanentError(
+        new ForgeRequestError(status, "permanent", JSON.stringify({ message: "rate limit" })),
       )).toBe(true);
     }
-    expect(isPermanentGithubFailure(
-      new GithubRequestError(500, "transient", JSON.stringify({ message: "server error" })),
+    expect(isPermanentError(
+      new ForgeRequestError(500, "transient", JSON.stringify({ message: "server error" })),
     )).toBe(false);
   });
 
   test("posts exact single- and multi-line anchors with a suggestion block", async () => {
     const fake = fakeRunOp([response(200, { id: 7654 })]);
-    const poster = makeGithubReviewPoster({ runIntegrationOp: fake.run });
+    const forge = makeGithubForge({ runIntegrationOp: fake.run });
     const multiLineBody = buildInlineCommentBody(finding());
 
-    expect(await poster.postReview({
+    expect(await forge.postReview({
       repo: "openai/engrams",
       prNumber: 100,
       commitId: "head-sha",
@@ -296,7 +294,7 @@ describe("GithubReviewPoster", () => {
         },
       ],
     })).toEqual({
-      githubReviewId: "7654",
+      providerReviewId: "7654",
       posted: true,
       inlinePosted: true,
       summaryMd: "inline summary",
@@ -331,9 +329,9 @@ describe("GithubReviewPoster", () => {
       response(422, { message: "line must be part of the diff" }),
       response(200, { id: 7655 }),
     ]);
-    const poster = makeGithubReviewPoster({ runIntegrationOp: fake.run });
+    const forge = makeGithubForge({ runIntegrationOp: fake.run });
 
-    expect(await poster.postReview({
+    expect(await forge.postReview({
       repo: "openai/engrams",
       prNumber: 100,
       commitId: "head-sha",
@@ -346,7 +344,7 @@ describe("GithubReviewPoster", () => {
         body: "Inline finding",
       }],
     })).toEqual({
-      githubReviewId: "7655",
+      providerReviewId: "7655",
       posted: true,
       inlinePosted: false,
       summaryMd: "fallback summary",
@@ -366,7 +364,7 @@ describe("GithubReviewPoster", () => {
     expect(second).not.toHaveProperty("comments");
   });
 
-  test("alreadyPosted detects only the matching hidden marker", async () => {
+  test("hasReviewWithMarker detects only the matching marker", async () => {
     const fake = fakeRunOp([
       response(200, [
         { body: "<!-- engrams-review:other-review -->" },
@@ -374,21 +372,21 @@ describe("GithubReviewPoster", () => {
       ]),
       response(200, [{ body: "<!-- engrams-review:other-review -->" }]),
     ]);
-    const poster = makeGithubReviewPoster({ runIntegrationOp: fake.run });
+    const forge = makeGithubForge({ runIntegrationOp: fake.run });
 
-    expect(await poster.alreadyPosted("openai/engrams", 100, "review-1")).toBe(true);
-    expect(await poster.alreadyPosted("openai/engrams", 100, "review-1")).toBe(false);
+    expect(await forge.hasReviewWithMarker("openai/engrams", 100, "<!-- engrams-review:review-1 -->")).toBe(true);
+    expect(await forge.hasReviewWithMarker("openai/engrams", 100, "<!-- engrams-review:review-1 -->")).toBe(false);
   });
 
-  test("alreadyPosted paginates past a full first page to find the marker (#764-3)", async () => {
+  test("hasReviewWithMarker reads past a full first page to find the marker", async () => {
     const fullPage = Array.from({ length: 100 }, () => ({ body: "<!-- engrams-review:other -->" }));
     const fake = fakeRunOp([
       response(200, fullPage),
       response(200, [{ body: "Done\n<!-- engrams-review:review-1 -->" }]),
     ]);
-    const poster = makeGithubReviewPoster({ runIntegrationOp: fake.run });
+    const forge = makeGithubForge({ runIntegrationOp: fake.run });
 
-    expect(await poster.alreadyPosted("openai/engrams", 100, "review-1")).toBe(true);
+    expect(await forge.hasReviewWithMarker("openai/engrams", 100, "<!-- engrams-review:review-1 -->")).toBe(true);
     // It kept walking because page 1 was full (100) and lacked the marker.
     expect(fake.calls).toHaveLength(2);
     expect(fake.calls[0]?.request.path).toContain("page=1");

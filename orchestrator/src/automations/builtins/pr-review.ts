@@ -39,7 +39,7 @@
  */
 
 import { config } from "../../config.ts";
-import { normalizeMentionHandle } from "../../integrations/github-webhook.ts";
+import { normalizeMentionHandle } from "../../providers/github/webhook.ts";
 import { REVIEW_CATEGORIES } from "../../reviewers/render.ts";
 import {
   FINDER_SYSTEM_PROMPT,

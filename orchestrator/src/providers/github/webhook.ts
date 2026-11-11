@@ -1,7 +1,8 @@
 /** Pure GitHub webhook classification and review-command parsing — the command
  *  mention matches the configured App handle, not a hardcoded name (ADR 0100). */
 
-import { readPrContext, type PrContext } from "../reviews/pr-context.ts";
+import type { PrContext } from "../../reviews/pr-context.ts";
+import { readPrContext } from "./forge.ts";
 
 export type GithubEvent =
   | {

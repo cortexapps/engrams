@@ -18,7 +18,7 @@ const PROVIDERS = "github|slack|openrouter";
 const LITERAL = new RegExp(`["'\`](${PROVIDERS})["'\`]`);
 /** An import of a module named for a provider, e.g. `../integrations/slack-policy.ts`. */
 const IMPORT = new RegExp(`from\\s+"[^"]*/(${PROVIDERS})[^"/]*"`);
-/** A module named for a provider, e.g. `reviews/github-review.ts`. */
+/** A module named for a provider, e.g. `integrations/slack.ts`. */
 const FILENAME = new RegExp(`(^|/)(${PROVIDERS})[^/]*\\.ts$`);
 
 const ALLOWED: string[] = [
@@ -32,27 +32,19 @@ const ALLOWED: string[] = [
   "automations/engine/blocks/relay-close.ts",
   "automations/engine/blocks/relay.ts",
   "automations/engine/blocks/resolve-user.ts",
-  "automations/engine/blocks/review.ts",
   "automations/engine/blocks/slack-choice.ts",
-  "automations/handles.ts",
   "automations/profile-cards.ts",
   "automations/retire-provider-webhooks.ts",
   "automations/session-relay.ts",
   "db/connectors.ts",
   "db/schema.ts",
   "index.ts",
-  "integrations/github-webhook.ts",
   "integrations/slack-blocks.ts",
   "integrations/slack-identity.ts",
   "integrations/slack-message-text.ts",
   "integrations/slack-policy.ts",
   "integrations/slack.ts",
-  "listeners/pr-link-consumer.ts",
   "log.ts",
-  "reviews/automation-review.ts",
-  "reviews/control-plane.ts",
-  "reviews/github-review.ts",
-  "reviews/target-hydrator.ts",
   "routes/slack-interactivity.ts",
   "rpc/automations.ts",
   "rpc/integration.ts",

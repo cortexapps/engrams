@@ -13,6 +13,7 @@ import type {
 } from "../db/integration-events.ts";
 import { makeIntegrationEventsRoute } from "../routes/integration-events.ts";
 import { githubEventSource, type GithubEventsDeps } from "../providers/github/events.ts";
+import type { ReviewCoordinate } from "../reviews/automation-review.ts";
 
 const SECRET = "github-route-secret";
 
@@ -154,7 +155,7 @@ export function fakeIngress() {
 
 function app() {
   const refreshes: UpsertReviewTargetInput[] = [];
-  const stops: Array<{ repo: string; prNumber: number }> = [];
+  const stops: ReviewCoordinate[] = [];
   const ingress = fakeIngress();
   return {
     refreshes,
@@ -403,7 +404,7 @@ describe("POST /api/v1/integrations/github/events", () => {
       headers: headers(body, "issue_comment"),
     });
     expect(res.status).toBe(200);
-    expect(fixture.stops).toEqual([{ repo: enrollment.repo, prNumber: 100 }]);
+    expect(fixture.stops).toEqual([{ provider: "github", repo: enrollment.repo, prNumber: 100 }]);
   });
 
   test("closed refreshes an existing target without starting a pass", async () => {

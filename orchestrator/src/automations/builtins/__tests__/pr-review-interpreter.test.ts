@@ -149,10 +149,10 @@ function harness(options: {
       return { kind: "created", reviewId: "review-1", taskId: "task-1" };
     },
     async bootstrapFinderSession(_sid, input) {
-      cpCalls.push(`bootstrapFinder:skipClone=${String(input.skipClone)}:cats=${(input.enabledCategories ?? []).join("+")}`);
+      cpCalls.push(`bootstrapFinder:cats=${(input.enabledCategories ?? []).join("+")}`);
     },
-    async bootstrapVerifierSession(_sid, input) {
-      cpCalls.push(`bootstrapVerifier:skipClone=${String(input.skipClone)}`);
+    async bootstrapVerifierSession() {
+      cpCalls.push("bootstrapVerifier");
     },
     async composeFinderPrompt() {
       cpCalls.push("composeFinderPrompt");
@@ -317,7 +317,7 @@ describe("PR-review built-in on the interpreter", () => {
     expect(h.cpCalls).toEqual([
       "resolveReviewTarget",
       "createReviewPass:opened",
-      "bootstrapFinder:skipClone=true:cats=functional-correctness+security-privacy",
+      "bootstrapFinder:cats=functional-correctness+security-privacy",
       "composeFinderPrompt",
       "markPhasePrompted:finder",
       "decideReviewResults",
@@ -408,7 +408,7 @@ describe("PR-review built-in on the interpreter", () => {
 
     expect(result.status).toBe("completed");
     expect(h.sessions.map((s) => s.role)).toEqual(["finder", "verifier"]);
-    expect(h.cpCalls).toContain("bootstrapVerifier:skipClone=true");
+    expect(h.cpCalls).toContain("bootstrapVerifier");
     expect(h.cpCalls).toContain("markPhasePrompted:verifier");
     expect(h.prompts.map((p) => p.text)).toEqual(["FINDER PROMPT", "VERIFIER PROMPT"]);
     expect(h.execs).toHaveLength(2);

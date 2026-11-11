@@ -6,8 +6,7 @@ import type {
   ReviewTargetHydrationStore,
   UnhydratedReviewTarget,
 } from "../db/review-target-hydration.ts";
-import { isPermanentGithubFailure } from "./github-review.ts";
-import type { PrContext } from "./pr-context.ts";
+import type { GitForge } from "../forges/forge.ts";
 
 export const TARGET_HYDRATION_INTERVAL_MS = 60_000;
 export const TARGET_HYDRATION_BATCH_SIZE = 25;
@@ -22,18 +21,13 @@ export const DEFAULT_TARGET_HYDRATOR_CONFIG = {
   batchSize: TARGET_HYDRATION_BATCH_SIZE,
 } as const satisfies TargetHydratorConfig;
 
-export interface TargetHydrationReader {
-  fetchPrContext(repo: string, number: number): Promise<{
-    headSha: string;
-    baseSha: string;
-    pr: PrContext;
-  }>;
-}
+export type TargetHydrationReader = Pick<GitForge, "fetchPullRequest" | "isPermanentError">;
 
 export interface TargetHydratorDeps {
   config: TargetHydratorConfig;
   store: ReviewTargetHydrationStore;
-  github: TargetHydrationReader;
+  /** The forge for a target's provider; null when it is not a forge. */
+  forge(provider: string): TargetHydrationReader | null;
   now: () => Date;
   log: Logger;
   setInterval?: (
@@ -85,7 +79,8 @@ export async function runTargetHydration(
   };
 
   for (const target of targets) {
-    if (target.provider !== "github") {
+    const forge = deps.forge(target.provider);
+    if (!forge) {
       result.permanentlyFailed++;
       await markPermanentFailure(
         deps,
@@ -96,14 +91,14 @@ export async function runTargetHydration(
     }
 
     try {
-      const resolved = await deps.github.fetchPrContext(target.repo, target.number);
+      const resolved = await forge.fetchPullRequest(target.repo, target.number);
       const providerId = resolved.pr.providerId;
       if (providerId === null) {
         result.permanentlyFailed++;
         await markPermanentFailure(
           deps,
           target,
-          new Error("GitHub pull request response carried no provider id"),
+          new Error("the pull request response carried no provider id"),
         );
         continue;
       }
@@ -116,7 +111,7 @@ export async function runTargetHydration(
       if (outcome === "updated") result.hydrated++;
       else result.alreadyHydrated++;
     } catch (error) {
-      if (isPermanentGithubFailure(error)) {
+      if (forge.isPermanentError(error)) {
         result.permanentlyFailed++;
         await markPermanentFailure(deps, target, error);
       } else {

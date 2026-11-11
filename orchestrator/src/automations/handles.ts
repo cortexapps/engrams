@@ -10,15 +10,14 @@
  */
 
 import type { HandleTemplatePart, WebhookFacet } from "../connectors/registry.ts";
+import { forgeFor } from "../forges/registry.ts";
 import { ownPath } from "./paths.ts";
 
-/** Providers whose external identifiers are case-insensitive (GitHub repo
- * full names). Handles AND trigger scope values canonicalize under the same
- * rule so a write and a later match can never disagree by case. */
-export const CASE_INSENSITIVE_HANDLE_PROVIDERS: ReadonlySet<string> = new Set(["github"]);
-
-export function canonicalHandle(provider: string, handle: string): string {
-  return CASE_INSENSITIVE_HANDLE_PROVIDERS.has(provider) ? handle.toLowerCase() : handle;
+/** The stored form of a provider's external identifier: lower case for a
+ * forge whose repository names compare without case. Handles and trigger
+ * scope values both pass through here, so a write and a later match agree. */
+export function canonicalIdentifier(provider: string, value: string): string {
+  return forgeFor(provider)?.caseInsensitiveRepos ? value.toLowerCase() : value;
 }
 
 /** Render one template. `resolve` maps a path part to a payload value; a
@@ -63,7 +62,7 @@ export function extractHandleCandidates(input: {
   for (const template of templates) {
     const rendered = renderHandleParts(template.parts, (path) => ownPath(input.payload, path));
     if (rendered === null) continue;
-    const handle = canonicalHandle(input.provider, rendered);
+    const handle = canonicalIdentifier(input.provider, rendered);
     if (seen.has(handle)) continue;
     seen.add(handle);
     out.push(handle);

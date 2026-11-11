@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   classifyGithubEvent,
   parseReviewCommand,
-} from "../integrations/github-webhook.ts";
+} from "../webhook.ts";
 
 /** A `pull_request` delivery shaped like the real thing: GitHub sends the whole
  *  pull-request object, which is what lets a review start without an API call

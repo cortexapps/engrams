@@ -1,19 +1,5 @@
 /**
- * One reader for GitHub's pull-request object (ADR 0100 decision 11).
- *
- * The same shape arrives by two routes — the `GET /repos/{repo}/pulls/{n}`
- * response and the `pull_request` webhook payload's `pull_request` member — and
- * both are parsed here so a field can never be understood one way on the fetch
- * path and another on the webhook path.
- *
- * Deliberately total: every field falls back to null on its own, so an
- * unexpected payload costs a title, never a review. The two SHAs are the
- * exception — they are load-bearing, so callers extract and validate those
- * themselves rather than reading a nullable here.
- */
-
-/**
- * A pull request as GitHub last described it.
+ * A pull request as its forge last described it.
  *
  * The fields split across two tables downstream, and the split is not cosmetic:
  *
@@ -49,26 +35,6 @@ export interface PrContext {
   changedFiles: number | null;
 }
 
-/** Pull the descriptive fields out of a GitHub pull-request object. */
-export function readPrContext(pr: Record<string, unknown>): PrContext {
-  const head = isObject(pr["head"]) ? pr["head"] : null;
-  const base = isObject(pr["base"]) ? pr["base"] : null;
-  const user = isObject(pr["user"]) ? pr["user"] : null;
-  return {
-    providerId: identifier(pr["id"]),
-    title: nullableString(pr["title"]),
-    author: user ? nullableString(user["login"]) : null,
-    state: readPrState(pr),
-    url: nullableString(pr["html_url"]),
-    providerUpdatedAt: nullableDate(pr["updated_at"]),
-    headBranch: head ? nullableString(head["ref"]) : null,
-    baseBranch: base ? nullableString(base["ref"]) : null,
-    additions: nullableCount(pr["additions"]),
-    deletions: nullableCount(pr["deletions"]),
-    changedFiles: nullableCount(pr["changed_files"]),
-  };
-}
-
 /**
  * True when a capture carries every field we persist, so the API fetch adds
  * nothing and can be skipped.
@@ -93,47 +59,4 @@ export function isCompletePrContext(pr: PrContext): boolean {
     pr.deletions !== null &&
     pr.changedFiles !== null
   );
-}
-
-/**
- * GitHub splits a PR's disposition across three fields — `state` is only
- * open/closed, with `merged` and `draft` as separate booleans. Readers think in
- * one axis, so fold them: merged outranks closed (every merged PR is closed),
- * and draft only means anything while the PR is open.
- */
-function readPrState(pr: Record<string, unknown>): string | null {
-  if (pr["merged"] === true) return "merged";
-  const state = nullableString(pr["state"]);
-  if (state === "open") return pr["draft"] === true ? "draft" : "open";
-  return state;
-}
-
-/** GitHub ids exceed 2^53 in principle and arrive as JSON numbers, so they are
- *  carried as strings — never as a number that could round. */
-function identifier(value: unknown): string | null {
-  if (typeof value === "string" && value !== "") return value;
-  if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) {
-    return String(value);
-  }
-  return null;
-}
-
-/** An ISO-8601 timestamp, or null when it is absent or unparseable. Never throws
- *  and never yields an Invalid Date, which would poison every later comparison. */
-function nullableDate(value: unknown): Date | null {
-  if (typeof value !== "string" || value === "") return null;
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? null : parsed;
-}
-
-function nullableString(value: unknown): string | null {
-  return typeof value === "string" && value !== "" ? value : null;
-}
-
-function nullableCount(value: unknown): number | null {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
