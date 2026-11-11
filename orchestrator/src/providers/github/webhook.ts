@@ -1,5 +1,4 @@
-/** Pure GitHub webhook classification and review-command parsing — the command
- *  mention matches the configured App handle, not a hardcoded name (ADR 0100). */
+/** GitHub webhook deliveries, classified without I/O. */
 
 import type { PrContext } from "../../forges/pr-context.ts";
 import { readPrContext } from "./pr.ts";
@@ -39,11 +38,6 @@ export type GithubEvent =
     }
   | { kind: "ping" }
   | { kind: "ignore" };
-
-export type EngramsCommand =
-  | { kind: "review"; focus?: string }
-  | { kind: "fix"; text: string }
-  | { kind: "stop" };
 
 const PULL_REQUEST_ACTIONS: ReadonlySet<string> = new Set([
   "opened",
@@ -127,46 +121,6 @@ export function classifyGithubEvent(
   return { kind: "ignore" };
 }
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/** Normalize a configured handle: drop a leading "@" and a trailing "[bot]"
- * (GitHub App bot logins are "<slug>[bot]", but people @-mention "<slug>"). */
-export function normalizeMentionHandle(handle: string): string {
-  return handle.trim().replace(/^@/, "").replace(/\[bot\]$/i, "").trim();
-}
-
-/**
- * Find a command line that @-mentions the review App by its configured handle
- * (`handle`, e.g. the App's slug) — NOT a hardcoded name. Leading prose on
- * earlier lines is allowed; the command itself is an exact deterministic match.
- * An `[bot]` suffix on the mention is tolerated. Returns null when the handle is
- * unset/blank (mention commands are then disabled).
- */
-export function parseReviewCommand(body: string, handle: string): EngramsCommand | null {
-  const slug = normalizeMentionHandle(handle);
-  if (!slug) return null;
-  const mention = `@${escapeRegExp(slug)}(?:\\[bot\\])?`;
-  const lineMatcher = new RegExp(`^${mention}(?:\\s|$)`, "i");
-  const line = body
-    .split(/\r?\n/)
-    .map((candidate) => candidate.trim())
-    .find((candidate) => lineMatcher.test(candidate));
-  if (!line) return null;
-
-  const match = new RegExp(`^${mention}\\s+(review|fix|stop)(?:\\s+([\\s\\S]*))?$`, "i").exec(line);
-  if (!match) return null;
-  const verb = match[1]?.toLowerCase();
-  const text = sanitize(match[2] ?? "");
-  if (verb === "review") {
-    return text ? { kind: "review", focus: text } : { kind: "review" };
-  }
-  if (verb === "fix") return text ? { kind: "fix", text } : null;
-  if (verb === "stop") return text ? null : { kind: "stop" };
-  return null;
-}
-
 function classifyComment(
   body: Record<string, unknown>,
   pr: Record<string, unknown>,
@@ -199,13 +153,6 @@ function classifyComment(
     authorAssociation,
     senderType,
   };
-}
-
-function sanitize(value: string): string {
-  return value
-    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
-    .trim()
-    .slice(0, 500);
 }
 
 function isPullRequestAction(value: string | null): value is PullRequestAction {

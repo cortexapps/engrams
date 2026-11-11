@@ -8,7 +8,7 @@ import {
   type ReviewVariant,
 } from "../../automations/builtins/review-variant.ts";
 import { config } from "../../config.ts";
-import { normalizeMentionHandle } from "./webhook.ts";
+import { normalizeMentionHandle } from "../../forges/review-command.ts";
 
 /** Admission + fact derivation. Returns null to reject (the filter block
  * after it ends the run as `filtered`), else the facts object. Pure, no I/O,

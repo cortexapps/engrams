@@ -20,7 +20,8 @@ import {
   type ReviewCoordinate,
   type StopAutomationReviewResult,
 } from "../../reviews/automation-review.ts";
-import { classifyGithubEvent, parseReviewCommand } from "./webhook.ts";
+import { parseReviewCommand } from "../../forges/review-command.ts";
+import { classifyGithubEvent } from "./webhook.ts";
 
 const log = rootLog.child({ component: "github-webhook" });
 const AUTHORIZED_COMMENT_ASSOCIATIONS: ReadonlySet<string> = new Set([
