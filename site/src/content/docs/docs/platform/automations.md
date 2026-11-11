@@ -106,8 +106,8 @@ issue or comment. The credential is resolved on the server and the block never s
 **Decisions.** Decide asks a decision model typed questions about a state, in one call:
 pick one of a list of options, rate on ordered levels, or yes or no. Each answer has a
 calibrated confidence, so a branch can act on a sure answer and ask a person about the rest.
-It needs an [OpenRouter key](../../guides/model-routers/); without one it answers
-`decided: false` and the graph takes its fallback, and the builder does not offer it. List
+It needs a connected [model router](../../guides/model-routers/) with a decision model;
+without one it answers `decided: false` and the graph takes its fallback, and the builder does not offer it. List
 profiles returns the organization's profiles as options for a Decide question. Slack choice
 posts a question with one button per option into a thread and waits for the click.
 

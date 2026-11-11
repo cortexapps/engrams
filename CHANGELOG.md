@@ -59,6 +59,16 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 - **Save your GitHub token again** in Settings → Credentials before you use the "Mine"
   filter on Reviews. A token saved earlier names no login. ([#1719])
 - **To build from source,** you need Node 26 and Rust 1.94 or later. ([#1736], [#1573])
+- **Set the backend selectors in your Helm values before you upgrade.** They have no
+  default now, and `helm upgrade` fails at render, before it changes the release, when one
+  is unset. An install that relied on the old defaults sets `blob.backend: gcs`,
+  `kek.provider: gcp-kms` and `secrets.backend: gcp` (`engram`), and `blob.backend: gcs`
+  and `egress.caSource: gcp-secret-manager` (`engram-host-fleet`). The example overlays
+  set all of them.
+- **Upgrade the hosts before the control plane to use GitLab or Azure DevOps git.** A
+  session clones and pushes to them through the egress proxy of the new host agent.
+- **A rollback past this release** makes a profile routed to LiteLLM, and the GitLab
+  review, fail until you upgrade again. Nothing else changes back.
 
 ### Added
 
@@ -77,6 +87,15 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 - An All / Mine switch on Reviews. ([#1719])
 - `storage.ioScheduler` (`engram-host-fleet`, default `none`): node-prep sets the I/O
   scheduler of the work-dir disk. ([#1766])
+- **LiteLLM is a model router.** Point engrams at your own LiteLLM proxy and route Claude
+  Code and Codex sessions, titles and decisions through it. An admin picks the model for
+  each of those roles on Settings → Model routers.
+- **GitLab merge request review.** GitLab is a git forge: sessions clone and push with the
+  organization's token, which stays out of the VM, and a second review built-in reviews
+  merge requests. It needs GitLab 17.4 or later. An organization can use GitHub and GitLab
+  together.
+- An Azure DevOps connector: git over HTTPS, pull requests, work items and pipelines. It
+  has no review built-in.
 
 ### Changed
 
@@ -98,6 +117,15 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 - Destroying a VM does not wait for a guest shutdown. ([#1755])
 - The orchestrator caches a verified API key for 5 s. A revoked key can work for up to
   5 s on another replica. ([#1753])
+- **Git forges, chat services and model routers are roles.** GitHub, Slack and OpenRouter
+  are implementations of them, and a new provider that fills a role gets the features built
+  on it. The pull request review and the Slack thread bot are unchanged. The site's "Add a
+  provider" page says what a provider implements.
+- A Decide block and smart routing work with any connected router that has a decision
+  model. A router with no decisions endpoint answers with a structured chat completion.
+- A session gets git credentials only for a forge that its profile grants.
+- Every provider's webhooks arrive at `/api/v1/integrations/<provider>/events`. The URLs of
+  the existing providers are the same.
 - Dependency updates.
 
 ### Fixed

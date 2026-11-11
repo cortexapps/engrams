@@ -2,8 +2,8 @@
  *
  * A provider's name and its modules belong to `src/providers/<name>/`. Other
  * code reaches a provider through its role (git forge, chat, model router).
- * ALLOWED lists the files that still break the rule. It only shrinks: a file
- * that stops offending must leave the list, and no file may join it.
+ * ALLOWED lists the files that name one for a reason that is not a role, with
+ * the reason. A file that stops naming a provider must leave the list.
  */
 
 import { readdirSync, readFileSync } from "node:fs";
@@ -22,9 +22,13 @@ const IMPORT = new RegExp(`from\\s+"[^"]*/(${PROVIDERS})[^"/]*"`);
 const FILENAME = new RegExp(`(^|/)(${PROVIDERS})[^/]*\\.ts$`);
 
 const ALLOWED: string[] = [
+  // The drafting prompt shows the stored shape of a relay target.
   "automations/draft-catalog.ts",
+  // A backfill of rows that were GitHub's before triggers named a provider.
   "automations/retire-provider-webhooks.ts",
+  // Column defaults for rows written before the column existed.
   "db/schema.ts",
+  // "github" is a markdown dialect here, not a provider.
   "specs/projection.ts",
 ];
 

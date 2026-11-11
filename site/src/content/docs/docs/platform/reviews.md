@@ -1,6 +1,6 @@
 ---
 title: Pull request review
-description: A finder and a verifier review each pull request on the repositories you enroll, and post the confirmed findings as one GitHub review.
+description: A finder and a verifier review each pull request on the repositories you enroll, and post the confirmed findings as one review on GitHub or GitLab.
 sidebar:
   order: 3
 ---
@@ -28,6 +28,29 @@ to apply, and free-text **organization instructions** that both agents read.
 
 The GitHub connection has to exist first; [Connect GitHub](../../guides/connect-github/)
 covers the app and its webhook.
+
+## GitLab merge requests
+
+GitLab has its own review built-in, **Merge request review**, with its own switch and its own
+projects map. It appears once GitLab is connected, and an organization can run it beside
+the GitHub one. Its settings are the same; a project is named by its full path, subgroups
+included.
+
+1. Connect GitLab under Settings → Integrations with the host and an access token that can
+   read the projects and comment on their merge requests.
+2. Save a webhook secret as the org secret `gitlab.webhook_secret` under Settings → Secrets.
+3. In each GitLab project or group, add a webhook to
+   `<origin>/api/v1/integrations/gitlab/events` with that secret as its secret token, for
+   merge request events and comments.
+
+It differs from the GitHub review in four ways:
+
+- It needs GitLab 17.4 or later. An earlier GitLab sends no stable delivery id, and engrams
+  skips a delivery without one.
+- A comment starts a review only when it starts a line with `@<handle> review`, and its
+  author has the Developer role or higher on the project.
+- The findings are inline comments and one summary note, not one review object.
+- There is no `stop` command.
 
 ## What a review does
 
