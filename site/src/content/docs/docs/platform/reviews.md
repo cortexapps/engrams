@@ -37,7 +37,8 @@ the GitHub one. Its settings are the same; a project is named by its full path, 
 included.
 
 1. Connect GitLab under Settings → Integrations with the host and an access token that can
-   read the projects and comment on their merge requests.
+   read the projects and comment on their merge requests. Use the token of a bot or a
+   service account: a comment from the token's own user does not start a review.
 2. Save a webhook secret as the org secret `gitlab.webhook_secret` under Settings → Secrets.
 3. In each GitLab project or group, add a webhook to
    `<origin>/api/v1/integrations/gitlab/events` with that secret as its secret token, for

@@ -392,16 +392,18 @@ describe("executeIntegrationAction — builtins", () => {
         deps(f.runOp, { builtinDeps: builtinDeps(f.runOp) }),
       );
 
-    const first = fakeRunOp([json(200, []), json(201, { id: 8 })]);
+    // The lookup asks who the token's user is: only that user's comment counts.
+    const self = { id: 5 };
+    const first = fakeRunOp([json(200, self), json(200, []), json(201, { id: 8 })]);
     expect(await upsert(first)).toMatchObject({ commentId: "7:8" });
-    expect(first.calls[1]!.req).toMatchObject({ method: "POST", path: NOTES });
-    const posted = String((JSON.parse(first.calls[1]!.req.body as string) as { body: string }).body);
+    expect(first.calls[2]!.req).toMatchObject({ method: "POST", path: NOTES });
+    const posted = String((JSON.parse(first.calls[2]!.req.body as string) as { body: string }).body);
     const marker = posted.slice(posted.indexOf("<!--"));
     expect(posted).toBe(`Reviewing.\n\n${marker}`);
 
-    const again = fakeRunOp([json(200, [{ id: 8, body: posted }])]);
+    const again = fakeRunOp([json(200, self), json(200, [{ id: 8, author: self, body: posted }])]);
     expect(await upsert(again)).toMatchObject({ commentId: "7:8" });
-    expect(again.calls).toHaveLength(1);
+    expect(again.calls).toHaveLength(2);
   });
 
   test("gitlab.update_pr_comment rewrites the comment and keeps its marker", async () => {

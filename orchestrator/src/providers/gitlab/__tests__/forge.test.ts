@@ -263,28 +263,34 @@ describe("GitLab forge", () => {
     });
   // A renamed file. Old line 2 is gone, new lines 2 and 3 are added, and
   // old line 3 is new line 4.
-  const DIFFS = [
-    {
-      old_path: "src/old-a.ts",
-      new_path: "src/a.ts",
-      diff: "@@ -1,4 +1,5 @@\n one\n-two\n+two!\n+extra\n three\n four\n",
-    },
-  ];
+  const VERSION = {
+    id: 90,
+    head_commit_sha: DIFF_REFS.head_sha,
+    base_commit_sha: DIFF_REFS.base_sha,
+    start_commit_sha: DIFF_REFS.start_sha,
+    diffs: [
+      {
+        old_path: "src/old-a.ts",
+        new_path: "src/a.ts",
+        diff: "@@ -1,4 +1,5 @@\n one\n-two\n+two!\n+extra\n three\n four\n",
+      },
+    ],
+  };
+  // An earlier version comes first in the list: the review's head selects.
+  const VERSIONS = [{ id: 91, head_commit_sha: "e".repeat(40) }, { id: 90, head_commit_sha: DIFF_REFS.head_sha }];
+  const SELF = { id: 5 };
   const paths = (calls: IntegrationOpRequest[]) => calls.map((call) => `${call.method} ${call.path}`);
   const PAGE = "?per_page=100&page=1";
+  const WHERE = { ...DIFF_REFS, position_type: "text", new_path: "src/a.ts", old_path: "src/old-a.ts" };
 
-  test("posts the comments as drafts, publishes each, then posts the summary", async () => {
+  test("posts each comment on the reviewed diff version, then the summary", async () => {
     const { forge, calls } = scripted([
-      // A draft an earlier attempt left, and one that is not this post's.
-      response(200, [{ id: 30, note: "A finding.\n\n<!-- m -->" }, { id: 31, note: "a person's draft" }]),
-      response(204, {}),
-      response(200, MERGE_REQUEST),
+      response(200, VERSIONS),
+      response(200, VERSION),
+      response(200, SELF),
       response(200, []),
-      response(200, DIFFS),
-      response(201, { id: 41 }),
-      response(201, { id: 42 }),
-      response(200, {}),
-      response(200, {}),
+      response(201, { id: "d1" }),
+      response(201, { id: "d2" }),
       response(201, { id: 500 }),
     ]);
     expect(await post(forge)).toEqual({
@@ -294,48 +300,74 @@ describe("GitLab forge", () => {
       summaryMd: "summary\n\n<!-- m -->",
     });
     expect(paths(calls)).toEqual([
-      `GET ${MR_PATH}/draft_notes${PAGE}`,
-      `DELETE ${MR_PATH}/draft_notes/30`,
-      `GET ${MR_PATH}`,
+      `GET ${MR_PATH}/versions${PAGE}`,
+      `GET ${MR_PATH}/versions/90`,
+      "GET /api/v4/user",
       `GET ${MR_PATH}/discussions${PAGE}`,
-      `GET ${MR_PATH}/diffs${PAGE}`,
-      `POST ${MR_PATH}/draft_notes`,
-      `POST ${MR_PATH}/draft_notes`,
-      `PUT ${MR_PATH}/draft_notes/41/publish`,
-      `PUT ${MR_PATH}/draft_notes/42/publish`,
+      `POST ${MR_PATH}/discussions`,
+      `POST ${MR_PATH}/discussions`,
       `POST ${MR_PATH}/notes`,
     ]);
-    const where = { ...DIFF_REFS, position_type: "text", new_path: "src/a.ts", old_path: "src/old-a.ts" };
     // A line both sides have carries both numbers; a removed line only its own.
-    expect(JSON.parse(calls[5]!.body as string)).toEqual({
-      note: "A finding.\n\n<!-- m -->",
-      position: { ...where, new_line: 4, old_line: 3 },
+    expect(JSON.parse(calls[4]!.body as string)).toEqual({
+      body: "A finding.\n\n<!-- m -->",
+      position: { ...WHERE, new_line: 4, old_line: 3 },
     });
-    expect(JSON.parse(calls[6]!.body as string).position).toEqual({ ...where, old_line: 2 });
+    expect(JSON.parse(calls[5]!.body as string).position).toEqual({ ...WHERE, old_line: 2 });
   });
 
-  test("an attempt after a partial publish posts only what is missing", async () => {
+  test("an attempt after a partial post adds only what is missing", async () => {
+    const own = { type: "DiffNote", author: SELF, body: "A finding.\n\n<!-- m -->" };
     const { forge, calls } = scripted([
-      response(200, []),
-      response(200, MERGE_REQUEST),
-      response(200, [{ id: "d1", notes: [{ id: 1, type: "DiffNote", body: "A finding.\n\n<!-- m -->" }] }]),
-      response(200, DIFFS),
-      response(201, { id: 42 }),
-      response(200, {}),
+      response(200, VERSIONS),
+      response(200, VERSION),
+      response(200, SELF),
+      response(200, [
+        // GitLab can store another body than the one sent: the position says
+        // which comment it is.
+        { id: "d1", notes: [{ ...own, id: 1, body: "A finding, stored.\n\n<!-- m -->", position: { ...WHERE, new_line: 4, old_line: 3 } }] },
+        // Another user's note at the second position, with the marker.
+        { id: "d2", notes: [{ ...own, id: 2, author: { id: 6 }, position: { ...WHERE, old_line: 2, new_line: null } }] },
+      ]),
+      response(201, { id: "d3" }),
       response(201, { id: 500 }),
     ]);
     expect(await post(forge)).toMatchObject({ inlinePosted: true });
-    expect(paths(calls).slice(4)).toEqual([
-      `POST ${MR_PATH}/draft_notes`,
-      `PUT ${MR_PATH}/draft_notes/42/publish`,
-      `POST ${MR_PATH}/notes`,
-    ]);
-    expect(JSON.parse(calls[4]!.body as string).note).toBe("Another finding.\n\n<!-- m -->");
+    expect(paths(calls).slice(4)).toEqual([`POST ${MR_PATH}/discussions`, `POST ${MR_PATH}/notes`]);
+    expect(JSON.parse(calls[4]!.body as string).body).toBe("Another finding.\n\n<!-- m -->");
   });
 
-  test("a head that moved after the review takes no inline comment", async () => {
-    const moved = { ...MERGE_REQUEST, diff_refs: { ...DIFF_REFS, head_sha: "e".repeat(40) } };
-    const { forge, calls } = scripted([response(200, []), response(200, moved), response(201, { id: 502 })]);
+  test("two findings on one line both post, and a retry skips only the one that is there", async () => {
+    const twice = [
+      { findingId: "f1", path: "src/a.ts", line: 4, side: "RIGHT", body: "Same text." },
+      { findingId: "f2", path: "src/a.ts", line: 4, side: "RIGHT", body: "Same text." },
+    ];
+    const { forge, calls } = scripted([
+      response(200, VERSIONS),
+      response(200, VERSION),
+      response(200, SELF),
+      response(200, [
+        { id: "d1", notes: [{ id: 1, type: "DiffNote", author: SELF, body: "Same text.\n\n<!-- m -->", position: { ...WHERE, new_line: 4, old_line: 3 } }] },
+      ]),
+      response(201, { id: "d2" }),
+      response(201, { id: 500 }),
+    ]);
+    await forge.postReview({
+      repo: REPO,
+      prNumber: 7,
+      commitId: DIFF_REFS.head_sha,
+      buildSummary: () => "summary\n\n<!-- m -->",
+      marker: "<!-- m -->",
+      comments: twice,
+    });
+    expect(paths(calls).slice(4)).toEqual([`POST ${MR_PATH}/discussions`, `POST ${MR_PATH}/notes`]);
+  });
+
+  test("a review of a head with no diff version takes no inline comment", async () => {
+    const { forge, calls } = scripted([
+      response(200, [{ id: 91, head_commit_sha: "e".repeat(40) }]),
+      response(201, { id: 502 }),
+    ]);
     expect(await post(forge)).toMatchObject({
       inlinePosted: false,
       summaryMd: "summary with every finding\n\n<!-- m -->",
@@ -343,36 +375,58 @@ describe("GitLab forge", () => {
     expect(paths(calls).at(-1)).toBe(`POST ${MR_PATH}/notes`);
   });
 
-  test("a comment the diff refuses deletes the drafts and posts the full summary", async () => {
+  test("a finding on a line the diff does not show posts no inline comment at all", async () => {
+    // The file's diff is collapsed, so it shows no line.
+    const collapsed = { ...VERSION, diffs: [{ old_path: "src/a.ts", new_path: "src/a.ts", diff: "" }] };
+    const { forge, calls } = scripted([response(200, VERSIONS), response(200, collapsed), response(201, { id: 501 })]);
+    expect(await post(forge)).toMatchObject({
+      inlinePosted: false,
+      summaryMd: "summary with every finding\n\n<!-- m -->",
+    });
+    expect(paths(calls)).toHaveLength(3);
+  });
+
+  test("a position GitLab refuses stops the inline comments and posts the full summary", async () => {
     const { forge, calls } = scripted([
+      response(200, VERSIONS),
+      response(200, VERSION),
+      response(200, SELF),
       response(200, []),
-      response(200, MERGE_REQUEST),
-      response(200, []),
-      response(200, DIFFS),
-      response(201, { id: 41 }),
+      response(201, { id: "d1" }),
       response(400, { message: "400 Bad request - Note {:line_code=>[\"can't be blank\"]}" }),
-      response(204, {}),
       response(201, { id: 501 }),
     ]);
     expect(await post(forge)).toMatchObject({
       inlinePosted: false,
       summaryMd: "summary with every finding\n\n<!-- m -->",
     });
-    expect(paths(calls).slice(6)).toEqual([`DELETE ${MR_PATH}/draft_notes/41`, `POST ${MR_PATH}/notes`]);
+    expect(paths(calls).at(-1)).toBe(`POST ${MR_PATH}/notes`);
   });
 
-  test("a draft that fails for another reason fails the post and leaves no draft", async () => {
-    const { forge, calls } = scripted([
+  test("a comment that fails for another reason fails the post", async () => {
+    const { forge } = scripted([
+      response(200, VERSIONS),
+      response(200, VERSION),
+      response(200, SELF),
       response(200, []),
-      response(200, MERGE_REQUEST),
-      response(200, []),
-      response(200, DIFFS),
-      response(201, { id: 41 }),
       response(403, { message: "403 Forbidden" }),
-      response(204, {}),
     ]);
     await expect(post(forge)).rejects.toBeInstanceOf(ForgeRequestError);
-    expect(paths(calls).at(-1)).toBe(`DELETE ${MR_PATH}/draft_notes/41`);
+  });
+
+  test("a line that GitLab would run as a quick action is escaped, outside a code block", async () => {
+    const { forge, calls } = scripted([response(200, VERSIONS.slice(0, 1)), response(201, { id: 503 })]);
+    await forge.postReview({
+      repo: REPO,
+      prNumber: 7,
+      commitId: DIFF_REFS.head_sha,
+      buildSummary: () => "Found:\r\n/approve\n  /merge\n```sh\n/bin/true\n```\na/b\n<!-- m -->",
+      marker: "<!-- m -->",
+      comments: [],
+    });
+    expect(JSON.parse(calls[1]!.body as string).body).toBe(
+      "Found:\n\\/approve\n  \\/merge\n```sh\n/bin/true\n```\na/b\n<!-- m -->",
+    );
   });
 
   test("a list that does not end is an error, not a part of the answer", async () => {
@@ -381,20 +435,30 @@ describe("GitLab forge", () => {
     await expect(forge.hasReviewWithMarker(REPO, 7, "<!-- m -->")).rejects.toBeInstanceOf(ForgeRequestError);
   });
 
-  test("finds a posted review, and a status comment, by its marker", async () => {
+  test("finds a posted review, and a status comment, by its marker and its author", async () => {
     // Only the summary says the review is complete: an inline comment with
     // the marker is a review that stopped before its summary.
-    const inline = { id: "d2", notes: [{ id: 2, body: "A finding.\n\n<!-- m -->", type: "DiffNote" }] };
-    const summary = { id: "d3", notes: [{ id: 3, body: "summary\n\n<!-- m -->", type: null }] };
-    const found = scripted([response(200, [inline, summary])]);
+    const inline = { id: "d2", notes: [{ id: 2, author: SELF, body: "A finding.\n\n<!-- m -->", type: "DiffNote" }] };
+    const summary = { id: "d3", notes: [{ id: 3, author: SELF, body: "summary\n\n<!-- m -->", type: null }] };
+    const found = scripted([response(200, SELF), response(200, [inline, summary])]);
     expect(await found.forge.hasReviewWithMarker(REPO, 7, "<!-- m -->")).toBe(true);
-    const partial = scripted([response(200, [inline])]);
+    const partial = scripted([response(200, SELF), response(200, [inline])]);
     expect(await partial.forge.hasReviewWithMarker(REPO, 7, "<!-- m -->")).toBe(false);
+    // Any commenter can post the marker.
+    const forged = { id: "d4", notes: [{ id: 4, author: { id: 6 }, body: "<!-- m -->", type: null }] };
+    const other = scripted([response(200, SELF), response(200, [forged])]);
+    expect(await other.forge.hasReviewWithMarker(REPO, 7, "<!-- m -->")).toBe(false);
 
-    const notes = scripted([response(200, [{ id: 9, body: "x" }, { id: 8, body: "status <!-- k -->" }])]);
+    const notes = scripted([
+      response(200, SELF),
+      response(200, [
+        { id: 9, author: { id: 6 }, body: "not ours <!-- k -->" },
+        { id: 8, author: SELF, body: "status <!-- k -->" },
+      ]),
+    ]);
     expect(await notes.forge.findCommentWithMarker(REPO, 7, "<!-- k -->")).toMatchObject({ id: "7:8" });
-    expect(notes.calls[0]!.path).toBe(`${MR_PATH}/notes?per_page=100&page=1&sort=desc&order_by=created_at`);
-    const down = scripted([response(500, {})]);
+    expect(notes.calls[1]!.path).toBe(`${MR_PATH}/notes?per_page=100&page=1&sort=desc&order_by=created_at`);
+    const down = scripted([response(200, SELF), response(500, {})]);
     expect(await down.forge.findCommentWithMarker(REPO, 7, "<!-- k -->")).toBeNull();
   });
 

@@ -276,18 +276,21 @@ function readDiffRefs(mr: Json): DiffRefs | null {
   return base && start && head ? { base_sha: base, start_sha: start, head_sha: head } : null;
 }
 
-/** One file of the merge request's diff. */
+/** One file of a diff. Each map holds the lines of one side that the diff
+ * shows; the value is the line's number on the other side, or null for a
+ * line that only this side has. */
 interface FileDiff {
   oldPath: string;
-  /** The lines that both sides have, by their number on each side. */
-  newToOld: Map<number, number>;
-  oldToNew: Map<number, number>;
+  newPath: string;
+  newLines: Map<number, number | null>;
+  oldLines: Map<number, number | null>;
 }
 
-/** The unchanged lines of a unified diff. */
-function unchangedLines(diff: string): Pick<FileDiff, "newToOld" | "oldToNew"> {
-  const newToOld = new Map<number, number>();
-  const oldToNew = new Map<number, number>();
+/** The lines of a unified diff. A file with no diff text (collapsed, too
+ * large, binary) has none. */
+function diffLines(diff: string): Pick<FileDiff, "newLines" | "oldLines"> {
+  const newLines = new Map<number, number | null>();
+  const oldLines = new Map<number, number | null>();
   let oldLine = 0;
   let newLine = 0;
   for (const line of diff.split("\n")) {
@@ -296,35 +299,70 @@ function unchangedLines(diff: string): Pick<FileDiff, "newToOld" | "oldToNew"> {
       oldLine = Number(hunk[1]);
       newLine = Number(hunk[2]);
     } else if (line.startsWith("+")) {
-      newLine++;
+      newLines.set(newLine++, null);
     } else if (line.startsWith("-")) {
-      oldLine++;
+      oldLines.set(oldLine++, null);
     } else if (line.startsWith(" ")) {
-      newToOld.set(newLine, oldLine);
-      oldToNew.set(oldLine, newLine);
+      newLines.set(newLine, oldLine);
+      oldLines.set(oldLine, newLine);
       oldLine++;
       newLine++;
     }
   }
-  return { newToOld, oldToNew };
+  return { newLines, oldLines };
 }
 
-/** A diff position. A finding names a line of the new file, or of the old
- * file when its side is LEFT. GitLab wants both numbers for a line that
- * both sides have, and the old path of a renamed file. It takes one line: a
- * range needs line codes, which this client does not compute, so a range
- * anchors on its last line. */
-function position(refs: DiffRefs, comment: InlineComment, file: FileDiff | undefined): Json {
+/** The diff a review read: one version of the merge request's diff. */
+interface ReviewedDiff {
+  refs: DiffRefs;
+  /** By new path, and by old path for a renamed or deleted file. */
+  files: Map<string, FileDiff>;
+}
+
+/** A diff position; null when the diff does not show the line. A finding
+ * names a line of the new file, or of the old file when its side is LEFT.
+ * GitLab wants both numbers for a line that both sides have, and the old
+ * path of a renamed file. It takes one line: a range needs line codes, which
+ * this client does not compute, so a range anchors on its last line. */
+function position(diff: ReviewedDiff, comment: InlineComment): Json | null {
+  const file = diff.files.get(comment.path);
   const left = comment.side === "LEFT";
-  const other = left ? file?.oldToNew.get(comment.line) : file?.newToOld.get(comment.line);
+  const other = (left ? file?.oldLines : file?.newLines)?.get(comment.line);
+  if (file === undefined || other === undefined) return null;
   return {
-    ...refs,
+    ...diff.refs,
     position_type: "text",
-    new_path: comment.path,
-    old_path: file?.oldPath ?? comment.path,
+    new_path: file.newPath,
+    old_path: file.oldPath,
     ...(left ? { old_line: comment.line } : { new_line: comment.line }),
-    ...(other === undefined ? {} : left ? { new_line: other } : { old_line: other }),
+    ...(other === null ? {} : left ? { new_line: other } : { old_line: other }),
   };
+}
+
+/** One key for a position this client sends and the one GitLab stores. */
+function positionKey(where: Json): string {
+  return [str(where["new_path"]), positiveInt(where["old_line"]), positiveInt(where["new_line"])].join("\n");
+}
+
+/** GitLab runs a line that starts with "/" as a quick action (`/approve`,
+ * `/merge`) with the token's role, outside a code block. The text of a
+ * review comes from a model that read the merge request, so such a line is
+ * escaped. GitLab also drops "\r". */
+function withoutQuickActions(body: string): string {
+  let fence: string | null = null;
+  return body
+    .replace(/\r/g, "")
+    .split("\n")
+    .map((line) => {
+      const mark = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1]?.[0];
+      if (mark !== undefined) {
+        if (fence === null) fence = mark;
+        else if (fence === mark) fence = null;
+        return line;
+      }
+      return fence === null && /^ {0,3}\//.test(line) ? line.replace("/", "\\/") : line;
+    })
+    .join("\n");
 }
 
 /** A status comment's id names its merge request too: GitLab addresses a
@@ -386,6 +424,18 @@ export function makeGitlabForge(
     }
     throw unusable(operation, `more than ${MAX_PAGES * PER_PAGE} items`);
   };
+  /** The user of the connection's token. */
+  const selfId = async (): Promise<string> => {
+    const id = identifier((await requestObject("get current user", "GET", "/api/v4/user"))["id"]);
+    if (id === null) throw unusable("get current user", "no id");
+    return id;
+  };
+  /** A marker in a note proves nothing by itself: any commenter can post
+   * one. Only a note of the token's user is this client's. */
+  const isOwn = (note: Json, self: string, marker: string): boolean =>
+    isObject(note["author"])
+    && identifier(note["author"]["id"]) === self
+    && (str(note["body"])?.includes(marker) ?? false);
   /** The notes of the merge request, a list per discussion. */
   const discussionNotes = async (repo: string, prNumber: number): Promise<Json[][]> =>
     (await list("list merge request discussions", `${mergeRequest(repo, prNumber)}/discussions`)).map(
@@ -393,17 +443,31 @@ export function makeGitlabForge(
     );
   const readMergeRequest = (repo: string, prNumber: number): Promise<Json> =>
     requestObject("get merge request", "GET", mergeRequest(repo, prNumber));
-  const fileDiffs = async (repo: string, prNumber: number): Promise<Map<string, FileDiff>> => {
+  /** The diff version whose head is `commitId`; null when there is none.
+   * The refs and the lines come from one version, so a push between two
+   * reads cannot mix them, and a review of an earlier head still anchors. */
+  const reviewedDiff = async (repo: string, prNumber: number, commitId: string): Promise<ReviewedDiff | null> => {
+    const versions = `${mergeRequest(repo, prNumber)}/versions`;
+    const match = (await list("list merge request versions", versions)).find(
+      (version) => str(version["head_commit_sha"]) === commitId,
+    );
+    const id = match && identifier(match["id"]);
+    if (!id) return null;
+    const version = await requestObject("get merge request version", "GET", `${versions}/${id}`);
+    const base = str(version["base_commit_sha"]);
+    const start = str(version["start_commit_sha"]);
+    if (base === null || start === null) throw unusable("get merge request version", "no commits");
     const files = new Map<string, FileDiff>();
-    for (const file of await list("list merge request diffs", `${mergeRequest(repo, prNumber)}/diffs`)) {
-      const newPath = str(file["new_path"]);
+    const diffs = Array.isArray(version["diffs"]) ? version["diffs"].filter(isObject) : [];
+    for (const entry of diffs) {
+      const newPath = str(entry["new_path"]);
       if (newPath === null) continue;
-      files.set(newPath, {
-        oldPath: str(file["old_path"]) ?? newPath,
-        ...unchangedLines(str(file["diff"]) ?? ""),
-      });
+      const oldPath = str(entry["old_path"]) ?? newPath;
+      const file = { oldPath, newPath, ...diffLines(str(entry["diff"]) ?? "") };
+      files.set(newPath, file);
+      if (!files.has(oldPath)) files.set(oldPath, file);
     }
-    return files;
+    return { refs: { base_sha: base, start_sha: start, head_sha: commitId }, files };
   };
 
   const typedReview: TypedReviewForge = {
@@ -419,13 +483,12 @@ export function makeGitlabForge(
       if (typeof level !== "number" || level < MIN_ACCESS_TO_REQUEST_REVIEW) return false;
       // A review quotes its findings. A command in a quote, posted with the
       // connection's own token, must not start the next review.
-      const self = await requestObject("get current user", "GET", "/api/v4/user");
-      return identifier(self["id"]) !== authorId;
+      return (await selfId()) !== authorId;
     },
 
     async createComment(repo, prNumber, body) {
       const note = await requestObject("create merge request note", "POST", `${mergeRequest(repo, prNumber)}/notes`, {
-        body,
+        body: withoutQuickActions(body),
       });
       const id = identifier(note["id"]);
       if (id === null) throw unusable("create merge request note", "no id");
@@ -435,7 +498,7 @@ export function makeGitlabForge(
     async updateComment(repo, id, body) {
       const { prNumber, noteId } = parseCommentId(id);
       await requestObject("update merge request note", "PUT", `${mergeRequest(repo, prNumber)}/notes/${noteId}`, {
-        body,
+        body: withoutQuickActions(body),
       });
     },
   };
@@ -481,15 +544,17 @@ export function makeGitlabForge(
     // The summary note is the last thing a review posts, so it alone says
     // that the review is complete. The inline comments carry the marker too.
     async hasReviewWithMarker(repo, prNumber, marker) {
-      const discussions = await discussionNotes(repo, prNumber);
-      return discussions.some((notes) =>
-        notes.some((note) => note["type"] !== "DiffNote" && str(note["body"])?.includes(marker)),
+      const self = await selfId();
+      return (await discussionNotes(repo, prNumber)).some((notes) =>
+        notes.some((note) => note["type"] !== "DiffNote" && isOwn(note, self, marker)),
       );
     },
 
     async findCommentWithMarker(repo, prNumber, marker) {
+      let self: string;
       let notes: Json[];
       try {
+        self = await selfId();
         notes = await list(
           "list merge request notes",
           `${mergeRequest(repo, prNumber)}/notes`,
@@ -498,84 +563,55 @@ export function makeGitlabForge(
       } catch {
         return null;
       }
-      const note = notes.find((item) => str(item["body"])?.includes(marker));
+      const note = notes.find((item) => isOwn(item, self, marker));
       const id = note && identifier(note["id"]);
       return note && id ? { ...note, id: commentId(prNumber, id) } : null;
     },
 
-    /** The inline comments post as draft notes, which nobody sees until
-     * each is published. So a comment the diff refuses costs nothing
-     * visible: the drafts are deleted and the summary quotes every finding.
-     * Every comment carries the marker, so an attempt after a failure
-     * publishes only the comments that are not on the merge request yet. */
+    /** Every position is checked against the reviewed diff before anything
+     * posts: with one finding the diff does not show, the summary quotes
+     * every finding and no inline comment posts. Each inline comment carries
+     * the marker, so an attempt after a failure posts only the comments that
+     * are not on the merge request yet. */
     async postReview(input) {
       const { repo, prNumber, marker } = input;
       const base = mergeRequest(repo, prNumber);
-      const deleteDrafts = async (ids: string[]): Promise<void> => {
-        for (const id of ids) {
-          const response = await send("DELETE", `${base}/draft_notes/${id}`);
-          if (!succeeded(response) && response.status !== 404) {
-            throw responseError("delete draft note", response);
-          }
+      const diff = await reviewedDiff(repo, prNumber, input.commitId);
+      const positions = diff === null ? [] : input.comments.map((comment) => position(diff, comment));
+      let inlinePosted = diff !== null && positions.every((where) => where !== null);
+      if (inlinePosted && input.comments.length > 0) {
+        const self = await selfId();
+        // How many of this review's comments each position already has.
+        const posted = new Map<string, number>();
+        for (const note of (await discussionNotes(repo, prNumber)).flat()) {
+          if (note["type"] !== "DiffNote" || !isObject(note["position"]) || !isOwn(note, self, marker)) continue;
+          const key = positionKey(note["position"]);
+          posted.set(key, (posted.get(key) ?? 0) + 1);
         }
-      };
-      // Drafts an earlier attempt of this post left behind.
-      const leftover = (await list("list draft notes", `${base}/draft_notes`))
-        .filter((draft) => str(draft["note"])?.includes(marker))
-        .map((draft) => identifier(draft["id"]))
-        .filter((id): id is string => id !== null);
-      await deleteDrafts(leftover);
-
-      const refs = readDiffRefs(await readMergeRequest(repo, prNumber));
-      // The findings name lines of the reviewed head. A newer head has other
-      // lines, so its diff takes no inline comment.
-      const anchored = refs !== null && refs.head_sha === input.commitId;
-      let inlinePosted = anchored;
-      if (anchored && input.comments.length > 0) {
-        const published = new Set(
-          (await discussionNotes(repo, prNumber))
-            .flat()
-            .filter((note) => note["type"] === "DiffNote")
-            .map((note) => str(note["body"])),
-        );
-        const files = await fileDiffs(repo, prNumber);
-        const drafts: string[] = [];
-        try {
-          for (const comment of input.comments) {
-            const note = `${comment.body}\n\n${marker}`;
-            if (published.has(note)) continue;
-            const response = await send("POST", `${base}/draft_notes`, {
-              note,
-              position: position(refs, comment, files.get(comment.path)),
-            });
-            // GitLab refuses a position that is not in the diff.
-            if (response.status === 400 || response.status === 422) {
-              inlinePosted = false;
-              break;
-            }
-            if (!succeeded(response)) throw responseError("create draft note", response);
-            const draft = parseJson(response, "create draft note");
-            const id = isObject(draft) ? identifier(draft["id"]) : null;
-            if (id === null) throw unusable("create draft note", "no id");
-            drafts.push(id);
+        for (const [index, comment] of input.comments.entries()) {
+          const where = positions[index];
+          if (!where) continue;
+          const key = positionKey(where);
+          const already = posted.get(key) ?? 0;
+          if (already > 0) {
+            posted.set(key, already - 1);
+            continue;
           }
-        } catch (error) {
-          await deleteDrafts(drafts);
-          throw error;
-        }
-        if (inlinePosted) {
-          // One publish per draft: the bulk call also publishes every other
-          // draft of the token's user on the merge request.
-          for (const id of drafts) {
-            const response = await send("PUT", `${base}/draft_notes/${id}/publish`);
-            if (!succeeded(response)) throw responseError("publish draft note", response);
+          const response = await send("POST", `${base}/discussions`, {
+            body: `${withoutQuickActions(comment.body)}\n\n${marker}`,
+            position: where,
+          });
+          // GitLab refuses a position it cannot place. The comments before
+          // this one stay; the summary quotes every finding.
+          if (response.status === 400) {
+            inlinePosted = false;
+            break;
           }
-        } else {
-          await deleteDrafts(drafts);
+          if (!succeeded(response)) throw responseError("create merge request discussion", response);
         }
       }
 
-      const summaryMd = input.buildSummary(inlinePosted);
+      const summaryMd = withoutQuickActions(input.buildSummary(inlinePosted));
       const note = await requestObject("create merge request note", "POST", `${base}/notes`, {
         body: summaryMd,
       });
