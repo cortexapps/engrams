@@ -12,79 +12,109 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 
 ### Upgrade notes
 
-- **Firecracker hosts need a session-disk pool.** The host agent no longer serves disks
-  over NBD, and it refuses to start the Firecracker backend without a pool. Node-prep in
-  the `engram-host-fleet` chart builds a device-mapper thin pool from two files on the
-  host's working filesystem, and the host agent opens it through `ENGRAM_THIN_POOL`; with
-  node-prep disabled, the node image must provide the pool. The node needs the
-  `dm_thin_pool` module and `thin-provisioning-tools`. The `nbd` chart values, the node-prep
-  NBD step, and `ENGRAM_NBD_MAX_SLOTS` / `ENGRAM_NBD_WARM_SLOTS` are gone.
-- **The upgrade drains every host first.** The new host agent cannot adopt VMs whose disk
-  the old one served, so `helm upgrade` of either chart runs a job, before it changes
-  anything, that cordons every host and evicts each running session to a checkpoint (taking
-  one first for a session that never had one). A session the job cannot evict within
-  `upgradeDrain.timeoutSeconds` stops the upgrade before any change. After the host fleet
-  chart upgrades, a second job replaces the drained host pods (the operator does it when it
-  is enabled), and each host's cordon lifts when it registers on the new build. Each session
-  resumes from its checkpoint the next time it is used. An idle session whose only
-  recoverable state was the host's live disk manifest is marked dead by migration 0126.
-- **Node-prep makes room for the pool.** When the pool's files would leave less than 15% of
-  the disk free (`POOL_RESERVE` in the node-prep script), node-prep clears the chunk cache
-  before it creates them; the cache refills from the chunk store, so the first resumes on
-  that host are slower. A disk without that room even then fails node-prep with a clear
-  message and no change. `storage.chunkCacheDiskFraction` now defaults to `0.3`, so the pool's half
-  of the disk and the cache fit together.
-- **Three database migrations (0126, 0127, 0128).** They drop the live disk manifest, cancel
-  queued evictions of the retired quarantine flavour, and replace the NBD slot columns with
-  the pool capacity columns. Either chart can be upgraded first; both run the drain.
-  Until the old coordinator pods stop, they fail requests that read the dropped columns. If
-  a drain job fails with a database error about a missing column, run the same
-  `helm upgrade` again; the drain is safe to repeat.
-- **With the operator enabled, the roll needs room under `operator.capacityFloor`.** The
-  operator replaces a host pod only when the fleet keeps at least `capacityFloor` Ready
-  hosts without it. A fleet with no more hosts than the floor waits with every host
-  cordoned. Set the floor below the host count (`0` for a single host) before you upgrade.
-- **Removed metrics and knobs.** `engram_quarantine_stuck_total`,
-  `engram_durability_rollback_total`, and `ENGRAM_QUARANTINE_CAPTURE_TIMEOUT_SECS` no longer
-  exist; delete alert policies that read them. The capability vector reports `session_disk`
-  where it reported `nbd`. `engrams admin flush` is gone: a checkpoint is the only way disk
-  state leaves a host.
-- **Fleet API.** `HostView` loses `nbd_slots_total` and `nbd_slots_in_use` and gains
-  `pool_data_free_mib`, `pool_data_total_mib`, `pool_metadata_free_mib`, and
-  `pool_metadata_total_mib`. `FlushSession` is gone.
-- **A Firecracker resume always restores memory lazily.** `ENGRAM_FC_RESTORE_MODE` and the
-  `firecracker.restoreMode` chart value (`engram-host-fleet`) are removed; delete them from
-  your values. Every resume spawns `engram-uffd-handler`, so the host image must ship it.
-- **This upgrade drains every host again.** The host agent no longer serves memory handlers,
-  Firecracker processes, or migration sources from an earlier build, so the reattach
-  generation goes to 2. With `upgradeDrain.enabled` (the default), the pre-upgrade job
-  evicts each running session to a checkpoint before Helm changes anything, as described
-  above. Nothing ends and no data is lost: each session resumes on the new build the next
-  time it is used. With `upgradeDrain.enabled: false`, evict every session before the
-  upgrade. To roll back past this release, drain the hosts first the same way.
-- **A resume copies its disk in behind the running VM, which needs `ublk_drv`.** The host
-  agent serves the part of a session's disk the host does not hold as a ublk block device,
-  so the node needs the `ublk_drv` module; node-prep loads it. On a node without
-  `/dev/ublk-control` the host agent logs an error at startup and writes each disk in full
-  before its VM starts, as before. The reattach generation goes to 3, so this upgrade
-  drains every host as described above. To roll back past this release, drain the hosts
-  first: an earlier host agent cannot serve a disk that is still copying, and its VM would
-  hang.
+- **The upgrade drains every host.** The new host agent cannot adopt a VM from an earlier
+  build. Before `helm upgrade` of either chart changes anything, a job cordons every host
+  and evicts each running session to a checkpoint. Each session resumes the next time it is
+  used. A session the job cannot evict within `upgradeDrain.timeoutSeconds` stops the
+  upgrade. The drain is safe to repeat: if it fails with a database error about a missing
+  column, run the same `helm upgrade` again. With `upgradeDrain.enabled: false`, evict
+  every session before the upgrade. To roll back past this release, drain the hosts first
+  the same way. ([#1734], [#1778], [#1783])
+- **Firecracker hosts need a session-disk pool and two kernel modules.** Node-prep in the
+  `engram-host-fleet` chart builds a device-mapper thin pool and loads `dm_thin_pool` and
+  `ublk_drv`; the node also needs `thin-provisioning-tools`. With node-prep disabled, the
+  node image must provide the pool (`ENGRAM_THIN_POOL`). The host agent does not start the
+  Firecracker backend without a pool. Without `/dev/ublk-control`, it writes each disk in
+  full before its VM starts. ([#1733], [#1783])
+- **Node-prep makes room for the pool.** When the pool would leave less than 15% of the
+  disk free, node-prep clears the chunk cache first, so the first resumes on that host are
+  slower. A disk that is still too small fails node-prep with no change.
+  `storage.chunkCacheDiskFraction` now defaults to `0.3`. ([#1744])
+- **Three database migrations (0126, 0127, 0128).** Either chart can be upgraded first.
+  Migration 0126 marks dead an idle session whose only recoverable state was the host's
+  live disk manifest.
+- **With the operator enabled, set `operator.capacityFloor` below the host count** (`0` for
+  a single host). The operator replaces a host pod only when the fleet keeps that many
+  Ready hosts without it.
+- **Removed.** Delete these from your values, environment and alert policies:
+  - The `nbd` chart values, `ENGRAM_NBD_MAX_SLOTS` and `ENGRAM_NBD_WARM_SLOTS`.
+  - `firecracker.restoreMode` and `ENGRAM_FC_RESTORE_MODE`. Every resume restores memory
+    lazily, so the host image must ship `engram-uffd-handler`.
+  - `ENGRAM_QUARANTINE_CAPTURE_TIMEOUT_SECS`, and the metrics
+    `engram_quarantine_stuck_total` and `engram_durability_rollback_total`.
+  - `engrams admin flush` and the `FlushSession` RPC.
+- **Fleet API.** `HostView` replaces `nbd_slots_total` and `nbd_slots_in_use` with
+  `pool_data_free_mib`, `pool_data_total_mib`, `pool_metadata_free_mib` and
+  `pool_metadata_total_mib`. The capability vector reports `session_disk` where it
+  reported `nbd`.
+- **The first enable or refresh of each image uploads it in full and captures again.** The
+  new disk layout shares no chunks with images packed before. Sessions, checkpoints and
+  base snapshots that exist are not changed. ([#1759])
+- **The Slack app needs new scopes.** The bot token asks for `im:write`, `mpim:write` and
+  `groups:write`. Update the app from the manifest and install it again. ([#1702])
+- **The orchestrator logs JSON by default.** Set `ENGRAM_LOG_FORMAT=pretty` for the old
+  format. ([#1753])
+- **Save your GitHub token again** in Settings → Credentials before you use the "Mine"
+  filter on Reviews. A token saved earlier names no login. ([#1719])
+- **To build from source,** you need Node 26 and Rust 1.94 or later. ([#1736], [#1573])
+
+### Added
+
+- **An automation is an agent with ways in.** A definition has one agent, scoped per
+  event, per key (a thread, a pull request, an issue) or per automation. Each way in
+  starts the agent, reaches it, or closes it. The Slack threads built-in and the web
+  canvas use this model. ([#1694], [#1695], [#1700])
+- Connectors for Vanta, Rippling and Google Workspace. A connector can get its token with
+  a client-credentials grant or a service-account grant. ([#1702], [#1703])
+- The Slack connector opens direct messages and private channels, finds a member by
+  email, and creates and invites to channels. ([#1702])
+- A "Programmatic only" profile setting. Only automations, API keys and admins can start
+  sessions on such a profile. ([#1713])
+- A configurable API region for OpenRouter, for workspaces that permit only regional
+  hosts. ([#1714])
+- An All / Mine switch on Reviews. ([#1719])
+- `storage.ioScheduler` (`engram-host-fleet`, default `none`): node-prep sets the I/O
+  scheduler of the work-dir disk. ([#1766])
 
 ### Changed
 
-- **The kernel owns the session disk.** A VM's disk is a thin volume in a device-mapper pool;
-  no host process is in the data path, and a host agent restart does not touch a running
-  VM's disk. A base image is staged into the pool once per host and every session's volume
-  is a snapshot of it, so a create writes nothing. A resume starts the VM on a snapshot of
-  the nearest base the host holds and copies the difference in behind it, so the time to
-  the first prompt does not grow with the size of the session's disk. A checkpoint pauses the VM for tens of
-  milliseconds however much it wrote and uploads only the blocks that changed. The disk daemon, the
-  copy-on-write view, the flush pipeline, the durability-rollback path, and the
-  quarantined-survivor eviction are gone with it.
-- Placement refuses a host whose pool is below a floor: `ENGRAM_PLACEMENT_POOL_FLOOR_BYTES`
-  (16 GiB by default) of data space, and 64 MiB of metadata space. There is no per-session
-  disk reservation.
+- **The kernel owns the session disk.** A VM's disk is a thin volume in a device-mapper
+  pool, and a host agent restart does not touch a running VM's disk. A create writes
+  nothing. A resume starts the VM first and copies the missing part of the disk in behind
+  it, so the time to the first prompt does not grow with the disk size. A checkpoint
+  pauses the VM for tens of milliseconds and uploads only the changed blocks. ([#1733],
+  [#1783])
+- One chunk fill engine per host serves memory and disk restores, with one priority order
+  and one shared limit. ([#1764])
+- Images are packed with a layout that keeps most disk chunks stable from one version to
+  the next, so a new version uploads and stages about a third of the data. An image with
+  no suggested disk size gets a disk of 4× its data. ([#1759])
+- Placement refuses a host whose pool has less than `ENGRAM_PLACEMENT_POOL_FLOOR_BYTES`
+  (16 GiB by default) of data space or 64 MiB of metadata space.
+- A parked VM keeps its host until a queued session has no other room. ([#1782])
+- A prompt does not wait for a checkpoint upload. ([#1758])
+- Destroying a VM does not wait for a guest shutdown. ([#1755])
+- The orchestrator caches a verified API key for 5 s. A revoked key can work for up to
+  5 s on another replica. ([#1753])
+- Dependency updates.
+
+### Fixed
+
+- A live move whose destination never loaded the state ended the session. The source now
+  resumes. ([#1750])
+- A resume could wait in the queue while a host had room, after the image's memory config
+  grew. ([#1789])
+- A live move of a large session failed on a request above 4 MiB. ([#1788])
+- A rate-limited upload to the chunk store retried after 300 ms. It now backs off for
+  seconds. ([#1784])
+- A session could die on resume after a second base capture of its image. ([#1730])
+- A deploy could evict sessions that had survived the host agent restart. ([#1728])
+- The coordinator kept dialing a host at an old address. ([#1745])
+- Scheduled automations: re-enable and "Run now" work for a cron way in. ([#1716],
+  [#1717])
+- The Slack bot reads group direct messages. ([#1709])
+- The `vanta` CLI sends list filters as repeated parameters. ([#1711])
+- The TUI cursor stays on its row when a space ends a wrapped row. ([#1693])
 
 ## [0.12.0] - 2026-10-26
 
@@ -273,6 +303,7 @@ The first tagged release. See the
 [0.10.0]: https://github.com/cortexapps/engrams/releases/tag/v0.10.0
 [#1471]: https://github.com/cortexapps/engrams/pull/1471
 [#1568]: https://github.com/cortexapps/engrams/pull/1568
+[#1573]: https://github.com/cortexapps/engrams/pull/1573
 [#1574]: https://github.com/cortexapps/engrams/pull/1574
 [#1575]: https://github.com/cortexapps/engrams/pull/1575
 [#1576]: https://github.com/cortexapps/engrams/pull/1576
@@ -322,3 +353,36 @@ The first tagged release. See the
 [#1671]: https://github.com/cortexapps/engrams/pull/1671
 [#1672]: https://github.com/cortexapps/engrams/pull/1672
 [#1675]: https://github.com/cortexapps/engrams/pull/1675
+[#1693]: https://github.com/cortexapps/engrams/pull/1693
+[#1694]: https://github.com/cortexapps/engrams/pull/1694
+[#1695]: https://github.com/cortexapps/engrams/pull/1695
+[#1700]: https://github.com/cortexapps/engrams/pull/1700
+[#1702]: https://github.com/cortexapps/engrams/pull/1702
+[#1703]: https://github.com/cortexapps/engrams/pull/1703
+[#1709]: https://github.com/cortexapps/engrams/pull/1709
+[#1711]: https://github.com/cortexapps/engrams/pull/1711
+[#1713]: https://github.com/cortexapps/engrams/pull/1713
+[#1714]: https://github.com/cortexapps/engrams/pull/1714
+[#1716]: https://github.com/cortexapps/engrams/pull/1716
+[#1717]: https://github.com/cortexapps/engrams/pull/1717
+[#1719]: https://github.com/cortexapps/engrams/pull/1719
+[#1728]: https://github.com/cortexapps/engrams/pull/1728
+[#1730]: https://github.com/cortexapps/engrams/pull/1730
+[#1733]: https://github.com/cortexapps/engrams/pull/1733
+[#1734]: https://github.com/cortexapps/engrams/pull/1734
+[#1736]: https://github.com/cortexapps/engrams/pull/1736
+[#1744]: https://github.com/cortexapps/engrams/pull/1744
+[#1745]: https://github.com/cortexapps/engrams/pull/1745
+[#1750]: https://github.com/cortexapps/engrams/pull/1750
+[#1753]: https://github.com/cortexapps/engrams/pull/1753
+[#1755]: https://github.com/cortexapps/engrams/pull/1755
+[#1758]: https://github.com/cortexapps/engrams/pull/1758
+[#1759]: https://github.com/cortexapps/engrams/pull/1759
+[#1764]: https://github.com/cortexapps/engrams/pull/1764
+[#1766]: https://github.com/cortexapps/engrams/pull/1766
+[#1778]: https://github.com/cortexapps/engrams/pull/1778
+[#1782]: https://github.com/cortexapps/engrams/pull/1782
+[#1783]: https://github.com/cortexapps/engrams/pull/1783
+[#1784]: https://github.com/cortexapps/engrams/pull/1784
+[#1788]: https://github.com/cortexapps/engrams/pull/1788
+[#1789]: https://github.com/cortexapps/engrams/pull/1789
