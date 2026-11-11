@@ -38,9 +38,11 @@ describe("PrRefStore", () => {
         // The (repo, number) index stays for one release: a second forge
         // cannot take the same pair, and the previous build's conflict
         // target resolves.
-        await expect(store.upsert(input("forge-b", "same pair"))).rejects.toSatisfy(
-          isUniqueViolation,
+        const refused = await store.upsert(input("forge-b", "same pair")).then(
+          () => null,
+          (error: unknown) => error,
         );
+        expect(isUniqueViolation(refused)).toBe(true);
         await db.execute(sql`
           INSERT INTO pr_ref (id, repo, pr_number, session_id, title, url, head_branch, base_branch, observed_at)
           VALUES (${crypto.randomUUID()}, ${repo}, 7, 'session-old', 'old build', '', '', '', now())
