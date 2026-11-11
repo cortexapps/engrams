@@ -8,7 +8,16 @@ const updatePolicy = vi.hoisted(() => vi.fn());
 const refresh = vi.hoisted(() => vi.fn());
 const putSecret = vi.hoisted(() => vi.fn());
 const invalidate = vi.hoisted(() => vi.fn());
-const updateSettings = vi.hoisted(() => vi.fn());
+/** The saves in flight, in call order: a test settles each one. */
+const saves = vi.hoisted(
+  () => [] as Array<{ resolve: () => void; reject: (cause: Error) => void }>,
+);
+const updateSettings = vi.hoisted(() =>
+  vi.fn(
+    (_request: Record<string, string>) =>
+      new Promise<void>((resolve, reject) => saves.push({ resolve, reject })),
+  ),
+);
 
 vi.mock("@/hooks/useModelRouters", () => ({
   useModelRouters: () => ({
@@ -59,7 +68,7 @@ vi.mock("@/hooks/useModelRouters", () => ({
   }),
   useRefreshRouterModels: () => ({ mutate: refresh, isPending: false, error: null }),
   useUpdateRouterModelPolicy: () => ({ mutate: updatePolicy, isPending: false }),
-  useUpdateModelRouterSettings: () => ({ mutate: updateSettings, isPending: false, error: null }),
+  useUpdateModelRouterSettings: () => ({ mutateAsync: updateSettings, isPending: false }),
   useInvalidateRouter: () => invalidate,
 }));
 
@@ -74,6 +83,7 @@ afterEach(() => {
   putSecret.mockClear();
   invalidate.mockClear();
   updateSettings.mockClear();
+  saves.length = 0;
 });
 
 describe("ModelRoutersPanel", () => {
@@ -103,16 +113,13 @@ describe("ModelRoutersPanel", () => {
 
     const title = screen.getByLabelText("Title model");
     await userEvent.type(title, "deepseek/deepseek-v4-pro-0813{Enter}");
-    expect(updateSettings).toHaveBeenCalledWith(
-      { routerId: "openrouter", titleModel: "deepseek/deepseek-v4-pro-0813" },
-      expect.anything(),
-    );
+    expect(updateSettings).toHaveBeenCalledWith({
+      routerId: "openrouter",
+      titleModel: "deepseek/deepseek-v4-pro-0813",
+    });
     // The typed value stays until the save succeeds.
     expect((title as HTMLInputElement).value).toBe("deepseek/deepseek-v4-pro-0813");
-    act(() => {
-      updateSettings.mock.calls[0]![1].onSuccess();
-      updateSettings.mock.calls[0]![1].onSettled();
-    });
+    await act(async () => saves[0]!.resolve());
 
     const decision = screen.getByLabelText("Decision model");
     expect((decision as HTMLInputElement).value).toBe("jev");
@@ -121,10 +128,7 @@ describe("ModelRoutersPanel", () => {
     expect(updateSettings).toHaveBeenCalledTimes(1);
     await userEvent.clear(decision);
     await userEvent.tab();
-    expect(updateSettings).toHaveBeenLastCalledWith(
-      { routerId: "openrouter", decisionModel: "" },
-      expect.anything(),
-    );
+    expect(updateSettings).toHaveBeenLastCalledWith({ routerId: "openrouter", decisionModel: "" });
   });
 
   test("a save in flight is not sent twice, and does not hold back another field", async () => {
@@ -142,12 +146,30 @@ describe("ModelRoutersPanel", () => {
     ]);
   });
 
+  test("a save that fails while another field saves shows its error and can be sent again", async () => {
+    render(<ModelRoutersPanel />);
+
+    const title = screen.getByLabelText("Title model") as HTMLInputElement;
+    await userEvent.type(title, "bad-model{Enter}");
+    const decision = screen.getByLabelText("Decision model");
+    await userEvent.clear(decision);
+    await userEvent.tab();
+    await act(async () => saves[0]!.reject(new Error("unknown model")));
+    await act(async () => saves[1]!.resolve());
+
+    expect(title.value).toBe("bad-model");
+    expect(screen.getByText(/Could not save — unknown model/)).toBeTruthy();
+    await userEvent.click(title);
+    await userEvent.tab();
+    expect(updateSettings).toHaveBeenCalledTimes(3);
+  });
+
   test("a failed save keeps the typed value and sends it again on the next blur", async () => {
     render(<ModelRoutersPanel />);
 
     const title = screen.getByLabelText("Title model") as HTMLInputElement;
     await userEvent.type(title, "model-a{Enter}");
-    act(() => updateSettings.mock.calls[0]![1].onSettled());
+    await act(async () => saves[0]!.reject(new Error("no")));
     expect(title.value).toBe("model-a");
     await userEvent.tab();
     expect(updateSettings).toHaveBeenCalledTimes(2);
@@ -164,10 +186,7 @@ describe("ModelRoutersPanel", () => {
     const title = screen.getByLabelText("Title model") as HTMLInputElement;
     await userEvent.type(title, "model-a{Enter}");
     await userEvent.type(title, "b");
-    act(() => {
-      updateSettings.mock.calls[0]![1].onSuccess();
-      updateSettings.mock.calls[0]![1].onSettled();
-    });
+    await act(async () => saves[0]!.resolve());
     expect(title.value).toBe("model-ab");
   });
 });

@@ -105,7 +105,7 @@ import { makeIntegrationConnectionStore } from "./db/integration-connections.ts"
 import { makeIntegrationEventStore } from "./db/integration-events.ts";
 import { registerAutomationDraftTools } from "./tools/automation-draft.ts";
 import { makeConnectorStore } from "./db/connectors.ts";
-import { declaredIngress, loadRegistry } from "./connectors/registry.ts";
+import { connectorRegistry, interactivityPath, loadRegistry } from "./connectors/registry.ts";
 import { tools } from "./tools/registry.ts";
 import { makeSessionFilesRoute } from "./routes/session-files.ts";
 import { makeSpecsRoute, PostgresSpecReadStore } from "./routes/specs.ts";
@@ -438,13 +438,20 @@ app.route("/", integrationOpRoute);
 app.route("/", integrationOauthRoute);
 // Provider event webhooks, verified against each connector's declared ingress.
 app.route("/", integrationEventsRoute);
-for (const spec of chatSpecs()) {
-  const declared = declaredIngress(spec.provider)?.ingress.interactivity === true;
-  if (declared !== (spec.interactivity !== undefined)) {
-    throw new Error(`chat provider "${spec.provider}": the connector and the provider disagree on interactivity`);
+// A connector that declares interactivity makes the path public, so a
+// handler must be behind it, and a handler needs the declaration.
+const interactivity = new Map(chatSpecs().map((spec) => [spec.provider, spec.interactivity]));
+for (const [provider, connector] of connectorRegistry()) {
+  const declared = connector.webhook?.ingress?.interactivity === true;
+  const route = interactivity.get(provider);
+  if (declared !== (route !== undefined)) {
+    throw new Error(`"${provider}": the connector and the chat provider disagree on interactivity`);
   }
-  if (spec.interactivity) {
-    app.route(`/api/v1/integrations/${spec.provider}/interactivity`, spec.interactivity());
+  if (route) app.route(interactivityPath(provider), route());
+}
+for (const provider of interactivity.keys()) {
+  if (!connectorRegistry().has(provider)) {
+    throw new Error(`chat provider "${provider}" has no built-in connector`);
   }
 }
 // ADR 0102: dynamically registered webhooks verify their own registration

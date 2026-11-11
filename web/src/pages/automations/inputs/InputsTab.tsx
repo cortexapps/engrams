@@ -42,10 +42,16 @@ export function InputsTab({ automationId }: InputsTabProps) {
   const automation = query.data?.automation;
   const setInputs = useSetInputs();
 
-  const schema = useMemo(
-    () => parseInputsSchema(parseDefinition(automation?.version?.definitionJson).inputsSchema),
+  const definition = useMemo(
+    () => parseDefinition(automation?.version?.definitionJson),
     [automation],
   );
+  const schema = useMemo(() => parseInputsSchema(definition.inputsSchema), [definition]);
+  const connectionId =
+    definition.trigger.kind === "integration" &&
+    typeof definition.trigger["connectionId"] === "string"
+      ? definition.trigger["connectionId"]
+      : undefined;
   const stored = useMemo(
     () => resolveInputValues(schema, parseInputsJson(automation?.inputsJson)),
     [schema, automation],
@@ -147,6 +153,7 @@ export function InputsTab({ automationId }: InputsTabProps) {
           errors={errors.filter((e) => e.key === spec.key)}
           onChange={(next) => update(spec.key, next)}
           disabled={setInputs.isPending}
+          connectionId={connectionId}
         />
       ))}
 

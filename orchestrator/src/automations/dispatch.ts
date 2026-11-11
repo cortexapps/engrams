@@ -988,12 +988,10 @@ export async function dispatchIntegrationEvent(
       }
     }
   }
-  // The suppression VERDICT is a property of the delivery, not of which
-  // brains happen to be enabled: record it whenever ownership held, so the
-  // legacy route stands down even when the built-in is not a target (the
-  // owner may be the built-in brain's own thread — the legacy brain still
-  // has no business in it). The per-target loop below skips the matched
-  // built-in only when ANOTHER automation's workstream owns the thread.
+  // The suppression verdict is a property of the delivery: it is recorded
+  // whenever a workstream owns the thread, also when the built-in is not a
+  // target. The per-target loop below skips the matched built-in only when
+  // another automation's workstream owns the thread.
   const catchAllIds = new Set(
     targets
       .filter(({ target }) => target.automation.builtinKey === catchAll)

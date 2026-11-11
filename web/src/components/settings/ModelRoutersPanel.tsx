@@ -28,6 +28,7 @@ import {
 } from "@/hooks/useModelRouters";
 import type { ModelRouter, RouterModel } from "@/gen/engram/app/v1/model_router_pb";
 import { EmptyState } from "@/components/empty-state";
+import { errorMessage } from "@/lib/errors";
 import { SkeletonRows } from "@/components/skeleton-rows";
 
 export function ModelRoutersPanel() {
@@ -156,9 +157,7 @@ function RouterCard({ router }: { router: ModelRouter }) {
                 help={help}
                 stored={router[field]}
                 models={models}
-                onSave={(model, done) =>
-                  settings.mutate({ routerId: router.id, [field]: model }, done)
-                }
+                onSave={(model) => settings.mutateAsync({ routerId: router.id, [field]: model })}
               />
             ))}
           </div>
@@ -182,9 +181,9 @@ function RouterCard({ router }: { router: ModelRouter }) {
               Last refresh failed: {router.lastSyncError}
             </EmptyState>
           )}
-          {(putSecret.error || refresh.error || settings.error) && (
+          {(putSecret.error || refresh.error) && (
             <EmptyState tone="error" inline className="mt-2">
-              {String(putSecret.error ?? refresh.error ?? settings.error)}
+              {String(putSecret.error ?? refresh.error)}
             </EmptyState>
           )}
         </div>
@@ -246,9 +245,12 @@ function RoleModelField({
   help: string;
   stored: string;
   models: RouterModel[];
-  onSave: (model: string, done: { onSuccess: () => void; onSettled: () => void }) => void;
+  onSave: (model: string) => Promise<unknown>;
 }) {
   const [draft, setDraft] = useState<string | null>(null);
+  // The fields share one mutation, whose state is that of its last call.
+  // So each field holds the result of its own save.
+  const [error, setError] = useState<string | null>(null);
   // The value of this field's save in flight: a blur after Enter must not
   // send it again. Another field, or a newer value, saves on its own.
   const sent = useRef<string | null>(null);
@@ -260,12 +262,15 @@ function RoleModelField({
       return;
     }
     sent.current = next;
-    onSave(next, {
-      onSuccess: () => setDraft((now) => (now?.trim() === next ? null : now)),
-      onSettled: () => {
+    setError(null);
+    onSave(next)
+      .then(
+        () => setDraft((now) => (now?.trim() === next ? null : now)),
+        (cause: unknown) => setError(errorMessage(cause)),
+      )
+      .finally(() => {
         if (sent.current === next) sent.current = null;
-      },
-    });
+      });
   };
   return (
     <div className="space-y-1">
@@ -293,6 +298,11 @@ function RoleModelField({
           ))}
       </datalist>
       <p className="text-xs text-muted-foreground">{help}</p>
+      {error && (
+        <EmptyState tone="error" inline>
+          Could not save — {error}
+        </EmptyState>
+      )}
     </div>
   );
 }

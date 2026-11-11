@@ -154,6 +154,12 @@ export async function retryAutomationReview(
   }
   // The built-in whose enrolment the caller checked.
   const { builtin } = await requireBuiltin(store, provider);
+  // The trigger of another automation's run means nothing to the built-in.
+  if (original.automationId !== builtin.id) {
+    throw new RetryAutomationError(
+      "another automation wrote this review; start the review again from that automation",
+    );
+  }
   const definition = effectiveDefinition(builtin.version, builtin.blockOverrides);
 
   const deliveryKey = `retry:${randomUUID()}`;

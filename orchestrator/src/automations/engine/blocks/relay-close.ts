@@ -1,7 +1,8 @@
 /** `relay_close` — the closing message of a relayed session, for a
- * `settings.onFinalize` hook (ADR 0119). Renders the run's terminal state into the relayed place
- * through the chat provider's policy, then removes the session's relay (a
- * later run re-installs it):
+ * `settings.onFinalize` hook (ADR 0119). Renders the run's terminal state
+ * into the relayed place through the chat provider's policy, then removes
+ * the session's relay (a later run re-installs it). A failed post keeps the
+ * relay until the session ends:
  *
  *   completed          → onComplete (✅, last message, asset recap)
  *   failed | deadline  → onFail (❌ + the run's error)

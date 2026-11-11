@@ -116,7 +116,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 import { auth } from "./better-auth.ts";
 import { config } from "../config.ts";
-import { declaredIngress } from "../connectors/registry.ts";
+import { declaredIngress, interactivityPath } from "../connectors/registry.ts";
 import { extractApiKey } from "./api-key-header.ts";
 
 // ---------------------------------------------------------------------------
@@ -127,7 +127,7 @@ import { extractApiKey } from "./api-key-header.ts";
  * Paths the bridge lets through WITHOUT any IAP/session check — matched
  * exactly against the path component (query string stripped).
  *
- * Two categories live here:
+ * Three categories live here:
  *
  *   1. Health/readiness probes. kubelet readiness probes and GCP LB health
  *      checks hit the orchestrator directly, bypassing IAP, so they carry no
@@ -139,7 +139,8 @@ import { extractApiKey } from "./api-key-header.ts";
  *      session cookie, and reach the orchestrator through a no-IAP load
  *      balancer backend. Each route verifies the provider's own signature and
  *      answers 401 itself. A provider's event path is public when its
- *      connector declares a webhook ingress. Dynamic automation hooks require
+ *      connector declares a webhook ingress, and its interactivity path
+ *      when the ingress declares interactivity. Dynamic automation hooks require
  *      POST plus exactly one validated registration slug; the load balancer's
  *      broader prefix rule is not the authorization boundary. A path must
  *      also be in the deployment's ingress path list: exempted in only one
@@ -168,17 +169,17 @@ const PUBLIC_GET_PATHS: ReadonlySet<string> = new Set([
 ]);
 
 const EVENT_PATH_RE = /^\/api\/v1\/integrations\/([a-z0-9_]+)\/events$/;
-const INTERACTIVITY_PATH_RE = /^\/api\/v1\/integrations\/([a-z0-9_]+)\/interactivity$/;
 const HOOK_PATH_RE = /^\/api\/v1\/hooks\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 /** Pure seam for exact-path public ingress tests (query strings are ignored). */
 export function isIapPublicPath(url: string, method = "GET"): boolean {
   const path = url.split("?", 1)[0] ?? "/";
   const eventProvider = EVENT_PATH_RE.exec(path)?.[1];
-  const chatProvider = INTERACTIVITY_PATH_RE.exec(path)?.[1];
+  // The provider of any `/api/v1/integrations/<provider>/...` path.
+  const provider = path.split("/")[4] ?? "";
   return PUBLIC_PATHS.has(path) ||
     (eventProvider !== undefined && declaredIngress(eventProvider) !== undefined) ||
-    (chatProvider !== undefined && declaredIngress(chatProvider)?.ingress.interactivity === true) ||
+    (path === interactivityPath(provider) && declaredIngress(provider)?.ingress.interactivity === true) ||
     (method === "GET" && PUBLIC_GET_PATHS.has(path)) ||
     (method === "POST" && HOOK_PATH_RE.test(path));
 }

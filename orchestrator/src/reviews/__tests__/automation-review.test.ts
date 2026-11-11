@@ -130,6 +130,14 @@ describe("retryAutomationReview", () => {
     expect(h.started).toEqual([runId]);
   });
 
+  test("refuses a review that another automation wrote", async () => {
+    const h = harness({ ...originalRun(), automationId: "user-automation" });
+    await expect(retryAutomationReview("autorun:b1:github:d1", "github", h.deps)).rejects.toThrow(
+      /another automation wrote this review/,
+    );
+    expect(h.admitted).toEqual([]);
+  });
+
   test("throws when the original run no longer exists", async () => {
     const h = harness(null);
     await expect(retryAutomationReview("gone", "github", h.deps)).rejects.toBeInstanceOf(RetryAutomationError);

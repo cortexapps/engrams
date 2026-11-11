@@ -86,7 +86,7 @@ function isPermanentError(error: unknown): boolean {
 
 /** The id of a review that is posted. A body that cannot be read gives no
  * id; it must not fail the post. */
-function reviewIdFrom(result: IntegrationOpResult): string | undefined {
+function reviewIdFrom(result: IntegrationOpResult, repo: string, prNumber: number): string | undefined {
   let value: unknown;
   try {
     value = JSON.parse(decodeBody(result.body));
@@ -95,7 +95,10 @@ function reviewIdFrom(result: IntegrationOpResult): string | undefined {
   }
   const id = isObject(value) ? value["id"] : undefined;
   if (typeof id === "string" || typeof id === "number") return String(id);
-  log.warn({ status: result.status, truncated: result.truncated }, "a posted review returned no readable id");
+  log.warn(
+    { repo, prNumber, status: result.status, truncated: result.truncated },
+    "a posted review returned no readable id",
+  );
   return undefined;
 }
 
@@ -259,7 +262,7 @@ export function makeGithubForge(
           response,
         );
       }
-      const providerReviewId = reviewIdFrom(response);
+      const providerReviewId = reviewIdFrom(response, input.repo, input.prNumber);
       return {
         ...(providerReviewId ? { providerReviewId } : {}),
         posted: true,

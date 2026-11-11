@@ -471,7 +471,7 @@ export interface WebhookIngressSpec {
     | "gitlab_webhook";
   secretRef: string;
   /** The provider also sends card clicks, signed the same way, to
-   * `/api/v1/integrations/<provider>/interactivity`. The path takes
+   * `interactivityPath(provider)`. The path takes
    * requests with no login. */
   interactivity?: true;
 }
@@ -2575,6 +2575,12 @@ function loadFromDisk(): Map<string, Connector> {
 export function connectorRegistry(): Map<string, Connector> {
   if (cachedRegistry === null) cachedRegistry = loadFromDisk();
   return cachedRegistry;
+}
+
+/** Where a chat provider's card clicks arrive. The route mount and the
+ * public-path rule both read it. */
+export function interactivityPath(provider: string): string {
+  return `/api/v1/integrations/${provider}/interactivity`;
 }
 
 /** The ingress a built-in connector declares, if any. */

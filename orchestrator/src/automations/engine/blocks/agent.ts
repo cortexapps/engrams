@@ -26,18 +26,21 @@
  * `close_agent` — the step a `close` way in ends on: post the closing
  * message into the agent's relayed place and remove the relay, end the
  * kept session, then close the workstream (admission drops later events
- * for it).
+ * for it). A closing message that cannot be posted does not stop the rest.
  */
 
 import { z } from "zod";
 
 import { terminalOutcomeForStatus } from "../../../control-plane/session-events.ts";
 import { sessionWebUrl } from "../../../links.ts";
+import { log as rootLog } from "../../../log.ts";
 import { closeRelay, installSessionRelay, type InstallSessionRelayInput } from "../../session-relay.ts";
 import { sessionRefSchema } from "../definition.ts";
 import type { RunContext } from "../context.ts";
 import { registerBlock, type BlockOutcome } from "./registry.ts";
 import { installRelayForSession, mentionFromRelayConfig, relayConfigSchema } from "./relay.ts";
+
+const log = rootLog.child({ component: "agent-block" });
 import { createSessionConfigSchema, executeCreateSession, renderSessionPrompt } from "./session.ts";
 import { errorMessage } from "../errors.ts";
 
@@ -252,7 +255,13 @@ async function executeClose(config: CloseAgentConfig, ctx: RunContext): Promise<
     const relays = ctx.deps.relays;
     const row = relays ? await relays.get(previous.sessionId) : null;
     if (relays && row !== null) {
-      await closeRelay(row, { kind: "neutral", message: reason ?? "This agent was closed." }, { store: relays });
+      try {
+        await closeRelay(row, { kind: "neutral", message: reason ?? "This agent was closed." }, { store: relays });
+      } catch (error) {
+        // The place can be gone for good (an archived channel). The session
+        // still ends, and its end removes the relay.
+        log.warn({ err: error, sessionId: previous.sessionId }, "the closing message of an agent was not posted");
+      }
     }
     await ctx.deps.sessions.endSession(previous.sessionId);
     ended = true;
