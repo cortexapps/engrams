@@ -10,6 +10,7 @@ import {
 import {
   makeVerificationSecretResolver,
   resetVerificationSecretCache,
+  verifyIngress,
   verifyWebhook,
 } from "../verify.ts";
 
@@ -30,9 +31,6 @@ function digest(value: string | Uint8Array): string {
 }
 
 describe("webhook verification strategies", () => {
-  // Only the generic scheme survives ADR 0119 D5; the provider schemes
-  // (github_hmac_sha256, slack_v0) are verified on the integration ingress
-  // routes and can no longer be stored on a registration.
   test("generic_hmac_sha256 accepts a valid signature", () => {
     expect(verify("generic_hmac_sha256", {
       "x-engrams-signature-256": `sha256=${digest(BODY)}`,
@@ -50,6 +48,69 @@ describe("webhook verification strategies", () => {
     expect(verify("generic_hmac_sha256", {
       "x-hub-signature-256": `sha256=${digest(BODY)}`,
     })).toBe(false);
+  });
+});
+
+describe("provider ingress verification", () => {
+  const NOW = new Date("2026-08-21T12:00:00Z");
+  const seconds = String(Math.floor(NOW.getTime() / 1000));
+
+  function ingress(
+    scheme: "github_hmac_sha256" | "slack_v0" | "linear_hmac_sha256" | "svix_hmac_sha256",
+    headers: Record<string, string>,
+    secret = SECRET,
+  ): Promise<boolean> {
+    return verifyIngress({
+      provider: "example",
+      ingress: { scheme, secretRef: "example.webhook_secret" },
+      headers: new Headers(headers),
+      rawBody: BODY,
+      secrets: { resolve: async () => secret },
+      now: NOW,
+    });
+  }
+
+  test("github_hmac_sha256 reads the prefixed X-Hub-Signature-256", async () => {
+    const header = "x-hub-signature-256";
+    expect(await ingress("github_hmac_sha256", { [header]: `sha256=${digest(BODY)}` })).toBe(true);
+    expect(await ingress("github_hmac_sha256", { [header]: `sha256=${digest("other")}` })).toBe(false);
+    expect(await ingress("github_hmac_sha256", { [header]: "sha256=short" })).toBe(false);
+    expect(await ingress("github_hmac_sha256", { [header]: encodeURI("💥") })).toBe(false);
+    expect(await ingress("github_hmac_sha256", {})).toBe(false);
+  });
+
+  test("linear_hmac_sha256 reads the bare hex Linear-Signature", async () => {
+    expect(await ingress("linear_hmac_sha256", { "linear-signature": digest(BODY) })).toBe(true);
+    expect(await ingress("linear_hmac_sha256", { "linear-signature": `sha256=${digest(BODY)}` }))
+      .toBe(false);
+    expect(await ingress("linear_hmac_sha256", {})).toBe(false);
+  });
+
+  test("slack_v0 signs the timestamp with the body and refuses a stale one", async () => {
+    const sign = (ts: string) => ({
+      "x-slack-request-timestamp": ts,
+      "x-slack-signature": `v0=${digest(Buffer.concat([Buffer.from(`v0:${ts}:`), BODY]))}`,
+    });
+    expect(await ingress("slack_v0", sign(seconds))).toBe(true);
+    expect(await ingress("slack_v0", sign(String(Number(seconds) - 3600)))).toBe(false);
+    expect(await ingress("slack_v0", {})).toBe(false);
+  });
+
+  test("svix_hmac_sha256 signs id, timestamp, and body under the decoded secret", async () => {
+    const key = Buffer.from("svix-test-key");
+    const secret = `whsec_${key.toString("base64")}`;
+    const sign = (ts: string) => ({
+      "svix-id": "msg_1",
+      "svix-timestamp": ts,
+      "svix-signature": `v1,${createHmac("sha256", key)
+        .update(`msg_1.${ts}.`)
+        .update(BODY)
+        .digest("base64")}`,
+    });
+    expect(await ingress("svix_hmac_sha256", sign(seconds), secret)).toBe(true);
+    expect(await ingress("svix_hmac_sha256", sign(String(Number(seconds) - 3600)), secret))
+      .toBe(false);
+    expect(await ingress("svix_hmac_sha256", {}, secret)).toBe(false);
   });
 });
 

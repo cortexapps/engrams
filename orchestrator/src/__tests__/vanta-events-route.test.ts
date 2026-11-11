@@ -6,7 +6,8 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 
-import { makeVantaEventsRoute, vantaEventKey } from "../routes/vanta-events.ts";
+import { makeIntegrationEventsRoute } from "../routes/integration-events.ts";
+import { vantaEventKey, vantaEventSource } from "../providers/vanta/events.ts";
 import type { RecordIntegrationEventInput } from "../db/integration-events.ts";
 
 const RAW_SECRET = Buffer.from("vanta-test-signing-secret-bytes");
@@ -28,7 +29,8 @@ async function deliver(
 ): Promise<Delivered> {
   const recorded: RecordIntegrationEventInput[] = [];
   const body = JSON.stringify(payload);
-  const app = makeVantaEventsRoute({
+  const app = makeIntegrationEventsRoute({
+    sources: [vantaEventSource],
     secrets: { resolve: async () => SECRET },
     now: () => NOW,
     ingress: {
@@ -119,7 +121,8 @@ describe("vanta ingress", () => {
     const body = JSON.stringify({ type: "v1.evidence.created", evidence: { id: "e1" } });
     const id = "msg_multi";
     const timestamp = String(Math.floor(NOW.getTime() / 1000));
-    const app = makeVantaEventsRoute({
+    const app = makeIntegrationEventsRoute({
+      sources: [vantaEventSource],
       secrets: { resolve: async () => SECRET },
       now: () => NOW,
       ingress: {

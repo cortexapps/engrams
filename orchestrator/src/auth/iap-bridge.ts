@@ -116,6 +116,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 import { auth } from "./better-auth.ts";
 import { config } from "../config.ts";
+import { declaredIngress } from "../connectors/registry.ts";
 import { extractApiKey } from "./api-key-header.ts";
 
 // ---------------------------------------------------------------------------
@@ -134,26 +135,15 @@ import { extractApiKey } from "./api-key-header.ts";
  *      (401), which would mark the pod / backend perpetually unhealthy.
  *      /healthz only reports {ok, db}, so it is unauthenticated by design.
  *
- *   2. Inbound provider webhooks (ADR 0060/0100/0119). Slack, GitHub and
- *      Linear POSTs carry no IAP assertion and no session cookie — in prod
- *      they reach the orchestrator through a no-IAP GCLB backend (see
- *      deploy/helm values-iap overlay), so the fail-closed path would 401
- *      them before the handler runs. These routes do NOT rely on the bridge
- *      for auth: each verifies the provider's own signature (Slack signing
- *      secret + timestamp window, GitHub's X-Hub-Signature-256 HMAC, or
- *      Linear's hex Linear-Signature HMAC plus a webhookTimestamp replay
- *      window) and rejects a bad signature with 401 itself. The bridge would
- *      only get in the way, so we exempt the exact webhook paths. Dynamic
- *      automation hooks additionally require POST plus exactly one validated
- *      registration slug; the load balancer's broader Prefix rule is not
- *      trusted as the application authorization boundary.
- *      The strings must stay in lockstep with the routes' `app.post(...)`
- *      paths in orchestrator/src/routes/{slack-events,slack-interactivity,
- *      github-events,linear-events,hooks}.ts — AND with the ingress path list
- *      in the deploy repo's values. A path exempted in only one of the two
- *      places stays closed: the GCLB answers "Invalid IAP credentials: empty
- *      token" before the pod is ever reached, which is how the Linear route
- *      shipped dark (prod 2026-08-29: zero Linear deliveries ever ledgered).
+ *   2. Inbound provider webhooks. They carry no IAP assertion and no
+ *      session cookie, and reach the orchestrator through a no-IAP load
+ *      balancer backend. Each route verifies the provider's own signature and
+ *      answers 401 itself. A provider's event path is public when its
+ *      connector declares a webhook ingress. Dynamic automation hooks require
+ *      POST plus exactly one validated registration slug; the load balancer's
+ *      broader prefix rule is not the authorization boundary. A path must
+ *      also be in the deployment's ingress path list: exempted in only one
+ *      place, it stays closed at the load balancer.
  *
  *   3. The device-authorization CLI endpoints (`engrams auth login`). The CLI
  *      requests a code and polls for the token from a bare terminal — no IAP
@@ -168,10 +158,7 @@ import { extractApiKey } from "./api-key-header.ts";
  */
 const PUBLIC_PATHS: ReadonlySet<string> = new Set([
   "/healthz",
-  "/api/v1/integrations/slack/events",
   "/api/v1/integrations/slack/interactivity",
-  "/api/v1/integrations/github/events",
-  "/api/v1/integrations/linear/events",
   "/api/auth/device/code",
   "/api/auth/device/token",
 ]);
@@ -181,12 +168,15 @@ const PUBLIC_GET_PATHS: ReadonlySet<string> = new Set([
   "/api/v1/integrations/google-cloud/oidc/jwks",
 ]);
 
+const EVENT_PATH_RE = /^\/api\/v1\/integrations\/([a-z0-9_]+)\/events$/;
 const HOOK_PATH_RE = /^\/api\/v1\/hooks\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 /** Pure seam for exact-path public ingress tests (query strings are ignored). */
 export function isIapPublicPath(url: string, method = "GET"): boolean {
   const path = url.split("?", 1)[0] ?? "/";
+  const eventProvider = EVENT_PATH_RE.exec(path)?.[1];
   return PUBLIC_PATHS.has(path) ||
+    (eventProvider !== undefined && declaredIngress(eventProvider) !== undefined) ||
     (method === "GET" && PUBLIC_GET_PATHS.has(path)) ||
     (method === "POST" && HOOK_PATH_RE.test(path));
 }

@@ -20,7 +20,7 @@ const ROUTE = { team: "T1", channel: "C1", threadRoot: "100.0" };
 function makeApp() {
   const calls: { answers: unknown[]; modals: unknown[] } = { answers: [], modals: [] };
   const app = makeSlackInteractivityRoute({
-    signingSecret: async () => SECRET,
+    secrets: { resolve: async () => SECRET },
     deliverAnswer: async (route, answer) => void calls.answers.push({ route, answer }),
     openModal: async (triggerId, view) => void calls.modals.push({ triggerId, view }),
   });

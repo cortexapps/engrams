@@ -5,8 +5,7 @@
  *
  * The single inbound surface for AskUserQuestion answers: an inline option
  * click, an "Answer…" click (→ open the answer modal), or the modal submission.
- * Verifies every request with the SDK's `isValidSlackRequest` over the raw form
- * body, classifies the `payload` field via the Block Kit contract, and:
+ * Verifies every request against the connector's declared ingress, classifies the `payload` field via the Block Kit contract, and:
  *   - answer to a session's question (the route carries `sessionId`, contract
  *     5) → completes the session's tool call through the session relay;
  *   - answer to a run's `slack_choice` card (the route carries `runId`) → a
@@ -21,11 +20,10 @@
 
 import { Hono } from "hono";
 import { DBOS } from "@dbos-inc/dbos-sdk";
-import { isValidSlackRequest } from "@slack/bolt";
 import type { ModalView } from "@slack/types";
 
 import { log as rootLog } from "../log.ts";
-import { getSlackClient, getSlackSigningSecret } from "../integrations/slack.ts";
+import { getSlackClient } from "../integrations/slack.ts";
 import { parseInteractivity, type ThreadRoute } from "../integrations/slack-blocks.ts";
 import type { SourceAnswer } from "../workflows/communication-policy.ts";
 import {
@@ -33,10 +31,16 @@ import {
   assertIdempotencyKey,
   type AutomationInbox,
 } from "../automations/engine/inbox.ts";
+import {
+  makeVerificationSecretResolver,
+  verifyIngress,
+  type VerificationSecretResolver,
+} from "../automations/verify.ts";
+import { declaredIngress } from "../connectors/registry.ts";
 import { CHOICE_ID_PREFIX, SLACK_ANSWER_SIGNAL, deliverSessionAnswer } from "../automations/session-relay.ts";
 
 export interface SlackInteractivityDeps {
-  signingSecret?: () => Promise<string>;
+  secrets?: VerificationSecretResolver;
   /** Deliver an answer to the run whose relay posted the question. Default =
    *  DBOS.send of a `slack_answer` signal (idempotent on tool_call_id). */
   deliverAnswer?: (route: ThreadRoute, answer: SourceAnswer) => Promise<void>;
@@ -113,24 +117,26 @@ async function defaultOpenModal(triggerId: string, view: ModalView): Promise<voi
 const log = rootLog.child({ component: "slack" });
 
 export function makeSlackInteractivityRoute(deps: SlackInteractivityDeps = {}): Hono {
-  const signingSecret = deps.signingSecret ?? getSlackSigningSecret;
+  const secrets = deps.secrets ?? makeVerificationSecretResolver();
+  const declared = declaredIngress("slack");
+  if (!declared) throw new Error("the slack connector declares no webhook ingress");
   const deliverAnswer = deps.deliverAnswer ?? defaultDeliverAnswer;
   const openModal = deps.openModal ?? defaultOpenModal;
   const app = new Hono();
 
   app.post("/api/v1/integrations/slack/interactivity", async (c) => {
-    const rawBody = await c.req.text();
-    const valid = isValidSlackRequest({
-      signingSecret: await signingSecret(),
-      body: rawBody,
-      headers: {
-        "x-slack-signature": c.req.header("x-slack-signature") ?? "",
-        "x-slack-request-timestamp": Number(c.req.header("x-slack-request-timestamp") ?? 0),
-      },
+    const rawBody = new Uint8Array(await c.req.arrayBuffer());
+    const valid = await verifyIngress({
+      provider: "slack",
+      ingress: declared.ingress,
+      headers: c.req.raw.headers,
+      rawBody,
+      secrets,
+      now: new Date(),
     });
     if (!valid) return c.json({ error: "invalid signature" }, 401);
 
-    const payload = new URLSearchParams(rawBody).get("payload") ?? "";
+    const payload = new URLSearchParams(new TextDecoder().decode(rawBody)).get("payload") ?? "";
     const action = parseInteractivity(payload);
     switch (action.kind) {
       case "answer":

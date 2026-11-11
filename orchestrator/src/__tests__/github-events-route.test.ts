@@ -3,14 +3,36 @@ import { describe, expect, test } from "bun:test";
 
 import type { UpsertReviewTargetInput } from "../db/reviews.ts";
 import { dispatchIntegrationEvent, type DispatchWebhookInput } from "../automations/dispatch.ts";
-import type { IntegrationEventDispatchInput } from "../automations/integration-ingress.ts";
+import type {
+  HandleDeliveryDeps,
+  IntegrationEventDispatchInput,
+} from "../automations/integration-ingress.ts";
 import type {
   IntegrationEventStore,
   RecordIntegrationEventInput,
 } from "../db/integration-events.ts";
-import { makeGithubEventsRoute } from "../routes/github-events.ts";
+import { makeIntegrationEventsRoute } from "../routes/integration-events.ts";
+import { githubEventSource, type GithubEventsDeps } from "../providers/github/events.ts";
 
 const SECRET = "github-route-secret";
+
+function makeGithubEventsRoute({
+  webhookSecret,
+  ingress,
+  now,
+  ...source
+}: GithubEventsDeps & {
+  webhookSecret: () => Promise<string>;
+  ingress: HandleDeliveryDeps;
+  now?: () => Date;
+}) {
+  return makeIntegrationEventsRoute({
+    sources: [githubEventSource(source)],
+    secrets: { resolve: webhookSecret },
+    ingress,
+    ...(now ? { now } : {}),
+  });
+}
 const PATH = "/api/v1/integrations/github/events";
 const enrollment = { repo: "openai/engrams" };
 

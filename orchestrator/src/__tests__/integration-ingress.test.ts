@@ -19,8 +19,9 @@ import type {
   IntegrationEventStore,
   RecordIntegrationEventInput,
 } from "../db/integration-events.ts";
-import { makeLinearEventsRoute } from "../routes/linear-events.ts";
-import { makeSlackEventsRoute } from "../routes/slack-events.ts";
+import { makeIntegrationEventsRoute } from "../routes/integration-events.ts";
+import { linearEventSource } from "../providers/linear/events.ts";
+import { slackEventSource } from "../providers/slack/events.ts";
 
 function fakeStore() {
   const recorded: RecordIntegrationEventInput[] = [];
@@ -216,7 +217,8 @@ function linearHeaders(body: string, overrides: Record<string, string> = {}) {
 describe("POST /api/v1/integrations/linear/events", () => {
   function linearApp() {
     const s = seams();
-    const app = makeLinearEventsRoute({
+    const app = makeIntegrationEventsRoute({
+      sources: [linearEventSource],
       secrets: { resolve: async () => LINEAR_SECRET },
       ingress: s.deps,
     });
@@ -310,8 +312,9 @@ function slackSigned(body: string) {
 describe("slack events through the spine", () => {
   function slackApp() {
     const s = seams();
-    const app = makeSlackEventsRoute({
-      signingSecret: async () => SLACK_SECRET,
+    const app = makeIntegrationEventsRoute({
+      sources: [slackEventSource],
+      secrets: { resolve: async () => SLACK_SECRET },
       ingress: s.deps,
     });
     return { ...s, app };

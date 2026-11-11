@@ -22,6 +22,12 @@ describe("GitHub webhook IAP exemption", () => {
     expect(isIapPublicPath("/api/v1/integrations/linear")).toBe(false);
   });
 
+  test("an event path is public only for a connector that declares an ingress", () => {
+    expect(isIapPublicPath("/api/v1/integrations/vanta/events", "POST")).toBe(true);
+    expect(isIapPublicPath("/api/v1/integrations/gitlab/events", "POST")).toBe(false);
+    expect(isIapPublicPath("/api/v1/integrations/unknown/events", "POST")).toBe(false);
+  });
+
   test("dynamic hooks require POST plus exactly one valid registration slug", () => {
     expect(isIapPublicPath("/api/v1/hooks/my-hook?delivery=1", "POST")).toBe(true);
     expect(isIapPublicPath("/api/v1/hooks/my-hook", "GET")).toBe(false);

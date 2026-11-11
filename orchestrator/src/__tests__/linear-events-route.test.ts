@@ -11,7 +11,8 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 
-import { makeLinearEventsRoute } from "../routes/linear-events.ts";
+import { makeIntegrationEventsRoute } from "../routes/integration-events.ts";
+import { linearEventSource } from "../providers/linear/events.ts";
 import type { RecordIntegrationEventInput } from "../db/integration-events.ts";
 
 const SECRET = "linear-test-signing-secret";
@@ -21,7 +22,8 @@ const NOW = new Date("2026-08-31T17:06:35.000Z");
 async function deliver(payload: Record<string, unknown>): Promise<RecordIntegrationEventInput> {
   const recorded: RecordIntegrationEventInput[] = [];
   const body = JSON.stringify({ ...payload, webhookTimestamp: NOW.getTime() });
-  const app = makeLinearEventsRoute({
+  const app = makeIntegrationEventsRoute({
+    sources: [linearEventSource],
     secrets: { resolve: async () => SECRET },
     now: () => NOW,
     ingress: {

@@ -2535,6 +2535,15 @@ export function connectorRegistry(): Map<string, Connector> {
   return cachedRegistry;
 }
 
+/** The ingress a built-in connector declares, if any. */
+export function declaredIngress(
+  provider: string,
+): { displayName: string; ingress: WebhookIngressSpec } | undefined {
+  const connector = connectorRegistry().get(provider);
+  const ingress = connector?.webhook?.ingress;
+  return connector && ingress ? { displayName: connector.display.name, ingress } : undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Full registry = built-in seeds ∪ admin-authored (DB) connectors (ADR 0057 C1)
 // ---------------------------------------------------------------------------

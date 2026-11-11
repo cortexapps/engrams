@@ -18,7 +18,7 @@ const PROVIDERS = "github|slack|openrouter";
 const LITERAL = new RegExp(`["'\`](${PROVIDERS})["'\`]`);
 /** An import of a module named for a provider, e.g. `../integrations/slack-policy.ts`. */
 const IMPORT = new RegExp(`from\\s+"[^"]*/(${PROVIDERS})[^"/]*"`);
-/** A module named for a provider, e.g. `routes/github-events.ts`. */
+/** A module named for a provider, e.g. `reviews/github-review.ts`. */
 const FILENAME = new RegExp(`(^|/)(${PROVIDERS})[^/]*\\.ts$`);
 
 const ALLOWED: string[] = [
@@ -44,7 +44,6 @@ const ALLOWED: string[] = [
   "db/schema.ts",
   "index.ts",
   "integrations/github-webhook.ts",
-  "integrations/github.ts",
   "integrations/openrouter-decisions.ts",
   "integrations/openrouter.ts",
   "integrations/slack-blocks.ts",
@@ -62,8 +61,6 @@ const ALLOWED: string[] = [
   "reviews/control-plane.ts",
   "reviews/github-review.ts",
   "reviews/target-hydrator.ts",
-  "routes/github-events.ts",
-  "routes/slack-events.ts",
   "routes/slack-interactivity.ts",
   "rpc/automations.ts",
   "rpc/integration.ts",

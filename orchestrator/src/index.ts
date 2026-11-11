@@ -15,11 +15,8 @@ import meRoute from "./routes/me.ts";
 import adminRoute from "./routes/admin.ts";
 import integrationOpRoute from "./routes/integration-op.ts";
 import integrationOauthRoute from "./routes/integration-oauth.ts";
-import slackEventsRoute from "./routes/slack-events.ts";
+import integrationEventsRoute from "./routes/integration-events.ts";
 import slackInteractivityRoute from "./routes/slack-interactivity.ts";
-import githubEventsRoute from "./routes/github-events.ts";
-import linearEventsRoute from "./routes/linear-events.ts";
-import vantaEventsRoute from "./routes/vanta-events.ts";
 import hooksRoute from "./routes/hooks.ts";
 import reviewsDispatchRoute from "./routes/reviews-dispatch.ts";
 import { makeGoogleOidcRoute } from "./routes/google-oidc.ts";
@@ -441,17 +438,9 @@ app.route("/", adminRoute);
 app.route("/", integrationOpRoute);
 // OAuth acquisition for connectors with an `oauth` facet (e.g. Slack "Add to Slack").
 app.route("/", integrationOauthRoute);
-// ADR 0060: Slack external-trigger webhooks (events + interactivity). Both
-// verify every request with the SDK against the slack.signing_secret org secret.
-app.route("/", slackEventsRoute);
+// Provider event webhooks, verified against each connector's declared ingress.
+app.route("/", integrationEventsRoute);
 app.route("/", slackInteractivityRoute);
-// ADR 0100: GitHub's signed webhook and the bearer-authenticated CI trigger
-// converge on the same durable per-PR workflow.
-app.route("/", githubEventsRoute);
-// Linear webhook ingress (ADR 0119 D5) — new with the integration-event ledger.
-app.route("/", linearEventsRoute);
-// Vanta webhook ingress: Svix-signed deliveries.
-app.route("/", vantaEventsRoute);
 // ADR 0102: dynamically registered webhooks verify their own registration
 // secret and dispatch one-shot AutomationRunWorkflow occurrences.
 app.route("/", hooksRoute);
