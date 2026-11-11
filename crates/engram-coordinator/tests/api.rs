@@ -254,6 +254,33 @@ async fn forge_forward_runs_the_core_for_split_hosts() {
     );
 }
 
+#[tokio::test]
+async fn forge_oauth_fetch_rejects_another_sessions_broker_token() {
+    let (app, _token_owner, _forge) = build_forge_app().await;
+    let request = engram_harness_proto::ForgeRequest {
+        session_id: SessionId::new(),
+        broker_token: "broker-tok-123".into(),
+        op: engram_harness_proto::ForgeOp::FetchOAuthCredential,
+    };
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/hosts/forge")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response.into_body()).await;
+    assert_eq!(
+        body["Error"]["message"],
+        "invalid or missing credential broker token",
+    );
+}
+
 /// Fully-wired axum router over in-memory components, exposing the
 /// pinned in-process host id (the heartbeat test targets it).
 struct TestFixture {

@@ -201,6 +201,7 @@ async fn cold_assets_actual_files_require_pinned_mutual_tls() {
                 None,
             )),
             hub.clone(),
+            Arc::new(|_| {}),
             engram_fill::FillEngine::new(chunks, engram_fill::Config::default()),
         )
         .unwrap(),

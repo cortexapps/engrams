@@ -865,7 +865,7 @@ impl HostAgent {
                     });
                 },
             );
-            pooled.set_forge_sink(forge_sink);
+            pooled.set_forge_sink(forge_sink.clone());
 
             // ADR 0026 split-mode artifact forwarding. Like forge above,
             // the upload sink can't live on the host (needs the coord's
@@ -946,6 +946,7 @@ impl HostAgent {
                     pooled.clone(),
                     self.egress.clone().expect("managed egress checked"),
                     harness_hub.clone(),
+                    forge_sink,
                     fill,
                 )
                 .map_err(|e| HostAgentError::Config(e.to_string()))?;

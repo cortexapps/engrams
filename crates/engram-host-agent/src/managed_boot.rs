@@ -3,7 +3,7 @@ use crate::{
     bindings::BindingStore, egress::HostEgress, harness::HarnessHub, managed_assets::hash_file,
 };
 use engram_core::{
-    traits::{HarnessSink, SandboxBackend},
+    traits::{ForgeSink, HarnessSink, SandboxBackend},
     types::{
         egress::SessionEgressPolicy,
         image::SecretMode,
@@ -131,14 +131,19 @@ impl Owner {
             Self::Vz(owner) => owner.check_ready(epoch).await,
         }
     }
-    async fn start(&mut self, agent: AgentSpec, sink: HarnessSink) -> Result<(), SandboxError> {
+    async fn start(
+        &mut self,
+        agent: AgentSpec,
+        sink: HarnessSink,
+        forge: ForgeSink,
+    ) -> Result<(), SandboxError> {
         match self {
             #[cfg(test)]
             Self::ExecTest(_) => panic!("unexpected execution-test lifecycle call"),
             #[cfg(target_os = "linux")]
-            Self::Firecracker(owner) => owner.start_agent(agent, sink).await,
+            Self::Firecracker(owner) => owner.start_agent(agent, sink, forge).await,
             #[cfg(target_os = "macos")]
-            Self::Vz(owner) => owner.start_agent(agent, sink).await,
+            Self::Vz(owner) => owner.start_agent(agent, sink, forge).await,
         }
     }
     fn owns(&self, request: &engram_core::types::managed_cold::ManagedColdPrepare) -> bool {
@@ -355,6 +360,7 @@ pub struct ManagedBootHost {
     ordinary: Arc<dyn SandboxBackend>,
     egress: Arc<HostEgress>,
     hub: Arc<HarnessHub>,
+    forge: ForgeSink,
     bindings: BindingStore,
     directory: PathBuf,
     fill: engram_fill::FillEngine,
@@ -369,6 +375,7 @@ impl ManagedBootHost {
         ordinary: Arc<dyn SandboxBackend>,
         egress: Arc<HostEgress>,
         hub: Arc<HarnessHub>,
+        forge: ForgeSink,
         fill: engram_fill::FillEngine,
     ) -> Result<Self, SandboxError> {
         let ManagedBootHostConfig {
@@ -391,6 +398,7 @@ impl ManagedBootHost {
             egress,
             bindings: hub.binding_store(),
             hub,
+            forge,
             directory,
             fill,
             networks: std::sync::Mutex::new(NetworkSlots::new(512)),
@@ -1299,11 +1307,11 @@ impl ManagedBootHost {
             entry.attach_owner = Some(attach_owner);
             tokio::time::timeout(
                 std::time::Duration::from_secs(210),
-                entry
-                    .owner
-                    .as_mut()
-                    .ok_or_else(|| invalid("owner"))?
-                    .start(agent, sink),
+                entry.owner.as_mut().ok_or_else(|| invalid("owner"))?.start(
+                    agent,
+                    sink,
+                    self.forge.clone(),
+                ),
             )
             .await
             .map_err(invalid)??;
@@ -2978,6 +2986,7 @@ mod tests {
                 ordinary,
                 egress,
                 hub,
+                Arc::new(|_| {}),
                 engram_fill::FillEngine::new(chunks, engram_fill::Config::default()),
             )
             .unwrap(),

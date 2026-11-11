@@ -108,6 +108,7 @@ impl PreparedManagedVz {
         &mut self,
         agent: engram_core::types::sandbox::AgentSpec,
         sink: engram_core::traits::HarnessSink,
+        forge: engram_core::traits::ForgeSink,
     ) -> Result<(), engram_core::SandboxError> {
         let epoch = agent.binding_epoch;
         self.check_ready(epoch).await?;
@@ -130,7 +131,7 @@ impl PreparedManagedVz {
             self.vm.queue_clone(),
             path,
             Some(sink),
-            None,
+            Some(forge),
             None,
         )
         .await

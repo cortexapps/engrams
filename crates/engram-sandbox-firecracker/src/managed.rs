@@ -58,6 +58,33 @@ struct Prepared {
     streams: tokio::task::JoinSet<()>,
 }
 #[cfg(any(target_os = "linux", test))]
+fn start_listeners(
+    streams: &mut tokio::task::JoinSet<()>,
+    vsock: &std::path::Path,
+    harness: engram_core::traits::HarnessSink,
+    forge: engram_core::traits::ForgeSink,
+) -> Result<(), SandboxError> {
+    let listeners = [
+        (
+            tokio::net::UnixListener::bind(crate::harness_uds_for(vsock))?,
+            harness,
+        ),
+        (
+            tokio::net::UnixListener::bind(crate::forge_uds_for(vsock))?,
+            forge,
+        ),
+    ];
+    for (listener, sink) in listeners {
+        streams.spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                sink(Box::pin(stream));
+            }
+        });
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn normalize_config(mut config: serde_json::Value) -> std::io::Result<serde_json::Value> {
     let drives = config
         .get_mut("drives")
@@ -178,6 +205,7 @@ impl PreparedManagedFc {
         &mut self,
         agent: engram_core::types::sandbox::AgentSpec,
         sink: engram_core::traits::HarnessSink,
+        forge: engram_core::traits::ForgeSink,
     ) -> Result<(), SandboxError> {
         self.check_ready(agent.binding_epoch).await?;
         if self.inner.started {
@@ -199,12 +227,7 @@ impl PreparedManagedFc {
             &vsock,
         )
         .await?;
-        let listener = tokio::net::UnixListener::bind(crate::harness_uds_for(&vsock))?;
-        self.inner.streams.spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                sink(Box::pin(stream));
-            }
-        });
+        start_listeners(&mut self.inner.streams, &vsock, sink, forge)?;
         self.inner
             .api
             .put_action(crate::client::ActionType::InstanceStart)
@@ -553,6 +576,86 @@ async fn wait_for_stop(stream: &tokio::net::UnixStream) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn managed_start_registers_broker_before_harness_and_owns_listener() {
+        use engram_harness_proto::{read_msg, write_msg, ForgeOp, ForgeRequest, ForgeResponse};
+        let sockets = tempfile::tempdir_in("/tmp").unwrap();
+        let vsock = sockets.path().join("guest.vsock");
+        let session_id = engram_core::SessionId::new();
+        let sink: engram_core::traits::ForgeSink = std::sync::Arc::new(move |mut stream| {
+            tokio::spawn(async move {
+                let request: ForgeRequest = read_msg(&mut stream).await.unwrap();
+                assert_eq!(request.session_id, session_id);
+                assert_eq!(request.broker_token, "session-broker");
+                assert!(matches!(request.op, ForgeOp::FetchOAuthCredential));
+                write_msg(
+                    &mut stream,
+                    &ForgeResponse::OAuthCredential {
+                        provider: "openai-codex".into(),
+                        version: 1,
+                        opaque_bundle: b"fixture-bundle".to_vec(),
+                    },
+                )
+                .await
+                .unwrap();
+            });
+        });
+        let mut streams = tokio::task::JoinSet::new();
+        super::start_listeners(&mut streams, &vsock, std::sync::Arc::new(|_| {}), sink).unwrap();
+        let mut guest = tokio::net::UnixStream::connect(sockets.path().join("guest.vsock_1028"))
+            .await
+            .expect("managed startup must install the credential broker listener");
+        write_msg(
+            &mut guest,
+            &ForgeRequest {
+                session_id,
+                broker_token: "session-broker".into(),
+                op: ForgeOp::FetchOAuthCredential,
+            },
+        )
+        .await
+        .unwrap();
+        let response: ForgeResponse =
+            tokio::time::timeout(std::time::Duration::from_secs(1), read_msg(&mut guest))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(matches!(
+            response,
+            ForgeResponse::OAuthCredential { version: 1, .. }
+        ));
+        drop(guest);
+        streams.shutdown().await;
+        assert!(
+            tokio::net::UnixStream::connect(sockets.path().join("guest.vsock_1028"))
+                .await
+                .is_err(),
+            "closing the managed owner must close its broker listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_bind_failure_starts_no_managed_listeners() {
+        let sockets = tempfile::tempdir_in("/tmp").unwrap();
+        let vsock = sockets.path().join("guest.vsock");
+        let _occupied =
+            tokio::net::UnixListener::bind(sockets.path().join("guest.vsock_1028")).unwrap();
+        let mut streams = tokio::task::JoinSet::new();
+        assert!(super::start_listeners(
+            &mut streams,
+            &vsock,
+            std::sync::Arc::new(|_| {}),
+            std::sync::Arc::new(|_| {}),
+        )
+        .is_err());
+        assert!(streams.is_empty());
+        assert!(
+            tokio::net::UnixStream::connect(sockets.path().join("guest.vsock_1026"))
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn configuration_comparison_ignores_only_drive_order() {
         let expected = serde_json::json!({
