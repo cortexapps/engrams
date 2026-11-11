@@ -19,7 +19,6 @@ import {
   type PriorReviewPass,
   type ReviewStore,
 } from "../db/reviews.ts";
-import { type ProfileNetwork } from "../db/schema.ts";
 import { config } from "../config.ts";
 import { log as rootLog } from "../log.ts";
 import { sessions as defaultSessions } from "../control-plane/client.ts";

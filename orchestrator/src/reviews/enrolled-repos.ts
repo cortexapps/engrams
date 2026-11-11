@@ -1,11 +1,11 @@
-/** Which repositories the PR-review built-in reviews: its `repos` input, the
+/** Which repositories a forge's code-review built-in reviews: its `repos` input, the
  * single source since ADR 0119 phase 4.7b (the `review_enrollment` table
  * that mirrored it is gone). The Repositories page writes the map through
  * `SetMapInputEntry`; the dispatcher admits a pull request by the same map;
  * this is the read the retry RPC and the CI dispatch edge make before they
  * admit a run for a repo by name. */
 
-import { reviewBuiltinKey } from "../forges/registry.ts";
+import { reviewVariantFor } from "../forges/registry.ts";
 import type { AutomationStore } from "../db/automations.ts";
 
 /** One `repos` entry as the built-in declares it. */
@@ -37,8 +37,8 @@ export function makeEnrolledRepos(
 ): EnrolledRepos {
   return {
     async get(provider, repo) {
-      const key = reviewBuiltinKey(provider);
-      const builtin = key === null ? null : await store.getByBuiltinKey(key);
+      const variant = reviewVariantFor(provider);
+      const builtin = variant === null ? null : await store.getByBuiltinKey(variant.key);
       if (!builtin || builtin.archivedAt !== null) return null;
       const repos = builtin.inputs["repos"];
       if (typeof repos !== "object" || repos === null || Array.isArray(repos)) return null;

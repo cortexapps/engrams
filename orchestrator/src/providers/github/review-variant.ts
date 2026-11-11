@@ -103,9 +103,8 @@ export const GITHUB_REVIEW: ReviewVariant = {
     "pull_request.ready_for_review",
     "issue_comment.created",
   ],
-  closedEvent: "pull_request.closed",
+  closedEvents: ["pull_request.closed"],
   facts: {
-    id: "facts",
     type: "code",
     tunable: [],
     config: { source: REVIEW_FACTS_SOURCE, mode: "value" },
@@ -118,7 +117,7 @@ export const GITHUB_REVIEW: ReviewVariant = {
     `(git -C ${WORKSPACE} checkout ${REVIEW_HEAD_SHA} || ` +
     `(git -C ${WORKSPACE} fetch origin +refs/pull/${REVIEW_PR_NUMBER}/head && ` +
     `git -C ${WORKSPACE} checkout ${REVIEW_HEAD_SHA}))`,
-  capabilities: ["engram:pr_review", `github:contents:read@${REVIEW_REPO}`],
+  capabilities: [`github:contents:read@${REVIEW_REPO}`],
   // The clone and codeload hosts are listed because the connector declares
   // only api.github.com.
   network: {
@@ -138,5 +137,9 @@ export const GITHUB_REVIEW: ReviewVariant = {
     '${{ event.raw.repository.full_name }}#${{ event.raw | coalesce: "pull_request.number", "issue.number" }}',
   // The pull request's `html_url`, on the pull request or on the issue.
   concurrencyKeyTemplate: '${{ event.raw | coalesce: "pull_request.html_url", "issue.html_url" }}',
+  dispatchPayload: ({ repo, prNumber, url }) => ({
+    repository: { full_name: repo, name: repo.split("/")[1] ?? "" },
+    pull_request: { number: prNumber, html_url: url },
+  }),
   defaultMention: defaultMentionHandle,
 };

@@ -31,8 +31,14 @@
 
 import { REVIEW_CATEGORIES } from "../../reviewers/render.ts";
 import { FINDER_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT } from "../../reviews/control-plane.ts";
-import { REVIEW_PHASE_SIGNALS } from "../../tools/review.ts";
-import { REVIEW_FACTS, REVIEW_PR_NUMBER, REVIEW_REPO, type ReviewVariant } from "./review-variant.ts";
+import { PR_REVIEW_CAPABILITY, REVIEW_PHASE_SIGNALS } from "../../tools/review.ts";
+import {
+  REVIEW_FACTS,
+  REVIEW_HEAD_SHA,
+  REVIEW_PR_NUMBER,
+  REVIEW_REPO,
+  type ReviewVariant,
+} from "./review-variant.ts";
 import type { AutomationDefinition, BlockDef } from "../engine/definition.ts";
 import { DEFAULT_CONNECTION_PLACEHOLDER, type BuiltinAutomation } from "../engine/builtins.ts";
 import {
@@ -44,9 +50,7 @@ import {
 } from "../engine/blocks/review.ts";
 
 /** The event key the dispatch edge admits a run under; no forge delivery
- * carries it. Its payload is `{ repository: { full_name, name },
- * pull_request: { number } }`, and a variant's facts step accepts it for
- * any enrolled repository. */
+ * carries it. Its payload is the variant's `dispatchPayload`. */
 export const REVIEW_DISPATCH_EVENT_KEY = "review.dispatch";
 
 const F = REVIEW_FACTS;
@@ -74,7 +78,7 @@ function workerSession(
       titleTemplate: `Review ${REPO}#${PR_NUMBER} (${role})`,
       role,
       keepOnFinish: false,
-      capabilityOverride: v.capabilities,
+      capabilityOverride: [PR_REVIEW_CAPABILITY, ...v.capabilities],
       networkOverride: v.network,
       dropProfileSecretsAndEnv: true,
       appendSystemPrompt: systemPrompt,
@@ -106,7 +110,7 @@ function stage(id: string, phase: "finder" | "verifier", sessionBlock: string): 
       sessionId: `\${{ steps.${sessionBlock}.session_id }}`,
       repo: REPO,
       prNumber: PR_NUMBER,
-      headSha: "${{ steps.open.head_sha }}",
+      headSha: REVIEW_HEAD_SHA,
       baseSha: "${{ steps.open.base_sha }}",
       enabledCategories: { $ref: `${F}.categories` },
       orgInstructions: `\${{ ${F}.instructions }}`,
@@ -147,7 +151,7 @@ const STATUS_KEY = "review-status";
 
 function reviewBlocks(v: ReviewVariant): BlockDef[] {
   return [
-    v.facts,
+    { id: "facts", ...v.facts },
     {
       id: "admit",
       type: "filter",
@@ -361,7 +365,7 @@ export function reviewDefinition(v: ReviewVariant): AutomationDefinition {
           kind: "integration",
           provider: v.provider,
           connectionId: DEFAULT_CONNECTION_PLACEHOLDER,
-          eventKeys: [v.closedEvent],
+          eventKeys: v.closedEvents,
           scope: { fromInput: "repos" },
         },
         blocks: [

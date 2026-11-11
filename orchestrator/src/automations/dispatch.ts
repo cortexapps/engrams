@@ -942,17 +942,13 @@ export async function dispatchIntegrationEvent(
     ...(input.scopeValue !== undefined ? { scopeValue: input.scopeValue } : {}),
   };
 
-  // Instance resolution runs BEFORE admission for every matched pair, so
-  // rung-1 precedence can see across targets: when an open workstream of
-  // ANOTHER automation owns the event's thread (a handle bound it), the
-  // provider's chat-threads built-in stands down for this delivery: one thread, one
-  // responder. The brain's OWN workstream owning the thread is the normal
-  // case for a live thread (its "Started a session" post binds the thread
-  // handle to it) and routes the event to that workstream by key; it must
-  // never stand the brain down (prod 2026-10-01: every follow-up in every
-  // brain thread was suppressed by the brain's own binding). The verdict is
-  // computed over the PROVIDER's instanced automations even when no brain is
-  // a matched target, so `suppressed` is always this delivery's truth.
+  // Instance resolution runs before admission for every matched pair, so
+  // precedence can see across targets: when an open workstream of another
+  // automation owns the event's thread (a handle bound it), the provider's
+  // chat-threads built-in stands down for this delivery. One thread, one
+  // responder. The built-in's own workstream owning the thread is the
+  // normal case for a live thread, and must never stand it down.
+  const catchAll = threadsBuiltinKey(input.provider);
   const resolved: Array<{
     target: DispatchTarget;
     entrypoint: { id: string; trigger: TriggerSpec };
@@ -969,19 +965,14 @@ export async function dispatchIntegrationEvent(
     }
     resolved.push({ target, entrypoint, resolution });
   }
-  // Rung 2 completion: ownership is about the CONVERSATION, not the event
-  // subscription. A tagged message arrives as TWO deliveries (message +
-  // app_mention), and the owning workstream may subscribe to only one of
-  // them — but every brain must stand down for both (prod 2026-08-26: the
-  // legacy picker answered a mention in an owned channel because no MATCHED
-  // target was instanced, so no handle ever resolved). Ask the ledger
-  // which open workstreams — in any automation — own one of the event's
-  // candidate handles. Deliberately NOT gated on the suppressible built-in
-  // being a matched target: the verdict is this delivery's, whoever reads
-  // it (prod 2026-08-26, second finding: the built-in was disabled, the
-  // gate skipped the check, and a consumer of the verdict spawned a session
-  // in an owned channel with the fix fully deployed).
-  if (anyInstancedForProvider) {
+  // Ownership is about the conversation, not the event subscription. A
+  // tagged message arrives as two deliveries (message and mention), and the
+  // owning workstream may subscribe to only one of them, but the built-in
+  // must stand down for both. So the ledger is asked which open
+  // workstreams, in any automation, own one of the event's candidate
+  // handles. It is asked even when the built-in is not a matched target:
+  // the verdict is the delivery's.
+  if (catchAll !== null && anyInstancedForProvider) {
     const suppressFacet = facet ?? (await facets(input.provider));
     if (suppressFacet !== undefined) {
       const candidates = extractHandleCandidates({
@@ -1003,7 +994,6 @@ export async function dispatchIntegrationEvent(
   // owner may be the built-in brain's own thread — the legacy brain still
   // has no business in it). The per-target loop below skips the matched
   // built-in only when ANOTHER automation's workstream owns the thread.
-  const catchAll = threadsBuiltinKey(input.provider);
   const catchAllIds = new Set(
     targets
       .filter(({ target }) => target.automation.builtinKey === catchAll)
@@ -1015,7 +1005,7 @@ export async function dispatchIntegrationEvent(
     result.suppressed.push(catchAll);
     log.info(
       { provider: input.provider, eventKey: input.eventKey },
-      "instance precedence: another automation's workstream owns this conversation; the brain stands down",
+      "instance precedence: another automation's workstream owns this conversation; the chat-threads built-in stands down",
     );
   }
 

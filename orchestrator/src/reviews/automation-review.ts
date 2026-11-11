@@ -1,6 +1,6 @@
 /** Reviews reached from outside a webhook (ADR 0119 phase 4.4).
  *
- * The forge's webhook admits the PR-review built-in on its own. Three
+ * The forge's webhook admits its code-review built-in on its own. Three
  * other doors into a review exist, and each one admits a built-in run the
  * same way:
  *
@@ -27,7 +27,8 @@
  */
 
 import { REVIEW_DISPATCH_EVENT_KEY } from "../automations/builtins/review.ts";
-import { reviewBuiltinKey } from "../forges/registry.ts";
+import type { ReviewVariant } from "../automations/builtins/review-variant.ts";
+import { reviewVariantFor } from "../forges/registry.ts";
 import {
   admitAutomationRun,
   automationRunId,
@@ -60,7 +61,7 @@ export type AutomationReviewInstanceStore = Pick<
 >;
 
 export interface AutomationReviewDeps {
-  store?: Pick<AutomationStore, "get" | "getByBuiltinKey" | "getRun"> & AutomationDispatchStore;
+  store?: Pick<AutomationStore, "getByBuiltinKey" | "getRun"> & AutomationDispatchStore;
   starter?: AutomationWebhookStarter;
   sender?: AutomationSender;
   /** ADR 0120: the PR's workstream (the built-in is instanced per PR). */
@@ -128,20 +129,21 @@ async function bindWorkstream(
 async function requireBuiltin(
   store: Pick<AutomationStore, "getByBuiltinKey">,
   provider: string,
-): Promise<AutomationRow> {
-  const key = reviewBuiltinKey(provider);
-  const builtin = key === null ? null : await store.getByBuiltinKey(key);
-  if (!builtin) {
+): Promise<{ builtin: AutomationRow; variant: ReviewVariant }> {
+  const variant = reviewVariantFor(provider);
+  const builtin = variant === null ? null : await store.getByBuiltinKey(variant.key);
+  if (variant === null || !builtin) {
     throw new RetryAutomationError(`the code-review built-in for "${provider}" is not seeded`);
   }
-  return builtin;
+  return { builtin, variant };
 }
 
-/** Admit a fresh built-in run mirroring the review's original trigger.
- * Returns the new run id. Throws if the review never ran on the engine, or
+/** Admit a fresh run of the forge's built-in with the review's original
+ * trigger. Returns the new run id. Throws if the original run is gone or
  * the built-in is not seeded. */
 export async function retryAutomationReview(
   automationRunId_: string,
+  provider: string,
   deps: AutomationReviewDeps = {},
 ): Promise<string> {
   const { store, starter, sender, instances, now, randomUUID } = resolveDeps(deps);
@@ -150,11 +152,8 @@ export async function retryAutomationReview(
   if (!original) {
     throw new RetryAutomationError("the review's automation run no longer exists");
   }
-  // The run's own automation is the variant that reviewed the pull request.
-  const builtin = await store.get(original.automationId);
-  if (!builtin) {
-    throw new RetryAutomationError("the review's automation no longer exists");
-  }
+  // The built-in whose enrolment the caller checked.
+  const { builtin } = await requireBuiltin(store, provider);
   const definition = effectiveDefinition(builtin.version, builtin.blockOverrides);
 
   const deliveryKey = `retry:${randomUUID()}`;
@@ -194,7 +193,7 @@ export async function dispatchAutomationReview(
   deps: AutomationReviewDeps = {},
 ): Promise<string> {
   const { store, starter, sender, instances, now, randomUUID } = resolveDeps(deps);
-  const builtin = await requireBuiltin(store, input.provider);
+  const { builtin, variant } = await requireBuiltin(store, input.provider);
   const definition = effectiveDefinition(builtin.version, builtin.blockOverrides);
 
   const deliveryKey = `dispatch:${randomUUID()}`;
@@ -203,13 +202,11 @@ export async function dispatchAutomationReview(
     eventKey: REVIEW_DISPATCH_EVENT_KEY,
     receivedAt: now().toISOString(),
     scopeValue: input.repo,
-    payload: {
-      repository: { full_name: input.repo, name: input.repo.split("/")[1] ?? "" },
-      pull_request: {
-        number: input.prNumber,
-        html_url: requireForge(input.provider).pullRequestUrl(input.repo, input.prNumber),
-      },
-    },
+    payload: variant.dispatchPayload({
+      repo: input.repo,
+      prNumber: input.prNumber,
+      url: requireForge(input.provider).pullRequestUrl(input.repo, input.prNumber),
+    }),
   };
   const bound = await bindWorkstream(builtin, definition, trigger, deliveryKey, instances);
   const runId = automationRunId(builtin.id, deliveryKey, MAIN_ENTRYPOINT_ID, bound.instanceId);

@@ -132,7 +132,7 @@ export default ({ steps }) => {
 
 export function chatThreadsDefinition(v: ThreadsVariant): AutomationDefinition {
   const admit: BlockDef[] = [
-    v.facts,
+    { id: "facts", ...v.facts },
     {
       id: "admit",
       type: "filter",
@@ -415,7 +415,14 @@ export function chatThreadsDefinition(v: ThreadsVariant): AutomationDefinition {
       // profile.
       eventKeys: v.mentionEvents,
     },
-    blocks: [...admit, previous, v.replies, v.turn, hasTurn, routeUnlessContinued],
+    blocks: [
+      ...admit,
+      previous,
+      { id: "replies", ...v.replies },
+      { id: "turn", ...v.turn },
+      hasTurn,
+      routeUnlessContinued,
+    ],
     // One way in. The thread's agent is the definition's: every mention's
     // run ends on it.
     entrypoints: [],

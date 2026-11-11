@@ -116,7 +116,7 @@ function harness(run: AutomationRunRow | null) {
 describe("retryAutomationReview", () => {
   test("admits a fresh built-in run with a retry: delivery key and the original trigger payload", async () => {
     const h = harness(originalRun());
-    const runId = await retryAutomationReview("autorun:b1:github:d1", h.deps);
+    const runId = await retryAutomationReview("autorun:b1:github:d1", "github", h.deps);
     // Bound to the PR's workstream (ADR 0120), opened by the key template.
     expect(runId).toBe("autorun:b1:main:i-ai_pr:retry:uuid-1");
     expect(h.opened).toEqual([{ key: "engrams/engrams#7", openedBy: "review:retry:uuid-1" }]);
@@ -132,7 +132,7 @@ describe("retryAutomationReview", () => {
 
   test("throws when the original run no longer exists", async () => {
     const h = harness(null);
-    await expect(retryAutomationReview("gone", h.deps)).rejects.toBeInstanceOf(RetryAutomationError);
+    await expect(retryAutomationReview("gone", "github", h.deps)).rejects.toBeInstanceOf(RetryAutomationError);
   });
 });
 

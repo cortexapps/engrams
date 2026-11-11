@@ -21,13 +21,15 @@ export interface ThreadsVariant {
   mentionEvents: string[];
   /** The `facts` step: `value` is null to reject the event, else `admit`,
    * `team`, `channel`, `thread_ts`, `mention_ts`, `user_id`, `event_id`,
-   * `title` and `profile_id`, plus what the variant's own steps read. */
-  facts: BlockDef;
+   * `title`, `profile_id` (the channel's profile, else the default) and
+   * `smart` (true when smart routing chooses the profile), plus what the
+   * variant's own steps read. */
+  facts: Omit<BlockDef, "id">;
   /** The `replies` step reads the thread, from `steps.previous.mention_ts`
-   * on when a session continues. The `turn` step folds it into
-   * `value.text`, the prompt; an empty text ends the run. */
-  replies: BlockDef;
-  turn: BlockDef;
+   * on when a session continues. The `turn` step folds it into `value`:
+   * `text` is the prompt, and `has_text` false ends the run. */
+  replies: Omit<BlockDef, "id">;
+  turn: Omit<BlockDef, "id">;
   /** Connector action ids. `post` takes `channel`, `threadTs` and `text`;
    * `update` takes `channel`, `ts` and `text` and removes a card's buttons. */
   actions: { post: string; update: string };

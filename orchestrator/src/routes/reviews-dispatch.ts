@@ -16,7 +16,7 @@ type GetSession = (
 
 export interface ReviewsDispatchDeps {
   getSession?: GetSession;
-  /** The PR-review built-in's `repos` input: which repos get reviews. */
+  /** A code-review built-in's `repos` input: which repos get reviews. */
   enrolledRepos?: Pick<EnrolledRepos, "get">;
   /** Admit a built-in run for the coordinate; returns the run id. */
   dispatchAutomation?: (input: ReviewCoordinate) => Promise<string>;

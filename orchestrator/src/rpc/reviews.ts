@@ -40,7 +40,7 @@ export type GetSession = (
 export interface ReviewDeps {
   getSession?: GetSession;
   reviews?: ReviewStore;
-  /** The PR-review built-in's `repos` input: which repos get reviews. */
+  /** A code-review built-in's `repos` input: which repos get reviews. */
   enrolledRepos?: Pick<EnrolledRepos, "get">;
   db?: ReturnType<typeof getDb>;
   /** Admit a fresh built-in run for the review's original trigger. */
@@ -159,7 +159,7 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
   const enrolledRepos = (): Pick<EnrolledRepos, "get"> =>
     (enrolled ??= makeEnrolledRepos(makeAutomationStore(deps?.db ?? getDb())));
   const retryAutomation =
-    deps?.retryAutomation ?? ((runId: string) => retryAutomationReview(runId));
+    deps?.retryAutomation ?? retryAutomationReview;
 
   router.service(ReviewService, {
     async listReviews(req, ctx) {
@@ -223,7 +223,7 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
           Code.FailedPrecondition,
         );
       }
-      const runId = await retryAutomation(detail.review.automationRunId);
+      const runId = await retryAutomation(detail.review.automationRunId, provider);
       return { workflowId: runId };
     },
   });

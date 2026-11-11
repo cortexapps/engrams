@@ -144,14 +144,12 @@ export const SLACK_THREADS: ThreadsVariant = {
   definitionVersion: 15,
   mentionEvents: ["app_mention"],
   facts: {
-    id: "facts",
     type: "code",
     config: { source: SLACK_FACTS_SOURCE, mode: "value" },
   },
   // A continued session reads only what came after its previous turn: the
   // page is capped, and a long thread must not push the new messages off it.
   replies: {
-    id: "replies",
     type: "integration_action",
     config: {
       provider: "slack",
@@ -163,7 +161,7 @@ export const SLACK_THREADS: ThreadsVariant = {
       },
     },
   },
-  turn: { id: "turn", type: "code", config: { source: SLACK_TURN_SOURCE, mode: "value" } },
+  turn: { type: "code", config: { source: SLACK_TURN_SOURCE, mode: "value" } },
   actions: { post: "post_message", update: "update_message" },
   // `coalesce`, not `default:`, whose fallback argument is strict.
   threadKeyTemplate:
