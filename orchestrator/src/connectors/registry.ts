@@ -465,6 +465,10 @@ export interface WebhookEventSpec {
 export interface WebhookIngressSpec {
   scheme: "github_hmac_sha256" | "slack_v0" | "linear_hmac_sha256" | "svix_hmac_sha256";
   secretRef: string;
+  /** The provider also sends card clicks, signed the same way, to
+   * `/api/v1/integrations/<provider>/interactivity`. The path takes
+   * requests with no login. */
+  interactivity?: true;
 }
 
 /** Provider-specific coarse scope: one payload path whose value a trigger can
@@ -1796,7 +1800,14 @@ export function parseWebhookFacet(where: string, raw: unknown): WebhookFacet {
     if (typeof i.secretRef !== "string" || !/^\S+$/.test(i.secretRef)) {
       fail(where, '"webhook.ingress.secretRef" must be a non-empty org-secret name');
     }
-    ingress = { scheme: i.scheme as WebhookIngressSpec["scheme"], secretRef: i.secretRef };
+    if (i.interactivity !== undefined && i.interactivity !== true) {
+      fail(where, '"webhook.ingress.interactivity" must be true when present');
+    }
+    ingress = {
+      scheme: i.scheme as WebhookIngressSpec["scheme"],
+      secretRef: i.secretRef,
+      ...(i.interactivity === true ? { interactivity: true as const } : {}),
+    };
   }
 
   let scope: WebhookScopeSpec | undefined;

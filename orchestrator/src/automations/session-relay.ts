@@ -125,12 +125,18 @@ export interface SessionRelayDeps {
   sessionWebUrl(sessionId: string): string;
 }
 
-const sessionRelayPolicyDeps: Pick<SessionRelayDeps, "policy" | "sessionWebUrl"> = {
+const productionPolicyDeps: Pick<SessionRelayDeps, "policy" | "sessionWebUrl"> = {
   policy: (provider, sessionId) => requireChat(provider).policy({ sessionId }),
   sessionWebUrl: defaultSessionWebUrl,
 };
 
 let runtimeDeps: SessionRelayDeps | null = null;
+
+/** The renderer wiring: the installed deps, else production's. It makes no
+ * store, so a caller with its own store can read it. */
+function relayPolicyDeps(): Pick<SessionRelayDeps, "policy" | "sessionWebUrl"> {
+  return runtimeDeps ?? productionPolicyDeps;
+}
 
 export function setSessionRelayDeps(deps: SessionRelayDeps | null): void {
   runtimeDeps = deps;
@@ -140,7 +146,7 @@ export function sessionRelayDeps(): SessionRelayDeps {
   if (runtimeDeps) return runtimeDeps;
   runtimeDeps = {
     store: makeSessionRelayStore(),
-    ...sessionRelayPolicyDeps,
+    ...productionPolicyDeps,
     completeToolCall: (sessionId, toolCallId, result) =>
       defaultTools.complete(sessionId, toolCallId, result),
   };
@@ -180,6 +186,11 @@ export async function installSessionRelay(
   if (installed.created) return { created: true };
   let row: SessionRelayRow | null = installed.row;
   for (let attempt = 0; row !== null && attempt < CAS_ATTEMPTS; attempt += 1) {
+    if (row.provider !== input.provider) {
+      throw new Error(
+        `session relay "${input.sessionId}" is in ${row.provider}; it cannot move to ${input.provider}`,
+      );
+    }
     const state = stateOf(row);
     // Same mention: a re-executed step (crash before checkpoint). Nothing
     // to change, and the open bubble must stay open.
@@ -304,39 +315,40 @@ export type RelayClosing =
   | { kind: "neutral"; message: string }
   | { kind: "silent" };
 
-/** Settle the thread, post its closing message, and remove the relay. The
- * relay goes even when the post fails; the failure is the caller's. */
-export async function closeRelay(
-  row: SessionRelayRow,
-  closing: RelayClosing,
-  deps: Pick<SessionRelayDeps, "store"> & Partial<Pick<SessionRelayDeps, "policy" | "sessionWebUrl">>,
-): Promise<void> {
-  const defaults = deps.policy && deps.sessionWebUrl ? null : sessionRelayPolicyDeps;
-  const pol = (deps.policy ?? defaults!.policy)(row.provider, row.sessionId);
+type RelayCloseDeps = Pick<SessionRelayDeps, "store"> &
+  Partial<Pick<SessionRelayDeps, "policy" | "sessionWebUrl">>;
+
+/** Settle the thread and post its closing message. */
+async function postClosing(row: SessionRelayRow, closing: RelayClosing, deps: RelayCloseDeps): Promise<void> {
+  const { policy, sessionWebUrl } = { ...relayPolicyDeps(), ...deps };
+  const pol = policy(row.provider, row.sessionId);
   const mention = mentionOf(row);
   const st = stateOf(row);
-  try {
-    await settleMentions(pol, mention, st);
-    switch (closing.kind) {
-      case "complete":
-        await pol.onComplete(
-          mention,
-          { id: row.sessionId, webUrl: (deps.sessionWebUrl ?? defaults!.sessionWebUrl)(row.sessionId) },
-          { lastMessage: st.lastAssistantText, assets: st.assets },
-        );
-        break;
-      case "fail":
-        await pol.onFail(mention, closing.message);
-        break;
-      case "neutral":
-        await pol.onNeutralClose(mention, closing.message);
-        break;
-      case "silent":
-        break;
-    }
-  } finally {
-    await deps.store.remove(row.sessionId);
+  await settleMentions(pol, mention, st);
+  switch (closing.kind) {
+    case "complete":
+      await pol.onComplete(
+        mention,
+        { id: row.sessionId, webUrl: sessionWebUrl(row.sessionId) },
+        { lastMessage: st.lastAssistantText, assets: st.assets },
+      );
+      break;
+    case "fail":
+      await pol.onFail(mention, closing.message);
+      break;
+    case "neutral":
+      await pol.onNeutralClose(mention, closing.message);
+      break;
+    case "silent":
+      break;
   }
+}
+
+/** Settle the thread, post its closing message, then remove the relay. A
+ * failed post throws and keeps the relay, so a later close posts again. */
+export async function closeRelay(row: SessionRelayRow, closing: RelayClosing, deps: RelayCloseDeps): Promise<void> {
+  await postClosing(row, closing, deps);
+  await deps.store.remove(row.sessionId);
 }
 
 /** The session ended: close its relay. A neutral end (the sandbox reclaimed
@@ -355,11 +367,13 @@ export async function closeSessionRelay(
       : outcome === "failed"
         ? { kind: "fail", message: SESSION_FAILED_MSG }
         : { kind: "silent" };
+  // Nothing closes this relay again, so it goes even when the post fails.
   try {
-    await closeRelay(row, closing, deps);
+    await postClosing(row, closing, deps);
   } catch (err) {
     log.error({ sessionId, outcome, err }, "session relay: failed to post the closing message");
   }
+  await deps.store.remove(sessionId);
   return "closed";
 }
 

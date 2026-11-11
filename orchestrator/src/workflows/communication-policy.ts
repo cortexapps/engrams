@@ -59,12 +59,9 @@ export interface ClosingSummary {
   assets: AssetSummary[];
 }
 
-/**
- * The provider seam. Every method is invoked by the framework as a checkpointed
- * DBOS step, so a completed effect is never re-run on replay. `onUserQuestion`
- * returns a provider message ref (e.g. a Slack `ts`) the framework holds in
- * workflow-local state to later update via `onAnswered`.
- */
+/** What a chat provider renders for a relayed session. `onUserQuestion`
+ * returns the provider's message ref; the relay keeps it and passes it to
+ * `onAnswered`. */
 export interface CommunicationPolicy {
   /** The session started (Slack: a link message into the thread). */
   onStarted(m: SourceMention, session: StartedSession): Promise<void>;
@@ -172,7 +169,7 @@ export function routeSessionEvent(
   }
 }
 
-/** Match and validate the one session-handled generic tool Slack presents. */
+/** Match and validate the one session-handled generic tool a chat provider presents. */
 function parseGenericQuestionRequest(payloadJson: string): string | undefined {
   try {
     const payload = JSON.parse(payloadJson) as {

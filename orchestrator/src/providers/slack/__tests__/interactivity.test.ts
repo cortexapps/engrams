@@ -14,7 +14,7 @@ import { answerDelivery, makeSlackInteractivityRoute } from "../interactivity.ts
 import { ACTION_ANSWER, ACTION_OPEN } from "../blocks.ts";
 
 const SECRET = "test-signing-secret";
-const PATH = "/api/v1/integrations/slack/interactivity";
+const PATH = "/";
 const ROUTE = { team: "T1", channel: "C1", threadRoot: "100.0" };
 
 function makeApp() {

@@ -127,7 +127,7 @@ export function makeSlackInteractivityRoute(deps: SlackInteractivityDeps = {}): 
   const now = deps.now ?? (() => new Date());
   const app = new Hono();
 
-  app.post("/api/v1/integrations/slack/interactivity", async (c) => {
+  app.post("/", async (c) => {
     const rawBody = new Uint8Array(await c.req.arrayBuffer());
     const valid = await verifyIngress({
       provider: "slack",

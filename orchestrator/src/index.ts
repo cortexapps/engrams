@@ -24,7 +24,6 @@ import { makeConnectionCredentialBrokerRoute } from "./routes/connection-credent
 import { makeOidcKeyAdminRoute } from "./routes/oidc-key-admin.ts";
 import { startOidcKeyRotation } from "./integrations/oidc-key-rotation.ts";
 import { makeIntegrationOidcKeyStore } from "./db/integration-oidc-keys.ts";
-// Importing registers the Slack adapter on the generic SDK seam.
 import { makeShellUpgradeHandler } from "./routes/shell.ts";
 import { makeVncUpgradeHandler } from "./routes/vnc.ts";
 import { makeIdeRoute, makeIdeUpgradeHandler } from "./routes/ide.ts";
@@ -106,7 +105,7 @@ import { makeIntegrationConnectionStore } from "./db/integration-connections.ts"
 import { makeIntegrationEventStore } from "./db/integration-events.ts";
 import { registerAutomationDraftTools } from "./tools/automation-draft.ts";
 import { makeConnectorStore } from "./db/connectors.ts";
-import { loadRegistry } from "./connectors/registry.ts";
+import { declaredIngress, loadRegistry } from "./connectors/registry.ts";
 import { tools } from "./tools/registry.ts";
 import { makeSessionFilesRoute } from "./routes/session-files.ts";
 import { makeSpecsRoute, PostgresSpecReadStore } from "./routes/specs.ts";
@@ -440,7 +439,13 @@ app.route("/", integrationOauthRoute);
 // Provider event webhooks, verified against each connector's declared ingress.
 app.route("/", integrationEventsRoute);
 for (const spec of chatSpecs()) {
-  if (spec.interactivity) app.route("/", spec.interactivity());
+  const declared = declaredIngress(spec.provider)?.ingress.interactivity === true;
+  if (declared !== (spec.interactivity !== undefined)) {
+    throw new Error(`chat provider "${spec.provider}": the connector and the provider disagree on interactivity`);
+  }
+  if (spec.interactivity) {
+    app.route(`/api/v1/integrations/${spec.provider}/interactivity`, spec.interactivity());
+  }
 }
 // ADR 0102: dynamically registered webhooks verify their own registration
 // secret and dispatch one-shot AutomationRunWorkflow occurrences.

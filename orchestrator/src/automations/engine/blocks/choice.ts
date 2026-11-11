@@ -3,7 +3,8 @@
  *
  * The data half posts a card (one button per option) through the chat
  * provider's policy, with this run's id in every button's route, so the
- * interactivity endpoint delivers the click to this run as a signal. The wait half consumes the answer whose id is this block's.
+ * interactivity endpoint delivers the click to this run as a signal. The
+ * wait half consumes the answer whose id is this block's.
  * Nothing time-based fails the run: at the deadline the block records
  * `outcome: "deadline"` and the graph takes its own fallback. The card is
  * the graph's to close (an `update_message` on `message_ts`), so the thread
@@ -19,7 +20,7 @@ import { MAX_WAIT_DEADLINE_S } from "../definition.ts";
 import type { RunContext } from "../context.ts";
 import { requireChat } from "../../../chat/registry.ts";
 import { CHOICE_ANSWER_SIGNAL, CHOICE_ID_PREFIX } from "../../session-relay.ts";
-import { chatProviderSchema } from "./relay.ts";
+import { chatProviderSchema, mentionFromRelayConfig } from "./relay.ts";
 import { registerBlock } from "./registry.ts";
 
 export const CHOICE_TYPE = "slack_choice";
@@ -100,14 +101,7 @@ export function registerChoiceBlock(): void {
       }
       // The run id rides the card: its click is this run's answer.
       const ts = await requireChat(config.provider).policy({ runId: ctx.runId }).onChoice(
-        {
-          team: config.team,
-          channel: config.channel,
-          threadRoot: config.threadTs,
-          user: "",
-          ts: config.threadTs,
-          eventId: "",
-        },
+        { ...mentionFromRelayConfig(config), eventId: "" },
         { id: choiceId(ctx), question: config.question, options: labels },
       );
       return { kind: "ok", outputs: { message_ts: ts } };

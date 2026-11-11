@@ -359,6 +359,33 @@ describe("session relay (contract 5)", () => {
     expect(h.policy.calls.onNeutralClose).toEqual([]);
     expect(h.store.rows.size).toBe(0);
   });
+
+  test("the session's end removes the relay when the closing post fails", async () => {
+    const h = harness();
+    await h.install();
+    const deps: SessionRelayDeps = {
+      ...h.deps,
+      policy: () => ({
+        ...h.policy.pol,
+        onComplete: async () => {
+          throw new Error("chat down");
+        },
+      }),
+    };
+    expect(await closeSessionRelay(SESSION, "completed", deps)).toBe("closed");
+    expect(h.store.rows.has(SESSION)).toBe(false);
+  });
+
+  test("a relay does not move to another chat provider", async () => {
+    const h = harness();
+    await h.install();
+    await expect(
+      installSessionRelay(
+        { sessionId: SESSION, automationId: "auto-1", provider: "other-chat", target: { ...MENTION, ts: "200.0" } },
+        h.deps,
+      ),
+    ).rejects.toThrow(/cannot move/);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -469,6 +496,34 @@ describe("relay_close block", () => {
       const none = await close.execute!({ session: { blockId: "launch" }, status: "failed" } as never, h.ctx);
       expect(none).toEqual({ kind: "ok", outputs: { posted: false, rendered_as: "none" } });
       expect(policy.calls.onFail).toHaveLength(0);
+    } finally {
+      setSlackPolicyFactoryForTest(null);
+    }
+  });
+
+  test("a failed closing post fails the step and keeps the relay for the next close", async () => {
+    const h = blockHarness();
+    const policy = recordingPolicy();
+    let down = true;
+    setSlackPolicyFactoryForTest(() => ({
+      ...policy.pol,
+      onComplete: async (...args) => {
+        if (down) throw new Error("chat down");
+        return policy.pol.onComplete(...args);
+      },
+    }));
+    try {
+      await getBlock(RELAY_SESSION_TYPE)!.execute!(CONFIG as never, h.ctx);
+      const close = getBlock(RELAY_CLOSE_TYPE)!;
+      const config = { session: { blockId: "launch" }, status: "completed" } as never;
+      await expect(close.execute!(config, h.ctx)).rejects.toThrow("chat down");
+      expect(h.store.rows.size).toBe(1);
+      down = false;
+      expect(await close.execute!(config, h.ctx)).toEqual({
+        kind: "ok",
+        outputs: { posted: true, rendered_as: "complete" },
+      });
+      expect(h.store.rows.size).toBe(0);
     } finally {
       setSlackPolicyFactoryForTest(null);
     }

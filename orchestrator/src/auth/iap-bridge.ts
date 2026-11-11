@@ -116,7 +116,6 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 import { auth } from "./better-auth.ts";
 import { config } from "../config.ts";
-import { chatSpecs } from "../chat/registry.ts";
 import { declaredIngress } from "../connectors/registry.ts";
 import { extractApiKey } from "./api-key-header.ts";
 
@@ -179,7 +178,7 @@ export function isIapPublicPath(url: string, method = "GET"): boolean {
   const chatProvider = INTERACTIVITY_PATH_RE.exec(path)?.[1];
   return PUBLIC_PATHS.has(path) ||
     (eventProvider !== undefined && declaredIngress(eventProvider) !== undefined) ||
-    chatSpecs().some((spec) => spec.provider === chatProvider && spec.interactivity) ||
+    (chatProvider !== undefined && declaredIngress(chatProvider)?.ingress.interactivity === true) ||
     (method === "GET" && PUBLIC_GET_PATHS.has(path)) ||
     (method === "POST" && HOOK_PATH_RE.test(path));
 }

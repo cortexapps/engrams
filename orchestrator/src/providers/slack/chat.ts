@@ -1,29 +1,33 @@
 /** Slack as a chat provider. */
 
-import type { ChatProviderSpec } from "../../chat/chat.ts";
+import type { WebClient } from "@slack/web-api";
+
+import type { ChatProvider, ChatProviderSpec } from "../../chat/chat.ts";
 import { describeSlackChannels, listSlackChannelOptions } from "./channels.ts";
-import { getSlackClient } from "./client.ts";
+import { getSlackClient, SLACK_PROVIDER } from "./client.ts";
 import { makeSlackInteractivityRoute } from "./interactivity.ts";
 import { makeSlackPolicy } from "./policy.ts";
 import { SLACK_THREADS } from "./threads-variant.ts";
 
-const PROVIDER = "slack";
-
 export const SLACK_CHAT: ChatProviderSpec = {
-  provider: PROVIDER,
+  provider: SLACK_PROVIDER,
   legacyDefault: true,
-  make: () => ({
-    provider: PROVIDER,
-    policy: (route) => makeSlackPolicy({ routeExtras: route }),
-    /** Needs the `users:read.email` scope. */
-    async userEmail(externalUserId) {
-      const response = await (await getSlackClient()).users.info({ user: externalUserId });
-      return response.user?.profile?.email || null;
-    },
-    listChannels: async () => listSlackChannelOptions(await getSlackClient()),
-    describeChannels: async (keys) => describeSlackChannels(await getSlackClient(), keys),
-    threadHandle: (place) => `${PROVIDER}:${place.channel}:${place.threadRoot}`,
-  }),
+  make: () => makeSlackChat(),
   interactivity: makeSlackInteractivityRoute,
   threads: SLACK_THREADS,
 };
+
+export function makeSlackChat(client: () => Promise<WebClient> = getSlackClient): ChatProvider {
+  return {
+    provider: SLACK_PROVIDER,
+    policy: (route) => makeSlackPolicy({ routeExtras: route }),
+    /** Needs the `users:read.email` scope. */
+    async userEmail(externalUserId) {
+      const response = await (await client()).users.info({ user: externalUserId });
+      return response.user?.profile?.email || null;
+    },
+    listChannels: async () => listSlackChannelOptions(await client()),
+    describeChannels: async (keys) => describeSlackChannels(await client(), keys),
+    threadHandle: (place) => `${SLACK_PROVIDER}:${place.channel}:${place.threadRoot}`,
+  };
+}

@@ -38,9 +38,10 @@ export interface ChatProviderSpec {
   /** Stored rows and block configs with no provider mean this one. */
   legacyDefault?: true;
   make(): ChatProvider;
-  /** The app that takes card clicks at
-   * `/api/v1/integrations/<provider>/interactivity`. The path takes requests
-   * with no login, so the app verifies the sender. */
+  /** The app that takes card clicks. It is mounted at the provider's
+   * interactivity path when the connector's ingress declares one, and it
+   * handles `POST /`. The path takes requests with no login, so the app
+   * verifies the sender. */
   interactivity?: () => Hono;
   /** The provider's chat-threads built-in. */
   threads?: ThreadsVariant;

@@ -1,6 +1,5 @@
 /** `relay_close` — the closing message of a relayed session, for a
- * `settings.onFinalize` hook (ADR 0119 phase 4.6; a catalog block since
- * 2026-09). Renders the run's terminal state into the relayed place
+ * `settings.onFinalize` hook (ADR 0119). Renders the run's terminal state into the relayed place
  * through the chat provider's policy, then removes the session's relay (a
  * later run re-installs it):
  *
@@ -85,8 +84,7 @@ export function registerRelayCloseBlock(): void {
           };
       }
       await closeRelay(row, closing, { store });
-      const renderedAs = closing.kind === "fail" ? "fail" : closing.kind;
-      return { kind: "ok", outputs: { posted: true, rendered_as: renderedAs } };
+      return { kind: "ok", outputs: { posted: true, rendered_as: closing.kind } };
     },
   });
 }
