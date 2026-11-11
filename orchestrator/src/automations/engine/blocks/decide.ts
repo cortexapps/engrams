@@ -1,5 +1,6 @@
-/** The decide block: typed, calibrated decisions from a System One model
- * (TypeSafe's Jev) through the OpenRouter Decisions API.
+/** The decide block: typed decisions from a connected model router. A router
+ * with a native decisions endpoint answers with calibrated probabilities; any
+ * other router answers through a structured chat completion.
  *
  * One block asks one or more questions about one `state` in a single call —
  * the questions are answered in parallel, so a second question adds almost
@@ -16,13 +17,13 @@
  * into a label, rate a PR's risk or an incident's severity, decide "is this
  * noise?" before an expensive session.
  *
- * An org without OpenRouter gets `{ decided: false }` — a normal output, so a
- * graph falls back deterministically and the org keeps today's behavior.
+ * An org with no router that has a decision model gets `{ decided: false }`
+ * — a normal output, so a graph falls back deterministically.
  *
  * The call runs inside the block's checkpointed step: a call whose result was
  * recorded is never made again on replay. The guarantee is at-least-once, not
  * exactly-once — a crash after the provider answered and before the step was
- * recorded repeats the call (the Decisions API has no idempotency key).
+ * recorded repeats the call (a decision has no idempotency key).
  *
  * An editor dry run makes the call for real: the block is read-only and
  * costs fractions of a cent, and a dry run is how an author tries their

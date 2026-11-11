@@ -1,6 +1,6 @@
-/** The decisions contract: a `state` plus typed `questions` in, calibrated
- * typed answers out. A router answers it through a native endpoint when it
- * has one.
+/** The decisions contract: a `state` plus typed `questions` in, typed
+ * answers out. A router answers it through a native endpoint when it has
+ * one, and through a structured chat completion when it does not.
  */
 
 import { z } from "zod";
@@ -65,5 +65,5 @@ export class DecisionsApiError extends Error {
 }
 
 export interface DecisionsClient {
-  decide(request: DecisionsRequest): Promise<DecisionsResponse>;
+  decide(request: DecisionsRequest & { model: string }): Promise<DecisionsResponse>;
 }

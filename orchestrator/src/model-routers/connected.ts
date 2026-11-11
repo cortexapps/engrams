@@ -29,17 +29,15 @@ export async function connectedRouters(
   return listModelRouterDefinitions().filter((router) => names.has(router.credentialSecret));
 }
 
-/** The first connected router that `wanted` accepts, or null. An unreachable
- * control plane reads as "none connected": callers degrade, they do not
- * retry against a key that may not exist. */
-export async function firstConnectedRouter(
-  wanted: (router: ModelRouterDefinition) => boolean = () => true,
+/** The connected routers, or none when the secret names cannot be listed:
+ * callers degrade, they do not retry against a key that may not exist. */
+export async function connectedRoutersOrNone(
   client?: SecretNameClient,
-): Promise<ModelRouterDefinition | null> {
+): Promise<ModelRouterDefinition[]> {
   try {
-    return (await connectedRouters(client)).find(wanted) ?? null;
+    return await connectedRouters(client);
   } catch (err) {
     log.warn({ err }, "org-secret listing failed; treating every router as not connected");
-    return null;
+    return [];
   }
 }

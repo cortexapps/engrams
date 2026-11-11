@@ -2501,7 +2501,7 @@ async fn write_router_config(runtime_home: &Path) -> Result<(), String> {
 fn router_config(model: &str, base_url: &str, helper: &str) -> String {
     let quote = |value: &str| serde_json::to_string(value).expect("string JSON cannot fail");
     format!(
-        "model = {}\nmodel_provider = \"openrouter\"\n\n[model_providers.openrouter]\nname = \"OpenRouter\"\nbase_url = {}\nwire_api = \"responses\"\n\n[model_providers.openrouter.auth]\ncommand = {}\nargs = [\"__model-router-token\"]\ntimeout_ms = 5000\nrefresh_interval_ms = 0\n",
+        "model = {}\nmodel_provider = \"router\"\n\n[model_providers.router]\nname = \"Model router\"\nbase_url = {}\nwire_api = \"responses\"\n\n[model_providers.router.auth]\ncommand = {}\nargs = [\"__model-router-token\"]\ntimeout_ms = 5000\nrefresh_interval_ms = 0\n",
         quote(model),
         quote(base_url),
         quote(helper),
@@ -2533,14 +2533,13 @@ mod tests {
 
     #[test]
     fn routed_provider_config_uses_responses_and_command_auth() {
-        for host in ["openrouter.ai", "us.openrouter.ai", "eu.openrouter.ai"] {
-            let base_url = format!("https://{host}/api/v1");
+        for base_url in ["https://openrouter.ai/api/v1", "https://llm.example.com/v1"] {
             let config = router_config(
                 "deepseek/deepseek-v4-pro-0813",
-                &base_url,
+                base_url,
                 "/sbin/engram-harness-codex",
             );
-            assert!(config.contains("model_provider = \"openrouter\""));
+            assert!(config.contains("model_provider = \"router\""));
             assert!(config.contains("wire_api = \"responses\""));
             assert!(config.contains("command = \"/sbin/engram-harness-codex\""));
             assert!(config.contains("args = [\"__model-router-token\"]"));

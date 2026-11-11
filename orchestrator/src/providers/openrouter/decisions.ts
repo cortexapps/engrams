@@ -12,10 +12,6 @@ import {
   type DecisionsClient,
 } from "../../model-routers/decisions.ts";
 
-/** Pinned so a model release never changes a graph's thresholds; an author
- * opts into a newer one through the request's `model`. */
-const DEFAULT_MODEL = "typesafe/jev-1.13";
-
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 524, 529]);
 
 interface DecisionsClientOptions {
@@ -44,7 +40,7 @@ export function makeDecisionsClient(options: DecisionsClientOptions): DecisionsC
             Authorization: `Bearer ${options.apiKey}`,
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ ...request, model: request.model ?? DEFAULT_MODEL }),
+          body: JSON.stringify(request),
           signal: AbortSignal.timeout(timeoutMs),
         });
         // The body read is part of the transport: a reset or the abort after

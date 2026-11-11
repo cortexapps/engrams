@@ -80,6 +80,7 @@ import {
 } from "../integrations/providers/index.ts";
 import { makeModelRouterStore, type ModelRouterStore } from "../db/model-routers.ts";
 import { connectedRouters, type SecretNameClient } from "../model-routers/connected.ts";
+import { routerModels } from "../model-routers/models.ts";
 import { resolveRouterSelection } from "../model-routers/registry.ts";
 
 const log = rootLog.child({ component: "task" });
@@ -347,9 +348,9 @@ export async function compileSessionCreateInput(
   const modelId =
     opts.model ??
     profile.model ??
-    router?.defaultModel ??
-    descriptor.models.find((m) => m.default)?.id ??
-    descriptor.models[0]?.id;
+    (router
+      ? (await routerModels(router, deps.modelRouters)).default ?? undefined
+      : descriptor.models.find((m) => m.default)?.id ?? descriptor.models[0]?.id);
   let effortId: string | undefined =
     opts.effort ??
     profile.effort ??
@@ -358,7 +359,12 @@ export async function compileSessionCreateInput(
   const modelOption = router ? undefined : descriptor.models.find((m) => m.id === modelId);
   let routedModel;
   if (router) {
-    if (!modelId) throw new ConnectError("a routed launch requires a model", Code.InvalidArgument);
+    if (!modelId) {
+      throw new ConnectError(
+        `${router.label} has no default model — choose a model, or ask an admin to set the default`,
+        Code.FailedPrecondition,
+      );
+    }
     const [routed, connected] = await Promise.all([
       (deps.modelRouters ?? makeModelRouterStore()).getModel(router.id, modelId),
       connectedRouters(deps.orgSecret),

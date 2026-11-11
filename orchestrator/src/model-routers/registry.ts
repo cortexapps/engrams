@@ -4,6 +4,7 @@ import type { LanguageModel } from "ai";
 
 import { connectorRegistry } from "../connectors/registry.ts";
 import type { RouterModelInput } from "../db/model-routers.ts";
+import { LITELLM } from "../providers/litellm/router.ts";
 import { OPENROUTER } from "../providers/openrouter/router.ts";
 import type { DecisionsClient } from "./decisions.ts";
 
@@ -11,6 +12,10 @@ export const ROUTER_PROTOCOLS = ["anthropic_messages", "openai_responses"] as co
 export type RouterProtocol = (typeof ROUTER_PROTOCOLS)[number];
 
 export type CatalogModel = Omit<RouterModelInput, "routerId">;
+
+/** What a router's model is used for: `default` runs a routed launch that
+ * names no model, `title` titles a task, `decision` answers a decide block. */
+export type RouterRole = "default" | "title" | "decision";
 
 /** What a provider declares to be a model router. */
 export interface ModelRouterSpec {
@@ -20,20 +25,19 @@ export interface ModelRouterSpec {
   /** The connector that holds the router's key and host. */
   connector: string;
   protocols: Readonly<Record<RouterProtocol, { basePath: string }>>;
-  /** The model a routed launch uses when neither the task nor the profile names one. */
-  defaultModel: string;
-  /** The model that titles a task from its first prompt. */
-  titleModel: string;
+  /** Built-in model per role. A role without one needs an admin's choice. */
+  models: Partial<Record<RouterRole, string>>;
   catalog: {
     path: string;
     refreshIntervalMs: number;
     parse(body: Uint8Array): CatalogModel[];
   };
-  /** The public page for a model. */
-  modelUrl(modelId: string): string;
+  /** The public page for a model, when the router has one. */
+  modelUrl?(modelId: string): string;
   /** Chat models for calls the orchestrator makes itself. */
   chat(apiKey: string, host: string): (modelId: string) => LanguageModel;
-  /** Present when the router has a native decisions endpoint. */
+  /** Present when the router has a native decisions endpoint. Without one,
+   * a decision is a structured chat completion. */
   decisions?(apiKey: string, host: string): DecisionsClient;
 }
 
@@ -52,7 +56,7 @@ function define(spec: ModelRouterSpec): ModelRouterDefinition {
   return { ...spec, credentialSecret: secretRef };
 }
 
-const REGISTRY = new Map([OPENROUTER].map((spec) => [spec.id, define(spec)]));
+const REGISTRY = new Map([OPENROUTER, LITELLM].map((spec) => [spec.id, define(spec)]));
 
 export function listModelRouterDefinitions(): ModelRouterDefinition[] {
   return [...REGISTRY.values()];

@@ -2,7 +2,7 @@ import type { ModelRouterStore } from "../db/model-routers.ts";
 import { runIntegrationOp } from "../integrations/run-op.ts";
 import { errorMessage, log } from "../log.ts";
 import { getModelRouterDefinition, listModelRouterDefinitions } from "./registry.ts";
-import { connectedRouters } from "./connected.ts";
+import { connectedRoutersOrNone } from "./connected.ts";
 
 export interface RouterCatalogRefreshResult {
   discovered: number;
@@ -54,10 +54,7 @@ export class ModelRouterCatalogRefresher {
   constructor(private readonly deps: RouterCatalogDeps) {}
 
   async runOnce(): Promise<void> {
-    const routers = await connectedRouters().catch((err: unknown) => {
-      log.warn({ err }, "org-secret listing failed; no catalog refreshed");
-      return [];
-    });
+    const routers = await connectedRoutersOrNone();
     await Promise.allSettled(routers.map((router) => refreshRouterCatalog(router.id, this.deps)));
   }
 

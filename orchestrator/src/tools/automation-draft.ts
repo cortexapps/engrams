@@ -11,7 +11,7 @@
  * reject the WHOLE tools/list.
  */
 
-import { decisionsRouter } from "../model-routers/client.ts";
+import { canDecide } from "../model-routers/client.ts";
 import { z } from "zod";
 
 import { definitionOf, effectiveDefinition, SaveVersionConflictError } from "../db/automations.ts";
@@ -190,7 +190,7 @@ export function registerAutomationDraftTools(
           return {
             part: args.part,
             content: draftBlockCatalog(
-              await (deps.decisionsAvailable ?? (async () => (await decisionsRouter()) !== null))(),
+              await (deps.decisionsAvailable ?? canDecide)(),
             ),
           };
         case "patterns":

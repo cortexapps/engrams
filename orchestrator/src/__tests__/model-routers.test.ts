@@ -45,6 +45,8 @@ function store() {
     updatePolicy: async () => null,
     getSyncState: async () => null,
     recordFailure: async (_routerId, error) => { calls.failures.push(error); },
+    getSettings: async () => null,
+    setSettings: async () => {},
   };
   return { value, calls };
 }

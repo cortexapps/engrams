@@ -1327,6 +1327,16 @@ export const routerSyncState = pgTable("router_sync_state", {
   lastError: text("last_error"),
 });
 
+/** The models an admin chose for a router's roles. A null column uses the
+ * router's built-in model for that role, when it has one. */
+export const routerSettings = pgTable("router_settings", {
+  routerId: text("router_id").primaryKey(),
+  defaultModel: text("default_model"),
+  titleModel: text("title_model"),
+  decisionModel: text("decision_model"),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 /** Custom webhook registrations verify with the generic scheme only. The
  * provider schemes (github_hmac_sha256, slack_v0) retired with ADR 0119 D5:
  * provider events arrive on the integration ingress routes, verified by the

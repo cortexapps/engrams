@@ -264,7 +264,7 @@ export interface EnginePrRefLookup {
 /** The decide block's seam: a connected model router in production, a fake
  * in tests and the simulator. */
 export interface DecisionsRuntime {
-  /** Null when no connected model router can answer. */
+  /** Null when no connected model router has a decision model. */
   decide(request: DecisionsRequest): Promise<DecisionsResponse | null>;
 }
 

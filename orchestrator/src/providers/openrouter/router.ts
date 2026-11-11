@@ -57,8 +57,12 @@ export const OPENROUTER: ModelRouterSpec = {
     anthropic_messages: { basePath: "/api" },
     openai_responses: { basePath: "/api/v1" },
   },
-  defaultModel: "deepseek/deepseek-v4-pro-0813",
-  titleModel: "deepseek/deepseek-v4-flash",
+  models: {
+    default: "deepseek/deepseek-v4-pro-0813",
+    title: "deepseek/deepseek-v4-flash",
+    // Pinned so a model release never changes a graph's thresholds.
+    decision: "typesafe/jev-1.13",
+  },
   catalog: {
     path: "/api/v1/models/user?output_modalities=text&supported_parameters=tools&sort=newest",
     refreshIntervalMs: 6 * 60 * 60 * 1000,

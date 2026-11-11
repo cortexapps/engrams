@@ -4,6 +4,7 @@ import { getDb } from "./client.ts";
 import {
   routerModel,
   routerModelPolicy,
+  routerSettings,
   routerSyncState,
 } from "./schema.ts";
 
@@ -40,6 +41,13 @@ export interface RouterSyncStateRow {
   lastError: string | null;
 }
 
+/** An admin's model per role; null uses the router's built-in model. */
+export interface RouterSettings {
+  defaultModel: string | null;
+  titleModel: string | null;
+  decisionModel: string | null;
+}
+
 export interface ModelRouterStore {
   listModels(routerId: string, audience: RouterModelAudience, search?: string): Promise<RouterModelRow[]>;
   getModel(routerId: string, modelId: string): Promise<RouterModelRow | null>;
@@ -47,6 +55,8 @@ export interface ModelRouterStore {
   updatePolicy(routerId: string, modelId: string, enabled: boolean, userEnabled: boolean): Promise<RouterModelRow | null>;
   getSyncState(routerId: string): Promise<RouterSyncStateRow | null>;
   recordFailure(routerId: string, error: string, now: Date): Promise<void>;
+  getSettings(routerId: string): Promise<RouterSettings | null>;
+  setSettings(routerId: string, settings: RouterSettings, now: Date): Promise<void>;
 }
 
 export function makeModelRouterStore(db: ReturnType<typeof getDb> = getDb()): ModelRouterStore {
@@ -156,6 +166,16 @@ export function makeModelRouterStore(db: ReturnType<typeof getDb> = getDb()): Mo
       await db.insert(routerSyncState).values({ routerId, lastAttemptAt: now, lastError: error }).onConflictDoUpdate({
         target: routerSyncState.routerId,
         set: { lastAttemptAt: now, lastError: error },
+      });
+    },
+    async getSettings(routerId) {
+      const rows = await db.select().from(routerSettings).where(eq(routerSettings.routerId, routerId)).limit(1);
+      return rows[0] ?? null;
+    },
+    async setSettings(routerId, settings, now) {
+      await db.insert(routerSettings).values({ routerId, ...settings, updatedAt: now }).onConflictDoUpdate({
+        target: routerSettings.routerId,
+        set: { ...settings, updatedAt: now },
       });
     },
   };
