@@ -2289,7 +2289,7 @@ jobs:
           # upload/download-artifact's ZIP drops Unix mode bits; the guest execs
           # /opt/engram/dyn/0/harness, so it must stay executable in the squashfs.
           chmod +x var/harness-claude-stage/harness var/harness-claude-stage/claude
-          chmod +x var/harness-codex-stage/harness var/harness-codex-stage/codex
+          chmod +x var/harness-codex-stage/harness var/harness-codex-stage/codex var/harness-codex-stage/codex-code-mode-host
           ls -la var/harness-claude-stage/
           # Point `just bundles-squashfs` (tilt runs it next) at this downloaded
           # tree so it packs `harness-claude` into var/shared's stamp.
