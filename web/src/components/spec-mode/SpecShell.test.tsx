@@ -44,7 +44,9 @@ describe("SpecShell", () => {
     expect(getComputedStyle(viewport).overflowX).toBe("auto");
     expect(getComputedStyle(viewport).overflowY).toBe("hidden");
     expect(getComputedStyle(shell).minWidth).toBe("1188px");
-    expect(getComputedStyle(shell).gridTemplateColumns).toBe("236px minmax(0, 1fr) 392px");
+    // The jsdom 31 CSS engine serializes zero lengths with a unit (0 -> 0px),
+    // which is what browsers report for this grid.
+    expect(getComputedStyle(shell).gridTemplateColumns).toBe("236px minmax(0px, 1fr) 392px");
     expect(getComputedStyle(documentRegion).overflowY).toBe("auto");
   });
 
