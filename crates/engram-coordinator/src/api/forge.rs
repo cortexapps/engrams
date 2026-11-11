@@ -1,8 +1,8 @@
 //! ADRs 0023 and 0106 in-session credential-control seam.
 //!
-//! One operation the in-guest `GIT_ASKPASS` helper invokes — mint a fresh
-//! git clone/push credential — reachable over two transports that share the
-//! same auth + dispatch core:
+//! The in-guest `GIT_ASKPASS` helper asks for a fresh git clone/push
+//! credential, and the harness asks for its OAuth credential, over two
+//! transports that share one auth + dispatch core:
 //!
 //! - **HTTP** (`GET /sessions/:id/git-credential`): the ProcessBackend /
 //!   `--mode=all` loopback path. Mounted OUTSIDE the deployment bearer
@@ -15,100 +15,107 @@
 //! deployment token. OAuth operations select no subject/provider from guest
 //! input: the coordinator resolves the durable session binding.
 //!
-//! ADR 0056 P3 folded PR-open onto the egress inject+observe plane, so this
-//! seam now carries ONLY the git credential — the one delivery the egress
-//! interceptor can't header-inject (git speaks a credential-helper protocol,
-//! not a header-authed HTTP API).
+//! Only a forge whose integration mints a short-lived credential is served
+//! here. A forge with a static token gets it from the egress proxy as a
+//! header, so the token never enters the guest.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
+use chrono::{DateTime, Utc};
 use engram_core::traits::{CredentialHint, HarnessByteStream, Integration, ScopedCredential};
 use engram_core::types::ids::SessionId;
+use engram_core::types::Capability;
 use engram_harness_proto::{read_msg, write_msg, ForgeOp, ForgeRequest, ForgeResponse};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::state::SharedState;
 
-// ---- shared auth + dispatch core (HTTP + vsock) ------------------------
+// ---- shared core (HTTP + vsock) -----------------------------------------
 
-/// Why a forge request was denied. Maps onto an HTTP status (HTTP path)
-/// or a `ForgeResponse::Error` message (vsock path).
-enum Denied {
-    NoForge,
-    BadToken,
+/// A git forge the session may use: a provider among the session's
+/// capabilities whose integration serves a git host.
+pub(crate) struct SessionForge {
+    pub integration: Arc<dyn Integration>,
+    pub host: String,
 }
 
-impl Denied {
-    fn message(&self) -> &'static str {
-        match self {
-            Self::NoForge => "no git forge is configured",
-            Self::BadToken => "invalid or missing forge token",
+/// The session's forges, one per capability provider that serves a git host.
+pub(crate) async fn session_forges(state: &SharedState, caps: &[Capability]) -> Vec<SessionForge> {
+    let providers: BTreeSet<&str> = caps.iter().map(|c| c.provider.as_str()).collect();
+    let mut forges = Vec::new();
+    for provider in providers {
+        let Some(integration) = state
+            .integrations
+            .resolve(provider, &state.services.secrets)
+            .await
+        else {
+            continue;
+        };
+        if let Some(host) = integration.git_forge_host() {
+            forges.push(SessionForge { integration, host });
         }
     }
+    forges
 }
 
-impl From<Denied> for ApiError {
-    fn from(d: Denied) -> Self {
-        match d {
-            Denied::NoForge => ApiError::Unsupported(d.message().into()),
-            Denied::BadToken => ApiError::Unauthorized(d.message().into()),
-        }
-    }
+/// A git credential: the username and password git sends as HTTP Basic.
+struct GitCredential {
+    username: String,
+    password: String,
+    expires_at: DateTime<Utc>,
 }
 
-/// Verify the per-session broker token (constant-time) and return the
-/// configured forge. Layers the forge-configured check on top of the
-/// shared [`crate::api::session_auth::authorize_broker_token`].
-async fn authorize(
+/// Mint the session's git credential for `host`. The forge is the one among
+/// the session's capability providers that serves `host`; with no `host`, the
+/// session's only forge. The mint clamps the credential to the capabilities,
+/// so a session with no capability for a forge gets no credential from it.
+async fn fetch_git_credential(
     state: &SharedState,
     session: SessionId,
-    token: &str,
-) -> Result<Arc<dyn Integration>, Denied> {
-    let integration = state
-        .integrations
-        .resolve("github", &state.services.secrets)
-        .await
-        .ok_or(Denied::NoForge)?;
-    if crate::api::session_auth::authorize_broker_token(state, session, token).await {
-        Ok(integration)
-    } else {
-        Err(Denied::BadToken)
-    }
-}
-
-/// Mint a credential, rejecting a host that doesn't match the forge.
-///
-/// ADR 0056 (Plane A): the token is scoped to the session's bound capabilities
-/// — read them from PG and hand them to the mint, which clamps the GitHub App
-/// permissions to exactly what the profile granted (filtering to its own
-/// provider). An empty set falls back to the provider's default scopes.
-async fn op_fetch_credential(
-    state: &SharedState,
-    session: SessionId,
-    integration: &Arc<dyn Integration>,
     host: Option<String>,
     owner: Option<String>,
-) -> Result<ScopedCredential, String> {
+) -> Result<GitCredential, String> {
+    let host = host.filter(|s| !s.is_empty());
     let caps = state
         .services
         .meta
         .get_session_capabilities(session)
         .await
-        .unwrap_or_default();
-    // The git remote host (e.g. github.com); the integration validates it against
-    // its own served host. This is the one caller that legitimately sets it.
+        .map_err(|e| format!("read session capabilities: {e}"))?;
+    let mut forges = session_forges(state, &caps).await;
+    if let Some(host) = &host {
+        forges.retain(|forge| forge.host.eq_ignore_ascii_case(host));
+    }
+    let forge = match forges.as_slice() {
+        [forge] => forge,
+        [] => return Err("this session has no git forge for that host".into()),
+        _ => return Err("this session has more than one git forge; name the host".into()),
+    };
     let hint = CredentialHint {
-        served_host: host.filter(|s| !s.is_empty()),
+        served_host: host,
         owner: owner.filter(|s| !s.is_empty()),
     };
-    integration
-        .mint_credential(&caps, &hint)
-        .await
-        .map_err(|e| format!("mint git credential: {e}"))
+    match forge.integration.mint_credential(&caps, &hint).await {
+        Ok(ScopedCredential::Basic {
+            username,
+            password,
+            expires_at,
+        }) => Ok(GitCredential {
+            username,
+            password,
+            expires_at,
+        }),
+        Ok(_) => Err(format!(
+            "{} minted a credential git cannot send as HTTP Basic",
+            forge.integration.provider()
+        )),
+        Err(e) => Err(format!("mint git credential: {e}")),
+    }
 }
 
 use crate::api::session_auth::bearer;
@@ -130,9 +137,8 @@ pub struct GitCredentialResponse {
     pub expires_at: String,
 }
 
-/// `GET /sessions/:id/git-credential` — mint a fresh installation
-/// credential. The guest fetches per git op, so token expiry is
-/// invisible in-guest.
+/// `GET /sessions/:id/git-credential` — mint a fresh git credential. The
+/// guest fetches one per git operation, so it never sees a token expire.
 pub async fn git_credential(
     State(state): State<SharedState>,
     Path(id): Path<SessionId>,
@@ -141,24 +147,18 @@ pub async fn git_credential(
 ) -> Result<Json<GitCredentialResponse>, ApiError> {
     let token =
         bearer(&headers).ok_or_else(|| ApiError::Unauthorized("missing forge token".into()))?;
-    let integration = authorize(&state, id, &token).await?;
-    let cred = op_fetch_credential(&state, id, &integration, q.host, q.owner)
+    if !crate::api::session_auth::authorize_broker_token(&state, id, &token).await {
+        return Err(ApiError::Unauthorized(
+            "invalid or missing forge token".into(),
+        ));
+    }
+    let cred = fetch_git_credential(&state, id, q.host, q.owner)
         .await
         .map_err(ApiError::Internal)?;
-    let ScopedCredential::Basic {
-        username,
-        password,
-        expires_at,
-    } = cred
-    else {
-        return Err(ApiError::Internal(
-            "github mint returned a non-basic credential".into(),
-        ));
-    };
     Ok(Json(GitCredentialResponse {
-        username,
-        password,
-        expires_at: expires_at.to_rfc3339(),
+        username: cred.username,
+        password: cred.password,
+        expires_at: cred.expires_at.to_rfc3339(),
     }))
 }
 
@@ -232,25 +232,10 @@ async fn process_request(state: &SharedState, req: ForgeRequest) -> ForgeRespons
     }
     match req.op {
         ForgeOp::FetchCredential { host, owner } => {
-            let integration = match state
-                .integrations
-                .resolve("github", &state.services.secrets)
-                .await
-            {
-                Some(integration) => integration,
-                None => {
-                    return ForgeResponse::Error {
-                        message: Denied::NoForge.message().into(),
-                    }
-                }
-            };
-            match op_fetch_credential(state, req.session_id, &integration, Some(host), owner).await
-            {
-                Ok(ScopedCredential::Basic {
-                    username, password, ..
-                }) => ForgeResponse::Credential { username, password },
-                Ok(_) => ForgeResponse::Error {
-                    message: "github mint returned a non-basic credential".into(),
+            match fetch_git_credential(state, req.session_id, Some(host), owner).await {
+                Ok(cred) => ForgeResponse::Credential {
+                    username: cred.username,
+                    password: cred.password,
                 },
                 Err(message) => ForgeResponse::Error { message },
             }

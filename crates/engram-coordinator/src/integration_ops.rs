@@ -14,7 +14,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use engram_core::traits::{CredentialHint, ScopedCredential, SecretContext};
+use engram_core::traits::{
+    render_header_template, CredentialHint, ScopedCredential, SecretContext,
+};
 use engram_core::types::SecretSchema;
 use engram_protocol::app;
 
@@ -205,7 +207,7 @@ async fn apply_credential(
         } else {
             template
         };
-        return Ok(builder.header(header_name, template.replace("{}", &token.secret)));
+        return Ok(builder.header(header_name, render_header_template(template, &token.secret)));
     }
     if spec.source == "mint" {
         // Draft fields (the connect sheet's pre-save "Test") build a one-shot
@@ -257,7 +259,7 @@ async fn apply_credential(
         } else {
             inj.template.as_str()
         };
-        b = b.header(header_name, template.replace("{}", &value));
+        b = b.header(header_name, render_header_template(template, &value));
     }
     Ok(b)
 }

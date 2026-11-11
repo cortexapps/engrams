@@ -102,6 +102,12 @@ async fn build_forge_app() -> (
         })
         .await
         .expect("seed session");
+    meta.bind_session_capabilities(
+        session_id,
+        &[engram_core::types::Capability::parse("github:contents:read@acme/app").unwrap()],
+    )
+    .await
+    .expect("bind capabilities");
     let sandbox_dir = tempfile::tempdir().expect("sandbox tempdir").keep();
     let forge = Arc::new(engram_git_dev::StaticGitHubIntegration::github(
         "ghs_test_xyz",
@@ -185,6 +191,31 @@ async fn forge_git_credential_gated_by_broker_token() {
     let v = body_json(resp.into_body()).await;
     assert_eq!(v["username"], "x-access-token");
     assert_eq!(v["password"], "ghs_test_xyz");
+}
+
+#[tokio::test]
+async fn forge_git_credential_needs_a_capability_for_the_host() {
+    let (app, sid, forge) = build_forge_app().await;
+    let get = |uri: String| {
+        app.clone().oneshot(
+            Request::get(uri)
+                .header("authorization", "Bearer broker-tok-123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+    };
+    let uri = format!("/api/v1/sessions/{sid}/git-credential");
+
+    // The session's forge serves github.com: a named host must match it.
+    let resp = get(format!("{uri}?host=GitHub.com")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = get(format!("{uri}?host=gitlab.com")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    // The mint is clamped to the session's own capabilities.
+    let minted = forge.recorded_mint_caps();
+    assert_eq!(minted.len(), 1);
+    assert_eq!(minted[0][0].action, "contents:read");
 }
 
 #[tokio::test]

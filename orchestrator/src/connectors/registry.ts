@@ -39,7 +39,8 @@ import { join } from "node:path";
 // ---------------------------------------------------------------------------
 
 /** One injected auth header. `{}` in `template` is replaced by the resolved
- * secret value host-side (e.g. `"Bearer {}"`, default `"{}"`). `secretRef` names
+ * secret value host-side (e.g. `"Bearer {}"`, default `"{}"`); `{basic:USER}`
+ * by the HTTP Basic credential base64(`USER:secret`). `secretRef` names
  * the org secret for a static connector; on an oauth-facet connector it is
  * ABSENT — the value is the connector's OAuth access token, resolved and
  * refreshed from the coordinator's sealed credential store (ADR 0106 addendum). */
@@ -123,6 +124,10 @@ export interface Operation {
   grants: string[];
   /** Either an HTTP match (`method`/`path`) or a GraphQL match (`operation`/`field`). */
   match?: HttpMatch | GraphqlMatch;
+  /** Replaces the credential's header template on this operation, for a path
+   * that takes the same secret in another form (git over HTTPS takes a token
+   * as a Basic password). */
+  template?: string;
   asset?: AssetSpec;
 }
 
@@ -2027,6 +2032,17 @@ function parseActionIdempotency(where: string, raw: unknown): ActionIdempotency 
   }
 }
 
+/** A header template names the secret as `{}` or as `{basic:USER}`. */
+const TEMPLATE_PLACEHOLDER_RE = /\{\}|\{basic:[A-Za-z0-9_.-]*\}/;
+
+function assertHeaderTemplate(where: string, field: string, value: unknown): asserts value is string {
+  if (typeof value !== "string") fail(where, `"${field}" must be a string`);
+  if (/[\r\n]/.test(value)) fail(where, `"${field}" must not contain newlines`);
+  if (!TEMPLATE_PLACEHOLDER_RE.test(value)) {
+    fail(where, `"${field}" must contain the "{}" or "{basic:USER}" value placeholder`);
+  }
+}
+
 /** Validate + narrow one raw connector object. Throws Error on any malformation. */
 export function parseConnector(
   raw: unknown,
@@ -2060,11 +2076,7 @@ export function parseConnector(
         if (typeof inj.secretRef !== "string" || !inj.secretRef) fail(iw, '"secretRef" must be a non-empty string');
         if (/\s/.test(inj.secretRef)) fail(iw, '"secretRef" must not contain whitespace');
       }
-      if (inj.template !== undefined) {
-        if (typeof inj.template !== "string") fail(iw, '"template" must be a string');
-        if (/[\r\n]/.test(inj.template)) fail(iw, '"template" must not contain newlines');
-        if (!inj.template.includes("{}")) fail(iw, '"template" must contain the "{}" value placeholder');
-      }
+      if (inj.template !== undefined) assertHeaderTemplate(iw, "template", inj.template);
       let injectHosts: string[] | undefined;
       if (inj.hosts !== undefined) {
         injectHosts = asStringArray(iw, "hosts", inj.hosts);
@@ -2148,6 +2160,12 @@ export function parseConnector(
         match = { ...(typeof m.method === "string" ? { method: m.method } : {}), ...(typeof m.path === "string" ? { path: m.path } : {}) };
       }
     }
+    if (op.template !== undefined) {
+      assertHeaderTemplate(opWhere, "template", op.template);
+      if (credential.source !== "inject" || !match || isGraphqlMatch(match)) {
+        fail(opWhere, '"template" needs an inject credential and an HTTP match');
+      }
+    }
     let asset: AssetSpec | undefined;
     if (op.asset !== undefined) {
       if (typeof op.asset !== "object" || op.asset === null) fail(opWhere, '"asset" must be an object');
@@ -2204,7 +2222,12 @@ export function parseConnector(
         ...(urlFallback ? { urlFallback } : {}),
       };
     }
-    return { grants, ...(match ? { match } : {}), ...(asset ? { asset } : {}) };
+    return {
+      grants,
+      ...(match ? { match } : {}),
+      ...(typeof op.template === "string" ? { template: op.template } : {}),
+      ...(asset ? { asset } : {}),
+    };
   });
 
   const display = parseDisplay(where, o.display, o.provider, opts.builtin === true);
@@ -2413,9 +2436,7 @@ export function parseConnector(
       if (typeof inj.header !== "string" || !HEADER_NAME_RE.test(inj.header)) {
         fail(uw, '"inject.header" must be a valid HTTP header name');
       }
-      if (typeof inj.template !== "string" || !inj.template.includes("{}") || /[\r\n]/.test(inj.template)) {
-        fail(uw, '"inject.template" must be a string containing the "{}" placeholder and no newlines');
-      }
+      assertHeaderTemplate(uw, "inject.template", inj.template);
       userInject = { header: inj.header, template: inj.template };
     }
     if (credential.source === "inject") {
@@ -2704,7 +2725,7 @@ export function compileIntegrationPolicy(
           const entry: IntegrationInjectJson = {
             hosts: inj.hosts ?? hosts,
             header_name: inj.header,
-            header_template: inj.template ?? "{}",
+            header_template: op.template ?? inj.template ?? "{}",
             secret_ref: userScoped ? "" : (inj.secretRef ?? ""),
             mint_source: userScoped
               ? userMintSource()

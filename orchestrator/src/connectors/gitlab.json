@@ -13,7 +13,22 @@
       { "header": "Authorization", "template": "Bearer {}", "secretRef": "gitlab.api_token" }
     ]
   },
-  "hosts": ["gitlab.com"],
+  "settings": [
+    {
+      "name": "api_host",
+      "label": "GitLab host",
+      "kind": "host",
+      "options": [{ "value": "gitlab.com", "label": "GitLab.com" }],
+      "custom": {
+        "label": "Self-managed",
+        "hint": "The hostname of your GitLab instance, for example gitlab.example.com. No scheme, port, or path."
+      },
+      "default": "gitlab.com",
+      "env": "GITLAB_HOST",
+      "hint": "The GitLab your token belongs to. Sessions reach this host and no other GitLab host."
+    }
+  ],
+  "hosts": [],
   "test": { "path": "/api/v4/user" },
   "operations": [
     {
@@ -67,6 +82,26 @@
       "match": { "method": "POST", "path": "/api/v4/projects/*/repository/commits" }
     },
     {
+      "grants": ["repository:read"],
+      "match": { "method": "GET", "path": "/*/info/refs?service=git-upload-pack" },
+      "template": "Basic {basic:oauth2}"
+    },
+    {
+      "grants": ["repository:read"],
+      "match": { "method": "POST", "path": "/*/git-upload-pack" },
+      "template": "Basic {basic:oauth2}"
+    },
+    {
+      "grants": ["repository:write"],
+      "match": { "method": "GET", "path": "/*/info/refs?service=git-receive-pack" },
+      "template": "Basic {basic:oauth2}"
+    },
+    {
+      "grants": ["repository:write"],
+      "match": { "method": "POST", "path": "/*/git-receive-pack" },
+      "template": "Basic {basic:oauth2}"
+    },
+    {
       "grants": [
         "projects:read",
         "merge_requests:read",
@@ -86,6 +121,6 @@
     "binSource": "bundled",
     "dummyEnv": { "GITLAB_TOKEN": "x-engrams-managed" },
     "credentialDelivery": "inject",
-    "doc": "Use `glab` (the official GitLab CLI) to drive GitLab from this session — browse projects, open and review merge requests and issues, and inspect CI/CD pipelines on gitlab.com. Authentication is automatic: the egress proxy injects a capability-scoped GitLab personal access token (Authorization: Bearer) on every request to the GitLab REST API (/api/v4) and strips anything you supply. `GITLAB_TOKEN` is a managed placeholder. Do NOT run `glab auth login` or set a real token.\n\nCommon commands and the power each needs:\n- Projects: `glab repo view <group/project>`, `glab repo list` — requires `projects:read`.\n- Merge requests: `glab mr list`, `glab mr view <id>` (requires `merge_requests:read`); `glab mr create --source-branch <b> --target-branch main --title \"...\" --description \"...\"` (requires `merge_requests:write`). To open an MR: push your branch first (git auth is brokered, nothing to configure), then create the MR.\n- Issues: `glab issue list`, `glab issue view <iid>` (requires `issues:read`); `glab issue create --title \"...\" --description \"...\"` (requires `issues:write`).\n- Pipelines: `glab ci list`, `glab ci status`, `glab ci view` (requires `pipelines:read`); `glab ci run`/`glab ci trigger` (requires `pipelines:write`).\n- Repository contents (files, tree, commits, branches, tags): read requires `repository:read`; creating commits via the API requires `repository:write`.\n\nRaw REST passthrough: `glab api projects/:id/merge_requests` (GET) or `glab api --method POST projects/:id/issues -f title=\"...\"`. Only the resource families your profile granted are reachable — a call to a path you weren't granted is denied at the network boundary, not authenticated. Run `glab --help` to explore."
+    "doc": "Use `glab` (the official GitLab CLI) to drive GitLab from this session — browse projects, open and review merge requests and issues, and inspect CI/CD pipelines. Authentication is automatic: the egress proxy adds the GitLab access token to every request your powers allow, on the REST API (/api/v4) and on git over HTTPS, and strips anything you supply. `GITLAB_TOKEN` is a managed placeholder. Do NOT run `glab auth login` or set a real token.\n\nCommon commands and the power each needs:\n- Projects: `glab repo view <group/project>`, `glab repo list` — requires `projects:read`.\n- Merge requests: `glab mr list`, `glab mr view <id>` (requires `merge_requests:read`); `glab mr create --source-branch <b> --target-branch main --title \"...\" --description \"...\"` (requires `merge_requests:write`). To open an MR: push your branch first, then create the MR.\n- Issues: `glab issue list`, `glab issue view <iid>` (requires `issues:read`); `glab issue create --title \"...\" --description \"...\"` (requires `issues:write`).\n- Pipelines: `glab ci list`, `glab ci status`, `glab ci view` (requires `pipelines:read`); `glab ci run`/`glab ci trigger` (requires `pipelines:write`).\n- Repository contents (files, tree, commits, branches, tags): read requires `repository:read`; creating commits via the API requires `repository:write`.\n- Git: `git clone https://<host>/<group>/<project>.git` and `git fetch` require `repository:read`; `git push` requires `repository:write`. Use HTTPS remotes with no credential in the URL and no credential helper.\n\nRaw REST passthrough: `glab api projects/:id/merge_requests` (GET) or `glab api --method POST projects/:id/issues -f title=\"...\"`. Only the resource families your profile granted are reachable — a call to a path you weren't granted is denied at the network boundary, not authenticated. Run `glab --help` to explore."
   }
 }

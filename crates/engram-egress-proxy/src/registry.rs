@@ -1011,7 +1011,7 @@ mod tests {
         assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(e.secret(), "fresh-token");
         assert_eq!(
-            e.header_template.replace("{}", &e.secret()),
+            engram_core::traits::render_header_template(&e.header_template, &e.secret()),
             "Bearer fresh-token"
         );
     }
