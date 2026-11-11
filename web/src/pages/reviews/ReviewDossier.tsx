@@ -15,6 +15,7 @@ import {
 import type { Review } from "../../gen/engram/app/v1/review_pb";
 import { useRetryReview, useReview } from "../../hooks/useReviews";
 import { useBuiltinAutomation } from "../../hooks/useAutomations";
+import { useReviewForges } from "../../hooks/useIntegrations";
 import { useNow } from "../../hooks/useNow";
 import { useAbility } from "../../auth/AuthProvider";
 import type { SessionSubject } from "../../lib/ability";
@@ -181,10 +182,11 @@ function PrHeader({
   // borrow identity from the newest sibling.
   const title = prTitleOf(pass);
   const retry = useRetryReview();
-  const builtin = useBuiltinAutomation("pr_review");
-  const runAutomationId = builtin.data?.automation?.id;
+  // The run belongs to the review automation of this pass's forge.
+  const forge = useReviewForges().forges.find((entry) => entry.provider === pass.provider);
+  const runAutomationId = useBuiltinAutomation(forge?.builtinKey ?? "").data?.automation?.id;
   const navigate = useNavigate();
-  // One GitHub affordance, but never a label that lies about where it lands.
+  // One link to the forge, with a label that says where it lands.
   const forgeUrl = pass.postedReviewUrl ?? pass.prUrl;
 
   // A re-run cannot tell you the new pass's id: the RPC starts durable ingress
@@ -207,8 +209,7 @@ function PrHeader({
         </Text>
         <div className="flex shrink-0 items-center gap-1">
           {pass.automationRunId && runAutomationId && (
-            // The platform behind the product: this pass is one run of the
-            // PR-review automation, and the run's trace is the ground truth.
+            // This pass is one run of the review automation; the run has its trace.
             <Button variant="ghost" size="sm" asChild>
               <Link
                 to="/automations/$id"

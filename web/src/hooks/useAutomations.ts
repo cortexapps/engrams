@@ -34,13 +34,13 @@ export function useAutomation(id: string | undefined) {
   return useQuery(getAutomation, { lookup: { case: "id", value: id ?? "" } }, { enabled: !!id });
 }
 
-/** A built-in by its stable key (e.g. "pr_review") — resolves to null rather
- * than erroring when the built-in has not been seeded yet. */
+/** A built-in by its stable key (e.g. "pr_review"). The result is null when the
+ * built-in is not seeded. An empty key sends no request. */
 export function useBuiltinAutomation(builtinKey: string) {
   return useQuery(
     getAutomation,
     { lookup: { case: "builtinKey", value: builtinKey } },
-    { staleTime: 30_000, retry: false },
+    { staleTime: 30_000, retry: false, enabled: builtinKey !== "" },
   );
 }
 
