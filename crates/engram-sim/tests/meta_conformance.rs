@@ -3023,6 +3023,53 @@ async fn a_host_without_reported_cores_has_no_cpu_gate(ctx: &Ctx) {
     ));
 }
 
+/// `session_budget` is the reservation the session was created with. A
+/// session with no recorded budget, and an unknown session, have none.
+async fn session_budget_is_the_create_time_reservation(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let now = ctx.clock.now_utc();
+    let host = HostId::new();
+    meta.upsert_host(host_record(host, "conf-budget", now))
+        .await
+        .unwrap();
+    let budgeted = SessionId::new();
+    let placed = meta
+        .reserve_and_persist_create(
+            engram_core::traits::metadata::SessionCreateWriteSet {
+                session_id: budgeted,
+                spec: spec("conf:budget"),
+                mem_budget_mib: 4096,
+                cpu_budget_vcpus: 2,
+                sealed_secrets: None,
+                capabilities: Vec::new(),
+                integration_policy_json: None,
+                runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(
+                    Vec::new(),
+                    None,
+                    None,
+                    Vec::new(),
+                ),
+                oauth_binding: None,
+            },
+            &[host],
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        placed,
+        engram_core::traits::metadata::CreateDisposition::Placed(_)
+    ));
+    assert_eq!(
+        meta.session_budget(budgeted).await.unwrap(),
+        Some((4096, 2))
+    );
+
+    let unbudgeted = meta.create_session(spec("conf:no-budget")).await.unwrap();
+    assert_eq!(meta.session_budget(unbudgeted).await.unwrap(), None);
+    assert_eq!(meta.session_budget(SessionId::new()).await.unwrap(), None);
+}
+
 /// The register-time rehydrate list and the reconcile assignment list are
 /// one listing: every VM-resident state with a bound sandbox on the host.
 /// A rung-parked `Evicting` survivor and a `Created` survivor are as
@@ -5595,6 +5642,10 @@ conformance!(t_placement_no_fit, super::placement_no_fit);
 conformance!(
     t_a_host_without_reported_cores_has_no_cpu_gate,
     super::a_host_without_reported_cores_has_no_cpu_gate
+);
+conformance!(
+    t_session_budget_is_the_create_time_reservation,
+    super::session_budget_is_the_create_time_reservation
 );
 conformance!(
     t_enabled_image_config_update,
