@@ -45,10 +45,6 @@ describe("built-in tools", () => {
       nativeBindings: {
         codex: "requestUserInput",
       },
-      presenters: {
-        slack: "questionEffect",
-        web: "UserQuestionCard",
-      },
     });
     expect(tool!.nativeBindings?.claude).toBeUndefined();
     expect(
@@ -86,10 +82,6 @@ describe("built-in tools", () => {
     expect(tool).toMatchObject({
       handling: "session",
       execution: "deferred",
-      presenters: {
-        slack: "planEffect",
-        web: "PlanCard",
-      },
     });
     // No bindings at all (ADR 0107 + the headless built-in removals): every
     // harness receives the tool through the injected deferred path.
