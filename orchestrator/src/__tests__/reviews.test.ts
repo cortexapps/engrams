@@ -220,7 +220,7 @@ function spawn(
 function enrolledRepos(repos: string[]): Pick<EnrolledRepos, "get"> {
   const listed = new Set(repos.map((r) => r.toLowerCase()));
   return {
-    async get(repo) {
+    async get(_provider, repo) {
       return listed.has(repo.toLowerCase()) ? { mode: "on_request", autofix: false } : null;
     },
   };

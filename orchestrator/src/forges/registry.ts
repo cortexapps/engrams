@@ -1,6 +1,7 @@
 /** The registered git forges, by connector provider. */
 
 import { GITHUB_FORGE } from "../providers/github/forge.ts";
+import type { ReviewVariant } from "../automations/builtins/review-variant.ts";
 import type { ForgeDeps, GitForge, GitForgeSpec } from "./forge.ts";
 
 const SPECS: ReadonlyMap<string, GitForgeSpec> = new Map(
@@ -10,6 +11,16 @@ const production = new Map<string, GitForge>();
 
 export function forgeProviders(): string[] {
   return [...SPECS.keys()];
+}
+
+/** The code-review built-in of each forge that has one. */
+export function reviewVariants(): ReviewVariant[] {
+  return [...SPECS.values()].flatMap((spec) => (spec.review ? [spec.review] : []));
+}
+
+/** The key of a forge's code-review built-in; null when it has none. */
+export function reviewBuiltinKey(provider: string): string | null {
+  return SPECS.get(provider)?.review?.key ?? null;
 }
 
 /** The forge for `provider`, or null when the provider is not a forge. With

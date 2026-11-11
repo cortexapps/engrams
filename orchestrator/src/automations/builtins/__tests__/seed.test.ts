@@ -3,8 +3,12 @@ import { describe, expect, test } from "bun:test";
 import type { AutomationRow, AutomationVersionRow } from "../../../db/automations.ts";
 import type { AutomationDefinition } from "../../engine/definition.ts";
 import type { BuiltinAutomation } from "../../engine/builtins.ts";
-import { PR_REVIEW_BUILTIN, PR_REVIEW_BUILTIN_KEY } from "../pr-review.ts";
+import { reviewBuiltin } from "../review.ts";
+import { GITHUB_REVIEW } from "../../../providers/github/review-variant.ts";
 import { definitionContentHash, seedBuiltinAutomations, type BuiltinSeedStore } from "../seed.ts";
+
+const PR_REVIEW_BUILTIN = reviewBuiltin(GITHUB_REVIEW);
+const PR_REVIEW_BUILTIN_KEY = GITHUB_REVIEW.key;
 
 const NOW = new Date("2026-08-21T00:00:00Z");
 

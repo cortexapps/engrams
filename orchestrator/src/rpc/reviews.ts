@@ -210,8 +210,8 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
       }
       const detail = await reviews().getReview(id);
       if (!detail) throw new ConnectError("not found", Code.NotFound);
-      const { repo } = detail.review;
-      if (!(await enrolledRepos().get(repo))) {
+      const { provider, repo } = detail.review;
+      if (!(await enrolledRepos().get(provider, repo))) {
         throw new ConnectError("repo is not enrolled", Code.FailedPrecondition);
       }
       // A retry admits a fresh built-in run with the ORIGINAL run's trigger

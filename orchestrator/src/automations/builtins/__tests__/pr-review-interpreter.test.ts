@@ -21,7 +21,10 @@ import type { RunSnapshot } from "../../engine/context.ts";
 import type { EngineDeps, EngineSessionOps, EngineStepRecord } from "../../engine/deps.ts";
 import type { AutomationInbox } from "../../engine/inbox.ts";
 import { interpretAutomation } from "../../engine/interpreter.ts";
-import { PR_REVIEW_DEFINITION } from "../pr-review.ts";
+import { reviewDefinition } from "../review.ts";
+import { GITHUB_REVIEW } from "../../../providers/github/review-variant.ts";
+
+const PR_REVIEW_DEFINITION = reviewDefinition(GITHUB_REVIEW);
 
 registerEngineBlocks();
 afterEach(() => setReviewBlockDeps(null));

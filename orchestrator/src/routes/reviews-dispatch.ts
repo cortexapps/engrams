@@ -49,13 +49,14 @@ export function makeReviewsDispatchRoute(
       return c.json({ error: "repo and positive pr_number are required" }, 400);
     }
 
-    if (!(await enrolledRepos().get(repo))) {
+    const provider = defaultForgeProvider();
+    if (!(await enrolledRepos().get(provider, repo))) {
       // A repo the built-in does not list is a stable resource miss, not a
       // transient conflict.
       return c.json({ error: "repo is not enrolled" }, 404);
     }
     // The run id is the DBOS workflow id, so the response shape holds.
-    const runId = await dispatchAutomation({ provider: defaultForgeProvider(), repo, prNumber });
+    const runId = await dispatchAutomation({ provider, repo, prNumber });
     return c.json({ workflow_id: runId });
   });
 

@@ -235,13 +235,6 @@ function clipPriorText(text: string): string {
   return `${text.slice(0, PRIOR_TEXT_MAX)}…`;
 }
 
-// Review workers reach only the forge. The clone and codeload hosts are
-// listed because the GitHub connector declares only api.github.com.
-export const REVIEW_NETWORK: ProfileNetwork = {
-  default: "deny",
-  allowHosts: ["github.com", "codeload.github.com", "api.github.com"],
-  allowHostPatterns: [],
-};
 
 function assertSafeRepo(repo: string): void {
   if (!SAFE_REPO_PATH.test(repo)) throw new ReviewSetupError(`invalid repository: ${repo}`);

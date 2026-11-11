@@ -4,12 +4,11 @@ import { registerEngineBlocks } from "../../engine/blocks/index.ts";
 import { validateDefinition, applyBlockOverrides } from "../../engine/definition.ts";
 import { renderAutomationTemplateInScope } from "../../template.ts";
 import { evaluateCode } from "../../code/sandbox.ts";
-import {
-  PR_REVIEW_BUILTIN,
-  PR_REVIEW_DEFINITION,
-  REVIEW_FACTS_SOURCE,
-  defaultMentionHandle,
-} from "../pr-review.ts";
+import { reviewBuiltin, reviewDefinition } from "../review.ts";
+import { GITHUB_REVIEW, REVIEW_FACTS_SOURCE, defaultMentionHandle } from "../../../providers/github/review-variant.ts";
+
+const PR_REVIEW_BUILTIN = reviewBuiltin(GITHUB_REVIEW);
+const PR_REVIEW_DEFINITION = reviewDefinition(GITHUB_REVIEW);
 
 registerEngineBlocks();
 

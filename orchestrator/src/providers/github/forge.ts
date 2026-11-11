@@ -13,6 +13,7 @@ import {
   type IntegrationOpResult,
 } from "../../integrations/run-op.ts";
 import { readPrContext } from "./pr.ts";
+import { GITHUB_REVIEW } from "./review-variant.ts";
 
 const PROVIDER = "github";
 const PER_PAGE = 100;
@@ -271,4 +272,5 @@ export const GITHUB_FORGE: GitForgeSpec = {
   provider: PROVIDER,
   legacyDefault: true,
   make: makeGithubForge,
+  review: GITHUB_REVIEW,
 };

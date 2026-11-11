@@ -48,7 +48,7 @@ import { RESOLVE_USER_TYPE } from "../engine/blocks/resolve-user.ts";
 import { CHOICE_LABEL_MAX, CHOICE_TYPE } from "../engine/blocks/choice.ts";
 import { profileRouteQuestions } from "../profile-cards.ts";
 import { NO_USER_MSG } from "../../chat/identity.ts";
-import { DEFAULT_CONNECTION_PLACEHOLDER } from "./pr-review.ts";
+import { DEFAULT_CONNECTION_PLACEHOLDER } from "../engine/builtins.ts";
 
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
 

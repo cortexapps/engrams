@@ -6,9 +6,12 @@
 
 import { expect, test } from "bun:test";
 
-import { PR_REVIEW_DEFINITION } from "../pr-review.ts";
+import { reviewDefinition } from "../review.ts";
+import { GITHUB_REVIEW } from "../../../providers/github/review-variant.ts";
 import { definitionContentHash } from "../seed.ts";
 import { SLACK_BRAIN_DEFINITION } from "../slack-brain.ts";
+
+const PR_REVIEW_DEFINITION = reviewDefinition(GITHUB_REVIEW);
 
 test("the PR review definition hash is unchanged", () => {
   expect(definitionContentHash(PR_REVIEW_DEFINITION)).toBe("c11862e4e9faedf8d6727d752f55ad5816f8aca449f4ba2592ec945725b66313");

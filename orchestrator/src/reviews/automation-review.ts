@@ -26,7 +26,8 @@
  *   `report_halt` finalize hook posts the legacy halt comment.
  */
 
-import { PR_REVIEW_BUILTIN_KEY, REVIEW_DISPATCH_EVENT_KEY } from "../automations/builtins/pr-review.ts";
+import { REVIEW_DISPATCH_EVENT_KEY } from "../automations/builtins/review.ts";
+import { reviewBuiltinKey } from "../forges/registry.ts";
 import {
   admitAutomationRun,
   automationRunId,
@@ -59,7 +60,7 @@ export type AutomationReviewInstanceStore = Pick<
 >;
 
 export interface AutomationReviewDeps {
-  store?: Pick<AutomationStore, "getByBuiltinKey" | "getRun"> & AutomationDispatchStore;
+  store?: Pick<AutomationStore, "get" | "getByBuiltinKey" | "getRun"> & AutomationDispatchStore;
   starter?: AutomationWebhookStarter;
   sender?: AutomationSender;
   /** ADR 0120: the PR's workstream (the built-in is instanced per PR). */
@@ -126,10 +127,12 @@ async function bindWorkstream(
 
 async function requireBuiltin(
   store: Pick<AutomationStore, "getByBuiltinKey">,
+  provider: string,
 ): Promise<AutomationRow> {
-  const builtin = await store.getByBuiltinKey(PR_REVIEW_BUILTIN_KEY);
+  const key = reviewBuiltinKey(provider);
+  const builtin = key === null ? null : await store.getByBuiltinKey(key);
   if (!builtin) {
-    throw new RetryAutomationError("the PR-review built-in is not seeded");
+    throw new RetryAutomationError(`the code-review built-in for "${provider}" is not seeded`);
   }
   return builtin;
 }
@@ -147,7 +150,11 @@ export async function retryAutomationReview(
   if (!original) {
     throw new RetryAutomationError("the review's automation run no longer exists");
   }
-  const builtin = await requireBuiltin(store);
+  // The run's own automation is the variant that reviewed the pull request.
+  const builtin = await store.get(original.automationId);
+  if (!builtin) {
+    throw new RetryAutomationError("the review's automation no longer exists");
+  }
   const definition = effectiveDefinition(builtin.version, builtin.blockOverrides);
 
   const deliveryKey = `retry:${randomUUID()}`;
@@ -187,7 +194,7 @@ export async function dispatchAutomationReview(
   deps: AutomationReviewDeps = {},
 ): Promise<string> {
   const { store, starter, sender, instances, now, randomUUID } = resolveDeps(deps);
-  const builtin = await requireBuiltin(store);
+  const builtin = await requireBuiltin(store, input.provider);
   const definition = effectiveDefinition(builtin.version, builtin.blockOverrides);
 
   const deliveryKey = `dispatch:${randomUUID()}`;

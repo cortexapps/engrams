@@ -81,7 +81,8 @@ function harness(run: AutomationRunRow | null) {
   const admitted: Array<{ runId: string; deliveryKey: string; trigger: unknown }> = [];
   const started: string[] = [];
   const store = {
-    getByBuiltinKey: async () => (run ? (builtin() as never) : (builtin() as never)),
+    get: async () => builtin() as never,
+    getByBuiltinKey: async () => builtin() as never,
     getRun: async () => run,
     insertRun: async (input: { id: string; deliveryKey: string | null; trigger: unknown }) => {
       admitted.push({ runId: input.id, deliveryKey: input.deliveryKey ?? "", trigger: input.trigger });

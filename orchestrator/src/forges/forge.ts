@@ -2,6 +2,7 @@
  * pull request and to link one to the session that opened it. A provider
  * implements `GitForge` under `providers/<name>/` and joins `registry.ts`. */
 
+import type { ReviewVariant } from "../automations/builtins/review-variant.ts";
 import type { runIntegrationOp } from "../integrations/run-op.ts";
 import type { PrContext } from "./pr-context.ts";
 
@@ -111,4 +112,6 @@ export interface GitForgeSpec {
   /** Stored rows and block configs that name no forge mean this one. */
   legacyDefault?: true;
   make(deps: ForgeDeps): GitForge;
+  /** The forge's code-review built-in. */
+  review?: ReviewVariant;
 }

@@ -29,11 +29,13 @@ import type { AutomationDefinition, BlockDef, BlockOverrides, InputFieldSpec } f
 import { validateInputValues } from "../inputs.ts";
 import {
   listBuiltinAutomations,
+  DEFAULT_CONNECTION_PLACEHOLDER,
   mergeBuiltinOverrides,
   registerBuiltinAutomation,
   type BuiltinAutomation,
 } from "../engine/builtins.ts";
-import { DEFAULT_CONNECTION_PLACEHOLDER, PR_REVIEW_BUILTIN, PR_REVIEW_BUILTIN_KEY } from "./pr-review.ts";
+import { reviewVariants } from "../../forges/registry.ts";
+import { reviewBuiltin } from "./review.ts";
 import { SLACK_BRAIN_BUILTIN } from "./slack-brain.ts";
 
 const log = rootLog.child({ component: "builtin-seed" });
@@ -310,7 +312,7 @@ let registered = false;
 export function registerShippedBuiltins(): void {
   if (registered) return;
   registered = true;
-  registerBuiltinAutomation(PR_REVIEW_BUILTIN);
+  for (const variant of reviewVariants()) registerBuiltinAutomation(reviewBuiltin(variant));
   registerBuiltinAutomation(SLACK_BRAIN_BUILTIN);
 }
 

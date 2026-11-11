@@ -1,4 +1,5 @@
-import { PR_REVIEW_DEFINITION } from "../automations/builtins/pr-review.ts";
+import { reviewDefinition } from "../automations/builtins/review.ts";
+import { GITHUB_REVIEW } from "../providers/github/review-variant.ts";
 import { SLACK_BRAIN_DEFINITION } from "../automations/builtins/slack-brain.ts";
 import { beforeEach, describe, expect, test } from "bun:test";
 import { Code, ConnectError, createClient, createRouterTransport } from "@connectrpc/connect";
@@ -1378,6 +1379,8 @@ import type {
   AutomationInstanceRow,
   AutomationInstanceStore,
 } from "../db/automation-instances.ts";
+
+const PR_REVIEW_DEFINITION = reviewDefinition(GITHUB_REVIEW);
 
 function fakeInstanceStore() {
   const rows = new Map<string, AutomationInstanceRow>();

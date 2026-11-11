@@ -5,7 +5,7 @@
  * this is the read the retry RPC and the CI dispatch edge make before they
  * admit a run for a repo by name. */
 
-import { PR_REVIEW_BUILTIN_KEY } from "../automations/builtins/pr-review.ts";
+import { reviewBuiltinKey } from "../forges/registry.ts";
 import type { AutomationStore } from "../db/automations.ts";
 
 /** One `repos` entry as the built-in declares it. */
@@ -17,10 +17,10 @@ export interface RepoPolicy {
 }
 
 export interface EnrolledRepos {
-  /** The repo's policy, or null when the built-in does not list it. The
-   * match is case-insensitive, as the built-in's own admission is (GitHub
-   * repo names are). */
-  get(repo: string): Promise<RepoPolicy | null>;
+  /** The repo's policy in the forge's code-review built-in, or null when
+   * the built-in does not list it. The match ignores case, as the
+   * built-in's own admission does. */
+  get(provider: string, repo: string): Promise<RepoPolicy | null>;
 }
 
 export function policyOf(value: unknown): RepoPolicy | null {
@@ -36,8 +36,9 @@ export function makeEnrolledRepos(
   store: Pick<AutomationStore, "getByBuiltinKey">,
 ): EnrolledRepos {
   return {
-    async get(repo) {
-      const builtin = await store.getByBuiltinKey(PR_REVIEW_BUILTIN_KEY);
+    async get(provider, repo) {
+      const key = reviewBuiltinKey(provider);
+      const builtin = key === null ? null : await store.getByBuiltinKey(key);
       if (!builtin || builtin.archivedAt !== null) return null;
       const repos = builtin.inputs["repos"];
       if (typeof repos !== "object" || repos === null || Array.isArray(repos)) return null;
