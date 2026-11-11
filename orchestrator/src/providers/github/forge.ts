@@ -12,10 +12,12 @@ import {
   runIntegrationOp as defaultRunIntegrationOp,
   type IntegrationOpResult,
 } from "../../integrations/run-op.ts";
+import { log as rootLog } from "../../log.ts";
 import { readPrContext } from "./pr.ts";
 import { GITHUB_REVIEW } from "./review-variant.ts";
 
 const PROVIDER = "github";
+const log = rootLog.child({ component: "github-forge" });
 const PER_PAGE = 100;
 // The marker scan guards the window between a posted review and its
 // checkpoint, so it gives up, and the action posts, after this many pages.
@@ -89,11 +91,12 @@ function reviewIdFrom(result: IntegrationOpResult): string | undefined {
   try {
     value = JSON.parse(decodeBody(result.body));
   } catch {
-    return undefined;
+    value = undefined;
   }
-  if (!isObject(value)) return undefined;
-  const id = value["id"];
-  return typeof id === "string" || typeof id === "number" ? String(id) : undefined;
+  const id = isObject(value) ? value["id"] : undefined;
+  if (typeof id === "string" || typeof id === "number") return String(id);
+  log.warn({ status: result.status, truncated: result.truncated }, "a posted review returned no readable id");
+  return undefined;
 }
 
 function commentPayload(comment: InlineComment): Record<string, unknown> {

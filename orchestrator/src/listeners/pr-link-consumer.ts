@@ -156,8 +156,8 @@ export function makePrLinkConsumer(deps: PrLinkConsumerDeps): SessionConsumer {
           return upsert();
         });
       } catch (error) {
-        // Another forge holds this repository name and number. A retry
-        // cannot succeed.
+        // Two conflicts in a row: another forge holds this repository name
+        // and number, and no later attempt can take it.
         if (!isUniqueViolation(error)) throw error;
         log.warn(
           { sessionId: ctx.sessionId, provider, repo, prNumber },
