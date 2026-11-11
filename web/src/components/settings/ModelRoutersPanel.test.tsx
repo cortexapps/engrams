@@ -103,10 +103,13 @@ describe("ModelRoutersPanel", () => {
 
     const title = screen.getByLabelText("Title model");
     await userEvent.type(title, "deepseek/deepseek-v4-pro-0813{Enter}");
-    expect(updateSettings).toHaveBeenCalledWith({
-      routerId: "openrouter",
-      titleModel: "deepseek/deepseek-v4-pro-0813",
-    });
+    expect(updateSettings).toHaveBeenCalledWith(
+      { routerId: "openrouter", titleModel: "deepseek/deepseek-v4-pro-0813" },
+      expect.anything(),
+    );
+    // The typed value stays until the save succeeds.
+    expect((title as HTMLInputElement).value).toBe("deepseek/deepseek-v4-pro-0813");
+    updateSettings.mock.calls[0]![1].onSuccess();
 
     const decision = screen.getByLabelText("Decision model");
     expect((decision as HTMLInputElement).value).toBe("jev");
@@ -115,6 +118,9 @@ describe("ModelRoutersPanel", () => {
     expect(updateSettings).toHaveBeenCalledTimes(1);
     await userEvent.clear(decision);
     await userEvent.tab();
-    expect(updateSettings).toHaveBeenLastCalledWith({ routerId: "openrouter", decisionModel: "" });
+    expect(updateSettings).toHaveBeenLastCalledWith(
+      { routerId: "openrouter", decisionModel: "" },
+      expect.anything(),
+    );
   });
 });

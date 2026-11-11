@@ -201,7 +201,7 @@ describe("SlackThreads — smart routing", () => {
     expect(screen.queryByText(/smart routing/i)).toBeNull();
   });
 
-  it("with a key, turning smart routing on writes only the routing input", async () => {
+  it("with a decision model, turning smart routing on writes only the routing input", async () => {
     state.canDecide = true;
     renderWithProviders(<SlackThreads />);
     await userEvent.click(await screen.findByRole("combobox", { name: "Routing" }));

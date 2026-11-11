@@ -156,11 +156,16 @@ function RouterCard({ router }: { router: ModelRouter }) {
                 help={help}
                 stored={router[field]}
                 models={models}
-                disabled={settings.isPending}
-                onSave={(model) => settings.mutate({ routerId: router.id, [field]: model })}
+                saving={settings.isPending}
+                onSave={(model, onSaved) =>
+                  settings.mutate({ routerId: router.id, [field]: model }, { onSuccess: onSaved })
+                }
               />
             ))}
           </div>
+          <p className="mt-1 text-xs text-muted-foreground">
+            An empty role uses the router&apos;s built-in model, when it has one.
+          </p>
 
           <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-xs text-muted-foreground">
             <span>{router.availableModelCount.toLocaleString()} available</span>
@@ -225,15 +230,16 @@ const ROLE_FIELDS = [
   { field: "decisionModel", label: "Decision model", help: "Decide blocks and smart routing." },
 ] as const;
 
-/** One role's model id. It saves on blur or Enter; an empty value clears the
- * role. The listed models are suggestions: the server checks the id. */
+/** One role's model id. It saves on blur or Enter, and keeps the typed
+ * value until the save succeeds. An empty value clears the stored choice.
+ * The listed models are suggestions: the server checks the id. */
 function RoleModelField({
   id,
   label,
   help,
   stored,
   models,
-  disabled,
+  saving,
   onSave,
 }: {
   id: string;
@@ -241,14 +247,16 @@ function RoleModelField({
   help: string;
   stored: string;
   models: RouterModel[];
-  disabled: boolean;
-  onSave: (model: string) => void;
+  /** A save is in flight: a blur after Enter must not send it again. */
+  saving: boolean;
+  onSave: (model: string, onSaved: () => void) => void;
 }) {
   const [draft, setDraft] = useState<string | null>(null);
   const commit = () => {
+    if (saving) return;
     const next = draft?.trim();
-    if (next !== undefined && next !== stored) onSave(next);
-    setDraft(null);
+    if (next === undefined || next === stored) setDraft(null);
+    else onSave(next, () => setDraft(null));
   };
   return (
     <div className="space-y-1">
@@ -259,7 +267,6 @@ function RoleModelField({
         id={id}
         list={`${id}-models`}
         value={draft ?? stored}
-        disabled={disabled}
         placeholder="none"
         onChange={(event) => setDraft(event.target.value)}
         onBlur={commit}

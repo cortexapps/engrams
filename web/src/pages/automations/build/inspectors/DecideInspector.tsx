@@ -106,7 +106,7 @@ const MODEL_FIELD: FieldSpec = {
   type: "string",
   key: "model",
   label: "Model",
-  help: "Default: typesafe/jev-1.13 (pinned, so thresholds stay stable).",
+  help: "Default: the model router's decision model.",
 };
 const ON_ERROR_FIELD: FieldSpec = {
   type: "select",
@@ -159,7 +159,7 @@ export function DecideInspector(props: DecideInspectorProps) {
 
   return (
     <div className="flex flex-col gap-3">
-      {!canDecide && (
+      {canDecide === false && !block.config["model"] && (
         <p className="rounded-md border border-instrument-caution/40 bg-instrument-caution/10 p-2 text-xs">
           No model router has a key and a decision model: this block outputs{" "}
           <code>decided: false</code> and the graph takes its fallback.{" "}

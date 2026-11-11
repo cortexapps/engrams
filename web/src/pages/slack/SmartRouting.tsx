@@ -35,7 +35,7 @@ export function routingOf(inputs: Record<string, unknown>): SlackRouting {
 }
 
 export function SmartRouting({ automationId, inputs, profiles }: SmartRoutingProps) {
-  const connected = useCanDecide();
+  const canDecide = useCanDecide();
   const setInput = useSetInputValue();
   const routing = routingOf(inputs);
   const threshold =
@@ -60,9 +60,9 @@ export function SmartRouting({ automationId, inputs, profiles }: SmartRoutingPro
     }
   };
 
-  if (!connected && routing === "default") return null;
+  if (canDecide === undefined || (!canDecide && routing === "default")) return null;
 
-  if (!connected) {
+  if (!canDecide) {
     return (
       <section className="flex flex-col gap-3" aria-label="Routing">
         <h2 className="text-base font-semibold">Routing</h2>

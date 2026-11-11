@@ -33,7 +33,7 @@ function KindItem({ spec, onPick }: { spec: BlockKindSpec; onPick: (kind: string
 }
 
 export function BlockKindMenu({ onPick, align = "center", withAgent = false }: BlockKindMenuProps) {
-  const groups = groupedBlockKinds(useCanDecide(), { withAgent });
+  const groups = groupedBlockKinds(useCanDecide() === true, { withAgent });
   const advanced = groups.find((group) => group.id === "advanced");
   const plain = groups.filter((group) => group.id !== "advanced");
   return (

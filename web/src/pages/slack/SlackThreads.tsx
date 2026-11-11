@@ -110,7 +110,7 @@ export function SlackThreads() {
   const enabled = automation?.enabled === true;
   // Smart routing answers everywhere on its own, but only while it can run.
   const canDecide = useCanDecide();
-  const smartLive = routingOf(inputs) === "smart" && canDecide;
+  const smartLive = routingOf(inputs) === "smart" && canDecide === true;
   const answersSomewhere = defaultProfile !== "" || channels.length > 0 || smartLive;
 
   const onEnabledChange = async (next: boolean) => {
