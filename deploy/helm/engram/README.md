@@ -167,11 +167,11 @@ common knobs:
 | `image.repository` | `ghcr.io/cortexapps/engrams/coordinator` | Set to your registry. |
 | `image.tag` | `""` → `Chart.AppVersion` | Pin a specific version. |
 | `mode` | `coordinator` | `all` is dev-only. |
-| `blob.backend` | `gcs` | `local` for dev; `s3` reserved. |
+| `blob.backend` | none | Required: `local`, `gcs`, or `s3`. |
 | `blob.gcs.bucket` | `""` | Required for `gcs`. |
-| `kek.provider` | `gcp-kms` | `env-var` for dev. |
+| `kek.provider` | none | Required: `env-var`, `gcp-kms`, or `aws-kms`. |
 | `kek.gcpResource` | `""` | Required for `gcp-kms`. |
-| `secrets.backend` | `gcp` | `env` for dev. |
+| `secrets.backend` | none | Required: `env`, `gcp`, or `aws`. |
 | `secrets.gcpProjectId` | `""` | Required for `gcp`. |
 | `database.existingSecret` | `engram-coordinator-secrets` | |
 | `auth.existingSecret` | `""` | Empty disables bearer auth (dev). |

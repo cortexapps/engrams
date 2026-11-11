@@ -5,11 +5,14 @@
 # values-gcp.yaml.example / values-aws.yaml.example for those. New
 # required-value guards must add a stub here or the lane goes red.
 blob:
+  backend: gcs
   gcs:
     bucket: ci-render-stub
 kek:
+  provider: gcp-kms
   gcpResource: projects/ci/locations/global/keyRings/ci/cryptoKeys/ci
 secrets:
+  backend: gcp
   gcpProjectId: ci-render-stub
 # The chart default sign-in door is `oauth`, which needs a provider and
 # an allowlist.

@@ -15,7 +15,7 @@ data:
   {{- if .Values.web.enabled }}
   ENGRAM_ORCHESTRATOR_INTERNAL_URL: {{ printf "http://%s:%v" (include "engram.orchestrator.fullname" .) .Values.orchestrator.service.port | quote }}
   {{- end }}
-  ENGRAM_BLOB_BACKEND: {{ .Values.blob.backend | quote }}
+  ENGRAM_BLOB_BACKEND: {{ include "engram.choice" (list .Values.blob.backend "values.blob.backend" (list "local" "gcs" "s3")) | quote }}
   {{- if eq .Values.blob.backend "gcs" }}
   {{- if not .Values.blob.gcs.bucket }}
   {{- fail "values.blob.gcs.bucket is required when blob.backend=gcs" }}
@@ -35,7 +35,7 @@ data:
   ENGRAM_S3_REGION: {{ . | quote }}
   {{- end }}
   {{- end }}
-  ENGRAM_KEK_PROVIDER: {{ .Values.kek.provider | quote }}
+  ENGRAM_KEK_PROVIDER: {{ include "engram.choice" (list .Values.kek.provider "values.kek.provider" (list "env-var" "gcp-kms" "aws-kms")) | quote }}
   {{- if eq .Values.kek.provider "env-var" }}
   ENGRAM_KEK_ENV_VAR: {{ .Values.kek.envVarName | quote }}
   {{- else if eq .Values.kek.provider "gcp-kms" }}
@@ -49,7 +49,7 @@ data:
   {{- end }}
   ENGRAM_KEK_AWS_KEY_ID: {{ .Values.kek.awsKeyId | quote }}
   {{- end }}
-  ENGRAM_SECRETS_BACKEND: {{ .Values.secrets.backend | quote }}
+  ENGRAM_SECRETS_BACKEND: {{ include "engram.choice" (list .Values.secrets.backend "values.secrets.backend" (list "env" "gcp" "aws")) | quote }}
   {{- if eq .Values.secrets.backend "gcp" }}
   {{- if not .Values.secrets.gcpProjectId }}
   {{- fail "values.secrets.gcpProjectId is required when secrets.backend=gcp" }}
