@@ -51,7 +51,7 @@ export async function titleModel(): Promise<LanguageModel | null> {
   return (await getIntegrationClient<RouterClient>(chosen.router.connector)).chat(chosen.model);
 }
 
-/** Whether a connected router can answer a decisions request. */
+/** Whether a connected router has a decision model. */
 export async function canDecide(): Promise<boolean> {
   return (await routerFor("decision")) !== null;
 }
@@ -65,12 +65,27 @@ const TRANSIENT_LOOKUP_CODES = new Set([
   Code.Internal,
 ]);
 
-/** Answer a decisions request on the first connected router that has a
- * decision model; null when there is none. The request's own `model`
- * replaces the router's. A transient failure to resolve the key is a
- * retryable DecisionsApiError; a missing or rejected key stays permanent. */
+/** Answer a decisions request; null when no connected router can. A request
+ * that names its `model` goes to the first connected router; any other goes
+ * to the first one that has a decision model. A transient failure to resolve
+ * the key is a retryable DecisionsApiError; a missing or rejected key stays
+ * permanent. */
 export async function decide(request: DecisionsRequest): Promise<DecisionsResponse | null> {
-  const chosen = await routerFor("decision");
+  let chosen: { router: ModelRouterDefinition; model: string } | null;
+  if (request.model) {
+    const [router] = await connectedRoutersOrNone();
+    chosen = router ? { router, model: request.model } : null;
+  } else {
+    try {
+      chosen = await routerFor("decision");
+    } catch (error) {
+      throw new DecisionsApiError(
+        `read the decision model: ${error instanceof Error ? error.message : String(error)}`,
+        null,
+        true,
+      );
+    }
+  }
   if (!chosen) return null;
   let client: RouterClient;
   try {
@@ -81,7 +96,7 @@ export async function decide(request: DecisionsRequest): Promise<DecisionsRespon
     }
     throw error;
   }
-  const resolved = { ...request, model: request.model ?? chosen.model };
+  const resolved = { ...request, model: chosen.model };
   return client.decisions
     ? client.decisions.decide(resolved)
     : decideByChat(client.chat(resolved.model), resolved);

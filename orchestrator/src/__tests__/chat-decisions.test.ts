@@ -66,13 +66,20 @@ describe("decision by chat completion", () => {
     expect(JSON.stringify(model.doGenerateCalls[0]!.prompt)).toContain("the build is red on main");
   });
 
-  test("a choice outside the options is a retryable failure", async () => {
+  test("an answer that does not fit the schema is a retryable failure", async () => {
+    const model = modelAnswering({ urgent: { noul: "yes" } });
+    expect((await failure(decideByChat(model, REQUEST))).retryable).toBe(true);
+  });
+
+  test("the call makes no retries of its own and carries a timeout", async () => {
     const model = modelAnswering({
       urgent: { noul: 0.5 },
-      team: { choice: "sales", confidence: 0.9 },
+      team: { choice: "web", confidence: 0.9 },
       risk: { score: 1, confidence: 0.5 },
     });
-    expect((await failure(decideByChat(model, REQUEST))).retryable).toBe(true);
+    await decideByChat(model, REQUEST);
+    expect(model.doGenerateCalls).toHaveLength(1);
+    expect(model.doGenerateCalls[0]!.abortSignal).toBeInstanceOf(AbortSignal);
   });
 
   test("an API rejection that a retry cannot fix is permanent", async () => {

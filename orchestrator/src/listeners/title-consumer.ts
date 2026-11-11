@@ -22,13 +22,14 @@
  */
 
 import { and, eq, isNull, ne } from "drizzle-orm";
-import { APICallError, generateObject, RetryError } from "ai";
+import { generateObject } from "ai";
 import { z } from "zod";
 
 import type { CuratedEvent } from "../control-plane/session-events.ts";
 import { getDb } from "../db/client.ts";
 import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
 import { titleModel } from "../model-routers/client.ts";
+import { isPermanentModelError } from "../model-routers/errors.ts";
 import { log as rootLog } from "../log.ts";
 import type { SessionConsumer } from "./consumer.ts";
 
@@ -179,16 +180,6 @@ export function makeProductionTitleConsumer(): SessionConsumer {
         .set({ suggestedTitle: title })
         .where(and(eq(taskTable.id, taskId), isNull(taskTable.suggestedTitle)));
     },
-    isPermanentError,
+    isPermanentError: isPermanentModelError,
   });
-}
-
-/** Permanent = an API rejection a retry cannot fix: an `APICallError` the SDK
- *  itself marks non-retryable (401 bad key, 400/404 bad model id). The SDK's
- *  internal retries surface as a `RetryError`; classify by its last cause.
- *  Everything else (429/5xx, network, an unreachable coordinator) is worth the
- *  pump's backoff — the attempt cap bounds the spend either way. */
-export function isPermanentError(err: unknown): boolean {
-  const cause = RetryError.isInstance(err) ? err.lastError : err;
-  return APICallError.isInstance(cause) && !cause.isRetryable;
 }

@@ -16,7 +16,7 @@
 import { describe, expect, test } from "bun:test";
 import { Code, ConnectError, createClient, createRouterTransport } from "@connectrpc/connect";
 
-import type { ModelRouterStore, RouterSettings } from "../db/model-routers.ts";
+import type { ModelRouterStore, RouterModelRow, RouterSettings } from "../db/model-routers.ts";
 import { registerModelRouters } from "../rpc/model-routers.ts";
 import { ModelRouterService, RouterModelAudience } from "../gen/engram/app/v1/model_router_pb.ts";
 
@@ -24,7 +24,8 @@ function fakeStore(): ModelRouterStore {
   const settings = new Map<string, RouterSettings>();
   return {
     listModels: async () => [],
-    getModel: async () => null,
+    getModel: async (_routerId, modelId) =>
+      modelId.startsWith("known/") ? ({ available: true } as RouterModelRow) : null,
     replaceCatalog: async () => ({ markedUnavailable: 0 }),
     updatePolicy: async () => null,
     getSyncState: async () => null,
@@ -72,22 +73,30 @@ describe("router connection gating", () => {
     expect(openrouter.decisionModel).toBe("typesafe/jev-1.13");
     expect(litellm).toMatchObject({ defaultModel: "", titleModel: "", decisionModel: "" });
 
-    const set = await api.updateModelRouterSettings({
-      routerId: "litellm",
-      defaultModel: "claude-sonnet",
-      titleModel: " gpt-mini ",
-      decisionModel: "",
-    });
-    expect(set.router).toMatchObject({ defaultModel: "claude-sonnet", titleModel: "gpt-mini", decisionModel: "" });
+    await api.updateModelRouterSettings({ routerId: "litellm", defaultModel: "known/sonnet" });
+    // A field that is absent keeps its role's model.
+    const set = await api.updateModelRouterSettings({ routerId: "litellm", titleModel: " known/mini " });
+    expect(set.router).toMatchObject({ defaultModel: "known/sonnet", titleModel: "known/mini", decisionModel: "" });
 
-    await api.updateModelRouterSettings({ routerId: "openrouter", titleModel: "other/title" });
-    const cleared = await api.updateModelRouterSettings({ routerId: "openrouter" });
+    await api.updateModelRouterSettings({ routerId: "openrouter", titleModel: "known/title" });
+    const cleared = await api.updateModelRouterSettings({ routerId: "openrouter", titleModel: "" });
     expect(cleared.router?.titleModel).toBe("deepseek/deepseek-v4-flash");
+  });
+
+  test("a chosen model must be in the router's catalog", async () => {
+    const api = client("admin", ["openrouter.api_key", "litellm.api_key"]);
+    await expect(api.updateModelRouterSettings({ routerId: "litellm", titleModel: "typo" })).rejects.toThrow(
+      /not in the LiteLLM catalog/,
+    );
+    await expect(api.updateModelRouterSettings({ routerId: "litellm", decisionModel: "typo" })).rejects.toThrow();
+    // A native decisions endpoint serves models the chat catalog does not list.
+    const set = await api.updateModelRouterSettings({ routerId: "openrouter", decisionModel: "typesafe/jev-2" });
+    expect(set.router?.decisionModel).toBe("typesafe/jev-2");
   });
 
   test("only an admin sets a router's models", async () => {
     const api = client("user", ["litellm.api_key"]);
-    await expect(api.updateModelRouterSettings({ routerId: "litellm", defaultModel: "m" })).rejects.toThrow();
+    await expect(api.updateModelRouterSettings({ routerId: "litellm", defaultModel: "known/m" })).rejects.toThrow();
   });
 
   test("non-admin with the key: router listed AND credentialConfigured=true", async () => {

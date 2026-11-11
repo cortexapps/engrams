@@ -17,7 +17,7 @@
  * policy.
  */
 
-import { resolveIntegrationHost } from "../integrations/run-op.ts";
+import { ConnectorHostUnsetError, resolveIntegrationHost } from "../integrations/run-op.ts";
 import { ConnectError, Code } from "@connectrpc/connect";
 import { and, eq, isNull } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
@@ -344,6 +344,12 @@ export async function compileSessionCreateInput(
     connectors: deps.connectors,
     settingsFor: async (provider) =>
       storedSettingsOf((await deps.connections.getDefault(provider))?.config),
+  }).catch((error: unknown) => {
+    if (!(error instanceof ConnectorHostUnsetError)) throw error;
+    throw new ConnectError(
+      `${router.label} has no host — an admin must set it under Settings before routed launches work`,
+      Code.FailedPrecondition,
+    );
   }) : undefined;
   const modelId =
     opts.model ??

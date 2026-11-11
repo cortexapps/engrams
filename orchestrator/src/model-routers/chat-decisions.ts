@@ -15,6 +15,7 @@ import {
   type DecisionsRequest,
   type DecisionsResponse,
 } from "./decisions.ts";
+import { isPermanentModelError } from "./errors.ts";
 
 const SYSTEM_PROMPT = [
   "You answer questions about the given state. Return one answer per question id.",
@@ -24,6 +25,9 @@ const SYSTEM_PROMPT = [
   "`confidence` is your probability from 0 to 1 that the answer is right.",
 ].join("\n");
 
+/** One call, no SDK retries: the decide block makes the one retry. */
+const TIMEOUT_MS = 20_000;
+
 const unit = (value: number): number => Math.max(0, Math.min(1, value));
 
 function answerSchema(question: DecisionQuestion) {
@@ -31,7 +35,10 @@ function answerSchema(question: DecisionQuestion) {
     case "noul":
       return z.object({ noul: z.number() });
     case "choice":
-      return z.object({ choice: z.enum(Object.keys(question.criteria)), confidence: z.number() });
+      // A plain string: the labels are in the prompt, and a strict schema
+      // limits the enum values it accepts. The decide block rejects a label
+      // that is not an option.
+      return z.object({ choice: z.string(), confidence: z.number() });
     case "score":
       return z.object({ score: z.number(), confidence: z.number() });
   }
@@ -63,6 +70,8 @@ export async function decideByChat(
       schema: z.object(Object.fromEntries(questions.map(([id, question]) => [id, answerSchema(question)]))),
       system: SYSTEM_PROMPT,
       prompt: JSON.stringify({ state: request.state, questions: request.questions }),
+      maxRetries: 0,
+      abortSignal: AbortSignal.timeout(TIMEOUT_MS),
     });
     const answers = object as Record<string, Record<string, unknown>>;
     return {
@@ -71,15 +80,13 @@ export async function decideByChat(
       usage: { input_tokens: usage.inputTokens ?? 0, output_tokens: usage.outputTokens ?? 0 },
     };
   } catch (error) {
-    // An API rejection the SDK marks non-retryable (a bad key, an unknown
-    // model) is permanent. A network fault, a rate limit, or an answer that
-    // does not fit the schema is worth one more call.
+    // A network fault, a timeout, a rate limit, or an answer that does not
+    // fit the schema is worth one more call.
     const cause = RetryError.isInstance(error) ? error.lastError : error;
-    const permanent = APICallError.isInstance(cause) && !cause.isRetryable;
     throw new DecisionsApiError(
       `decision by chat completion failed: ${error instanceof Error ? error.message : String(error)}`,
       APICallError.isInstance(cause) ? (cause.statusCode ?? null) : null,
-      !permanent,
+      !isPermanentModelError(error),
     );
   }
 }

@@ -1,4 +1,4 @@
-import { resolveIntegrationHost, type RunOpDeps } from "../integrations/run-op.ts";
+import { ConnectorHostUnsetError, resolveIntegrationHost, type RunOpDeps } from "../integrations/run-op.ts";
 import { Code, ConnectError, type ConnectRouter } from "@connectrpc/connect";
 
 import { getDb } from "../db/client.ts";
@@ -71,8 +71,10 @@ export function registerModelRouters(router: ConnectRouter, deps?: ModelRouterSe
       store.listModels(definition.id, "admin"),
       store.getSyncState(definition.id),
       routerModels(definition, store),
-      // A router whose host an admin has not set yet has no egress host.
-      resolveIntegrationHost(definition.connector, deps?.integration).catch(() => null),
+      resolveIntegrationHost(definition.connector, deps?.integration).catch((error: unknown) => {
+        if (error instanceof ConnectorHostUnsetError) return null;
+        throw error;
+      }),
     ]);
     return {
       id: definition.id,
@@ -184,17 +186,30 @@ export function registerModelRouters(router: ConnectRouter, deps?: ModelRouterSe
       await requireAdmin(ctx, getSession);
       const definition = getModelRouterDefinition(req.routerId);
       if (!definition) throw new ConnectError("model router not found", Code.NotFound);
-      // An empty field clears the admin's choice for that role.
-      const chosen = (model: string): string | null => model.trim() || null;
-      await store.setSettings(
-        definition.id,
-        {
-          defaultModel: chosen(req.defaultModel),
-          titleModel: chosen(req.titleModel),
-          decisionModel: chosen(req.decisionModel),
-        },
-        now(),
-      );
+      // An absent field keeps the stored choice; an empty one clears it.
+      const stored = await store.getSettings(definition.id);
+      const chosen = (model: string | undefined, kept: string | null | undefined): string | null =>
+        model === undefined ? (kept ?? null) : model.trim() || null;
+      const settings = {
+        defaultModel: chosen(req.defaultModel, stored?.defaultModel),
+        titleModel: chosen(req.titleModel, stored?.titleModel),
+        decisionModel: chosen(req.decisionModel, stored?.decisionModel),
+      };
+      // A native decisions endpoint serves models the chat catalog does not list.
+      const inCatalog = [
+        settings.defaultModel,
+        settings.titleModel,
+        definition.decisions ? null : settings.decisionModel,
+      ];
+      for (const model of inCatalog) {
+        if (model && !(await store.getModel(definition.id, model))?.available) {
+          throw new ConnectError(
+            `model "${model}" is not in the ${definition.label} catalog`,
+            Code.InvalidArgument,
+          );
+        }
+      }
+      await store.setSettings(definition.id, settings, now());
       return { router: await routerToProto(definition, true, await connected()) };
     },
   });

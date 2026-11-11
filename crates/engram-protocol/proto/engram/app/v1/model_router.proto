@@ -85,11 +85,12 @@ message UpdateRouterModelPolicyRequest {
 }
 message UpdateRouterModelPolicyResponse { RouterModel model = 1; }
 
-// An empty model clears the admin's choice for that role.
+// An absent model keeps the admin's choice for that role; an empty one
+// clears it.
 message UpdateModelRouterSettingsRequest {
   string router_id = 1;
-  string default_model = 2;
-  string title_model = 3;
-  string decision_model = 4;
+  optional string default_model = 2;
+  optional string title_model = 3;
+  optional string decision_model = 4;
 }
 message UpdateModelRouterSettingsResponse { ModelRouter router = 1; }
