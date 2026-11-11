@@ -1269,9 +1269,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protoc and the pool tools
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
-            protobuf-compiler thin-provisioning-tools
+          install() {
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends \
+              protobuf-compiler thin-provisioning-tools
+          }
+          # The hosted runner's resolver sometimes fails for the package
+          # hosts. Show its state, then try again with public resolvers.
+          if ! install; then
+            link="$(ip route show default | awk '{print $5; exit}')"
+            resolvectl status "$link" || true
+            getent hosts azure.archive.ubuntu.com archive.ubuntu.com github.com || true
+            sudo resolvectl dns "$link" 1.1.1.1 8.8.8.8
+            sudo resolvectl flush-caches
+            getent hosts azure.archive.ubuntu.com archive.ubuntu.com || true
+            install
+          fi
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ublk-root
