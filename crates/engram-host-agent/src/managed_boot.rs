@@ -139,7 +139,10 @@ impl Owner {
     ) -> Result<(), SandboxError> {
         match self {
             #[cfg(test)]
-            Self::ExecTest(_) => panic!("unexpected execution-test lifecycle call"),
+            Self::ExecTest(owner) => {
+                owner.started.lock().unwrap().push(agent);
+                Ok(())
+            }
             #[cfg(target_os = "linux")]
             Self::Firecracker(owner) => owner.start_agent(agent, sink, forge).await,
             #[cfg(target_os = "macos")]
@@ -1285,7 +1288,8 @@ impl ManagedBootHost {
             ManagedBootHostState::Finalized { receipt } if receipt == &request.receipt => (),
             _ => return Err(invalid("start consumed")),
         }
-        let agent = entry.agent.take().ok_or_else(|| invalid("agent"))?;
+        let mut agent = entry.agent.take().ok_or_else(|| invalid("agent"))?;
+        self.egress.install_ca(&mut agent);
         entry.record.state = ManagedBootHostState::StartPending {
             intent: request.clone(),
         };
@@ -1914,6 +1918,7 @@ mod tests {
         chunks: Vec<bytes::Bytes>,
     }
     pub(super) struct ExecOwner {
+        pub(super) started: Arc<std::sync::Mutex<Vec<AgentSpec>>>,
         pub(super) close_fails: bool,
         pub(super) close_intents: Arc<std::sync::Mutex<Vec<bool>>>,
         pub(super) capture_acks: Arc<std::sync::atomic::AtomicUsize>,
@@ -2036,6 +2041,7 @@ mod tests {
             record,
             attach_owner: Some(host.hub.managed_owner(intent)),
             owner: Some(Owner::ExecTest(Box::new(ExecOwner {
+                started: Arc::new(std::sync::Mutex::new(Vec::new())),
                 close_fails: false,
                 close_intents: Arc::new(std::sync::Mutex::new(Vec::new())),
                 capture_acks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2969,7 +2975,7 @@ mod tests {
             Arc::new(crate::proxyd_client::ProxydHandle::new(
                 path.join("absent.sock"),
             )),
-            String::new(),
+            "host-ca".into(),
             None,
         ));
         let chunks = engram_chunk_store::ChunkStore::new(Arc::new(
@@ -3527,6 +3533,39 @@ mod tests {
                 receipt_id: digest(b"receipt"),
             },
             start_id: "issued-start".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_start_passes_host_ca_and_preserves_explicit_ca() {
+        for (provided, expected) in [(None, "host-ca"), (Some("explicit-ca"), "explicit-ca")] {
+            let temp = tempfile::tempdir().unwrap();
+            let (host, request) = fixture(temp.path());
+            let entry = install_exec_owner(&host, &request);
+            let mut intent = issued_start(&request);
+            intent.start_id = digest(b"start");
+            let started = {
+                let mut entry = entry.lock().await;
+                entry.record.state = ManagedBootHostState::Finalized {
+                    receipt: intent.receipt.clone(),
+                };
+                entry.agent = Some(AgentSpec {
+                    argv: vec![],
+                    env: Default::default(),
+                    session_env: Default::default(),
+                    binding_epoch: 1,
+                    host_ca_pem: provided.map(str::to_owned),
+                });
+                match entry.owner.as_ref().unwrap() {
+                    Owner::ExecTest(owner) => owner.started.clone(),
+                    _ => unreachable!(),
+                }
+            };
+            host.start(intent.clone()).await.unwrap();
+            host.start(intent).await.unwrap();
+            let started = started.lock().unwrap();
+            assert_eq!(started.len(), 1);
+            assert_eq!(started[0].host_ca_pem.as_deref(), Some(expected));
         }
     }
 

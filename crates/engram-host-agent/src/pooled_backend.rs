@@ -6185,16 +6185,8 @@ impl SandboxBackend for PooledBackend {
             .capture_gate(id)
             .quiesce(id, CaptureUser::StartAgent)
             .await;
-        // ADR 0021 P1.2: only the host-agent knows the per-host egress-
-        // proxy CA, so it stamps the PEM onto the AgentSpec right
-        // before the backend sees it. Each backend rides it into the
-        // guest on the same `SpawnHarness` frame that spawns the
-        // harness (2026-07 core-ops fold — one first-contact RPC
-        // installs the CA and spawns, instead of a separate round
-        // trip). Coord-supplied specs always arrive with
-        // `host_ca_pem = None`; the host-agent fills it in here.
-        if agent.host_ca_pem.is_none() {
-            agent.host_ca_pem = self.egress.as_ref().map(|e| e.ca_cert_pem.clone());
+        if let Some(egress) = &self.egress {
+            egress.install_ca(&mut agent);
         }
         self.inner.start_agent(id, agent).await
     }
