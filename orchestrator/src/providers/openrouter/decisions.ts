@@ -18,7 +18,7 @@ const DEFAULT_MODEL = "typesafe/jev-1.13";
 
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 524, 529]);
 
-export interface DecisionsClientOptions {
+interface DecisionsClientOptions {
   apiKey: string;
   host: string;
   /** Per-call abort. The model answers in well under a second; a call that

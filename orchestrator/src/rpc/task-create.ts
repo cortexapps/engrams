@@ -204,8 +204,7 @@ export interface SessionCompileDeps {
    *  only when the profile sets includeUserTokens, to additionally carry the
    *  user's OTHER credentials into the sandbox. */
   resolveAllUserTokens: () => Promise<Record<string, string>>;
-  /** Name-only org-secret lookup used to reject unresolved descriptor refs.
-   *  Production uses the control-plane client; tests may inject a fake. */
+  /** Lists org-secret names, to check that the selected router has a key. */
   orgSecret?: SecretNameClient;
   /** Resolve whether the human owner has a live provider connection. */
   hasOAuthCredential?: (provider: string) => Promise<boolean>;

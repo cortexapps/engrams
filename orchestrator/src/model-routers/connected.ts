@@ -43,10 +43,3 @@ export async function firstConnectedRouter(
     return null;
   }
 }
-
-export async function isRouterConnected(
-  routerId: string,
-  client?: SecretNameClient,
-): Promise<boolean> {
-  return (await firstConnectedRouter((router) => router.id === routerId, client)) !== null;
-}

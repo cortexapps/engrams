@@ -164,9 +164,9 @@ export function registerModelRouters(router: ConnectRouter, deps?: ModelRouterSe
         throw new ConnectError("available to users requires enabled", Code.InvalidArgument);
       }
       const definition = getModelRouterDefinition(req.routerId);
-      const model = definition
-        && await store.updatePolicy(req.routerId, req.modelId, req.enabled, req.userEnabled);
-      if (!definition || !model) throw new ConnectError("router model not found", Code.NotFound);
+      if (!definition) throw new ConnectError("router model not found", Code.NotFound);
+      const model = await store.updatePolicy(req.routerId, req.modelId, req.enabled, req.userEnabled);
+      if (!model) throw new ConnectError("router model not found", Code.NotFound);
       return { model: modelToProto(definition, model) };
     },
   });

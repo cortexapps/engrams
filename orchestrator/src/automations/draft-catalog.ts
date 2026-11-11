@@ -44,9 +44,6 @@ function jsonSchemaOf(schema: z.ZodType): unknown {
   }
 }
 
-/** The block + definition catalog. Pure: derived from code, no I/O. Without
- * `decisionsAvailable` the decide block is left out, so the agent never
- * drafts one that cannot decide anything. */
 /** The condition group a filter or a branch takes. Its zod schema is an
  * opaque refinement, so the JSON schema says nothing; this note does. */
 const CONDITIONS_NOTE =
@@ -54,6 +51,9 @@ const CONDITIONS_NOTE =
   'path is a scope path ("event.raw.pull_request.user.type", "steps.facts.value.ok"); op is one of equals, not_equals, contains, matches, in, is_empty, gt, lt, is_true, is_false. ' +
   'Example: {"mode":"all","conditions":[{"path":"event.raw.pull_request.user.type","op":"not_equals","value":"Bot"}]}.';
 
+/** The block + definition catalog. Pure: derived from code, no I/O. Without
+ * `decisionsAvailable` the decide block is left out, so the agent never
+ * drafts one that cannot decide anything. */
 export function draftBlockCatalog(decisionsAvailable = false): Record<string, unknown> {
   registerEngineBlocks();
   const blocks = listBlockTypes()

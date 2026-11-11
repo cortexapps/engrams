@@ -62,7 +62,7 @@ export function getModelRouterDefinition(id: string): ModelRouterDefinition | nu
   return REGISTRY.get(id) ?? null;
 }
 
-export function selectRouterProtocol(
+function selectRouterProtocol(
   router: ModelRouterDefinition,
   harnessProtocols: readonly string[],
 ): RouterProtocol | null {
