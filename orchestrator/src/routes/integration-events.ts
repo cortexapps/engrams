@@ -4,9 +4,9 @@
  *
  * One route for every provider. The connector's `webhook.ingress` declares
  * how a delivery is signed; the provider's event source says what a verified
- * delivery means. The route answers 200 after the ledger write and the
- * dispatch commit, so a crash before the answer is covered by the provider's
- * retry and the delivery id dedupes it.
+ * delivery means. The route answers after the ledger write and the dispatch
+ * commit, so a crash before the answer is covered by the provider's retry
+ * and the delivery id dedupes it.
  */
 
 import { Hono } from "hono";
@@ -31,31 +31,36 @@ export interface IntegrationEventsDeps {
   sources?: IntegrationEventSource[];
   secrets?: VerificationSecretResolver;
   /** Ingress-spine seams (ledger store, trigger dispatch, connection). */
-  ingress?: HandleDeliveryDeps;
+  ingress?: Omit<HandleDeliveryDeps, "now">;
+  /** The one clock for verification, extraction, and the ledger. */
   now?: () => Date;
+}
+
+/** One source per connector that declares a webhook ingress. */
+export function defaultEventSources(): IntegrationEventSource[] {
+  return [githubEventSource(), linearEventSource, slackEventSource, vantaEventSource];
 }
 
 export function makeIntegrationEventsRoute(deps: IntegrationEventsDeps = {}): Hono {
   const secrets = deps.secrets ?? makeVerificationSecretResolver();
   const now = deps.now ?? (() => new Date());
-  const ingressDeps: HandleDeliveryDeps = { now, ...deps.ingress };
+  const ingressDeps: HandleDeliveryDeps = { ...deps.ingress, now };
 
   const sources = new Map(
-    (deps.sources ?? [githubEventSource(), linearEventSource, slackEventSource, vantaEventSource])
-      .map((source) => {
-        const declared = declaredIngress(source.provider);
-        if (!declared) {
-          throw new Error(`event source ${source.provider}: its connector declares no webhook ingress`);
-        }
-        return [source.provider, { source, ...declared }] as const;
-      }),
+    (deps.sources ?? defaultEventSources()).map((source) => {
+      const declared = declaredIngress(source.provider);
+      if (!declared) {
+        throw new Error(`event source ${source.provider}: its connector declares no webhook ingress`);
+      }
+      return [source.provider, { source, ...declared }] as const;
+    }),
   );
 
   const app = new Hono();
 
-  app.post("/api/v1/integrations/:provider/events", async (c) => {
+  app.post("/api/v1/integrations/:provider/events", async (c, next) => {
     const entry = sources.get(c.req.param("provider"));
-    if (!entry) return c.notFound();
+    if (!entry) return next();
     const { source, displayName, ingress } = entry;
     const headers = c.req.raw.headers;
 

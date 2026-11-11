@@ -27,7 +27,6 @@ async function deliver(payload: Record<string, unknown>): Promise<RecordIntegrat
     secrets: { resolve: async () => SECRET },
     now: () => NOW,
     ingress: {
-      now: () => NOW,
       connectionIdFor: async () => "conn-linear",
       store: {
         record: async (input) => {

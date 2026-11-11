@@ -5,7 +5,8 @@
  *
  * The single inbound surface for AskUserQuestion answers: an inline option
  * click, an "Answer…" click (→ open the answer modal), or the modal submission.
- * Verifies every request against the connector's declared ingress, classifies the `payload` field via the Block Kit contract, and:
+ * Verifies every request against the connector's declared ingress,
+ * classifies the `payload` field via the Block Kit contract, and:
  *   - answer to a session's question (the route carries `sessionId`, contract
  *     5) → completes the session's tool call through the session relay;
  *   - answer to a run's `slack_choice` card (the route carries `runId`) → a
@@ -41,6 +42,7 @@ import { CHOICE_ID_PREFIX, SLACK_ANSWER_SIGNAL, deliverSessionAnswer } from "../
 
 export interface SlackInteractivityDeps {
   secrets?: VerificationSecretResolver;
+  now?: () => Date;
   /** Deliver an answer to the run whose relay posted the question. Default =
    *  DBOS.send of a `slack_answer` signal (idempotent on tool_call_id). */
   deliverAnswer?: (route: ThreadRoute, answer: SourceAnswer) => Promise<void>;
@@ -122,6 +124,7 @@ export function makeSlackInteractivityRoute(deps: SlackInteractivityDeps = {}): 
   if (!declared) throw new Error("the slack connector declares no webhook ingress");
   const deliverAnswer = deps.deliverAnswer ?? defaultDeliverAnswer;
   const openModal = deps.openModal ?? defaultOpenModal;
+  const now = deps.now ?? (() => new Date());
   const app = new Hono();
 
   app.post("/api/v1/integrations/slack/interactivity", async (c) => {
@@ -132,7 +135,7 @@ export function makeSlackInteractivityRoute(deps: SlackInteractivityDeps = {}): 
       headers: c.req.raw.headers,
       rawBody,
       secrets,
-      now: new Date(),
+      now: now(),
     });
     if (!valid) return c.json({ error: "invalid signature" }, 401);
 

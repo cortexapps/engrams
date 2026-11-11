@@ -34,7 +34,6 @@ async function deliver(
     secrets: { resolve: async () => SECRET },
     now: () => NOW,
     ingress: {
-      now: () => NOW,
       connectionIdFor: async () => "conn-vanta",
       store: {
         record: async (input) => {
@@ -126,7 +125,6 @@ describe("vanta ingress", () => {
       secrets: { resolve: async () => SECRET },
       now: () => NOW,
       ingress: {
-        now: () => NOW,
         connectionIdFor: async () => "conn-vanta",
         store: {
           record: async (input) => {
