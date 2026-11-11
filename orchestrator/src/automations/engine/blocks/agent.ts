@@ -39,10 +39,10 @@ import { sessionRefSchema } from "../definition.ts";
 import type { RunContext } from "../context.ts";
 import { registerBlock, type BlockOutcome } from "./registry.ts";
 import { installRelayForSession, mentionFromRelayConfig, relayConfigSchema } from "./relay.ts";
-
-const log = rootLog.child({ component: "agent-block" });
 import { createSessionConfigSchema, executeCreateSession, renderSessionPrompt } from "./session.ts";
 import { errorMessage } from "../errors.ts";
+
+const log = rootLog.child({ component: "agent-block" });
 
 export const RUN_AGENT_TYPE = "run_agent";
 export const CLOSE_AGENT_TYPE = "close_agent";

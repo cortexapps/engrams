@@ -201,7 +201,9 @@ function spawn(
   role = "user",
   repos: string[] = [],
   overrides?: {
-    retryAutomation?: (automationRunId: string) => Promise<string>;
+    retryAutomation?: (automationRunId: string, provider: string) => Promise<string>;
+    /** The automation of each run id; a run that is not listed is gone. */
+    runAutomations?: Record<string, string>;
   },
 ) {
   const transport = createRouterTransport((router) =>
@@ -210,6 +212,12 @@ function spawn(
         authenticated ? { user: { id: "review-user", role } } : null,
       reviews: store,
       enrolledRepos: enrolledRepos(repos),
+      runs: {
+        async getRun(id) {
+          const automationId = overrides?.runAutomations?.[id];
+          return automationId === undefined ? null : { automationId };
+        },
+      },
       ...(overrides?.retryAutomation != null ? { retryAutomation: overrides.retryAutomation } : {}),
     }),
   );
@@ -305,6 +313,19 @@ describe("ReviewService", () => {
       reasoning: "The failing path is reachable.",
       sessionId: "verifier-session",
     });
+  });
+
+  test("GetReview names the automation of the pass's run", async () => {
+    const runId = "autorun:auto-9:d1";
+    const store = makeStore({ ...detail, review: reviewRow({ automationRunId: runId }) });
+    const linked = await spawn(store, true, "user", [], { runAutomations: { [runId]: "auto-9" } }).getReview({
+      id: REVIEW_ID,
+    });
+    expect(linked.review).toMatchObject({ automationRunId: runId, automationId: "auto-9" });
+    // The run's row is gone: the pass still loads, with no automation.
+    const gone = await spawn(store).getReview({ id: REVIEW_ID });
+    expect(gone.review?.automationId).toBeUndefined();
+    expect((await spawn(makeStore(detail)).getReview({ id: REVIEW_ID })).review?.automationId).toBeUndefined();
   });
 
   test("GetReview sends the forge's links for the pass and its findings", async () => {

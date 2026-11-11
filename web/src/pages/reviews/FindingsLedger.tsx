@@ -255,8 +255,7 @@ function FindingCard({
             {finding.suggestedFix && (
               <div>
                 <h3 className="mb-1 text-sm font-semibold">Suggested fix</h3>
-                {/* GitHub receives this as a committable suggestion block, so it
-                    is replacement code and renders as code here too. */}
+                {/* Replacement code: the forge gets it as a suggestion block. */}
                 <pre className="overflow-x-auto rounded-md border bg-muted px-3 py-2 font-mono text-sm">
                   {finding.suggestedFix}
                 </pre>

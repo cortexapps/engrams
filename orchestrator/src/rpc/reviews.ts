@@ -44,8 +44,14 @@ export interface ReviewDeps {
   /** A code-review built-in's `repos` input: which repos get reviews. */
   enrolledRepos?: Pick<EnrolledRepos, "get">;
   db?: ReturnType<typeof getDb>;
-  /** Admit a fresh built-in run for the review's original trigger. */
-  retryAutomation?: (automationRunId: string) => Promise<string>;
+  /** Admit a fresh run of the forge's built-in for the review's original trigger. */
+  retryAutomation?: (automationRunId: string, provider: string) => Promise<string>;
+  runs?: RunAutomations;
+}
+
+/** Which automation a run belongs to. */
+interface RunAutomations {
+  getRun(id: string): Promise<{ automationId: string } | null>;
 }
 
 function findingCounts(findings: ReviewFindingRow[]): FindingCounts {
@@ -68,7 +74,8 @@ function findingCounts(findings: ReviewFindingRow[]): FindingCounts {
 /** The pull request's URL: the stored one, else the one the forge builds
  * from the coordinates. */
 function prUrlOf(row: ReviewRow): string | undefined {
-  return row.prUrl ?? forgeFor(row.provider)?.links.pullRequest(row.repo, row.prNumber) ?? undefined;
+  // A stored "" is a URL nobody knew, not a URL.
+  return (row.prUrl || forgeFor(row.provider)?.links.pullRequest(row.repo, row.prNumber)) ?? undefined;
 }
 
 function reviewToProto(row: ReviewRow, counts: FindingCounts): ReviewProto {
@@ -182,6 +189,9 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
   let store = deps?.reviews;
   const reviews = (): ReviewStore =>
     (store ??= makeReviewStore(deps?.db ?? getDb()));
+  let automations = deps?.runs;
+  const runs = (): RunAutomations =>
+    (automations ??= makeAutomationStore(deps?.db ?? getDb()));
   let enrolled = deps?.enrolledRepos;
   const enrolledRepos = (): Pick<EnrolledRepos, "get"> =>
     (enrolled ??= makeEnrolledRepos(makeAutomationStore(deps?.db ?? getDb())));
@@ -213,12 +223,17 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
       await requireUser(ctx, getSession);
       const detail = await reviews().getReview(req.id);
       if (!detail) throw new ConnectError("not found", Code.NotFound);
-      const [events, passes] = await Promise.all([
+      const { automationRunId } = detail.review;
+      const [events, passes, run] = await Promise.all([
         reviews().listEvents(req.id),
         reviews().listPasses(detail.review.targetId),
+        automationRunId ? runs().getRun(automationRunId) : null,
       ]);
       return {
-        review: reviewToProto(detail.review, findingCounts(detail.findings)),
+        review: {
+          ...reviewToProto(detail.review, findingCounts(detail.findings)),
+          ...(run ? { automationId: run.automationId } : {}),
+        },
         findings: detail.findings.map((finding) => findingToProto(finding, detail.review)),
         verdicts: detail.verdicts.map(verdictToProto),
         events: events.map(eventToProto),

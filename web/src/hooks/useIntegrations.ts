@@ -70,7 +70,12 @@ export function useReviewForges(): {
       builtinKey: entry.reviewBuiltinKey,
     }))
     .sort((a, b) => Number(connected.has(b.provider)) - Number(connected.has(a.provider)));
-  return { forges, isPending: catalog.isPending, error: catalog.error };
+  // The order reads both lists, so it is not known until both are.
+  return {
+    forges,
+    isPending: catalog.isPending || connectors.isPending,
+    error: catalog.error,
+  };
 }
 
 /** The coordinator's mint-kind registry (Plane-A form metadata). */

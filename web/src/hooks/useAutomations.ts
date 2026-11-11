@@ -35,12 +35,12 @@ export function useAutomation(id: string | undefined) {
 }
 
 /** A built-in by its stable key (e.g. "pr_review"). The result is null when the
- * built-in is not seeded. An empty key sends no request. */
+ * built-in is not seeded. */
 export function useBuiltinAutomation(builtinKey: string) {
   return useQuery(
     getAutomation,
     { lookup: { case: "builtinKey", value: builtinKey } },
-    { staleTime: 30_000, retry: false, enabled: builtinKey !== "" },
+    { staleTime: 30_000, retry: false },
   );
 }
 

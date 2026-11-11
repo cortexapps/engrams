@@ -266,7 +266,10 @@ function RoleModelField({
     onSave(next)
       .then(
         () => setDraft((now) => (now?.trim() === next ? null : now)),
-        (cause: unknown) => setError(errorMessage(cause)),
+        // A newer value is the field's state now; its save reports for it.
+        (cause: unknown) => {
+          if (sent.current === next) setError(errorMessage(cause));
+        },
       )
       .finally(() => {
         if (sent.current === next) sent.current = null;

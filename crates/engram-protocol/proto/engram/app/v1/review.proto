@@ -100,6 +100,8 @@ message Review {
   // The review as the forge shows it, when one was posted and the pull
   // request has a URL.
   optional string posted_review_url = 31;
+  // The automation that `automation_run_id` is a run of. GetReview only.
+  optional string automation_id = 32;
 }
 
 // Per-severity finding counts for the list page.

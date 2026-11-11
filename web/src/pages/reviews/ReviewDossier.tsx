@@ -14,8 +14,6 @@ import {
 
 import type { Review } from "../../gen/engram/app/v1/review_pb";
 import { useRetryReview, useReview } from "../../hooks/useReviews";
-import { useBuiltinAutomation } from "../../hooks/useAutomations";
-import { useReviewForges } from "../../hooks/useIntegrations";
 import { useNow } from "../../hooks/useNow";
 import { useAbility } from "../../auth/AuthProvider";
 import type { SessionSubject } from "../../lib/ability";
@@ -165,9 +163,8 @@ function BackToLedger() {
  * recorded before that landed, so the coordinate carries the heading when there
  * is no title rather than a placeholder standing in for one.
  *
- * One GitHub affordance, not two: it lands on the review engrams posted when there
- * is one and on the PR itself otherwise. Both are the same page over there, so a
- * second link would only make a reader choose between them.
+ * One link to the forge: to the review engrams posted when there is one, else
+ * to the pull request.
  */
 function PrHeader({
   pass,
@@ -182,11 +179,7 @@ function PrHeader({
   // borrow identity from the newest sibling.
   const title = prTitleOf(pass);
   const retry = useRetryReview();
-  // The run belongs to the review automation of this pass's forge.
-  const forge = useReviewForges().forges.find((entry) => entry.provider === pass.provider);
-  const runAutomationId = useBuiltinAutomation(forge?.builtinKey ?? "").data?.automation?.id;
   const navigate = useNavigate();
-  // One link to the forge, with a label that says where it lands.
   const forgeUrl = pass.postedReviewUrl ?? pass.prUrl;
 
   // A re-run cannot tell you the new pass's id: the RPC starts durable ingress
@@ -208,12 +201,12 @@ function PrHeader({
           {title ?? `Pull request #${pass.prNumber}`}
         </Text>
         <div className="flex shrink-0 items-center gap-1">
-          {pass.automationRunId && runAutomationId && (
+          {pass.automationRunId && pass.automationId && (
             // This pass is one run of the review automation; the run has its trace.
             <Button variant="ghost" size="sm" asChild>
               <Link
                 to="/automations/$id"
-                params={{ id: runAutomationId }}
+                params={{ id: pass.automationId }}
                 search={{ tab: "activity", run: pass.automationRunId }}
               >
                 <Workflow className="size-3.5" aria-hidden />

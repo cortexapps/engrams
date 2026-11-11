@@ -105,7 +105,7 @@ import { makeIntegrationConnectionStore } from "./db/integration-connections.ts"
 import { makeIntegrationEventStore } from "./db/integration-events.ts";
 import { registerAutomationDraftTools } from "./tools/automation-draft.ts";
 import { makeConnectorStore } from "./db/connectors.ts";
-import { connectorRegistry, interactivityPath, loadRegistry } from "./connectors/registry.ts";
+import { connectorRegistry, declaredIngress, interactivityPath, loadRegistry } from "./connectors/registry.ts";
 import { tools } from "./tools/registry.ts";
 import { makeSessionFilesRoute } from "./routes/session-files.ts";
 import { makeSpecsRoute, PostgresSpecReadStore } from "./routes/specs.ts";
@@ -441,8 +441,8 @@ app.route("/", integrationEventsRoute);
 // A connector that declares interactivity makes the path public, so a
 // handler must be behind it, and a handler needs the declaration.
 const interactivity = new Map(chatSpecs().map((spec) => [spec.provider, spec.interactivity]));
-for (const [provider, connector] of connectorRegistry()) {
-  const declared = connector.webhook?.ingress?.interactivity === true;
+for (const provider of connectorRegistry().keys()) {
+  const declared = declaredIngress(provider)?.ingress.interactivity === true;
   const route = interactivity.get(provider);
   if (declared !== (route !== undefined)) {
     throw new Error(`"${provider}": the connector and the chat provider disagree on interactivity`);
