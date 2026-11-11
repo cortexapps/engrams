@@ -11,6 +11,7 @@ import {
   type PrReviewComment,
   type ReviewEvent,
   type ReviewEventPullRequest,
+  type TypedReviewForge,
 } from "../../forges/forge.ts";
 import type { PrContext } from "../../forges/pr-context.ts";
 import {
@@ -23,7 +24,7 @@ import { GITLAB_REVIEW } from "./review-variant.ts";
 const GITLAB_PROVIDER = "gitlab";
 const PER_PAGE = 100;
 // IntegrationOp returns no response headers, so a short page is the end.
-const MAX_PAGES = 10;
+const MAX_PAGES = 20;
 /** Developer: the lowest role that can push to a project. */
 const MIN_ACCESS_TO_REQUEST_REVIEW = 30;
 /** A project or group access token acts as a bot user with this name. */
@@ -258,17 +259,54 @@ function readDiffRefs(mr: Json): DiffRefs | null {
   return base && start && head ? { base_sha: base, start_sha: start, head_sha: head } : null;
 }
 
+/** One file of the merge request's diff. */
+interface FileDiff {
+  oldPath: string;
+  /** The lines that both sides have, by their number on each side. */
+  newToOld: Map<number, number>;
+  oldToNew: Map<number, number>;
+}
+
+/** The unchanged lines of a unified diff. */
+function unchangedLines(diff: string): Pick<FileDiff, "newToOld" | "oldToNew"> {
+  const newToOld = new Map<number, number>();
+  const oldToNew = new Map<number, number>();
+  let oldLine = 0;
+  let newLine = 0;
+  for (const line of diff.split("\n")) {
+    const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+    if (hunk) {
+      oldLine = Number(hunk[1]);
+      newLine = Number(hunk[2]);
+    } else if (line.startsWith("+")) {
+      newLine++;
+    } else if (line.startsWith("-")) {
+      oldLine++;
+    } else if (line.startsWith(" ")) {
+      newToOld.set(newLine, oldLine);
+      oldToNew.set(oldLine, newLine);
+      oldLine++;
+      newLine++;
+    }
+  }
+  return { newToOld, oldToNew };
+}
+
 /** A diff position. A finding names a line of the new file, or of the old
- * file when its side is LEFT. GitLab takes one line: a range needs line
- * codes, which this client does not compute, so a range anchors on its last
- * line. */
-function position(refs: DiffRefs, comment: InlineComment): Json {
+ * file when its side is LEFT. GitLab wants both numbers for a line that
+ * both sides have, and the old path of a renamed file. It takes one line: a
+ * range needs line codes, which this client does not compute, so a range
+ * anchors on its last line. */
+function position(refs: DiffRefs, comment: InlineComment, file: FileDiff | undefined): Json {
+  const left = comment.side === "LEFT";
+  const other = left ? file?.oldToNew.get(comment.line) : file?.newToOld.get(comment.line);
   return {
     ...refs,
     position_type: "text",
     new_path: comment.path,
-    old_path: comment.path,
-    ...(comment.side === "LEFT" ? { old_line: comment.line } : { new_line: comment.line }),
+    old_path: file?.oldPath ?? comment.path,
+    ...(left ? { old_line: comment.line } : { new_line: comment.line }),
+    ...(other === undefined ? {} : left ? { new_line: other } : { old_line: other }),
   };
 }
 
@@ -286,7 +324,7 @@ function parseCommentId(id: string): { prNumber: string; noteId: string } {
 
 export function makeGitlabForge(
   deps: { runIntegrationOp?: typeof defaultRunIntegrationOp } = {},
-): GitForge {
+): GitForge & { typedReview: TypedReviewForge } {
   const runOp = deps.runIntegrationOp ?? defaultRunIntegrationOp;
   const send = (method: string, path: string, body?: unknown): Promise<IntegrationOpResult> =>
     runOp(GITLAB_PROVIDER, {
@@ -319,30 +357,39 @@ export function makeGitlabForge(
     if (!isObject(value)) throw unusable(operation, "a non-object response");
     return value;
   };
-  /** Every item of a list, up to `MAX_PAGES` pages. */
+  /** Every item of a list. A list longer than `MAX_PAGES` pages is an error:
+   * a caller that read a part of it would act on a wrong answer. */
   const list = async (operation: string, path: string, query = ""): Promise<Json[]> => {
     const items: Json[] = [];
     for (let page = 1; page <= MAX_PAGES; page++) {
       const value = await request(operation, "GET", `${path}?per_page=${PER_PAGE}&page=${page}${query}`);
       if (!Array.isArray(value)) throw unusable(operation, "a non-array response");
       items.push(...value.filter(isObject));
-      if (value.length < PER_PAGE) break;
+      if (value.length < PER_PAGE) return items;
     }
-    return items;
+    throw unusable(operation, `more than ${MAX_PAGES * PER_PAGE} items`);
   };
+  /** The notes of the merge request, a list per discussion. */
   const discussionNotes = async (repo: string, prNumber: number): Promise<Json[][]> =>
     (await list("list merge request discussions", `${mergeRequest(repo, prNumber)}/discussions`)).map(
       (discussion) => (Array.isArray(discussion["notes"]) ? discussion["notes"].filter(isObject) : []),
     );
   const readMergeRequest = (repo: string, prNumber: number): Promise<Json> =>
     requestObject("get merge request", "GET", mergeRequest(repo, prNumber));
+  const fileDiffs = async (repo: string, prNumber: number): Promise<Map<string, FileDiff>> => {
+    const files = new Map<string, FileDiff>();
+    for (const file of await list("list merge request diffs", `${mergeRequest(repo, prNumber)}/diffs`)) {
+      const newPath = str(file["new_path"]);
+      if (newPath === null) continue;
+      files.set(newPath, {
+        oldPath: str(file["old_path"]) ?? newPath,
+        ...unchangedLines(str(file["diff"]) ?? ""),
+      });
+    }
+    return files;
+  };
 
-  return {
-    provider: GITLAB_PROVIDER,
-    // GitLab finds a project by its path in any case.
-    caseInsensitiveRepos: true,
-    parsePullRequestUrl,
-    isPermanentError,
+  const typedReview: TypedReviewForge = {
     reviewEvent,
 
     async mayRequestReview(repo, authorId) {
@@ -352,8 +399,37 @@ export function makeGitlabForge(
       if (!succeeded(response)) throw responseError("get project member", response);
       const member = parseJson(response, "get project member");
       const level = isObject(member) ? member["access_level"] : null;
-      return typeof level === "number" && level >= MIN_ACCESS_TO_REQUEST_REVIEW;
+      if (typeof level !== "number" || level < MIN_ACCESS_TO_REQUEST_REVIEW) return false;
+      // A review quotes its findings. A command in a quote, posted with the
+      // connection's own token, must not start the next review.
+      const self = await requestObject("get current user", "GET", "/api/v4/user");
+      return identifier(self["id"]) !== authorId;
     },
+
+    async createComment(repo, prNumber, body) {
+      const note = await requestObject("create merge request note", "POST", `${mergeRequest(repo, prNumber)}/notes`, {
+        body,
+      });
+      const id = identifier(note["id"]);
+      if (id === null) throw unusable("create merge request note", "no id");
+      return commentId(prNumber, id);
+    },
+
+    async updateComment(repo, id, body) {
+      const { prNumber, noteId } = parseCommentId(id);
+      await requestObject("update merge request note", "PUT", `${mergeRequest(repo, prNumber)}/notes/${noteId}`, {
+        body,
+      });
+    },
+  };
+
+  return {
+    provider: GITLAB_PROVIDER,
+    // GitLab finds a project by its path in any case.
+    caseInsensitiveRepos: true,
+    parsePullRequestUrl,
+    isPermanentError,
+    typedReview,
 
     async fetchPullRequest(repo, prNumber) {
       const mr = await readMergeRequest(repo, prNumber);
@@ -384,98 +460,103 @@ export function makeGitlabForge(
       return comments;
     },
 
+    // The summary note is the last thing a review posts, so it alone says
+    // that the review is complete. The inline comments carry the marker too.
     async hasReviewWithMarker(repo, prNumber, marker) {
       const discussions = await discussionNotes(repo, prNumber);
-      return discussions.some((notes) => notes.some((note) => str(note["body"])?.includes(marker)));
+      return discussions.some((notes) =>
+        notes.some((note) => note["type"] !== "DiffNote" && str(note["body"])?.includes(marker)),
+      );
     },
 
     async findCommentWithMarker(repo, prNumber, marker) {
-      const response = await send(
-        "GET",
-        `${mergeRequest(repo, prNumber)}/notes?per_page=${PER_PAGE}&sort=desc&order_by=created_at`,
-      );
-      if (!succeeded(response)) return null;
-      let value: unknown;
+      let notes: Json[];
       try {
-        value = JSON.parse(decodeBody(response.body));
+        notes = await list(
+          "list merge request notes",
+          `${mergeRequest(repo, prNumber)}/notes`,
+          "&sort=desc&order_by=created_at",
+        );
       } catch {
         return null;
       }
-      if (!Array.isArray(value)) return null;
-      const note = value.find(
-        (item): item is Json => isObject(item) && (str(item["body"])?.includes(marker) ?? false),
-      );
+      const note = notes.find((item) => str(item["body"])?.includes(marker));
       const id = note && identifier(note["id"]);
       return note && id ? { ...note, id: commentId(prNumber, id) } : null;
-    },
-
-    async createComment(repo, prNumber, body) {
-      const note = await requestObject("create merge request note", "POST", `${mergeRequest(repo, prNumber)}/notes`, {
-        body,
-      });
-      const id = identifier(note["id"]);
-      if (id === null) throw unusable("create merge request note", "no id");
-      return commentId(prNumber, id);
-    },
-
-    async updateComment(repo, id, body) {
-      const { prNumber, noteId } = parseCommentId(id);
-      await requestObject("update merge request note", "PUT", `${mergeRequest(repo, prNumber)}/notes/${noteId}`, {
-        body,
-      });
     },
 
     /** The inline comments post as draft notes, which nobody sees until
      * each is published. So a comment the diff refuses costs nothing
      * visible: the drafts are deleted and the summary quotes every finding.
-     * Every comment carries the marker, so a pass that stops between a
-     * publish and the summary does not post the comments again. */
+     * Every comment carries the marker, so an attempt after a failure
+     * publishes only the comments that are not on the merge request yet. */
     async postReview(input) {
-      const base = mergeRequest(input.repo, input.prNumber);
-      const deleteDraft = async (id: string): Promise<void> => {
-        const response = await send("DELETE", `${base}/draft_notes/${id}`);
-        if (!succeeded(response) && response.status !== 404) {
-          throw responseError("delete draft note", response);
+      const { repo, prNumber, marker } = input;
+      const base = mergeRequest(repo, prNumber);
+      const deleteDrafts = async (ids: string[]): Promise<void> => {
+        for (const id of ids) {
+          const response = await send("DELETE", `${base}/draft_notes/${id}`);
+          if (!succeeded(response) && response.status !== 404) {
+            throw responseError("delete draft note", response);
+          }
         }
       };
       // Drafts an earlier attempt of this post left behind.
-      for (const draft of await list("list draft notes", `${base}/draft_notes`)) {
-        const id = identifier(draft["id"]);
-        if (id !== null && str(draft["note"])?.includes(input.marker)) await deleteDraft(id);
-      }
-      const refs = readDiffRefs(await readMergeRequest(input.repo, input.prNumber));
-      const drafts: string[] = [];
-      let inlinePosted = refs !== null;
-      if (refs !== null) {
-        for (const comment of input.comments) {
-          const response = await send("POST", `${base}/draft_notes`, {
-            note: `${comment.body}\n\n${input.marker}`,
-            position: position(refs, comment),
-          });
-          if (!succeeded(response)) {
+      const leftover = (await list("list draft notes", `${base}/draft_notes`))
+        .filter((draft) => str(draft["note"])?.includes(marker))
+        .map((draft) => identifier(draft["id"]))
+        .filter((id): id is string => id !== null);
+      await deleteDrafts(leftover);
+
+      const refs = readDiffRefs(await readMergeRequest(repo, prNumber));
+      // The findings name lines of the reviewed head. A newer head has other
+      // lines, so its diff takes no inline comment.
+      const anchored = refs !== null && refs.head_sha === input.commitId;
+      let inlinePosted = anchored;
+      if (anchored && input.comments.length > 0) {
+        const published = new Set(
+          (await discussionNotes(repo, prNumber))
+            .flat()
+            .filter((note) => note["type"] === "DiffNote")
+            .map((note) => str(note["body"])),
+        );
+        const files = await fileDiffs(repo, prNumber);
+        const drafts: string[] = [];
+        try {
+          for (const comment of input.comments) {
+            const note = `${comment.body}\n\n${marker}`;
+            if (published.has(note)) continue;
+            const response = await send("POST", `${base}/draft_notes`, {
+              note,
+              position: position(refs, comment, files.get(comment.path)),
+            });
             // GitLab refuses a position that is not in the diff.
-            if (response.status !== 400 && response.status !== 422) {
-              throw responseError("create draft note", response);
+            if (response.status === 400 || response.status === 422) {
+              inlinePosted = false;
+              break;
             }
-            inlinePosted = false;
-            break;
+            if (!succeeded(response)) throw responseError("create draft note", response);
+            const draft = parseJson(response, "create draft note");
+            const id = isObject(draft) ? identifier(draft["id"]) : null;
+            if (id === null) throw unusable("create draft note", "no id");
+            drafts.push(id);
           }
-          const draft = parseJson(response, "create draft note");
-          const id = isObject(draft) ? identifier(draft["id"]) : null;
-          if (id === null) throw unusable("create draft note", "no id");
-          drafts.push(id);
+        } catch (error) {
+          await deleteDrafts(drafts);
+          throw error;
+        }
+        if (inlinePosted) {
+          // One publish per draft: the bulk call also publishes every other
+          // draft of the token's user on the merge request.
+          for (const id of drafts) {
+            const response = await send("PUT", `${base}/draft_notes/${id}/publish`);
+            if (!succeeded(response)) throw responseError("publish draft note", response);
+          }
+        } else {
+          await deleteDrafts(drafts);
         }
       }
-      // One publish per draft: the bulk call also publishes every other
-      // draft of the token's user on the merge request.
-      for (const id of drafts) {
-        if (!inlinePosted) {
-          await deleteDraft(id);
-          continue;
-        }
-        const response = await send("PUT", `${base}/draft_notes/${id}/publish`);
-        if (!succeeded(response)) throw responseError("publish draft note", response);
-      }
+
       const summaryMd = input.buildSummary(inlinePosted);
       const note = await requestObject("create merge request note", "POST", `${base}/notes`, {
         body: summaryMd,

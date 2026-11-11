@@ -117,8 +117,11 @@ export class ForgeRequestError extends Error {
   }
 }
 
-export interface GitForge extends Partial<TypedReviewForge> {
+export interface GitForge {
   readonly provider: string;
+  /** Present when the forge's review variant uses the typed facts step and
+   * the built-in comment actions. */
+  readonly typedReview?: TypedReviewForge;
   /** Repository names compare without case, so handles and trigger scopes
    * for this forge are stored in lower case. */
   readonly caseInsensitiveRepos: boolean;

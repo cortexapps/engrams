@@ -155,14 +155,19 @@ function requireMarker(ctx: BuiltinActionContext): string {
   return ctx.marker;
 }
 
+function requireComments(forge: GitForge): NonNullable<GitForge["typedReview"]> {
+  if (!forge.typedReview) {
+    throw new IntegrationActionError(`"${forge.provider}" has no comment action`, true);
+  }
+  return forge.typedReview;
+}
+
 /** Post a comment on a pull request once per marker: a later call with the
  * same marker returns the id of the comment an earlier call posted. */
 function upsertPrComment(provider: string): BuiltinActionFn {
   return async (params, ctx, deps) => {
     const forge = deps.forge(provider);
-    if (!forge.createComment) {
-      throw new IntegrationActionError(`"${provider}" has no comment action`, true);
-    }
+    const comments = requireComments(forge);
     const repo = requireString(params, "repo");
     const number = params["number"];
     if (typeof number !== "number") {
@@ -173,7 +178,7 @@ function upsertPrComment(provider: string): BuiltinActionFn {
     if (existing !== null) return { commentId: String(existing["id"]) };
     try {
       const body = `${requireString(params, "body")}\n\n${marker}`;
-      return { commentId: await forge.createComment(repo, number, body) };
+      return { commentId: await comments.createComment(repo, number, body) };
     } catch (error) {
       return forgeFailure(error);
     }
@@ -184,13 +189,10 @@ function upsertPrComment(provider: string): BuiltinActionFn {
  * on the new body, so a later upsert still finds the comment. */
 function updatePrComment(provider: string): BuiltinActionFn {
   return async (params, ctx, deps) => {
-    const forge = deps.forge(provider);
-    if (!forge.updateComment) {
-      throw new IntegrationActionError(`"${provider}" has no comment action`, true);
-    }
+    const comments = requireComments(deps.forge(provider));
     const commentId = requireString(params, "commentId");
     try {
-      await forge.updateComment(
+      await comments.updateComment(
         requireString(params, "repo"),
         commentId,
         `${requireString(params, "body")}\n\n${requireMarker(ctx)}`,
@@ -208,7 +210,7 @@ export const BUILTIN_ACTIONS: BuiltinActionTable = {
       [`${provider}.post_pr_review`, postPrReview(provider)],
       // A forge with no comment methods posts its comments as plain HTTP
       // actions of its connector.
-      ...(requireForge(provider).createComment
+      ...(requireForge(provider).typedReview
         ? [
             [`${provider}.upsert_pr_comment`, upsertPrComment(provider)],
             [`${provider}.update_pr_comment`, updatePrComment(provider)],

@@ -1,8 +1,9 @@
 /** Builtin action ids (ADR 0119 D5). A connector `actions[]` entry with
  * `execute.kind: "builtin"` must name one of these; the implementations are
  * in automations/actions/builtin.ts. The registry stays declarative — it
- * names code, never loads it. Every git forge has `<provider>.post_pr_review`,
- * `<provider>.upsert_pr_comment` and `<provider>.update_pr_comment`.
+ * names code, never loads it. Every git forge has `<provider>.post_pr_review`.
+ * A forge with comment methods also has `<provider>.upsert_pr_comment` and
+ * `<provider>.update_pr_comment`.
  */
 
 export const BUILTIN_ACTION_IDS: ReadonlySet<string> = new Set([

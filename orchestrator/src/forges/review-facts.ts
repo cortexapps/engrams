@@ -48,10 +48,9 @@ export async function reviewFacts(
   forge: GitForge,
   input: ReviewFactsInput,
 ): Promise<ReviewFacts | null> {
-  if (!forge.reviewEvent) {
-    throw new Error(`forge "${forge.provider}" does not classify review events`);
-  }
-  const event = forge.reviewEvent(input.eventKey, input.payload);
+  const typed = forge.typedReview;
+  if (!typed) throw new Error(`forge "${forge.provider}" does not classify review events`);
+  const event = typed.reviewEvent(input.eventKey, input.payload);
   if (event === null) return null;
   const { inputs } = input;
   const entry = enrolment(forge, inputs, event.pr.repo);
@@ -69,7 +68,7 @@ export async function reviewFacts(
       if (event.fromBot) return null;
       const mention = typeof inputs["mention"] === "string" ? inputs["mention"] : "";
       if (parseReviewCommand(event.body, mention)?.kind !== "review") return null;
-      if (!(await forge.mayRequestReview?.(event.pr.repo, event.authorId))) return null;
+      if (!(await typed.mayRequestReview(event.pr.repo, event.authorId))) return null;
       trigger = "command";
       break;
     }

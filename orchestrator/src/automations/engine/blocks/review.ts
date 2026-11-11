@@ -1,14 +1,10 @@
-/** Review blocks (ADR 0119 D7, graduated to the catalog 2026-09).
+/** Review blocks (ADR 0119 D7).
  *
- * The PR-review product logic that is not a generic primitive — the durable
- * review record (targets, passes, findings), the worker staging, and the
- * policy gate — lives in these four blocks. Writing the engrams review
- * ledger is legitimate product surface, the same way `create_session` is:
- * any automation may open a pass, and it shows on the Reviews page. Each
- * block wraps the extracted review control plane (reviews/control-plane.ts)
- * through an injected seam, so the legacy DBOS graph and the built-in share
- * one library and one set of tables. The Reviews product UI reads those
- * tables unchanged.
+ * The code-review logic that is not a generic primitive: the durable review
+ * record (targets, passes, findings), the worker staging, and the policy
+ * gate. Any automation may open a pass, and it shows on the Reviews page.
+ * The blocks that write the record call the review control plane
+ * (reviews/control-plane.ts) through an injected seam.
  *
  * The blocks:
  *   - review_facts       — whether the event starts a review, and the facts
@@ -22,13 +18,11 @@
  *                          returned onto the pass (the dossier's link)
  *   - review_close_pass  — the finalize-hook arm (contract 2): mark the pass
  *                          failed/halted with the sticky status comment +
- *                          activity event, or tear a superseded pass down —
- *                          byte-for-byte the legacy failReview/haltReview/
- *                          cleanup path
+ *                          activity event, or tear a superseded pass down
  *
- * Supersession itself is the ENGINE's concurrency policy (supersede keyed on
- * the PR url). The built-in reaches the legacy graph's failure/halt/supersede
- * behaviour through `settings.onFinalize` hooks that run review_close_pass.
+ * Supersession is the engine's concurrency policy (supersede keyed on the
+ * pull request). The built-in runs review_close_pass from its
+ * `settings.onFinalize` hooks.
  */
 
 import { z } from "zod";

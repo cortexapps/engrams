@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 // This module loads before the forge registry here; the registry must not
 // read a provider's spec while it loads.
 import { makeGitlabForge } from "../forge.ts";
+import { registerEngineBlocks } from "../../../automations/engine/blocks/index.ts";
 import { gitlabEventSource } from "../events.ts";
 import { GITLAB_REVIEW } from "../review-variant.ts";
 import { reviewDefinition } from "../../../automations/builtins/review.ts";
@@ -15,6 +16,8 @@ import {
   type IntegrationOpRequest,
   type IntegrationOpResult,
 } from "../../../integrations/run-op.ts";
+
+registerEngineBlocks();
 
 function response(status: number, body: unknown): IntegrationOpResult {
   return {
@@ -170,13 +173,18 @@ describe("GitLab review facts", () => {
   });
 
   test("a review command needs a member with Developer access", async () => {
-    const developer = scripted([response(200, { access_level: 30 })]);
+    const developer = scripted([response(200, { access_level: 30 }), response(200, { id: 99 })]);
     expect(await facts("note.merge_request", noteHook("please look\n@engrams review"), developer.forge)).toMatchObject({
       trigger: "command",
       pr_number: 7,
       pr_url: MERGE_REQUEST.web_url,
     });
     expect(developer.calls[0]!.path).toBe("/api/v4/projects/acme%2Fplatform%2Fapi/members/all/11");
+
+    // The connection's own user: its review quotes findings, and a command
+    // in a quote starts nothing.
+    const self = scripted([response(200, { access_level: 40 }), response(200, { id: 11 })]);
+    expect(await facts("note.merge_request", noteHook("@engrams review"), self.forge)).toBeNull();
 
     const reporter = scripted([response(200, { access_level: 20 })]);
     expect(await facts("note.merge_request", noteHook("@engrams review"), reporter.forge)).toBeNull();
@@ -240,7 +248,10 @@ describe("GitLab forge", () => {
     expect(forge.isPermanentError(new ForgeRequestError(429, "slow down", ""))).toBe(false);
   });
 
-  const comment = { findingId: "f1", path: "src/a.ts", line: 12, side: "RIGHT", body: "A finding." };
+  const comments = [
+    { findingId: "f1", path: "src/a.ts", line: 4, side: "RIGHT", body: "A finding." },
+    { findingId: "f2", path: "src/a.ts", line: 2, side: "LEFT", body: "Another finding." },
+  ];
   const post = (forge: GitForge) =>
     forge.postReview({
       repo: REPO,
@@ -248,8 +259,19 @@ describe("GitLab forge", () => {
       commitId: DIFF_REFS.head_sha,
       buildSummary: (inline) => `${inline ? "summary" : "summary with every finding"}\n\n<!-- m -->`,
       marker: "<!-- m -->",
-      comments: [comment, { ...comment, findingId: "f2", line: 3, side: "LEFT" }],
+      comments,
     });
+  // A renamed file. Old line 2 is gone, new lines 2 and 3 are added, and
+  // old line 3 is new line 4.
+  const DIFFS = [
+    {
+      old_path: "src/old-a.ts",
+      new_path: "src/a.ts",
+      diff: "@@ -1,4 +1,5 @@\n one\n-two\n+two!\n+extra\n three\n four\n",
+    },
+  ];
+  const paths = (calls: IntegrationOpRequest[]) => calls.map((call) => `${call.method} ${call.path}`);
+  const PAGE = "?per_page=100&page=1";
 
   test("posts the comments as drafts, publishes each, then posts the summary", async () => {
     const { forge, calls } = scripted([
@@ -257,6 +279,8 @@ describe("GitLab forge", () => {
       response(200, [{ id: 30, note: "A finding.\n\n<!-- m -->" }, { id: 31, note: "a person's draft" }]),
       response(204, {}),
       response(200, MERGE_REQUEST),
+      response(200, []),
+      response(200, DIFFS),
       response(201, { id: 41 }),
       response(201, { id: 42 }),
       response(200, {}),
@@ -269,27 +293,62 @@ describe("GitLab forge", () => {
       inlinePosted: true,
       summaryMd: "summary\n\n<!-- m -->",
     });
-    expect(calls.map((call) => `${call.method} ${call.path}`)).toEqual([
-      `GET ${MR_PATH}/draft_notes?per_page=100&page=1`,
+    expect(paths(calls)).toEqual([
+      `GET ${MR_PATH}/draft_notes${PAGE}`,
       `DELETE ${MR_PATH}/draft_notes/30`,
       `GET ${MR_PATH}`,
+      `GET ${MR_PATH}/discussions${PAGE}`,
+      `GET ${MR_PATH}/diffs${PAGE}`,
       `POST ${MR_PATH}/draft_notes`,
       `POST ${MR_PATH}/draft_notes`,
       `PUT ${MR_PATH}/draft_notes/41/publish`,
       `PUT ${MR_PATH}/draft_notes/42/publish`,
       `POST ${MR_PATH}/notes`,
     ]);
-    expect(JSON.parse(calls[3]!.body as string)).toEqual({
+    const where = { ...DIFF_REFS, position_type: "text", new_path: "src/a.ts", old_path: "src/old-a.ts" };
+    // A line both sides have carries both numbers; a removed line only its own.
+    expect(JSON.parse(calls[5]!.body as string)).toEqual({
       note: "A finding.\n\n<!-- m -->",
-      position: { ...DIFF_REFS, position_type: "text", new_path: "src/a.ts", old_path: "src/a.ts", new_line: 12 },
+      position: { ...where, new_line: 4, old_line: 3 },
     });
-    expect(JSON.parse(calls[4]!.body as string).position).toMatchObject({ old_line: 3 });
+    expect(JSON.parse(calls[6]!.body as string).position).toEqual({ ...where, old_line: 2 });
+  });
+
+  test("an attempt after a partial publish posts only what is missing", async () => {
+    const { forge, calls } = scripted([
+      response(200, []),
+      response(200, MERGE_REQUEST),
+      response(200, [{ id: "d1", notes: [{ id: 1, type: "DiffNote", body: "A finding.\n\n<!-- m -->" }] }]),
+      response(200, DIFFS),
+      response(201, { id: 42 }),
+      response(200, {}),
+      response(201, { id: 500 }),
+    ]);
+    expect(await post(forge)).toMatchObject({ inlinePosted: true });
+    expect(paths(calls).slice(4)).toEqual([
+      `POST ${MR_PATH}/draft_notes`,
+      `PUT ${MR_PATH}/draft_notes/42/publish`,
+      `POST ${MR_PATH}/notes`,
+    ]);
+    expect(JSON.parse(calls[4]!.body as string).note).toBe("Another finding.\n\n<!-- m -->");
+  });
+
+  test("a head that moved after the review takes no inline comment", async () => {
+    const moved = { ...MERGE_REQUEST, diff_refs: { ...DIFF_REFS, head_sha: "e".repeat(40) } };
+    const { forge, calls } = scripted([response(200, []), response(200, moved), response(201, { id: 502 })]);
+    expect(await post(forge)).toMatchObject({
+      inlinePosted: false,
+      summaryMd: "summary with every finding\n\n<!-- m -->",
+    });
+    expect(paths(calls).at(-1)).toBe(`POST ${MR_PATH}/notes`);
   });
 
   test("a comment the diff refuses deletes the drafts and posts the full summary", async () => {
     const { forge, calls } = scripted([
       response(200, []),
       response(200, MERGE_REQUEST),
+      response(200, []),
+      response(200, DIFFS),
       response(201, { id: 41 }),
       response(400, { message: "400 Bad request - Note {:line_code=>[\"can't be blank\"]}" }),
       response(204, {}),
@@ -299,45 +358,53 @@ describe("GitLab forge", () => {
       inlinePosted: false,
       summaryMd: "summary with every finding\n\n<!-- m -->",
     });
-    expect(calls.slice(4).map((call) => `${call.method} ${call.path}`)).toEqual([
-      `DELETE ${MR_PATH}/draft_notes/41`,
-      `POST ${MR_PATH}/notes`,
-    ]);
+    expect(paths(calls).slice(6)).toEqual([`DELETE ${MR_PATH}/draft_notes/41`, `POST ${MR_PATH}/notes`]);
   });
 
-  test("a draft that fails for another reason fails the post", async () => {
-    const { forge } = scripted([
+  test("a draft that fails for another reason fails the post and leaves no draft", async () => {
+    const { forge, calls } = scripted([
       response(200, []),
       response(200, MERGE_REQUEST),
+      response(200, []),
+      response(200, DIFFS),
+      response(201, { id: 41 }),
       response(403, { message: "403 Forbidden" }),
+      response(204, {}),
     ]);
     await expect(post(forge)).rejects.toBeInstanceOf(ForgeRequestError);
+    expect(paths(calls).at(-1)).toBe(`DELETE ${MR_PATH}/draft_notes/41`);
+  });
+
+  test("a list that does not end is an error, not a part of the answer", async () => {
+    const full = Array.from({ length: 100 }, (_, id) => ({ id: `d${id}`, notes: [] }));
+    const { forge } = scripted(Array.from({ length: 20 }, () => response(200, full)));
+    await expect(forge.hasReviewWithMarker(REPO, 7, "<!-- m -->")).rejects.toBeInstanceOf(ForgeRequestError);
   });
 
   test("finds a posted review, and a status comment, by its marker", async () => {
-    const discussions = [
-      { id: "d1", notes: [{ id: 1, body: "unrelated", type: null }] },
-      { id: "d2", notes: [{ id: 2, body: "A finding.\n\n<!-- m -->", type: "DiffNote" }] },
-    ];
-    const found = scripted([response(200, discussions)]);
+    // Only the summary says the review is complete: an inline comment with
+    // the marker is a review that stopped before its summary.
+    const inline = { id: "d2", notes: [{ id: 2, body: "A finding.\n\n<!-- m -->", type: "DiffNote" }] };
+    const summary = { id: "d3", notes: [{ id: 3, body: "summary\n\n<!-- m -->", type: null }] };
+    const found = scripted([response(200, [inline, summary])]);
     expect(await found.forge.hasReviewWithMarker(REPO, 7, "<!-- m -->")).toBe(true);
-    const none = scripted([response(200, discussions)]);
-    expect(await none.forge.hasReviewWithMarker(REPO, 7, "<!-- other -->")).toBe(false);
+    const partial = scripted([response(200, [inline])]);
+    expect(await partial.forge.hasReviewWithMarker(REPO, 7, "<!-- m -->")).toBe(false);
 
     const notes = scripted([response(200, [{ id: 9, body: "x" }, { id: 8, body: "status <!-- k -->" }])]);
     expect(await notes.forge.findCommentWithMarker(REPO, 7, "<!-- k -->")).toMatchObject({ id: "7:8" });
-    expect(notes.calls[0]!.path).toBe(`${MR_PATH}/notes?per_page=100&sort=desc&order_by=created_at`);
+    expect(notes.calls[0]!.path).toBe(`${MR_PATH}/notes?per_page=100&page=1&sort=desc&order_by=created_at`);
     const down = scripted([response(500, {})]);
     expect(await down.forge.findCommentWithMarker(REPO, 7, "<!-- k -->")).toBeNull();
   });
 
   test("a status comment's id names its merge request", async () => {
     const { forge, calls } = scripted([response(201, { id: 8 }), response(200, { id: 8 })]);
-    const id = await forge.createComment!(REPO, 7, "status");
+    const id = await forge.typedReview.createComment(REPO, 7, "status");
     expect(id).toBe("7:8");
-    await forge.updateComment!(REPO, id, "new status");
+    await forge.typedReview.updateComment(REPO, id, "new status");
     expect(calls[1]).toMatchObject({ method: "PUT", path: `${MR_PATH}/notes/8` });
-    await expect(forge.updateComment!(REPO, "8", "x")).rejects.toBeInstanceOf(ForgeRequestError);
+    await expect(forge.typedReview.updateComment(REPO, "8", "x")).rejects.toBeInstanceOf(ForgeRequestError);
   });
 
   test("lists diff comments with their thread root", async () => {
