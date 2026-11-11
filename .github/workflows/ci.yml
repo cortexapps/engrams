@@ -1269,9 +1269,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protoc and the pool tools
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
-            protobuf-compiler thin-provisioning-tools
+          install() {
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends \
+              protobuf-compiler thin-provisioning-tools
+          }
+          # The hosted runner reads packages from a regional mirror list. When
+          # that mirror does not resolve, read from the main archive.
+          if ! install; then
+            sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors.txt|http://archive.ubuntu.com/ubuntu/|' \
+              /etc/apt/sources.list.d/ubuntu.sources
+            install
+          fi
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ublk-root
