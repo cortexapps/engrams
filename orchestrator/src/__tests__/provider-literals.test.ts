@@ -23,13 +23,8 @@ const FILENAME = new RegExp(`(^|/)(${PROVIDERS})[^/]*\\.ts$`);
 
 const ALLOWED: string[] = [
   "automations/draft-catalog.ts",
-  "automations/profile-cards.ts",
   "automations/retire-provider-webhooks.ts",
-  "db/connectors.ts",
   "db/schema.ts",
-  "log.ts",
-  "rpc/automations.ts",
-  "rpc/integration.ts",
   "specs/projection.ts",
 ];
 

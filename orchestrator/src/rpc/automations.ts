@@ -105,6 +105,7 @@ import {
 } from "../automations/engine/inbox.ts";
 import type { AutomationDispatchStore } from "../db/automations.ts";
 import { defaultChatProvider, requireChat } from "../chat/registry.ts";
+import { defaultForgeProvider } from "../forges/registry.ts";
 import { makeLinearIssueClient } from "../integrations/linear-issues.ts";
 import type { WebhookAliasMapping } from "../automations/template.ts";
 
@@ -445,11 +446,11 @@ function productionInputKeyOptions(
     async list(noun, connectionId) {
       switch (noun) {
         case "repository": {
-          // Repositories observed on the GitHub connection's ledger: the
-          // installation-repos capability is not exposed to the orchestrator.
+          // Repositories observed on the forge connection's ledger: the
+          // orchestrator has no call that lists a forge's repositories.
           const connection = connectionId
             ? { id: connectionId }
-            : await connections().getDefault("github");
+            : await connections().getDefault(defaultForgeProvider());
           if (!connection) return [];
           const repos = await integrationEvents().listObservedScopeValues(connection.id);
           return repos.map((repo) => ({ key: repo, label: repo }));

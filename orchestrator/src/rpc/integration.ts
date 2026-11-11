@@ -3,7 +3,7 @@
  *
  * Orchestrator-native (like ProfileService), registered before the passthrough.
  * Connectors live in the orchestrator DB (the `connector` table, C1); the
- * built-ins (`github`/`datadog`) are read-only file seeds surfaced alongside
+ * built-in connectors are read-only file seeds surfaced alongside
  * custom ones. Admin-only. `config_json` is the raw connector JSON, validated by
  * `parseConnector` (the admin-trust boundary) on write; a successful write
  * invalidates the merged-registry cache so the next session-create sees it.

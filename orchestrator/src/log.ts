@@ -10,7 +10,7 @@
  *                      output stays clean.
  *
  * Level is `LOG_LEVEL` (default `info`). Tag a subsystem with a child logger,
- * e.g. `log.child({ component: "slack" })`, so its lines are filterable.
+ * e.g. `log.child({ component: "relay" })`, so its lines are filterable.
  */
 
 import pino from "pino";

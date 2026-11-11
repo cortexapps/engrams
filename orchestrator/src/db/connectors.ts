@@ -3,7 +3,7 @@
  *
  * The injectable seam `loadRegistry` (connectors/registry.ts) reads custom
  * (admin-authored) connectors from. Drizzle-backed by default; faked in tests.
- * Built-ins (`github`/`datadog`) are file seeds, NOT rows here — this table
+ * Built-in connectors are file seeds, NOT rows here — this table
  * holds only what an admin added. `config` is the raw connector JSON, validated
  * by `parseConnector` at load (the admin-trust boundary), never trusted here.
  *
