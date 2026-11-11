@@ -22,6 +22,7 @@ import {
   createWebhookRegistration,
   listWebhookRegistrations,
 } from "@/gen/engram/app/v1/automation-WebhookRegistrationService_connectquery";
+import { useIntegrationCatalog } from "@/hooks/useIntegrations";
 
 export function useEditorAutomation(id: string | undefined) {
   return useQuery(
@@ -43,6 +44,17 @@ export function useEventCatalog(provider: string | undefined) {
     { provider: provider ?? "" },
     { enabled: !!provider, staleTime: 60_000 },
   );
+}
+
+/** The providers an automation can use as a trigger source (`events`) or
+ * as the target of an action step (`actions`). A provider the definition
+ * already names stays in the list. */
+export function useAutomationProviders(use: "events" | "actions", current: string): string[] {
+  const catalog = useIntegrationCatalog();
+  const providers = (catalog.data?.providers ?? [])
+    .filter((entry) => (use === "events" ? entry.hasEvents : entry.hasActions))
+    .map((entry) => entry.provider);
+  return current === "" || providers.includes(current) ? providers : [current, ...providers];
 }
 
 export function useActionCatalog(provider: string | undefined) {

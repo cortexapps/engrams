@@ -3040,6 +3040,9 @@ export interface ProviderCatalogEntry {
    * decide this by hard-coding the one provider it knew was named.
    */
   connectionModel: "singleton" | "named";
+  /** Whether the connector declares webhook events, and actions. */
+  hasEvents: boolean;
+  hasActions: boolean;
   /** ADR 0115: user-scoped credential support, when declared. `tokenHint` is
    * the member-facing setup line for PAT mode. Drives the profile editor's
    * per-integration toggle and the Settings → Credentials cards. */
@@ -3091,6 +3094,8 @@ export function buildProviderCatalog(
       hosts: effectiveHosts(connector, resolveSettings(connector, settingsByProvider[connector.provider])),
       capabilities: [...byAction.values()],
       connectionModel: "singleton",
+      hasEvents: (connector.webhook?.events.length ?? 0) > 0,
+      hasActions: (connector.actions?.length ?? 0) > 0,
       ...(connector.userCredential
         ? {
             userCredential: {
@@ -3133,6 +3138,8 @@ export function buildProviderCatalog(
         ...(operation.endpointRule ? { endpointRule: operation.endpointRule } : {}),
       })),
       connectionModel: "named",
+      hasEvents: false,
+      hasActions: false,
     });
   }
   entries.sort((a, b) => a.provider.localeCompare(b.provider));

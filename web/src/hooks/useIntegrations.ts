@@ -41,6 +41,38 @@ export function useIntegrationCatalog() {
   return useQuery(getIntegrationCatalog, {}, { staleTime: 30_000 });
 }
 
+/** A git forge that has a code-review built-in. */
+export interface ReviewForge {
+  provider: string;
+  name: string;
+  /** The key of the forge's review built-in. */
+  builtinKey: string;
+}
+
+/** The forges with a code-review built-in, the connected ones first. */
+export function useReviewForges(): {
+  forges: ReviewForge[];
+  isPending: boolean;
+  error: unknown;
+} {
+  const catalog = useIntegrationCatalog();
+  const connectors = useConnectors();
+  const connected = new Set(
+    (connectors.data?.connectors ?? [])
+      .filter((connector) => connector.status === "connected")
+      .map((connector) => connector.provider),
+  );
+  const forges = (catalog.data?.providers ?? [])
+    .filter((entry) => entry.reviewBuiltinKey !== "")
+    .map((entry) => ({
+      provider: entry.provider,
+      name: entry.display?.name ?? entry.provider,
+      builtinKey: entry.reviewBuiltinKey,
+    }))
+    .sort((a, b) => Number(connected.has(b.provider)) - Number(connected.has(a.provider)));
+  return { forges, isPending: catalog.isPending, error: catalog.error };
+}
+
 /** The coordinator's mint-kind registry (Plane-A form metadata). */
 export function useMintKinds() {
   return useQuery(listMintKinds, {}, { staleTime: 60_000 });

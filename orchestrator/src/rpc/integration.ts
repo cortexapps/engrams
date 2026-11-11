@@ -51,6 +51,8 @@ import {
   type IntegrationConnectionStore,
 } from "../db/integration-connections.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
+import { threadsBuiltinKey } from "../chat/registry.ts";
+import { reviewVariantFor } from "../forges/registry.ts";
 import { makeIntegrationOidcKeyStore } from "../db/integration-oidc-keys.ts";
 import { assertGoogleCloudConfig, makeGoogleWifBroker } from "../integrations/google-wif.ts";
 import {
@@ -532,6 +534,10 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
           })),
           defaultConnectionId: defaultConnection?.id ?? "",
           connectionModel: e.connectionModel,
+          hasEvents: e.hasEvents,
+          hasActions: e.hasActions,
+          reviewBuiltinKey: reviewVariantFor(e.provider)?.key ?? "",
+          threadsBuiltinKey: threadsBuiltinKey(e.provider) ?? "",
           // ADR 0115: absent when the connector is org-only.
           ...(e.userCredential
             ? {
