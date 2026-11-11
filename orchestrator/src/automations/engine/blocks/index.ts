@@ -71,6 +71,7 @@ export const V1_BLOCK_TYPES = [
   "lookup_instance_session",
   "instance_close",
   "claim_handle",
+  "review_facts",
   "review_open_pass",
   "review_stage",
   "review_settle",

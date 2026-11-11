@@ -137,9 +137,9 @@ export const GITHUB_REVIEW: ReviewVariant = {
     '${{ event.raw.repository.full_name }}#${{ event.raw | coalesce: "pull_request.number", "issue.number" }}',
   // The pull request's `html_url`, on the pull request or on the issue.
   concurrencyKeyTemplate: '${{ event.raw | coalesce: "pull_request.html_url", "issue.html_url" }}',
-  dispatchPayload: ({ repo, prNumber, url }) => ({
+  dispatchPayload: ({ repo, prNumber }) => ({
     repository: { full_name: repo, name: repo.split("/")[1] ?? "" },
-    pull_request: { number: prNumber, html_url: url },
+    pull_request: { number: prNumber, html_url: `https://github.com/${repo}/pull/${prNumber}` },
   }),
   defaultMention: defaultMentionHandle,
 };

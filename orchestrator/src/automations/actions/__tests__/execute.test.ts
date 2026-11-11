@@ -378,6 +378,49 @@ describe("executeIntegrationAction — builtins", () => {
     expect(outputs).toMatchObject({ posted: false, already_posted: true });
   });
 
+  const NOTES = "/api/v4/projects/acme%2Fplatform%2Fapi/merge_requests/7/notes";
+
+  test("gitlab.upsert_pr_comment posts once per key and reuses the comment after", async () => {
+    const upsert = (f: ReturnType<typeof fakeRunOp>) =>
+      executeIntegrationAction(
+        {
+          provider: "gitlab",
+          actionId: "upsert_pr_comment",
+          params: { repo: "acme/platform/api", number: 7, key: "status", body: "Reviewing." },
+        },
+        CTX,
+        deps(f.runOp, { builtinDeps: builtinDeps(f.runOp) }),
+      );
+
+    const first = fakeRunOp([json(200, []), json(201, { id: 8 })]);
+    expect(await upsert(first)).toMatchObject({ commentId: "7:8" });
+    expect(first.calls[1]!.req).toMatchObject({ method: "POST", path: NOTES });
+    const posted = String((JSON.parse(first.calls[1]!.req.body as string) as { body: string }).body);
+    const marker = posted.slice(posted.indexOf("<!--"));
+    expect(posted).toBe(`Reviewing.\n\n${marker}`);
+
+    const again = fakeRunOp([json(200, [{ id: 8, body: posted }])]);
+    expect(await upsert(again)).toMatchObject({ commentId: "7:8" });
+    expect(again.calls).toHaveLength(1);
+  });
+
+  test("gitlab.update_pr_comment rewrites the comment and keeps its marker", async () => {
+    const f = fakeRunOp([json(200, { id: 8 })]);
+    const outputs = await executeIntegrationAction(
+      {
+        provider: "gitlab",
+        actionId: "update_pr_comment",
+        params: { repo: "acme/platform/api", commentId: "7:8", key: "status", body: "Done." },
+      },
+      CTX,
+      deps(f.runOp, { builtinDeps: builtinDeps(f.runOp) }),
+    );
+    expect(outputs).toMatchObject({ commentId: "7:8" });
+    expect(f.calls[0]!.req).toMatchObject({ method: "PUT", path: `${NOTES}/8` });
+    const body = String((JSON.parse(f.calls[0]!.req.body as string) as { body: string }).body);
+    expect(body).toMatch(/^Done\.\n\n<!-- .+ -->$/);
+  });
+
   test("slack.post_message maps ts/channel through the declared outputs", async () => {
     const sent: Array<Record<string, unknown>> = [];
     const f = fakeRunOp([]);

@@ -10,7 +10,9 @@
  * one library and one set of tables. The Reviews product UI reads those
  * tables unchanged.
  *
- * Four blocks:
+ * The blocks:
+ *   - review_facts       — whether the event starts a review, and the facts
+ *                          of its pull request, as the forge reads them
  *   - review_open_pass   — identity + pass row (+ stamps the run id)
  *   - review_stage       — stage a worker session for a phase and compose
  *                          its prompt (returned as an output for send_prompt)
@@ -36,8 +38,10 @@ import {
   type ReviewControlPlane,
   type ReviewPostPayload,
 } from "../../../reviews/control-plane.ts";
-import { SAFE_REPO_PATH, type PullRequestHeads } from "../../../forges/forge.ts";
-import { defaultForgeProvider } from "../../../forges/registry.ts";
+import { SAFE_REPO_PATH, type GitForge, type PullRequestHeads } from "../../../forges/forge.ts";
+import { defaultForgeProvider, requireForge } from "../../../forges/registry.ts";
+import { reviewFacts } from "../../../forges/review-facts.ts";
+import { REVIEW_FACTS_TYPE } from "../../builtins/review-variant.ts";
 import { isCompletePrContext, type PrContext } from "../../../forges/pr-context.ts";
 import { REVIEW_CATEGORIES, type ReviewCategory } from "../../../reviewers/render.ts";
 import { isHumanReviewTrigger } from "../../../reviews/review-trigger.ts";
@@ -49,6 +53,11 @@ export const REVIEW_STAGE_TYPE = "review_stage";
 export const REVIEW_SETTLE_TYPE = "review_settle";
 export const REVIEW_CLOSE_PASS_TYPE = "review_close_pass";
 export const REVIEW_RECORD_POST_TYPE = "review_record_post";
+
+/** `review_facts`: whether the run's event starts a review on `provider`'s
+ * forge, and the facts of the pull request. `value` is null when it does
+ * not. */
+export const reviewFactsConfigSchema = z.object({ provider: z.string().min(1) });
 
 /** The slice of the control plane the blocks use; injected for tests. */
 export type ReviewBlockControlPlane = Pick<
@@ -74,6 +83,8 @@ export interface ReviewBlockDeps {
     setAutomationRunId(reviewId: string, runId: string): Promise<void>;
     setGithubReviewId(reviewId: string, githubReviewId: string): Promise<void>;
   };
+  /** The forge the facts step asks; the registry's when absent. */
+  forge?(provider: string): GitForge;
 }
 
 let runtimeDeps: ReviewBlockDeps | null = null;
@@ -393,6 +404,20 @@ export async function executeReviewFinalize(config: ReviewFinalizeConfig): Promi
 }
 
 export function registerReviewBlocks(): void {
+  registerBlock<z.infer<typeof reviewFactsConfigSchema>>({
+    type: REVIEW_FACTS_TYPE,
+    outputs: ["value"],
+    configSchema: reviewFactsConfigSchema,
+    async execute(config, ctx) {
+      const value = await reviewFacts((deps().forge ?? requireForge)(config.provider), {
+        eventKey: ctx.trigger.event ?? "",
+        payload: ctx.event.raw,
+        inputs: ctx.inputs,
+      });
+      return { kind: "ok", outputs: { value } };
+    },
+  });
+
   registerBlock<ReviewRecordPostConfig>({
     type: REVIEW_RECORD_POST_TYPE,
     refusesDryRun: true,

@@ -1,6 +1,7 @@
 /** The git forges, keyed by the provider name of their connector. */
 
 import { GITHUB_FORGE } from "../providers/github/forge.ts";
+import { GITLAB_FORGE } from "../providers/gitlab/forge.ts";
 import type { ReviewVariant } from "../automations/builtins/review-variant.ts";
 import type { ForgeDeps, GitForge, GitForgeSpec } from "./forge.ts";
 
@@ -8,7 +9,7 @@ import type { ForgeDeps, GitForge, GitForgeSpec } from "./forge.ts";
 // spec is not initialized until its own module body ends.
 let specs: ReadonlyMap<string, GitForgeSpec> | null = null;
 function specTable(): ReadonlyMap<string, GitForgeSpec> {
-  return (specs ??= new Map([GITHUB_FORGE].map((spec) => [spec.provider, spec])));
+  return (specs ??= new Map([GITHUB_FORGE, GITLAB_FORGE].map((spec) => [spec.provider, spec])));
 }
 const production = new Map<string, GitForge>();
 

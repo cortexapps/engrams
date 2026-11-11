@@ -23,6 +23,7 @@ import {
 } from "../automations/verify.ts";
 import { declaredIngress } from "../connectors/registry.ts";
 import { githubEventSource } from "../providers/github/events.ts";
+import { gitlabEventSource } from "../providers/gitlab/events.ts";
 import { linearEventSource } from "../providers/linear/events.ts";
 import { slackEventSource } from "../providers/slack/events.ts";
 import { vantaEventSource } from "../providers/vanta/events.ts";
@@ -38,7 +39,7 @@ export interface IntegrationEventsDeps {
 
 /** One source per connector that declares a webhook ingress. */
 export function defaultEventSources(): IntegrationEventSource[] {
-  return [githubEventSource(), linearEventSource, slackEventSource, vantaEventSource];
+  return [githubEventSource(), gitlabEventSource, linearEventSource, slackEventSource, vantaEventSource];
 }
 
 export function makeIntegrationEventsRoute(deps: IntegrationEventsDeps = {}): Hono {

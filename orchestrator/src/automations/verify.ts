@@ -90,7 +90,7 @@ function sha256Signature(secret: string, body: Uint8Array): string {
   return createHmac("sha256", secret).update(body).digest("hex");
 }
 
-/** Svix's documented replay window. */
+/** The replay window Svix and Standard Webhooks document. */
 const SVIX_TOLERANCE_MS = 5 * 60_000;
 
 export interface VerifyIngressInput {
@@ -138,6 +138,24 @@ export async function verifyIngress(input: VerifyIngressInput): Promise<boolean>
         now: input.now.getTime(),
         toleranceMs: SVIX_TOLERANCE_MS,
       });
+    case "gitlab_webhook":
+      // GitLab has two secrets. A signing token (`whsec_...`, GitLab 19.0
+      // and later) signs the delivery as Svix does, under the Standard
+      // Webhooks header names. A secret token arrives as it is in a header.
+      // The stored secret says which one the administrator set, so a
+      // delivery cannot choose the weaker check.
+      if (secret.startsWith("whsec_")) {
+        return verifySvixSignature({
+          secret,
+          rawBody,
+          id: headers.get("webhook-id"),
+          timestamp: headers.get("webhook-timestamp"),
+          signature: headers.get("webhook-signature"),
+          now: input.now.getTime(),
+          toleranceMs: SVIX_TOLERANCE_MS,
+        });
+      }
+      return secret !== "" && timingSafeHeader(secret, headers.get("x-gitlab-token"));
   }
 }
 

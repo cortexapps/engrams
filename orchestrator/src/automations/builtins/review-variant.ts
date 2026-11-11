@@ -5,6 +5,14 @@
 import type { ProfileNetwork } from "../../db/schema.ts";
 import type { BlockDef } from "../engine/definition.ts";
 
+/** The event key the dispatch edge admits a run under; no forge delivery
+ * carries it. Its payload is the variant's `dispatchPayload`. */
+export const REVIEW_DISPATCH_EVENT_KEY = "review.dispatch";
+
+/** The typed facts step: the forge reads the event, and shared code admits
+ * it. A variant whose facts are not a code step uses it. */
+export const REVIEW_FACTS_TYPE = "review_facts";
+
 export const REVIEW_FACTS = "steps.facts.value";
 export const REVIEW_REPO = `\${{ ${REVIEW_FACTS}.repo }}`;
 export const REVIEW_PR_NUMBER = `\${{ ${REVIEW_FACTS}.pr_number }}`;
@@ -31,7 +39,7 @@ export interface ReviewVariant {
   facts: Omit<BlockDef, "id">;
   /** The payload of the dispatch event for a pull request named by
    * coordinate. The facts step and both key templates read it. */
-  dispatchPayload(pr: { repo: string; prNumber: number; url: string }): Record<string, unknown>;
+  dispatchPayload(pr: { repo: string; prNumber: number }): Record<string, unknown>;
   /** A shell command that leaves `REVIEW_HEAD_SHA` checked out in
    * `/workspace/<repo_name>`. */
   checkoutCommand: string;

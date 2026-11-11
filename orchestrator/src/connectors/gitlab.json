@@ -43,10 +43,15 @@
       "grants": ["merge_requests:write"],
       "match": { "method": "POST", "path": "/api/v4/projects/*/merge_requests" },
       "asset": {
-        "kind": "merge_request",
+        "kind": "pull_request",
         "surface": "asset",
         "success": { "statusClass": "2xx" },
-        "data": { "iid": "$.resp.iid", "title": "$.resp.title" },
+        "data": {
+          "number": "$.resp.iid",
+          "title": "$.resp.title",
+          "head_branch": "$.resp.source_branch",
+          "base_branch": "$.resp.target_branch"
+        },
         "fetchable": { "external": "$.resp.web_url" }
       }
     },
@@ -114,6 +119,748 @@
         "repository:write"
       ],
       "match": { "method": "GET", "path": "/api/v4/user" }
+    }
+  ],
+  "webhook": {
+    "verificationScheme": "generic_hmac_sha256",
+    "events": [
+      {
+        "key": "merge_request.open",
+        "label": "Merge request opened",
+        "description": "A merge request was opened.",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "object_kind": {
+              "type": "string"
+            },
+            "user": {
+              "type": "object",
+              "properties": {
+                "username": {
+                  "type": "string"
+                }
+              }
+            },
+            "project": {
+              "type": "object",
+              "properties": {
+                "path_with_namespace": {
+                  "type": "string"
+                },
+                "web_url": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              }
+            },
+            "object_attributes": {
+              "type": "object",
+              "properties": {
+                "iid": {
+                  "type": "integer"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "state": {
+                  "type": "string"
+                },
+                "action": {
+                  "type": "string"
+                },
+                "draft": {
+                  "type": "boolean"
+                },
+                "source_branch": {
+                  "type": "string"
+                },
+                "target_branch": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string",
+                  "format": "uri"
+                },
+                "last_commit": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "gitlab:"
+              },
+              {
+                "path": "project.path_with_namespace"
+              },
+              {
+                "lit": "#"
+              },
+              {
+                "path": "object_attributes.iid"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "merge_request.reopen",
+        "label": "Merge request reopened",
+        "description": "A closed merge request was opened again.",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "object_kind": {
+              "type": "string"
+            },
+            "user": {
+              "type": "object",
+              "properties": {
+                "username": {
+                  "type": "string"
+                }
+              }
+            },
+            "project": {
+              "type": "object",
+              "properties": {
+                "path_with_namespace": {
+                  "type": "string"
+                },
+                "web_url": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              }
+            },
+            "object_attributes": {
+              "type": "object",
+              "properties": {
+                "iid": {
+                  "type": "integer"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "state": {
+                  "type": "string"
+                },
+                "action": {
+                  "type": "string"
+                },
+                "draft": {
+                  "type": "boolean"
+                },
+                "source_branch": {
+                  "type": "string"
+                },
+                "target_branch": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string",
+                  "format": "uri"
+                },
+                "last_commit": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "gitlab:"
+              },
+              {
+                "path": "project.path_with_namespace"
+              },
+              {
+                "lit": "#"
+              },
+              {
+                "path": "object_attributes.iid"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "merge_request.update",
+        "label": "Merge request updated",
+        "description": "A merge request got commits or its details changed.",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "object_kind": {
+              "type": "string"
+            },
+            "user": {
+              "type": "object",
+              "properties": {
+                "username": {
+                  "type": "string"
+                }
+              }
+            },
+            "project": {
+              "type": "object",
+              "properties": {
+                "path_with_namespace": {
+                  "type": "string"
+                },
+                "web_url": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              }
+            },
+            "object_attributes": {
+              "type": "object",
+              "properties": {
+                "iid": {
+                  "type": "integer"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "state": {
+                  "type": "string"
+                },
+                "action": {
+                  "type": "string"
+                },
+                "draft": {
+                  "type": "boolean"
+                },
+                "source_branch": {
+                  "type": "string"
+                },
+                "target_branch": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string",
+                  "format": "uri"
+                },
+                "last_commit": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "gitlab:"
+              },
+              {
+                "path": "project.path_with_namespace"
+              },
+              {
+                "lit": "#"
+              },
+              {
+                "path": "object_attributes.iid"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "merge_request.close",
+        "label": "Merge request closed",
+        "description": "A merge request was closed without a merge.",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "object_kind": {
+              "type": "string"
+            },
+            "user": {
+              "type": "object",
+              "properties": {
+                "username": {
+                  "type": "string"
+                }
+              }
+            },
+            "project": {
+              "type": "object",
+              "properties": {
+                "path_with_namespace": {
+                  "type": "string"
+                },
+                "web_url": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              }
+            },
+            "object_attributes": {
+              "type": "object",
+              "properties": {
+                "iid": {
+                  "type": "integer"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "state": {
+                  "type": "string"
+                },
+                "action": {
+                  "type": "string"
+                },
+                "draft": {
+                  "type": "boolean"
+                },
+                "source_branch": {
+                  "type": "string"
+                },
+                "target_branch": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string",
+                  "format": "uri"
+                },
+                "last_commit": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "gitlab:"
+              },
+              {
+                "path": "project.path_with_namespace"
+              },
+              {
+                "lit": "#"
+              },
+              {
+                "path": "object_attributes.iid"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "merge_request.merge",
+        "label": "Merge request merged",
+        "description": "A merge request was merged.",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "object_kind": {
+              "type": "string"
+            },
+            "user": {
+              "type": "object",
+              "properties": {
+                "username": {
+                  "type": "string"
+                }
+              }
+            },
+            "project": {
+              "type": "object",
+              "properties": {
+                "path_with_namespace": {
+                  "type": "string"
+                },
+                "web_url": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              }
+            },
+            "object_attributes": {
+              "type": "object",
+              "properties": {
+                "iid": {
+                  "type": "integer"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "state": {
+                  "type": "string"
+                },
+                "action": {
+                  "type": "string"
+                },
+                "draft": {
+                  "type": "boolean"
+                },
+                "source_branch": {
+                  "type": "string"
+                },
+                "target_branch": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string",
+                  "format": "uri"
+                },
+                "last_commit": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "gitlab:"
+              },
+              {
+                "path": "project.path_with_namespace"
+              },
+              {
+                "lit": "#"
+              },
+              {
+                "path": "object_attributes.iid"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "note.merge_request",
+        "label": "Comment on a merge request",
+        "description": "A comment was posted on a merge request.",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "object_kind": {
+              "type": "string"
+            },
+            "user": {
+              "type": "object",
+              "properties": {
+                "username": {
+                  "type": "string"
+                }
+              }
+            },
+            "project": {
+              "type": "object",
+              "properties": {
+                "path_with_namespace": {
+                  "type": "string"
+                },
+                "web_url": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              }
+            },
+            "object_attributes": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "integer"
+                },
+                "note": {
+                  "type": "string"
+                },
+                "noteable_type": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              }
+            },
+            "merge_request": {
+              "type": "object",
+              "properties": {
+                "iid": {
+                  "type": "integer"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "state": {
+                  "type": "string"
+                },
+                "source_branch": {
+                  "type": "string"
+                },
+                "target_branch": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "gitlab:"
+              },
+              {
+                "path": "project.path_with_namespace"
+              },
+              {
+                "lit": "#"
+              },
+              {
+                "path": "merge_request.iid"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "aliases": [
+      {
+        "path": "object_attributes.title",
+        "alias": "merge_request.title"
+      },
+      {
+        "path": "object_attributes.iid",
+        "alias": "merge_request.iid"
+      },
+      {
+        "path": "project.path_with_namespace",
+        "alias": "project.path"
+      },
+      {
+        "path": "user.username",
+        "alias": "actor.login"
+      }
+    ],
+    "ingress": {
+      "scheme": "gitlab_webhook",
+      "secretRef": "gitlab.webhook_secret"
+    },
+    "scope": {
+      "key": "projects",
+      "label": "Projects",
+      "path": "project.path_with_namespace"
+    }
+  },
+  "actions": [
+    {
+      "id": "post_pr_review",
+      "label": "Post a merge request review",
+      "description": "Post a review on a merge request: a summary comment and a thread on each commented line.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "repo": {
+            "type": "string"
+          },
+          "prNumber": {
+            "type": "integer"
+          },
+          "commitId": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "fallbackSummary": {
+            "type": "string"
+          },
+          "comments": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "line": {
+                  "type": "integer"
+                },
+                "start_line": {
+                  "type": "integer"
+                },
+                "side": {
+                  "type": "string"
+                },
+                "body": {
+                  "type": "string"
+                },
+                "finding_id": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "required": [
+          "repo",
+          "prNumber",
+          "summary"
+        ]
+      },
+      "execute": {
+        "kind": "builtin",
+        "id": "gitlab.post_pr_review"
+      },
+      "idempotency": {
+        "kind": "marker_comment"
+      },
+      "handles": [
+        {
+          "parts": [
+            {
+              "lit": "gitlab:"
+            },
+            {
+              "path": "input.repo"
+            },
+            {
+              "lit": "#"
+            },
+            {
+              "path": "input.prNumber"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "upsert_pr_comment",
+      "label": "Create or reuse a pinned comment",
+      "description": "Post a comment on a merge request once per key. A later call with the same key returns the id of the comment an earlier call posted; edit it with update_pr_comment.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "repo": {
+            "type": "string"
+          },
+          "number": {
+            "type": "integer"
+          },
+          "key": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo",
+          "number",
+          "key",
+          "body"
+        ]
+      },
+      "execute": {
+        "kind": "builtin",
+        "id": "gitlab.upsert_pr_comment"
+      },
+      "output": {
+        "commentId": "commentId"
+      },
+      "idempotency": {
+        "kind": "marker_comment",
+        "markerTemplate": "<!-- engrams-pinned:{input.key} -->"
+      },
+      "handles": [
+        {
+          "parts": [
+            {
+              "lit": "gitlab:"
+            },
+            {
+              "path": "input.repo"
+            },
+            {
+              "lit": "#"
+            },
+            {
+              "path": "input.number"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "update_pr_comment",
+      "label": "Rewrite a pinned comment",
+      "description": "Edit a comment that upsert_pr_comment posted. The key's marker goes back on the new body, so a later upsert_pr_comment with the same key still finds the comment.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "repo": {
+            "type": "string"
+          },
+          "commentId": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo",
+          "commentId",
+          "key",
+          "body"
+        ]
+      },
+      "execute": {
+        "kind": "builtin",
+        "id": "gitlab.update_pr_comment"
+      },
+      "idempotency": {
+        "kind": "marker_comment",
+        "markerTemplate": "<!-- engrams-pinned:{input.key} -->"
+      }
     }
   ],
   "cli": {

@@ -148,7 +148,6 @@ export function makeGithubForge(
   return {
     provider: PROVIDER,
     caseInsensitiveRepos: true,
-    pullRequestUrl: (repo, prNumber) => `https://github.com/${repo}/pull/${prNumber}`,
     parsePullRequestUrl,
     isPermanentError,
 

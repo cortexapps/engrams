@@ -24,7 +24,8 @@ describe("GitHub webhook IAP exemption", () => {
 
   test("an event path is public only for a connector that declares an ingress", () => {
     expect(isIapPublicPath("/api/v1/integrations/vanta/events", "POST")).toBe(true);
-    expect(isIapPublicPath("/api/v1/integrations/gitlab/events", "POST")).toBe(false);
+    expect(isIapPublicPath("/api/v1/integrations/gitlab/events", "POST")).toBe(true);
+    expect(isIapPublicPath("/api/v1/integrations/asana/events", "POST")).toBe(false);
     expect(isIapPublicPath("/api/v1/integrations/unknown/events", "POST")).toBe(false);
   });
 

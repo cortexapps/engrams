@@ -26,7 +26,6 @@ function fakeForge(methods: Partial<GitForge>): () => GitForge {
   return () => ({
     provider: "github",
     caseInsensitiveRepos: true,
-    pullRequestUrl: unexpected("pullRequestUrl"),
     parsePullRequestUrl: unexpected("parsePullRequestUrl"),
     isPermanentError: unexpected("isPermanentError"),
     fetchPullRequest: unexpected("fetchPullRequest"),

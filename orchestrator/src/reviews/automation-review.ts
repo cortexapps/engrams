@@ -26,7 +26,7 @@
  *   `report_halt` finalize hook posts the legacy halt comment.
  */
 
-import { REVIEW_DISPATCH_EVENT_KEY } from "../automations/builtins/review.ts";
+import { REVIEW_DISPATCH_EVENT_KEY } from "../automations/builtins/review-variant.ts";
 import type { ReviewVariant } from "../automations/builtins/review-variant.ts";
 import { reviewVariantFor } from "../forges/registry.ts";
 import {
@@ -202,11 +202,7 @@ export async function dispatchAutomationReview(
     eventKey: REVIEW_DISPATCH_EVENT_KEY,
     receivedAt: now().toISOString(),
     scopeValue: input.repo,
-    payload: variant.dispatchPayload({
-      repo: input.repo,
-      prNumber: input.prNumber,
-      url: requireForge(input.provider).pullRequestUrl(input.repo, input.prNumber),
-    }),
+    payload: variant.dispatchPayload({ repo: input.repo, prNumber: input.prNumber }),
   };
   const bound = await bindWorkstream(builtin, definition, trigger, deliveryKey, instances);
   const runId = automationRunId(builtin.id, deliveryKey, MAIN_ENTRYPOINT_ID, bound.instanceId);

@@ -276,6 +276,7 @@ describe("the GitHub forge", () => {
       prNumber: 100,
       commitId: "head-sha",
       buildSummary: (inlinePosted) => (inlinePosted ? "inline summary" : "fallback summary"),
+      marker: "<!-- marker -->",
       comments: [
         {
           findingId: "single",
@@ -336,6 +337,7 @@ describe("the GitHub forge", () => {
       prNumber: 100,
       commitId: "head-sha",
       buildSummary: (inlinePosted) => (inlinePosted ? "inline summary" : "fallback summary"),
+      marker: "<!-- marker -->",
       comments: [{
         findingId: "finding-1",
         path: "src/index.ts",

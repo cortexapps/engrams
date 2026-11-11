@@ -1279,6 +1279,19 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
     defaults: () => ({}),
   },
   {
+    kind: "review_facts",
+    label: "Review facts",
+    description:
+      "Read the event as a pull or merge request of one forge, and decide whether it starts a review. The value is empty when it does not.",
+    icon: GitPullRequest,
+    group: "advanced",
+    insertable: false,
+    outputs: ["value"],
+    inspector: "readonly",
+    summary: (c) => str(c["provider"]) || "No forge",
+    defaults: () => ({}),
+  },
+  {
     kind: "slack_choice",
     label: "Slack choice",
     description:

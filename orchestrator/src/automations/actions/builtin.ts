@@ -129,6 +129,7 @@ function postPrReview(provider: string): BuiltinActionFn {
       prNumber,
       commitId,
       buildSummary: (inlinePosted) => `${inlinePosted ? summary : fallbackSummary}\n\n${marker}`,
+      marker,
       comments: readComments(params),
     });
     return {
@@ -141,9 +142,79 @@ function postPrReview(provider: string): BuiltinActionFn {
   };
 }
 
+function forgeFailure(error: unknown): never {
+  if (!(error instanceof ForgeRequestError)) throw error;
+  const { status } = error;
+  throw new IntegrationActionError(error.message, status >= 400 && status < 500 && status !== 429, status);
+}
+
+function requireMarker(ctx: BuiltinActionContext): string {
+  if (ctx.marker === null) {
+    throw new IntegrationActionError("this action needs marker_comment idempotency", true);
+  }
+  return ctx.marker;
+}
+
+/** Post a comment on a pull request once per marker: a later call with the
+ * same marker returns the id of the comment an earlier call posted. */
+function upsertPrComment(provider: string): BuiltinActionFn {
+  return async (params, ctx, deps) => {
+    const forge = deps.forge(provider);
+    if (!forge.createComment) {
+      throw new IntegrationActionError(`"${provider}" has no comment action`, true);
+    }
+    const repo = requireString(params, "repo");
+    const number = params["number"];
+    if (typeof number !== "number") {
+      throw new IntegrationActionError(`missing required integer "number"`, true);
+    }
+    const marker = requireMarker(ctx);
+    const existing = await forge.findCommentWithMarker(repo, number, marker);
+    if (existing !== null) return { commentId: String(existing["id"]) };
+    try {
+      const body = `${requireString(params, "body")}\n\n${marker}`;
+      return { commentId: await forge.createComment(repo, number, body) };
+    } catch (error) {
+      return forgeFailure(error);
+    }
+  };
+}
+
+/** Rewrite a comment that `upsert_pr_comment` posted. The marker goes back
+ * on the new body, so a later upsert still finds the comment. */
+function updatePrComment(provider: string): BuiltinActionFn {
+  return async (params, ctx, deps) => {
+    const forge = deps.forge(provider);
+    if (!forge.updateComment) {
+      throw new IntegrationActionError(`"${provider}" has no comment action`, true);
+    }
+    const commentId = requireString(params, "commentId");
+    try {
+      await forge.updateComment(
+        requireString(params, "repo"),
+        commentId,
+        `${requireString(params, "body")}\n\n${requireMarker(ctx)}`,
+      );
+    } catch (error) {
+      return forgeFailure(error);
+    }
+    return { commentId };
+  };
+}
+
 export const BUILTIN_ACTIONS: BuiltinActionTable = {
   ...Object.fromEntries(
-    forgeProviders().map((provider) => [`${provider}.post_pr_review`, postPrReview(provider)]),
+    forgeProviders().flatMap((provider) => [
+      [`${provider}.post_pr_review`, postPrReview(provider)],
+      // A forge with no comment methods posts its comments as plain HTTP
+      // actions of its connector.
+      ...(requireForge(provider).createComment
+        ? [
+            [`${provider}.upsert_pr_comment`, upsertPrComment(provider)],
+            [`${provider}.update_pr_comment`, updatePrComment(provider)],
+          ]
+        : []),
+    ]),
   ),
 
   ...SLACK_ACTIONS,

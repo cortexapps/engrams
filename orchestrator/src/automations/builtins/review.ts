@@ -33,6 +33,7 @@ import { REVIEW_CATEGORIES } from "../../reviewers/render.ts";
 import { FINDER_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT } from "../../reviews/control-plane.ts";
 import { PR_REVIEW_CAPABILITY, REVIEW_PHASE_SIGNALS } from "../../tools/review.ts";
 import {
+  REVIEW_DISPATCH_EVENT_KEY,
   REVIEW_FACTS,
   REVIEW_HEAD_SHA,
   REVIEW_PR_NUMBER,
@@ -48,10 +49,6 @@ import {
   REVIEW_SETTLE_TYPE,
   REVIEW_STAGE_TYPE,
 } from "../engine/blocks/review.ts";
-
-/** The event key the dispatch edge admits a run under; no forge delivery
- * carries it. Its payload is the variant's `dispatchPayload`. */
-export const REVIEW_DISPATCH_EVENT_KEY = "review.dispatch";
 
 const F = REVIEW_FACTS;
 const REPO = REVIEW_REPO;

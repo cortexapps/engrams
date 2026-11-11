@@ -56,7 +56,12 @@ describe("provider ingress verification", () => {
   const seconds = String(Math.floor(NOW.getTime() / 1000));
 
   function ingress(
-    scheme: "github_hmac_sha256" | "slack_v0" | "linear_hmac_sha256" | "svix_hmac_sha256",
+    scheme:
+      | "github_hmac_sha256"
+      | "slack_v0"
+      | "linear_hmac_sha256"
+      | "svix_hmac_sha256"
+      | "gitlab_webhook",
     headers: Record<string, string>,
     secret = SECRET,
   ): Promise<boolean> {
@@ -111,6 +116,31 @@ describe("provider ingress verification", () => {
     expect(await ingress("svix_hmac_sha256", sign(String(Number(seconds) - 3600)), secret))
       .toBe(false);
     expect(await ingress("svix_hmac_sha256", {}, secret)).toBe(false);
+  });
+
+  test("gitlab_webhook compares the secret token header", async () => {
+    expect(await ingress("gitlab_webhook", { "x-gitlab-token": SECRET })).toBe(true);
+    expect(await ingress("gitlab_webhook", { "x-gitlab-token": "other" })).toBe(false);
+    expect(await ingress("gitlab_webhook", {})).toBe(false);
+    expect(await ingress("gitlab_webhook", { "x-gitlab-token": "" }, "")).toBe(false);
+  });
+
+  test("gitlab_webhook with a signing token takes only a signature", async () => {
+    const key = Buffer.from("gitlab-test-key");
+    const secret = `whsec_${key.toString("base64")}`;
+    const signed = (ts: string) => ({
+      "webhook-id": "msg_1",
+      "webhook-timestamp": ts,
+      "webhook-signature": `v1,${createHmac("sha256", key)
+        .update(`msg_1.${ts}.`)
+        .update(BODY)
+        .digest("base64")}`,
+    });
+    expect(await ingress("gitlab_webhook", signed(seconds), secret)).toBe(true);
+    expect(await ingress("gitlab_webhook", signed(String(Number(seconds) - 3600)), secret))
+      .toBe(false);
+    // The secret in the token header does not pass in place of a signature.
+    expect(await ingress("gitlab_webhook", { "x-gitlab-token": secret }, secret)).toBe(false);
   });
 });
 

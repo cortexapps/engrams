@@ -22,9 +22,9 @@ import type { EngineDeps, EngineSessionOps, EngineStepRecord } from "../../engin
 import type { AutomationInbox } from "../../engine/inbox.ts";
 import { interpretAutomation } from "../../engine/interpreter.ts";
 import { reviewDefinition } from "../review.ts";
+import type { ReviewVariant } from "../review-variant.ts";
 import { GITHUB_REVIEW } from "../../../providers/github/review-variant.ts";
-
-const PR_REVIEW_DEFINITION = reviewDefinition(GITHUB_REVIEW);
+import { GITLAB_REVIEW } from "../../../providers/gitlab/review-variant.ts";
 
 registerEngineBlocks();
 afterEach(() => setReviewBlockDeps(null));
@@ -113,7 +113,10 @@ function harness(options: {
   closed?: Array<{ instanceId: string; reason?: string }>;
   /** What the settle step decides (default: one inline finding). */
   decision?: ReviewPostPayload;
+  /** The forge's variant of the built-in (default: GitHub). */
+  variant?: ReviewVariant;
 }): Harness {
+  const definition = reviewDefinition(options.variant ?? GITHUB_REVIEW);
   const names: string[] = [];
   const records: Harness["records"] = [];
   const cpCalls: string[] = [];
@@ -198,7 +201,7 @@ function harness(options: {
   });
 
   const snapshot: RunSnapshot = {
-    definition: { ...PR_REVIEW_DEFINITION, trigger: { ...PR_REVIEW_DEFINITION.trigger, ...(PR_REVIEW_DEFINITION.trigger.kind === "integration" ? { connectionId: "conn-github" } : {}) } },
+    definition: { ...definition, trigger: { ...definition.trigger, ...(definition.trigger.kind === "integration" ? { connectionId: "conn-github" } : {}) } },
     inputs: INPUTS,
     automationId: RUN.automationId,
     automationName: "PR review",
@@ -291,6 +294,7 @@ function harness(options: {
         if (input.actionId === "create_issue_comment") return { commentId: 777, status: 201 };
         // The pinned status comment: found or created, its id comes back.
         if (input.actionId === "upsert_issue_comment") return { commentId: 777 };
+        if (input.actionId === "upsert_pr_comment") return { commentId: "17:777" };
         if (input.actionId === "post_pr_review") {
           return { posted: true, inline_posted: true, already_posted: false, github_review_id: "9001" };
         }
@@ -530,5 +534,76 @@ describe("PR-review built-in on the interpreter", () => {
     const hook = h.records.filter((r) => r.path === "__finalize__.report_failure").at(-1)!;
     expect(hook.record.status).toBe("succeeded");
     expect(h.finalized[0]!.status).toBe("deadline");
+  });
+});
+
+describe("merge-request review built-in on the interpreter", () => {
+  const mergeRequest = (attributes: Record<string, unknown> = {}): Record<string, unknown> => ({
+    object_kind: "merge_request",
+    project: { path_with_namespace: "acme/repo" },
+    object_attributes: {
+      id: 4242,
+      iid: 17,
+      title: "Fix the thing",
+      state: "opened",
+      action: "open",
+      draft: false,
+      source_branch: "fix",
+      target_branch: "main",
+      url: "https://gitlab.example.com/acme/repo/-/merge_requests/17",
+      last_commit: { id: HEAD },
+      ...attributes,
+    },
+  });
+  const run = (payload: Record<string, unknown>, recv: AutomationInbox[] = []) =>
+    harness({ eventKey: "merge_request.open", payload, recv, variant: GITLAB_REVIEW });
+
+  test("an opened merge request runs the same graph through the forge's own actions", async () => {
+    const h = run(mergeRequest(), [finderDone(0)]);
+
+    const result = await interpretAutomation(RUN, h.deps);
+
+    expect(result.status).toBe("completed");
+    // The hook carries no diff base, so the pass asks the forge for the heads.
+    expect(h.cpCalls).toEqual([
+      "resolvePrHeads",
+      "resolveReviewTarget",
+      "createReviewPass:opened",
+      "bootstrapFinder:cats=functional-correctness+security-privacy",
+      "composeFinderPrompt",
+      "markPhasePrompted:finder",
+      "decideReviewResults",
+    ]);
+    expect(h.sessions[0]).toMatchObject({
+      keep: false,
+      capabilityOverride: ["engram:pr_review", "gitlab:repository:read"],
+    });
+    expect(h.execs[0]!.command).toContain('git clone "https://${GITLAB_HOST:?}/acme/repo.git" /workspace/repo');
+    expect(h.execs[0]!.command).toContain("fetch origin +refs/merge-requests/17/head");
+    expect(h.execs[0]!.command).toContain(`checkout ${HEAD}`);
+    expect(h.actions.map((a) => a.actionId)).toEqual([
+      "upsert_pr_comment",
+      "update_pr_comment",
+      "post_pr_review",
+      "update_pr_comment",
+    ]);
+    expect(h.actions[0]!.params).toMatchObject({ repo: "acme/repo", number: 17, key: "review-status" });
+    expect(h.actions[1]!.params).toMatchObject({ repo: "acme/repo", commentId: "17:777" });
+    expect(h.actions[2]!.params).toMatchObject({ repo: "acme/repo", prNumber: 17, commitId: HEAD });
+    expect(h.recorded).toEqual([{ reviewId: "review-1", githubReviewId: "9001" }]);
+    expect(h.finalized).toEqual([{ status: "completed" }]);
+  });
+
+  test("a draft and a project that is not enrolled start no session", async () => {
+    for (const payload of [
+      mergeRequest({ draft: true }),
+      { ...mergeRequest(), project: { path_with_namespace: "acme/unlisted" } },
+    ]) {
+      const h = run(payload);
+      const result = await interpretAutomation(RUN, h.deps);
+      expect(result.status).toBe("filtered");
+      expect(h.sessions).toEqual([]);
+      expect(h.cpCalls).toEqual([]);
+    }
   });
 });

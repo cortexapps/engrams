@@ -207,6 +207,8 @@ describe("state + probe blocks in the palette (ADR 0119 D10/D11)", () => {
     expect(blockKind("slack_choice").label).toBe("Slack choice");
     expect(blockKind("slack_choice").inspector).toBe("readonly");
     expect(insertableBlockKinds(false).some((s) => s.kind === "slack_choice")).toBe(false);
+    expect(blockKind("review_facts").label).toBe("Review facts");
+    expect(insertableBlockKinds(false).some((s) => s.kind === "review_facts")).toBe(false);
   });
 
   it("groups the insertable kinds by purpose, the internals under Advanced; the agent is not a block", () => {
