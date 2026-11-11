@@ -1,8 +1,8 @@
 /** Pure GitHub webhook classification and review-command parsing — the command
  *  mention matches the configured App handle, not a hardcoded name (ADR 0100). */
 
-import type { PrContext } from "../../reviews/pr-context.ts";
-import { readPrContext } from "./forge.ts";
+import type { PrContext } from "../../forges/pr-context.ts";
+import { readPrContext } from "./pr.ts";
 
 export type GithubEvent =
   | {
@@ -23,15 +23,9 @@ export type GithubEvent =
       baseSha: string | null;
       baseRef: string;
       draft: boolean;
-      /**
-       * The PR as this delivery described it (ADR 0100 decision 11).
-       *
-       * The payload carries the whole pull-request object, so a review
-       * triggered by a webhook needs no API call to know what it is reviewing.
-       * That is mostly a resilience win rather than a latency one: a GitHub
-       * blip during head resolution fails the pass outright, and that is
-       * exactly the case that used to leave a review record with no PR name.
-       */
+      /** The pull request as this delivery described it. The payload carries
+       *  the whole object, so a webhook-triggered pass needs no API call to
+       *  name what it reviews (ADR 0100 decision 11). */
       pr: PrContext;
     }
   | {

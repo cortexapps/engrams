@@ -7,7 +7,7 @@ import type {
 } from "../../db/review-target-hydration.ts";
 import { ForgeRequestError } from "../../forges/forge.ts";
 import { makeGithubForge } from "../../providers/github/forge.ts";
-import type { PrContext } from "../pr-context.ts";
+import type { PrContext } from "../../forges/pr-context.ts";
 import {
   runTargetHydration,
   type TargetHydrationReader,

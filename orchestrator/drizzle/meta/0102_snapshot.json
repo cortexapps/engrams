@@ -1,5 +1,5 @@
 {
-  "id": "86db8ead-cf3e-4915-b23b-a4f26aff0f23",
+  "id": "edf3dd10-b2ed-4279-ba6d-bd6bd619685f",
   "prevId": "d438dfa9-d1e8-48b6-b9c6-464d1a8a7376",
   "version": "7",
   "dialect": "postgresql",
@@ -3052,6 +3052,27 @@
               "asc": true,
               "nulls": "last"
             },
+            {
+              "expression": "repo",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "pr_number",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "pr_ref_repo_pr_number_unique": {
+          "name": "pr_ref_repo_pr_number_unique",
+          "columns": [
             {
               "expression": "repo",
               "isExpression": false,

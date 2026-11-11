@@ -9,7 +9,7 @@ import type {
   ReviewVerdictRow,
 } from "../../db/reviews.ts";
 import type { GitForge } from "../../forges/forge.ts";
-import type { PrContext } from "../pr-context.ts";
+import type { PrContext } from "../../forges/pr-context.ts";
 import {
   makeReviewControlPlane,
   ReviewSetupError,

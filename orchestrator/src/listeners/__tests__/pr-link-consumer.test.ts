@@ -122,6 +122,38 @@ describe("PR-link consumer", () => {
     expect(recorder.upserts[0]?.title).toBe("Record authored pull requests");
   });
 
+  test("a repository name and number that another forge holds is skipped, not retried", async () => {
+    const recorder = prRefRecorder();
+    const consumer = makePrLinkConsumer({
+      prRefs: {
+        ...recorder.store,
+        upsert: async () => {
+          throw Object.assign(new Error("duplicate key"), { code: "23505" });
+        },
+      },
+      findTaskId: async () => "task-1",
+    });
+
+    await consumer.handle(pullRequestAsset(), { sessionId: "session-1" });
+  });
+
+  test("a store failure that is not a key conflict reaches the listener's retry", async () => {
+    const recorder = prRefRecorder();
+    const consumer = makePrLinkConsumer({
+      prRefs: {
+        ...recorder.store,
+        upsert: async () => {
+          throw new Error("connection lost");
+        },
+      },
+      findTaskId: async () => "task-1",
+    });
+
+    await expect(consumer.handle(pullRequestAsset(), { sessionId: "session-1" })).rejects.toThrow(
+      "connection lost",
+    );
+  });
+
   test("derives repo AND number from the PR URL for the `gh pr create` payload shape (empty data)", async () => {
     // `gh pr create` opens the PR via the GraphQL createPullRequest mutation
     // whose selection set carries only `id`+`url`, so every `data` extractor

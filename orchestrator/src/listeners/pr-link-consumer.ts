@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import type { CuratedEvent } from "../control-plane/session-events.ts";
 import { getDb } from "../db/client.ts";
+import { isUniqueViolation } from "../db/pg-errors.ts";
 import { makePrRefStore, type PrRefStore } from "../db/pr-refs.ts";
 import { makeAutomationEngineStore } from "../db/automations.ts";
 import { makeAutomationInstanceStore } from "../db/automation-instances.ts";
@@ -132,18 +133,29 @@ export function makePrLinkConsumer(deps: PrLinkConsumerDeps): SessionConsumer {
       }
 
       const taskId = await deps.findTaskId(ctx.sessionId);
-      await deps.prRefs.upsert({
-        provider,
-        repo,
-        prNumber,
-        authoringTaskId: taskId,
-        sessionId: ctx.sessionId,
-        title: data.title ?? "",
-        url,
-        headBranch: data.head_branch ?? "",
-        baseBranch: data.base_branch ?? "",
-        observedAt: new Date(at),
-      });
+      try {
+        await deps.prRefs.upsert({
+          provider,
+          repo,
+          prNumber,
+          authoringTaskId: taskId,
+          sessionId: ctx.sessionId,
+          title: data.title ?? "",
+          url,
+          headBranch: data.head_branch ?? "",
+          baseBranch: data.base_branch ?? "",
+          observedAt: new Date(at),
+        });
+      } catch (error) {
+        // The upsert resolves its own key, so a unique violation is the
+        // (repo, number) index the previous build still needs: another forge
+        // holds this repository name and number. A retry cannot succeed.
+        if (!isUniqueViolation(error)) throw error;
+        log.warn(
+          { sessionId: ctx.sessionId, provider, repo, prNumber },
+          "another forge holds this repository name and pull-request number; PR reference not recorded",
+        );
+      }
 
       // ADR 0120: bind the PR to the session's workstream so review events
       // route back (handle admission). Best-effort AND loud: a conflict

@@ -12,7 +12,7 @@ import {
   runIntegrationOp as defaultRunIntegrationOp,
   type IntegrationOpResult,
 } from "../../integrations/run-op.ts";
-import type { PrContext } from "../../reviews/pr-context.ts";
+import { readPrContext } from "./pr.ts";
 
 const PROVIDER = "github";
 const PER_PAGE = 100;
@@ -31,11 +31,17 @@ function decodeBody(body: Uint8Array): string {
   return new TextDecoder().decode(body);
 }
 
+/** A 2xx response whose body is not what the operation returns. It carries
+ * the status, so no caller treats it as permanent. */
+function unusable(operation: string, result: IntegrationOpResult, what: string): ForgeRequestError {
+  return new ForgeRequestError(result.status, `${operation} returned ${what}`, "");
+}
+
 function parseJson(result: IntegrationOpResult, operation: string): unknown {
   try {
     return JSON.parse(decodeBody(result.body));
   } catch {
-    throw new Error(`${operation} returned invalid JSON`);
+    throw unusable(operation, result, "invalid JSON");
   }
 }
 
@@ -108,64 +114,6 @@ function parsePullRequestUrl(url: string): { repo: string; number: number | null
   return { repo: `${segments[0]}/${segments[1]}`, number };
 }
 
-/**
- * GitHub's pull-request object as a `PrContext`. The same object is the
- * `GET /repos/{repo}/pulls/{n}` response and the webhook payload's
- * `pull_request` member. Every field falls back to null on its own. The two
- * SHAs are not read here: callers require them.
- */
-export function readPrContext(pr: Record<string, unknown>): PrContext {
-  const head = isObject(pr["head"]) ? pr["head"] : null;
-  const base = isObject(pr["base"]) ? pr["base"] : null;
-  const user = isObject(pr["user"]) ? pr["user"] : null;
-  return {
-    providerId: identifier(pr["id"]),
-    title: nullableString(pr["title"]),
-    author: user ? nullableString(user["login"]) : null,
-    state: readPrState(pr),
-    url: nullableString(pr["html_url"]),
-    providerUpdatedAt: nullableDate(pr["updated_at"]),
-    headBranch: head ? nullableString(head["ref"]) : null,
-    baseBranch: base ? nullableString(base["ref"]) : null,
-    additions: nullableCount(pr["additions"]),
-    deletions: nullableCount(pr["deletions"]),
-    changedFiles: nullableCount(pr["changed_files"]),
-  };
-}
-
-/** GitHub gives `state` as open or closed, with `merged` and `draft` apart.
- * Merged outranks closed; draft applies only while open. */
-function readPrState(pr: Record<string, unknown>): string | null {
-  if (pr["merged"] === true) return "merged";
-  const state = nullableString(pr["state"]);
-  if (state === "open") return pr["draft"] === true ? "draft" : "open";
-  return state;
-}
-
-/** GitHub ids arrive as JSON numbers; they are carried as strings so a large
- * one cannot round. */
-function identifier(value: unknown): string | null {
-  if (typeof value === "string" && value !== "") return value;
-  if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) {
-    return String(value);
-  }
-  return null;
-}
-
-function nullableDate(value: unknown): Date | null {
-  if (typeof value !== "string" || value === "") return null;
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? null : parsed;
-}
-
-function nullableString(value: unknown): string | null {
-  return typeof value === "string" && value !== "" ? value : null;
-}
-
-function nullableCount(value: unknown): number | null {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
-}
-
 export function makeGithubForge(
   deps: { runIntegrationOp?: typeof defaultRunIntegrationOp } = {},
 ): GitForge {
@@ -183,7 +131,7 @@ export function makeGithubForge(
     const response = await get(`${path}?per_page=${PER_PAGE}&page=${page}`);
     if (!succeeded(response)) throw responseError(operation, response);
     const value = parseJson(response, operation);
-    if (!Array.isArray(value)) throw new Error(`${operation} returned a non-array response`);
+    if (!Array.isArray(value)) throw unusable(operation, response, "a non-array response");
     return value;
   };
 
@@ -233,7 +181,12 @@ export function makeGithubForge(
         `/repos/${repo}/issues/${prNumber}/comments?per_page=${PER_PAGE}&sort=created&direction=desc`,
       );
       if (!succeeded(response)) return null;
-      const value = parseJson(response, "list pull request comments");
+      let value: unknown;
+      try {
+        value = JSON.parse(decodeBody(response.body));
+      } catch {
+        return null;
+      }
       if (!Array.isArray(value)) return null;
       return (
         value.find(

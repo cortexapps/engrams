@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import type { ReviewFindingRow } from "../../../db/reviews.ts";
-import { ForgeRequestError } from "../../../forges/forge.ts";
+import { ForgeRequestError, SAFE_REPO_PATH } from "../../../forges/forge.ts";
 import {
   runIntegrationOp,
   type IntegrationOpRequest,
@@ -376,6 +376,39 @@ describe("the GitHub forge", () => {
 
     expect(await forge.hasReviewWithMarker("openai/engrams", 100, "<!-- engrams-review:review-1 -->")).toBe(true);
     expect(await forge.hasReviewWithMarker("openai/engrams", 100, "<!-- engrams-review:review-1 -->")).toBe(false);
+  });
+
+  test("a 2xx review list that is not a list is a forge error, and not a permanent one", async () => {
+    const fake = fakeRunOp([response(200, { message: "not a list" })]);
+    const forge = makeGithubForge({ runIntegrationOp: fake.run });
+
+    const error = await forge.hasReviewWithMarker("acme/app", 1, "marker").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ForgeRequestError);
+    expect(isPermanentError(error)).toBe(false);
+  });
+
+  test("findCommentWithMarker returns null for a list it cannot read", async () => {
+    const empty: IntegrationOpResult = {
+      status: 200,
+      body: new Uint8Array(),
+      contentType: "application/json",
+      truncated: false,
+    };
+    const fake = fakeRunOp([empty, response(200, { message: "not a list" }), response(500, {})]);
+    const forge = makeGithubForge({ runIntegrationOp: fake.run });
+
+    for (let i = 0; i < 3; i++) {
+      expect(await forge.findCommentWithMarker("acme/app", 1, "marker")).toBeNull();
+    }
+  });
+
+  test("a safe repository path has no `.` or `..` name", () => {
+    for (const repo of ["acme/app", "acme/group/app", "a.b/c_d-e", "acme/.config"]) {
+      expect(SAFE_REPO_PATH.test(repo)).toBe(true);
+    }
+    for (const repo of ["acme", "acme/..", "../acme/app", "acme/./app", "acme/app/..", "acme/a b"]) {
+      expect(SAFE_REPO_PATH.test(repo)).toBe(false);
+    }
   });
 
   test("hasReviewWithMarker reads past a full first page to find the marker", async () => {

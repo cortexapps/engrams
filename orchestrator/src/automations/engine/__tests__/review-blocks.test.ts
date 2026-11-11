@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
-import type { PrContext } from "../../../reviews/pr-context.ts";
+import type { PrContext } from "../../../forges/pr-context.ts";
 import type { ReviewPostPayload } from "../../../reviews/control-plane.ts";
 import { registerEngineBlocks } from "../blocks/index.ts";
 import { getBlock } from "../blocks/registry.ts";

@@ -825,6 +825,9 @@ export const prRef = pgTable(
   },
   (t) => [
     uniqueIndex("pr_ref_provider_repo_pr_number_unique").on(t.provider, t.repo, t.prNumber),
+    // The previous build's upsert targets this index. It goes once no deployed
+    // build names it; until then two forges cannot hold the same repo and number.
+    uniqueIndex("pr_ref_repo_pr_number_unique").on(t.repo, t.prNumber),
     index("pr_ref_authoring_task_idx").on(t.authoringTaskId),
     index("pr_ref_session_idx").on(t.sessionId),
   ],

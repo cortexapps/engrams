@@ -38,7 +38,7 @@ import {
 } from "../../../reviews/control-plane.ts";
 import { SAFE_REPO_PATH, type PullRequestHeads } from "../../../forges/forge.ts";
 import { defaultForgeProvider } from "../../../forges/registry.ts";
-import { isCompletePrContext, type PrContext } from "../../../reviews/pr-context.ts";
+import { isCompletePrContext, type PrContext } from "../../../forges/pr-context.ts";
 import { REVIEW_CATEGORIES, type ReviewCategory } from "../../../reviewers/render.ts";
 import { isHumanReviewTrigger } from "../../../reviews/review-trigger.ts";
 import { makeReviewStore } from "../../../db/reviews.ts";

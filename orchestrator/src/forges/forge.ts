@@ -3,12 +3,13 @@
  * implements `GitForge` under `providers/<name>/` and joins `registry.ts`. */
 
 import type { runIntegrationOp } from "../integrations/run-op.ts";
-import type { PrContext } from "../reviews/pr-context.ts";
+import type { PrContext } from "./pr-context.ts";
 
 /** A repository path that is safe inside a shell command and a URL path:
- * two or more `/`-separated names. It is a charset rule, not a forge's own
- * naming rule. */
-export const SAFE_REPO_PATH = /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+$/;
+ * two or more `/`-separated names, none of them `.` or `..`. It is a charset
+ * rule, not a forge's own naming rule. */
+export const SAFE_REPO_PATH =
+  /^(?!\.{1,2}(?:\/|$))[A-Za-z0-9._-]+(?:\/(?!\.{1,2}(?:\/|$))[A-Za-z0-9._-]+)+$/;
 
 export interface InlineComment {
   findingId: string;
@@ -77,8 +78,9 @@ export interface GitForge {
   readonly caseInsensitiveRepos: boolean;
 
   pullRequestUrl(repo: string, prNumber: number): string;
-  /** The repository and number a pull-request URL names; null when the URL
-   * is not one of this forge's. `number` is null when the URL has none. */
+  /** The repository and number a pull-request URL names; null when the path
+   * is not this forge's pull-request path. The host is not checked. `number`
+   * is null when the URL has none. */
   parsePullRequestUrl(url: string): { repo: string; number: number | null } | null;
   /** True when a retry cannot succeed: the pull request is gone or access to
    * it is. */
@@ -91,7 +93,8 @@ export interface GitForge {
   /** Whether a review that contains `marker` is on the pull request. */
   hasReviewWithMarker(repo: string, prNumber: number, marker: string): Promise<boolean>;
   /** The newest pull-request comment that contains `marker`, as the forge
-   * returned it; null when there is none or the list cannot be read. */
+   * returned it; null when there is none or the list cannot be read. It does
+   * not throw on a forge response. */
   findCommentWithMarker(
     repo: string,
     prNumber: number,
