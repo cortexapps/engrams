@@ -46,9 +46,7 @@ import {
   isActive,
   isHumanTrigger,
   passDuration,
-  postedReviewUrl,
   prTitleOf,
-  prUrl,
   reviewCreatedAt,
   shortSha,
   triggerOf,
@@ -187,7 +185,7 @@ function PrHeader({
   const runAutomationId = builtin.data?.automation?.id;
   const navigate = useNavigate();
   // One GitHub affordance, but never a label that lies about where it lands.
-  const reviewUrl = postedReviewUrl(pass);
+  const forgeUrl = pass.postedReviewUrl ?? pass.prUrl;
 
   // A re-run cannot tell you the new pass's id: the RPC starts durable ingress
   // and returns only its workflow id. Ingress writes the row shortly afterward,
@@ -222,12 +220,14 @@ function PrHeader({
               </Link>
             </Button>
           )}
-          <Button variant="ghost" size="sm" asChild>
-            <a href={reviewUrl ?? prUrl(pass)} target="_blank" rel="noreferrer">
-              <ExternalLink className="size-3.5" aria-hidden />
-              {reviewUrl ? "Review on GitHub" : "Pull request on GitHub"}
-            </a>
-          </Button>
+          {forgeUrl && (
+            <Button variant="ghost" size="sm" asChild>
+              <a href={forgeUrl} target="_blank" rel="noreferrer">
+                <ExternalLink className="size-3.5" aria-hidden />
+                {pass.postedReviewUrl ? "Open the review" : "Open the pull request"}
+              </a>
+            </Button>
+          )}
           {!isActive(pass) && (
             <Button
               variant="outline"

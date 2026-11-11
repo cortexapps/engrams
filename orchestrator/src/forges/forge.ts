@@ -117,8 +117,44 @@ export class ForgeRequestError extends Error {
   }
 }
 
+/** A file at a commit, with the lines of a finding. */
+export interface FileLocation {
+  repo: string;
+  sha: string;
+  path: string;
+  startLine?: number | null;
+  endLine?: number | null;
+}
+
+/** The web pages of a forge that a review links to. `prUrl` is the pull
+ * request's own URL, as the forge gave it. */
+export interface ForgeLinks {
+  /** The pull request from its coordinates, for a record with no stored
+   * URL. Null when the forge has no fixed host. */
+  pullRequest(repo: string, number: number): string | null;
+  review(prUrl: string, reviewId: string): string;
+  /** The inline comment a finding became. */
+  comment(prUrl: string, commentId: string): string;
+  file(prUrl: string, at: FileLocation): string;
+}
+
+/** A git path as URL path segments. A `#` or `?` in a file name must not
+ * start the fragment or the query. */
+export function escapeGitPath(path: string): string {
+  return path.split("/").map(encodeURIComponent).join("/");
+}
+
+/** The lines a file link points at: a range, one line, or none. */
+export function linkLines(at: FileLocation): { from: number; to?: number } | null {
+  const { startLine, endLine } = at;
+  if (startLine && endLine && startLine !== endLine) return { from: startLine, to: endLine };
+  const line = endLine ?? startLine;
+  return line ? { from: line } : null;
+}
+
 export interface GitForge {
   readonly provider: string;
+  readonly links: ForgeLinks;
   /** Present when the forge's review variant uses the typed facts step and
    * the built-in comment actions. */
   readonly typedReview?: TypedReviewForge;

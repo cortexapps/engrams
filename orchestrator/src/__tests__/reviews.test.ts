@@ -307,6 +307,39 @@ describe("ReviewService", () => {
     });
   });
 
+  test("GetReview sends the forge's links for the pass and its findings", async () => {
+    // No stored URL: GitHub's is built from the coordinates.
+    const github = await spawn(makeStore(detail)).getReview({ id: REVIEW_ID });
+    expect(github.review?.prUrl).toBe("https://github.com/openai/engrams/pull/100");
+    expect(github.review?.postedReviewUrl).toBeUndefined();
+    expect(github.findings[0]?.fileUrl).toBe(
+      "https://github.com/openai/engrams/blob/head-sha/orchestrator/src/index.ts#L10-L12",
+    );
+    expect(github.findings[0]?.threadUrl).toBeUndefined();
+
+    const prUrl = "https://gitlab.example.com/acme/platform/api/-/merge_requests/7";
+    const gitlab = await spawn(
+      makeStore({
+        ...detail,
+        review: reviewRow({ provider: "gitlab", repo: "acme/platform/api", prNumber: 7, prUrl, githubReviewId: "500" }),
+        findings: [{ ...findingRow(), githubThreadId: "41" }],
+      }),
+    ).getReview({ id: REVIEW_ID });
+    expect(gitlab.review?.postedReviewUrl).toBe(`${prUrl}#note_500`);
+    expect(gitlab.findings[0]).toMatchObject({
+      fileUrl: "https://gitlab.example.com/acme/platform/api/-/blob/head-sha/orchestrator/src/index.ts#L10-12",
+      threadUrl: `${prUrl}#note_41`,
+    });
+
+    // A GitLab record with no URL has no host to build one from.
+    const bare = await spawn(
+      makeStore({ ...detail, review: reviewRow({ provider: "gitlab", githubReviewId: "500" }) }),
+    ).getReview({ id: REVIEW_ID });
+    expect(bare.review?.prUrl).toBeUndefined();
+    expect(bare.review?.postedReviewUrl).toBeUndefined();
+    expect(bare.findings[0]?.fileUrl).toBeUndefined();
+  });
+
   test("GetReview surfaces the review activity log, oldest first", async () => {
     const events: ReviewEventRow[] = [
       {

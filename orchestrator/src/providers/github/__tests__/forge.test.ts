@@ -64,6 +64,16 @@ function finding(overrides: Partial<ReviewFindingRow> = {}): ReviewFindingRow {
   };
 }
 
+test("file links escape the path and anchor the finding's lines", () => {
+  const { links } = makeGithubForge();
+  const at = { repo: "openai/engrams", sha: "abc", path: "src/a#b?.ts" };
+  const base = "https://github.com/openai/engrams/blob/abc/src/a%23b%3F.ts";
+  expect(links.file("", at)).toBe(base);
+  expect(links.file("", { ...at, startLine: 3 })).toBe(`${base}#L3`);
+  expect(links.file("", { ...at, startLine: 3, endLine: 3 })).toBe(`${base}#L3`);
+  expect(links.file("", { ...at, startLine: 3, endLine: 9 })).toBe(`${base}#L3-L9`);
+});
+
 describe("the GitHub forge", () => {
   test("listReviewComments pages, tolerates junk entries, and keeps thread links", async () => {
     const fullPage = Array.from({ length: 100 }, (_, index) => ({

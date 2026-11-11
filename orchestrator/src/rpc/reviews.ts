@@ -9,6 +9,7 @@ import { getSessionFromHeaders } from "../auth/session.ts";
 import { requireUser } from "./require.ts";
 import { makeAutomationStore } from "../db/automations.ts";
 import { getDb } from "../db/client.ts";
+import { forgeFor } from "../forges/registry.ts";
 import { retryAutomationReview } from "../reviews/automation-review.ts";
 import { makeEnrolledRepos, type EnrolledRepos } from "../reviews/enrolled-repos.ts";
 import {
@@ -64,7 +65,15 @@ function findingCounts(findings: ReviewFindingRow[]): FindingCounts {
   return counts;
 }
 
+/** The pull request's URL: the stored one, else the one the forge builds
+ * from the coordinates. */
+function prUrlOf(row: ReviewRow): string | undefined {
+  return row.prUrl ?? forgeFor(row.provider)?.links.pullRequest(row.repo, row.prNumber) ?? undefined;
+}
+
 function reviewToProto(row: ReviewRow, counts: FindingCounts): ReviewProto {
+  const links = forgeFor(row.provider)?.links;
+  const prUrl = prUrlOf(row);
   return {
     id: row.id,
     repo: row.repo,
@@ -84,7 +93,10 @@ function reviewToProto(row: ReviewRow, counts: FindingCounts): ReviewProto {
     targetId: row.targetId,
     provider: row.provider,
     ...(row.providerId != null ? { providerId: row.providerId } : {}),
-    ...(row.prUrl != null ? { prUrl: row.prUrl } : {}),
+    ...(prUrl !== undefined ? { prUrl } : {}),
+    ...(links && prUrl !== undefined && row.githubReviewId != null
+      ? { postedReviewUrl: links.review(prUrl, row.githubReviewId) }
+      : {}),
     ...(row.prTitle != null ? { prTitle: row.prTitle } : {}),
     ...(row.prAuthor != null ? { prAuthor: row.prAuthor } : {}),
     ...(row.headBranch != null ? { headBranch: row.headBranch } : {}),
@@ -106,8 +118,23 @@ function listReviewToProto(row: ReviewListRow): ReviewProto {
   return reviewToProto(row, row.findingCounts);
 }
 
-function findingToProto(row: ReviewFindingRow): ReviewFindingProto {
+function findingToProto(row: ReviewFindingRow, review: ReviewRow): ReviewFindingProto {
+  const links = forgeFor(review.provider)?.links;
+  const prUrl = prUrlOf(review);
   return {
+    ...(links && prUrl !== undefined
+      ? {
+          // The commit the pass read: the branch has moved since.
+          fileUrl: links.file(prUrl, {
+            repo: review.repo,
+            sha: review.headSha,
+            path: row.path,
+            startLine: row.startLine,
+            endLine: row.endLine,
+          }),
+          ...(row.githubThreadId != null ? { threadUrl: links.comment(prUrl, row.githubThreadId) } : {}),
+        }
+      : {}),
     id: row.id,
     reviewId: row.reviewId,
     path: row.path,
@@ -192,7 +219,7 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
       ]);
       return {
         review: reviewToProto(detail.review, findingCounts(detail.findings)),
-        findings: detail.findings.map(findingToProto),
+        findings: detail.findings.map((finding) => findingToProto(finding, detail.review)),
         verdicts: detail.verdicts.map(verdictToProto),
         events: events.map(eventToProto),
         passes: passes.map(listReviewToProto),

@@ -2,7 +2,10 @@
  * IntegrationOp, which holds the credential: an installation-wide mint. */
 
 import {
+  escapeGitPath,
   ForgeRequestError,
+  linkLines,
+  type ForgeLinks,
   type GitForge,
   type GitForgeSpec,
   type InlineComment,
@@ -114,6 +117,18 @@ function commentPayload(comment: InlineComment): Record<string, unknown> {
   };
 }
 
+const GITHUB_LINKS: ForgeLinks = {
+  pullRequest: (repo, number) => `https://github.com/${repo}/pull/${number}`,
+  review: (prUrl, reviewId) => `${prUrl}#pullrequestreview-${reviewId}`,
+  comment: (prUrl, commentId) => `${prUrl}#discussion_r${commentId}`,
+  file(_prUrl, at) {
+    const base = `https://github.com/${at.repo}/blob/${at.sha}/${escapeGitPath(at.path)}`;
+    const lines = linkLines(at);
+    if (lines === null) return base;
+    return lines.to === undefined ? `${base}#L${lines.from}` : `${base}#L${lines.from}-L${lines.to}`;
+  },
+};
+
 function parsePullRequestUrl(url: string): { repo: string; number: number | null } | null {
   let parsed: URL;
   try {
@@ -152,6 +167,7 @@ export function makeGithubForge(
     provider: PROVIDER,
     caseInsensitiveRepos: true,
     parsePullRequestUrl,
+    links: GITHUB_LINKS,
     isPermanentError,
 
     async fetchPullRequest(repo, prNumber) {

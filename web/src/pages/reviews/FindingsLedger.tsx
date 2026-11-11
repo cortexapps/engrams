@@ -12,7 +12,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { cn } from "@/lib/utils";
 import { Sep } from "./Sep";
 import { groupByOutcome, type JudgedFinding, type Outcome } from "./review-findings";
-import { blobUrl, isActive, threadUrl } from "./review-format";
+import { isActive } from "./review-format";
 
 /**
  * The findings, grouped by what actually happened to them.
@@ -95,7 +95,6 @@ export function FindingsLedger({
       {groups.map((group, i) => (
         <OutcomeSection
           key={group.outcome}
-          review={review}
           outcome={group.outcome}
           items={group.items}
           total={judged.length}
@@ -112,13 +111,11 @@ export function FindingsLedger({
 /** Refuted findings start collapsed as a group: they are the verifier's working,
  *  not the pass's output, and the count is the part that matters at a glance. */
 function OutcomeSection({
-  review,
   outcome,
   items,
   total,
   autoOpen,
 }: {
-  review: Review;
   outcome: Outcome;
   items: JudgedFinding[];
   total: number;
@@ -161,7 +158,6 @@ function OutcomeSection({
           {items.map((item, i) => (
             <li key={item.finding.id}>
               <FindingCard
-                review={review}
                 finding={item.finding}
                 verdict={item.verdict}
                 defaultOpen={i < autoOpen}
@@ -204,18 +200,14 @@ const CATEGORY_LABELS: Record<string, string> = {
  * claim and its own heading would have no line to read down.
  */
 function FindingCard({
-  review,
   finding,
   verdict,
   defaultOpen,
 }: {
-  review: Review;
   finding: ReviewFinding;
   verdict: ReviewVerdict | undefined;
   defaultOpen: boolean;
 }) {
-  const thread = threadUrl(review, finding);
-
   return (
     <Collapsible defaultOpen={defaultOpen} asChild>
       {/* Stock `Card`, run dense: the component owns the edge, the radius and
@@ -279,16 +271,16 @@ function FindingCard({
             {verdict?.reasoning && <VerdictBlock verdict={verdict} />}
 
             {/* Deciding whether a finding is real means looking at the code, and
-                acting on it means the thread it became. Both were a manual hunt
-                on GitHub until now. The blob link is pinned to the SHA the pass
-                read — the branch has moved on, and lines that have shifted are
-                worse than no link. */}
+                acting on it means the thread it became. The file link is at
+                the commit the pass read. */}
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
-              <CardLink href={blobUrl(review, finding)} icon={Code2}>
-                View the code
-              </CardLink>
-              {thread && (
-                <CardLink href={thread} icon={MessageSquare}>
+              {finding.fileUrl && (
+                <CardLink href={finding.fileUrl} icon={Code2}>
+                  View the code
+                </CardLink>
+              )}
+              {finding.threadUrl && (
+                <CardLink href={finding.threadUrl} icon={MessageSquare}>
                   Open the thread
                 </CardLink>
               )}

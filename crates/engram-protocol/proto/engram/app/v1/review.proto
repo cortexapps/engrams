@@ -97,6 +97,9 @@ message Review {
   // graph drove). The product links here to the platform: Automations →
   // PR review → Activity opens the run's trace.
   optional string automation_run_id = 30;
+  // The review as the forge shows it, when one was posted and the pull
+  // request has a URL.
+  optional string posted_review_url = 31;
 }
 
 // Per-severity finding counts for the list page.
@@ -137,6 +140,11 @@ message ReviewFinding {
   optional string resolution = 17;
   string session_id = 18;
   google.protobuf.Timestamp created_at = 19;
+  // The finding's file on the forge at the commit the pass read, at the
+  // finding's lines; and the inline comment the finding became. Absent when
+  // the pull request has no URL.
+  optional string file_url = 20;
+  optional string thread_url = 21;
 }
 
 // The verifier's judgment on one finding.

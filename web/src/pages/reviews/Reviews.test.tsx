@@ -25,6 +25,7 @@ const newerPass = {
   finderSessionId: "finder-sess-2",
   verifierSessionId: "verifier-sess-2",
   prTitle: "Bump quinn-proto from 0.11.14 to 0.11.16",
+  prUrl: "https://github.com/cortexapps/engrams/pull/100",
   prAuthor: "dependabot[bot]",
   headBranch: "dependabot/cargo/quinn-proto-0.11.16",
   baseBranch: "main",
@@ -65,6 +66,8 @@ const findings = [
     evidence: ["src/index.ts", "src/validate.ts"],
     state: "posted",
     githubThreadId: "998877",
+    fileUrl: "https://github.com/cortexapps/engrams/blob/cccccccccccccccc/src/index.ts#L10-L12",
+    threadUrl: "https://github.com/cortexapps/engrams/pull/100#discussion_r998877",
     resolution: "fixed",
     sessionId: "finder-sess-1",
   },
@@ -469,7 +472,7 @@ describe("Reviews ledger", () => {
 });
 
 describe("Review dossier", () => {
-  it("names the PR once, with a single way over to GitHub", async () => {
+  it("names the PR once, with a single way over to the forge", async () => {
     renderWithProviders(<ReviewDossier />);
 
     expect(await screen.findByText("Bump quinn-proto from 0.11.14 to 0.11.16")).toBeTruthy();
@@ -477,7 +480,7 @@ describe("Review dossier", () => {
     expect(screen.getByText("main ← dependabot/cargo/quinn-proto-0.11.16")).toBeTruthy();
     expect(screen.getByText("+12 −4 across 2 files")).toBeTruthy();
 
-    const gh = screen.getAllByRole("link", { name: /GitHub/i });
+    const gh = screen.getAllByRole("link", { name: /Open the pull request/i });
     expect(gh).toHaveLength(1);
     expect(gh[0]!.getAttribute("href")).toBe("https://github.com/cortexapps/engrams/pull/100");
   });
@@ -695,8 +698,6 @@ describe("Review dossier", () => {
     renderWithProviders(<ReviewDossier />);
 
     const code = await screen.findByRole("link", { name: /View the code/i });
-    // Pinned to headSha, not a branch: lines that have shifted since are worse
-    // than no link at all.
     expect(code.getAttribute("href")).toBe(
       "https://github.com/cortexapps/engrams/blob/cccccccccccccccc/src/index.ts#L10-L12",
     );

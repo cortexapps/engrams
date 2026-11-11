@@ -4,7 +4,10 @@
  * segment. */
 
 import {
+  escapeGitPath,
   ForgeRequestError,
+  linkLines,
+  type ForgeLinks,
   type GitForge,
   type GitForgeSpec,
   type InlineComment,
@@ -131,6 +134,20 @@ function parsePullRequestUrl(url: string): { repo: string; number: number | null
     number: /^[1-9]\d*$/.test(iid) ? Number(iid) : null,
   };
 }
+
+/** The host is the connection's, so every link starts from the merge
+ * request's URL: `<project>/-/merge_requests/<iid>`. */
+const GITLAB_LINKS: ForgeLinks = {
+  pullRequest: () => null,
+  review: (prUrl, noteId) => `${prUrl}#note_${noteId}`,
+  comment: (prUrl, noteId) => `${prUrl}#note_${noteId}`,
+  file(prUrl, at) {
+    const base = `${prUrl.split("/-/")[0]}/-/blob/${at.sha}/${escapeGitPath(at.path)}`;
+    const lines = linkLines(at);
+    if (lines === null) return base;
+    return lines.to === undefined ? `${base}#L${lines.from}` : `${base}#L${lines.from}-${lines.to}`;
+  },
+};
 
 /** The pull request an event names, from the hook's merge-request object.
  * The hook carries no diff base and no author name, so the pass reads the
@@ -428,6 +445,7 @@ export function makeGitlabForge(
     // GitLab finds a project by its path in any case.
     caseInsensitiveRepos: true,
     parsePullRequestUrl,
+    links: GITLAB_LINKS,
     isPermanentError,
     typedReview,
 

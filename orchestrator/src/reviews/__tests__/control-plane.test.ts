@@ -10,6 +10,7 @@ import type {
 } from "../../db/reviews.ts";
 import type { GitForge } from "../../forges/forge.ts";
 import type { PrContext } from "../../forges/pr-context.ts";
+import { requireForge } from "../../forges/registry.ts";
 import {
   makeReviewControlPlane,
   ReviewSetupError,
@@ -26,6 +27,7 @@ function fakeForge(methods: Partial<GitForge>): () => GitForge {
   return () => ({
     provider: "github",
     caseInsensitiveRepos: true,
+    links: requireForge("github").links,
     parsePullRequestUrl: unexpected("parsePullRequestUrl"),
     isPermanentError: unexpected("isPermanentError"),
     fetchPullRequest: unexpected("fetchPullRequest"),
