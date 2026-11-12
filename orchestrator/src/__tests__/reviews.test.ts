@@ -201,7 +201,9 @@ function spawn(
   role = "user",
   repos: string[] = [],
   overrides?: {
-    retryAutomation?: (automationRunId: string) => Promise<string>;
+    retryAutomation?: (automationRunId: string, provider: string) => Promise<string>;
+    /** The automation of each run id; a run that is not listed is gone. */
+    runAutomations?: Record<string, string>;
   },
 ) {
   const transport = createRouterTransport((router) =>
@@ -210,6 +212,12 @@ function spawn(
         authenticated ? { user: { id: "review-user", role } } : null,
       reviews: store,
       enrolledRepos: enrolledRepos(repos),
+      runs: {
+        async getRun(id) {
+          const automationId = overrides?.runAutomations?.[id];
+          return automationId === undefined ? null : { automationId };
+        },
+      },
       ...(overrides?.retryAutomation != null ? { retryAutomation: overrides.retryAutomation } : {}),
     }),
   );
@@ -220,7 +228,7 @@ function spawn(
 function enrolledRepos(repos: string[]): Pick<EnrolledRepos, "get"> {
   const listed = new Set(repos.map((r) => r.toLowerCase()));
   return {
-    async get(repo) {
+    async get(_provider, repo) {
       return listed.has(repo.toLowerCase()) ? { mode: "on_request", autofix: false } : null;
     },
   };
@@ -305,6 +313,52 @@ describe("ReviewService", () => {
       reasoning: "The failing path is reachable.",
       sessionId: "verifier-session",
     });
+  });
+
+  test("GetReview names the automation of the pass's run", async () => {
+    const runId = "autorun:auto-9:d1";
+    const store = makeStore({ ...detail, review: reviewRow({ automationRunId: runId }) });
+    const linked = await spawn(store, true, "user", [], { runAutomations: { [runId]: "auto-9" } }).getReview({
+      id: REVIEW_ID,
+    });
+    expect(linked.review).toMatchObject({ automationRunId: runId, automationId: "auto-9" });
+    // The run's row is gone: the pass still loads, with no automation.
+    const gone = await spawn(store).getReview({ id: REVIEW_ID });
+    expect(gone.review?.automationId).toBeUndefined();
+    expect((await spawn(makeStore(detail)).getReview({ id: REVIEW_ID })).review?.automationId).toBeUndefined();
+  });
+
+  test("GetReview sends the forge's links for the pass and its findings", async () => {
+    // No stored URL: GitHub's is built from the coordinates.
+    const github = await spawn(makeStore(detail)).getReview({ id: REVIEW_ID });
+    expect(github.review?.prUrl).toBe("https://github.com/openai/engrams/pull/100");
+    expect(github.review?.postedReviewUrl).toBeUndefined();
+    expect(github.findings[0]?.fileUrl).toBe(
+      "https://github.com/openai/engrams/blob/head-sha/orchestrator/src/index.ts#L10-L12",
+    );
+    expect(github.findings[0]?.threadUrl).toBeUndefined();
+
+    const prUrl = "https://gitlab.example.com/acme/platform/api/-/merge_requests/7";
+    const gitlab = await spawn(
+      makeStore({
+        ...detail,
+        review: reviewRow({ provider: "gitlab", repo: "acme/platform/api", prNumber: 7, prUrl, githubReviewId: "500" }),
+        findings: [{ ...findingRow(), githubThreadId: "41" }],
+      }),
+    ).getReview({ id: REVIEW_ID });
+    expect(gitlab.review?.postedReviewUrl).toBe(`${prUrl}#note_500`);
+    expect(gitlab.findings[0]).toMatchObject({
+      fileUrl: "https://gitlab.example.com/acme/platform/api/-/blob/head-sha/orchestrator/src/index.ts#L10-12",
+      threadUrl: `${prUrl}#note_41`,
+    });
+
+    // A GitLab record with no URL has no host to build one from.
+    const bare = await spawn(
+      makeStore({ ...detail, review: reviewRow({ provider: "gitlab", githubReviewId: "500" }) }),
+    ).getReview({ id: REVIEW_ID });
+    expect(bare.review?.prUrl).toBeUndefined();
+    expect(bare.review?.postedReviewUrl).toBeUndefined();
+    expect(bare.findings[0]?.fileUrl).toBeUndefined();
   });
 
   test("GetReview surfaces the review activity log, oldest first", async () => {

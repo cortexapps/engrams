@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 
 import { invalidateRegistry } from "../../../connectors/registry.ts";
 import type { IntegrationOpRequest, IntegrationOpResult } from "../../../integrations/run-op.ts";
-import { makeGithubReviewPoster } from "../../../reviews/github-review.ts";
+import { requireForge } from "../../../forges/registry.ts";
 import { actionClientId } from "../client-id.ts";
 import { defaultBuiltinActionDeps, type BuiltinActionDeps } from "../builtin.ts";
 import { IntegrationActionError } from "../errors.ts";
@@ -293,8 +293,7 @@ describe("executeIntegrationAction — builtins", () => {
     overrides: Partial<BuiltinActionDeps> = {},
   ): BuiltinActionDeps {
     return {
-      runOp,
-      githubPoster: () => makeGithubReviewPoster({ runIntegrationOp: runOp }),
+      forge: (provider) => requireForge(provider, { runIntegrationOp: runOp }),
       slackClient: async () => {
         throw new Error("slack client not provided in this test");
       },
@@ -377,6 +376,51 @@ describe("executeIntegrationAction — builtins", () => {
     );
     expect(f.calls).toHaveLength(1);
     expect(outputs).toMatchObject({ posted: false, already_posted: true });
+  });
+
+  const NOTES = "/api/v4/projects/acme%2Fplatform%2Fapi/merge_requests/7/notes";
+
+  test("gitlab.upsert_pr_comment posts once per key and reuses the comment after", async () => {
+    const upsert = (f: ReturnType<typeof fakeRunOp>) =>
+      executeIntegrationAction(
+        {
+          provider: "gitlab",
+          actionId: "upsert_pr_comment",
+          params: { repo: "acme/platform/api", number: 7, key: "status", body: "Reviewing." },
+        },
+        CTX,
+        deps(f.runOp, { builtinDeps: builtinDeps(f.runOp) }),
+      );
+
+    // The lookup asks who the token's user is: only that user's comment counts.
+    const self = { id: 5 };
+    const first = fakeRunOp([json(200, self), json(200, []), json(201, { id: 8 })]);
+    expect(await upsert(first)).toMatchObject({ commentId: "7:8" });
+    expect(first.calls[2]!.req).toMatchObject({ method: "POST", path: NOTES });
+    const posted = String((JSON.parse(first.calls[2]!.req.body as string) as { body: string }).body);
+    const marker = posted.slice(posted.indexOf("<!--"));
+    expect(posted).toBe(`Reviewing.\n\n${marker}`);
+
+    const again = fakeRunOp([json(200, self), json(200, [{ id: 8, author: self, body: posted }])]);
+    expect(await upsert(again)).toMatchObject({ commentId: "7:8" });
+    expect(again.calls).toHaveLength(2);
+  });
+
+  test("gitlab.update_pr_comment rewrites the comment and keeps its marker", async () => {
+    const f = fakeRunOp([json(200, { id: 8 })]);
+    const outputs = await executeIntegrationAction(
+      {
+        provider: "gitlab",
+        actionId: "update_pr_comment",
+        params: { repo: "acme/platform/api", commentId: "7:8", key: "status", body: "Done." },
+      },
+      CTX,
+      deps(f.runOp, { builtinDeps: builtinDeps(f.runOp) }),
+    );
+    expect(outputs).toMatchObject({ commentId: "7:8" });
+    expect(f.calls[0]!.req).toMatchObject({ method: "PUT", path: `${NOTES}/8` });
+    const body = String((JSON.parse(f.calls[0]!.req.body as string) as { body: string }).body);
+    expect(body).toMatch(/^Done\.\n\n<!-- .+ -->$/);
   });
 
   test("slack.post_message maps ts/channel through the declared outputs", async () => {

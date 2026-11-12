@@ -1,7 +1,10 @@
-/** Webhook verification strategies and sealed-secret resolution (ADR 0102). */
+/** Webhook signature schemes and sealed-secret resolution. */
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 
+import { isValidSlackRequest } from "@slack/bolt";
+
+import type { WebhookIngressSpec } from "../connectors/registry.ts";
 import { integrationOp as defaultIntegrationOp } from "../control-plane/client.ts";
 import type { WebhookVerification } from "../db/schema.ts";
 import { asBearer } from "../integrations/clients.ts";
@@ -87,17 +90,76 @@ function sha256Signature(secret: string, body: Uint8Array): string {
   return createHmac("sha256", secret).update(body).digest("hex");
 }
 
-/** Bare hex-encoded HMAC-SHA256 of the raw body (no scheme prefix) — the
- * Linear-Signature format (ADR 0119 D5). Timing-safe with a length pre-check. */
-export function verifyHexHmacSha256(
-  secret: string,
-  rawBody: Uint8Array,
-  actual: string | null,
-): boolean {
-  return timingSafeHeader(sha256Signature(secret, rawBody), actual);
+/** The replay window Svix and Standard Webhooks document. */
+const SVIX_TOLERANCE_MS = 5 * 60_000;
+
+export interface VerifyIngressInput {
+  provider: string;
+  ingress: WebhookIngressSpec;
+  headers: Headers;
+  rawBody: Uint8Array;
+  secrets: VerificationSecretResolver;
+  now: Date;
 }
 
-export interface SvixSignatureInput {
+/** Verify a delivery on a provider's event route against the scheme and
+ * sealed secret its connector declares. Throws when the secret cannot be read. */
+export async function verifyIngress(input: VerifyIngressInput): Promise<boolean> {
+  const { headers, rawBody } = input;
+  const secret = await input.secrets.resolve({
+    provider: input.provider,
+    secretRef: input.ingress.secretRef,
+  });
+  switch (input.ingress.scheme) {
+    case "github_hmac_sha256":
+      return timingSafeHeader(
+        `sha256=${sha256Signature(secret, rawBody)}`,
+        headers.get("x-hub-signature-256"),
+      );
+    case "linear_hmac_sha256":
+      return timingSafeHeader(sha256Signature(secret, rawBody), headers.get("linear-signature"));
+    case "slack_v0":
+      return isValidSlackRequest({
+        signingSecret: secret,
+        body: new TextDecoder().decode(rawBody),
+        headers: {
+          "x-slack-signature": headers.get("x-slack-signature") ?? "",
+          "x-slack-request-timestamp": Number(headers.get("x-slack-request-timestamp") ?? 0),
+        },
+        nowMilliseconds: input.now.getTime(),
+      });
+    case "svix_hmac_sha256":
+      return verifySvixSignature({
+        secret,
+        rawBody,
+        id: headers.get("svix-id"),
+        timestamp: headers.get("svix-timestamp"),
+        signature: headers.get("svix-signature"),
+        now: input.now.getTime(),
+        toleranceMs: SVIX_TOLERANCE_MS,
+      });
+    case "gitlab_webhook":
+      // GitLab has two secrets. A signing token (`whsec_...`, GitLab 19.0
+      // and later) signs the delivery as Svix does, under the Standard
+      // Webhooks header names. A secret token arrives as it is in a header.
+      // The stored secret says which one the administrator set, so a
+      // delivery cannot choose the weaker check.
+      if (secret.startsWith("whsec_")) {
+        return verifySvixSignature({
+          secret,
+          rawBody,
+          id: headers.get("webhook-id"),
+          timestamp: headers.get("webhook-timestamp"),
+          signature: headers.get("webhook-signature"),
+          now: input.now.getTime(),
+          toleranceMs: SVIX_TOLERANCE_MS,
+        });
+      }
+      return secret !== "" && timingSafeHeader(secret, headers.get("x-gitlab-token"));
+  }
+}
+
+interface SvixSignatureInput {
   /** The endpoint secret as the dashboard shows it (`whsec_<base64>`); a bare
    * base64 secret is accepted too. */
   secret: string;
@@ -112,12 +174,11 @@ export interface SvixSignatureInput {
   toleranceMs: number;
 }
 
-/** The Svix webhook signature (Vanta): HMAC-SHA256 over
- * `${id}.${timestamp}.${body}` under the base64-decoded secret, base64
- * encoded, compared against every `v1,` entry of the header (a rotation
- * sends the old and the new). A timestamp outside the tolerance is a
- * replay. Timing-safe per entry. */
-export function verifySvixSignature(input: SvixSignatureInput): boolean {
+/** The Svix webhook signature: HMAC-SHA256 over `${id}.${timestamp}.${body}`
+ * under the base64-decoded secret, base64 encoded, compared against every
+ * `v1,` entry of the header (a rotation sends the old and the new). A
+ * timestamp outside the tolerance is a replay. */
+function verifySvixSignature(input: SvixSignatureInput): boolean {
   if (!input.id || !input.timestamp || !input.signature) return false;
   if (!/^\d{1,12}$/.test(input.timestamp)) return false;
   const sentMs = Number(input.timestamp) * 1000;
@@ -137,9 +198,8 @@ export function verifySvixSignature(input: SvixSignatureInput): boolean {
   return false;
 }
 
-/** Custom-registration verification: the generic scheme only. Provider
- * schemes retired with ADR 0119 D5 — GitHub/Slack/Linear deliveries arrive on
- * the integration ingress routes and verify with the connection's secret. */
+/** Verify a delivery to a custom webhook registration. Provider deliveries
+ * use {@link verifyIngress}. */
 export function verifyWebhook(input: VerifyWebhookInput): boolean {
   switch (input.verification.scheme) {
     case "generic_hmac_sha256":

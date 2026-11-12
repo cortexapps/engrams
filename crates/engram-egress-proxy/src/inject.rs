@@ -7,6 +7,8 @@
 //! secret the guest never sees. (A request to an inject-gated host whose
 //! shape matches no entry is rejected by the caller.)
 
+use engram_core::traits::render_header_template;
+
 use crate::registry::InjectEntry;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -45,7 +47,7 @@ pub fn request_line(prefix: &[u8]) -> Option<(String, String)> {
     Some((method.to_string(), path.to_string()))
 }
 
-/// Add each entry's `header_name: <template with {} → secret>` line after
+/// Add each entry's `header_name: <rendered template>` line after
 /// the request line. HTTP/1.1: headers follow the request line, so
 /// inserting right after the first CRLF is always valid and leaves
 /// `Content-Length` / the body untouched. Entries are assumed already
@@ -96,7 +98,7 @@ pub fn rendered_headers(
 ) -> Result<Vec<(String, String)>, InjectHeaderError> {
     let mut rendered: Vec<(&InjectEntry, String)> = Vec::with_capacity(entries.len());
     for entry in entries {
-        let value = entry.header_template.replace("{}", &entry.secret());
+        let value = render_header_template(&entry.header_template, &entry.secret());
         if let Some((existing_entry, existing_value)) = rendered.iter().find(|(existing, _)| {
             existing
                 .header_name
@@ -219,6 +221,17 @@ mod tests {
         // Untouched headers survive.
         assert!(s.contains("Host: api.github.com"));
         assert!(s.contains("Accept: */*"));
+    }
+
+    #[test]
+    fn template_renders_http_basic_for_git() {
+        let req = b"GET /g/p.git/info/refs?service=git-upload-pack HTTP/1.1\r\n\r\n".to_vec();
+        let e = entry("Authorization", "Basic {basic:oauth2}", "tok");
+        let out = inject_headers(req, &[&e]).unwrap();
+        // base64("oauth2:tok")
+        assert!(std::str::from_utf8(&out)
+            .unwrap()
+            .contains("Authorization: Basic b2F1dGgyOnRvaw==\r\n"));
     }
 
     #[test]

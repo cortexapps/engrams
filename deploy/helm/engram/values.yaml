@@ -33,8 +33,8 @@ sandboxBackend: firecracker
 # Blob storage backend selection (ADR 0007 / ADR 0122). Production
 # reads chunks from the same bucket the image-builder writes to.
 blob:
-  # `local` (dev), `gcs`, or `s3`.
-  backend: gcs
+  # Required: `local` (dev), `gcs`, or `s3`.
+  backend: ""
   # Required when backend=gcs.
   gcs:
     bucket: ""
@@ -51,9 +51,9 @@ blob:
 
 # KEK provider for envelope-encrypted creds + cold-tier blob seals.
 kek:
-  # `env-var` (dev/CI, and GCP production today — gcp-kms wrap/unwrap
-  # is a stub), `gcp-kms`, or `aws-kms` (real, ADR 0122).
-  provider: gcp-kms
+  # Required: `env-var` (dev/CI, and GCP production today — gcp-kms
+  # wrap/unwrap is a stub), `gcp-kms`, or `aws-kms` (real, ADR 0122).
+  provider: ""
   # env-var only — name of the env var carrying the base64 master key.
   envVarName: ENGRAM_KEK_MASTER_KEY
   # gcp-kms only — full resource path.
@@ -64,10 +64,10 @@ kek:
 
 # Secrets backend for image manifest's `[secrets.*]` references.
 secrets:
-  # `env` (dev), `gcp` (Secret Manager via Workload Identity), or
-  # `aws` (AWS Secrets Manager via IRSA — ADR 0122; needs no extra
+  # Required: `env` (dev), `gcp` (Secret Manager via Workload Identity),
+  # or `aws` (AWS Secrets Manager via IRSA — ADR 0122; needs no extra
   # keys here: region + credentials ride the SDK chain).
-  backend: gcp
+  backend: ""
   # Required when backend=gcp.
   gcpProjectId: ""
 

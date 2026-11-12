@@ -11,6 +11,7 @@ import {
   useSetInputValue,
   useSetMapInputEntry,
 } from "../../hooks/useAutomations";
+import { useReviewForges, type ReviewForge } from "../../hooks/useIntegrations";
 import { useProfiles } from "../../hooks/useProfiles";
 import { toast } from "sonner";
 import { errorMessage } from "../../lib/errors";
@@ -58,20 +59,63 @@ import {
   TableRow,
 } from "@/components/ui/table";
 
-// The repositories engrams reviews (ADR 0100), as a page of the Reviews
-// product. The list IS the PR-review automation's `repos` input (ADR 0119
-// phase 4.7b: the single source — no enrollment table beside it): enrolling
-// a repo writes one entry of that map and enables the automation, the way
-// the Slack page writes a channel override — the product is the front of
-// the platform, and the link below opens the back. `mode` decides whether a
-// PR is reviewed automatically on open (auto) or only when the app is
-// @mentioned / dispatched (on_request); `autofix` whether posted findings
-// route back for fixes. The review sessions run on the reviewer profile
-// picked below: the automation's `profile` input, written one key at a time
-// so a stale page never overwrites another admin's edit.
+/** The repositories engrams reviews. Each git forge has its own review
+ * automation, so the page shows one forge at a time. */
 export function ReviewRepositories() {
+  const { forges, isPending, error } = useReviewForges();
+  const [picked, setPicked] = useState<string>();
+  const forge = forges.find((f) => f.provider === picked) ?? forges[0];
+
+  if (!forge) {
+    return (
+      <div className="flex min-h-0 flex-1 flex-col gap-6 overflow-auto p-4 md:p-6">
+        <PageHeading title="Repositories" />
+        {isPending ? (
+          <SkeletonRows rows={3} columns={["minmax(12rem,1fr)", "6rem", "6rem", "6rem"]} />
+        ) : (
+          <EmptyState tone={error ? "error" : undefined}>
+            {error
+              ? `Could not load repositories — ${errorMessage(error)}`
+              : "No git forge with a code review is available."}
+          </EmptyState>
+        )}
+      </div>
+    );
+  }
+  return (
+    <ForgeRepositories
+      key={forge.provider}
+      forge={forge}
+      picker={
+        forges.length > 1 ? (
+          <Select value={forge.provider} onValueChange={setPicked}>
+            <SelectTrigger className="w-40" aria-label="Git forge">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {forges.map((f) => (
+                <SelectItem key={f.provider} value={f.provider}>
+                  {f.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        ) : undefined
+      }
+    />
+  );
+}
+
+// The list is the review automation's `repos` input: enrolling a repo writes
+// one entry of that map and enables the automation. `mode` decides whether a
+// pull request is reviewed when it opens (auto) or only when the app is
+// @mentioned or dispatched (on_request); `autofix` whether posted findings
+// route back for fixes. The review sessions run on the reviewer profile
+// picked below: the automation's `profile` input. Each write names one key,
+// so a stale page never overwrites another admin's edit.
+function ForgeRepositories({ forge, picker }: { forge: ReviewForge; picker?: React.ReactNode }) {
   const { data: profileData } = useProfiles();
-  const builtin = useBuiltinAutomation("pr_review");
+  const builtin = useBuiltinAutomation(forge.builtinKey);
   const setProfile = useSetInputValue();
   const profiles = profileData?.profiles ?? [];
   const automation = builtin.data?.automation;
@@ -100,11 +144,16 @@ export function ReviewRepositories() {
       <PageHeading
         title="Repositories"
         count={rows.length > 0 ? `${rows.length} enrolled` : undefined}
-        actions={automationId ? <EnrollDialog automationId={automationId} /> : undefined}
+        actions={
+          <div className="flex items-center gap-2">
+            {picker}
+            {automationId && <EnrollDialog automationId={automationId} forge={forge} />}
+          </div>
+        }
       />
 
       <p className="text-sm text-muted-foreground">
-        Pull requests on these repositories are reviewed by the{" "}
+        Pull requests on these {forge.name} repositories are reviewed by the{" "}
         {automationId ? (
           <Link
             to="/automations/$id"
@@ -163,7 +212,7 @@ export function ReviewRepositories() {
 
       {isPending ? (
         <SkeletonRows rows={3} columns={["minmax(12rem,1fr)", "6rem", "6rem", "6rem"]} />
-      ) : rows.length === 0 ? (
+      ) : !automationId || rows.length === 0 ? (
         <EmptyState>
           No repos enrolled yet. Enroll one to have engrams review its pull requests.
         </EmptyState>
@@ -179,7 +228,7 @@ export function ReviewRepositories() {
           </TableHeader>
           <TableBody>
             {rows.map((row) => (
-              <EnrollmentRow key={row.repo} row={row} automationId={automationId!} />
+              <EnrollmentRow key={row.repo} row={row} automationId={automationId} forge={forge} />
             ))}
           </TableBody>
         </Table>
@@ -249,7 +298,15 @@ function TriggerBadge({ mode }: { mode: string }) {
   );
 }
 
-function EnrollmentRow({ row, automationId }: { row: RepoRow; automationId: string }) {
+function EnrollmentRow({
+  row,
+  automationId,
+  forge,
+}: {
+  row: RepoRow;
+  automationId: string;
+  forge: ReviewForge;
+}) {
   const remove = useSetMapInputEntry();
   return (
     <TableRow>
@@ -260,7 +317,7 @@ function EnrollmentRow({ row, automationId }: { row: RepoRow; automationId: stri
       <TableCell className="text-xs text-muted-foreground">{row.autofix ? "on" : "off"}</TableCell>
       <TableCell>
         <div className="flex items-center justify-end gap-1">
-          <EnrollDialog automationId={automationId} existing={row} />
+          <EnrollDialog automationId={automationId} forge={forge} existing={row} />
           <AlertDialog>
             <AlertDialogTrigger asChild>
               <Button variant="ghost" size="sm" disabled={remove.isPending}>
@@ -307,13 +364,22 @@ const enrollSchema = z.object({
   repo: z
     .string()
     .trim()
-    .regex(/^[^/\s]+\/[^/\s]+$/, "must be owner/name (e.g. cortexapps/engrams)"),
+    // GitLab nests groups, so a path has two names or more.
+    .regex(/^[^/\s]+(\/[^/\s]+)+$/, "must be a repository path such as owner/name"),
   mode: z.enum(["auto", "on_request"]),
   autofix: z.boolean(),
 });
 type EnrollValues = z.infer<typeof enrollSchema>;
 
-function EnrollDialog({ automationId, existing }: { automationId: string; existing?: RepoRow }) {
+function EnrollDialog({
+  automationId,
+  forge,
+  existing,
+}: {
+  automationId: string;
+  forge: ReviewForge;
+  existing?: RepoRow;
+}) {
   const [open, setOpen] = useState(false);
   const upsert = useSetMapInputEntry();
   const isEdit = existing !== undefined;
@@ -370,8 +436,8 @@ function EnrollDialog({ automationId, existing }: { automationId: string; existi
         <DialogHeader>
           <DialogTitle>{isEdit ? `Edit ${existing.repo}` : "Enroll a repository"}</DialogTitle>
           <DialogDescription>
-            engrams reviews pull requests on enrolled repos. The GitHub App must be installed on the
-            repo for reviews to run.
+            engrams reviews pull requests on enrolled repos. The {forge.name} connection must have
+            access to the repo for reviews to run.
           </DialogDescription>
         </DialogHeader>
 
@@ -388,13 +454,13 @@ function EnrollDialog({ automationId, existing }: { automationId: string; existi
                     id={field.name}
                     autoFocus={!isEdit}
                     disabled={isEdit}
-                    placeholder="cortexapps/engrams"
+                    placeholder="owner/name"
                     spellCheck={false}
                     autoCapitalize="off"
                     aria-invalid={fieldState.invalid}
                   />
                   <FieldDescription>
-                    The GitHub owner/name. Cannot be changed later.
+                    The repository path on {forge.name}. Cannot be changed later.
                   </FieldDescription>
                   {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
                 </Field>

@@ -192,10 +192,6 @@ export function registerBuiltinTools(registry: ToolRegistry = tools, deps?: Buil
     output: AnswersSchema,
     handling: "session",
     execution: "deferred",
-    presenters: {
-      slack: "questionEffect",
-      web: "UserQuestionCard",
-    },
     nativeBindings: {
       codex: "requestUserInput",
     },
@@ -216,10 +212,6 @@ export function registerBuiltinTools(registry: ToolRegistry = tools, deps?: Buil
     output: PlanDecisionSchema,
     handling: "session",
     execution: "deferred",
-    presenters: {
-      slack: "planEffect",
-      web: "PlanCard",
-    },
   });
 
   // The single artifact tool (owner-scoped by construction: every action

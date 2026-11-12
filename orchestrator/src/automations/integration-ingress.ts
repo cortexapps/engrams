@@ -1,15 +1,10 @@
-/** Per-provider integration-event ingress spine (ADR 0119 D5).
+/** The ingress spine every provider event delivery passes through: bounded
+ * body → verify → parse → extract → redact → ledger → dispatch.
  *
- * One shared pipeline for every provider event route: bounded body → verify →
- * parse → extract → redact → ledger → dispatch. Verification lives with the
- * integration (each route supplies its provider's verifier and secret); the
- * spine owns the ledger write and the dispatch hand-off. Dispatch to
- * automations is an injectable seam that stays a no-op until trigger matching
- * lands (stack item 2.C) — `setIntegrationEventDispatch` installs it.
- *
- * The spine never swallows a provider's legacy behavior: routes receive the
- * raw body and parsed payload back and keep running their existing paths
- * (PR-review classifier, Slack thread brain) unchanged.
+ * The caller supplies the verifier and the provider's extract step. The spine
+ * owns the ledger write and the dispatch hand-off, and returns the raw body
+ * and parsed payload so the provider can do its own work on the delivery.
+ * `setIntegrationEventDispatch` installs the trigger dispatcher at boot.
  */
 
 import { makeIntegrationConnectionStore } from "../db/integration-connections.ts";
@@ -50,6 +45,19 @@ export interface IntegrationEventRoute {
   extract(headers: Headers, payload: Record<string, unknown>): IngressOutcome;
 }
 
+/** A provider's part of the event route: what a verified delivery means.
+ * The route verifies it against the connector's declared ingress. */
+export interface IntegrationEventSource {
+  provider: string;
+  extract(headers: Headers, payload: Record<string, unknown>, now: Date): IngressOutcome;
+  /** Provider work on a verified delivery, after the ledger write and the
+   * dispatch. A returned response replaces the route's 200. */
+  afterDelivery?(
+    delivery: Extract<DeliveryResult, { kind: "skipped" | "recorded" }>,
+    headers: Headers,
+  ): Promise<Response | undefined>;
+}
+
 export interface IntegrationEventDispatchInput {
   provider: string;
   connectionId: string;
@@ -65,8 +73,7 @@ export type IntegrationEventDispatch = (
   input: IntegrationEventDispatchInput,
 ) => Promise<DispatchIntegrationResult | undefined>;
 
-/** The 2.C seam: trigger matching installs itself here at boot. Until then a
- * verified delivery is ledgered and goes nowhere else. */
+/** Until the dispatcher is installed a verified delivery is only ledgered. */
 let integrationEventDispatch: IntegrationEventDispatch = async () => undefined;
 
 export function setIntegrationEventDispatch(dispatch: IntegrationEventDispatch): void {
@@ -89,7 +96,7 @@ export type DeliveryResult =
   | { kind: "rejected"; response: Response }
   /** Provider handshake answered — return the response as-is. */
   | { kind: "responded"; response: Response }
-  /** Verified but not ledgered; the route continues its legacy paths. */
+  /** Verified but not ledgered. */
   | { kind: "skipped"; reason: string; rawBody: Uint8Array; payload?: Record<string, unknown> }
   /** Verified, redacted, ledgered, dispatched. */
   | {
@@ -101,9 +108,7 @@ export type DeliveryResult =
       event: ExtractedIntegrationEvent;
       connectionId: string;
       /** What the trigger dispatcher did with the delivery (undefined until
-       * the dispatcher is installed at boot). A legacy route decides its
-       * own fallback from THIS — the dispatcher's fresh read — so the two
-       * brains can never disagree on who owns the delivery. */
+       * the dispatcher is installed at boot). */
       dispatch: DispatchIntegrationResult | undefined;
     };
 
@@ -152,8 +157,7 @@ export async function handleIntegrationDelivery(
     payload = parseWebhookPayload(rawBody);
   } catch (error) {
     if (!(error instanceof WebhookEventError)) throw error;
-    // Signed but unparseable: tolerate, exactly like the legacy GitHub path —
-    // the route's own classifier decides what a non-JSON body means.
+    // Signed but unparseable: the provider decides what a non-JSON body means.
     return { kind: "skipped", reason: `unparseable payload: ${error.message}`, rawBody };
   }
 

@@ -8,6 +8,7 @@ import { TriggerInspector } from "./TriggerInspector";
 
 vi.mock("@/hooks/useAutomationEditor", () => ({
   useActionCatalog: () => ({ data: undefined }),
+  useAutomationProviders: () => ["github", "gitlab"],
   useEventCatalog: () => ({
     data: {
       events: [

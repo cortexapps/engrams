@@ -20,7 +20,7 @@ export interface ProfileCard {
   /** "owner/name" when the remote parses, the in-guest path otherwise. */
   repos: string[];
   skills: string[];
-  /** Providers of the connections the profile is granted (e.g. "github"). */
+  /** Providers of the connections the profile is granted */
   integrations: string[];
   /** Egress allow-list entries (hosts + patterns). */
   allowHosts: string[];

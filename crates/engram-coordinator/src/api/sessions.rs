@@ -1809,33 +1809,17 @@ pub(crate) async fn inject_forge_env(
     session_id: SessionId,
     env: &mut HashMap<String, String>,
 ) -> Result<(), ApiError> {
-    // ADR 0056 P2: forge env is injected when the session holds a capability for a
-    // provider that (a) resolves a mint engine AND (b) declares a git-forge host
-    // (`Integration::git_forge_host`). De-hardcodes the old `"github"` literal — any
-    // git-forge integration (github today; gitlab/gitea later) gets the askpass env.
-    // The manifest `[git]` block is retired — git binding rides the profile's caps.
+    // The askpass env goes to a session that holds a capability for a git forge.
     let caps = state
         .services
         .meta
         .get_session_capabilities(session_id)
         .await?;
-    // The session's bound caps that belong to a git-forge provider.
-    let mut git_caps: Vec<&engram_core::types::Capability> = Vec::new();
-    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for provider in caps.iter().map(|c| c.provider.as_str()) {
-        if !seen.insert(provider) {
-            continue;
-        }
-        let is_git_forge = state
-            .integrations
-            .resolve(provider, &state.services.secrets)
-            .await
-            .and_then(|e| e.git_forge_host())
-            .is_some();
-        if is_git_forge {
-            git_caps.extend(caps.iter().filter(|c| c.provider == provider));
-        }
-    }
+    let forges = crate::api::forge::session_forges(state, &caps).await;
+    let git_caps: Vec<&engram_core::types::Capability> = caps
+        .iter()
+        .filter(|c| forges.iter().any(|f| f.provider == c.provider))
+        .collect();
     if git_caps.is_empty() {
         return Ok(());
     }

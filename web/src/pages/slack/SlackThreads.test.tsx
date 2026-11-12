@@ -12,7 +12,7 @@ const state = vi.hoisted(() => ({
     string,
     unknown
   >,
-  openRouter: false,
+  canDecide: false,
   enabled: false,
   profiles: [] as Array<{ id: string; name: string }>,
   instances: [] as Array<Record<string, unknown>>,
@@ -58,12 +58,8 @@ vi.mock("../../hooks/useAutomationInputs", () => ({
 vi.mock("../../hooks/useProfiles", () => ({
   useProfiles: () => ({ data: { profiles: state.profiles } }),
 }));
-vi.mock("../../hooks/useConnectedRouters", () => ({
-  useConnectedRouters: () => new Set(state.openRouter ? ["openrouter"] : []),
-}));
-vi.mock("@/hooks/useConnectedRouters", () => ({
-  useConnectedRouters: () => new Set(state.openRouter ? ["openrouter"] : []),
-}));
+vi.mock("../../hooks/useCanDecide", () => ({ useCanDecide: () => state.canDecide }));
+vi.mock("@/hooks/useCanDecide", () => ({ useCanDecide: () => state.canDecide }));
 vi.mock("../../hooks/useNow", () => ({ useNow: () => Date.parse("2026-09-30T12:00:00Z") }));
 
 beforeEach(() => {
@@ -72,7 +68,7 @@ beforeEach(() => {
   setEnabled.mockClear();
   state.inputs = { channels: { C0123456789: "prof-a" }, default_profile: "prof-d" };
   state.enabled = true;
-  state.openRouter = false;
+  state.canDecide = false;
   state.profiles = [
     { id: "prof-d", name: "Helpdesk" },
     { id: "prof-a", name: "Alerts" },
@@ -198,15 +194,15 @@ describe("SlackThreads", () => {
 });
 
 describe("SlackThreads — smart routing", () => {
-  it("offers no routing choice without an OpenRouter key", async () => {
+  it("offers no routing choice while no model router can decide", async () => {
     renderWithProviders(<SlackThreads />);
     await screen.findByRole("combobox", { name: "Default profile" });
     expect(screen.queryByRole("region", { name: "Routing" })).toBeNull();
     expect(screen.queryByText(/smart routing/i)).toBeNull();
   });
 
-  it("with a key, turning smart routing on writes only the routing input", async () => {
-    state.openRouter = true;
+  it("with a decision model, turning smart routing on writes only the routing input", async () => {
+    state.canDecide = true;
     renderWithProviders(<SlackThreads />);
     await userEvent.click(await screen.findByRole("combobox", { name: "Routing" }));
     await userEvent.click(await screen.findByRole("option", { name: "Smart routing" }));
@@ -220,7 +216,7 @@ describe("SlackThreads — smart routing", () => {
   });
 
   it("smart: leaving a profile out stores the remaining candidates", async () => {
-    state.openRouter = true;
+    state.canDecide = true;
     state.inputs = { ...state.inputs, routing: "smart" };
     renderWithProviders(<SlackThreads />);
     await userEvent.click(
@@ -236,7 +232,7 @@ describe("SlackThreads — smart routing", () => {
   });
 
   it("smart: a saved id of a deleted profile never turns 'some' into 'all'", async () => {
-    state.openRouter = true;
+    state.canDecide = true;
     state.profiles = [
       { id: "prof-d", name: "Helpdesk" },
       { id: "prof-a", name: "Alerts" },

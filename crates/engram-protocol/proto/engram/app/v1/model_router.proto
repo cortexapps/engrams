@@ -8,6 +8,7 @@ service ModelRouterService {
   rpc ListRouterModels(ListRouterModelsRequest) returns (ListRouterModelsResponse);
   rpc RefreshRouterModels(RefreshRouterModelsRequest) returns (RefreshRouterModelsResponse);
   rpc UpdateRouterModelPolicy(UpdateRouterModelPolicyRequest) returns (UpdateRouterModelPolicyResponse);
+  rpc UpdateModelRouterSettings(UpdateModelRouterSettingsRequest) returns (UpdateModelRouterSettingsResponse);
 }
 
 enum RouterModelAudience {
@@ -30,7 +31,13 @@ message ModelRouter {
   uint32 model_count = 10;
   uint32 available_model_count = 11;
   uint32 enabled_model_count = 12;
+  // The model in use for each role: the admin's choice, else the router's
+  // built-in model. Empty when the role has no model.
   string default_model = 13;
+  string title_model = 14;
+  string decision_model = 15;
+  // The connector that holds the router's key and host.
+  string connector = 16;
 }
 
 message RouterModel {
@@ -79,3 +86,13 @@ message UpdateRouterModelPolicyRequest {
   bool user_enabled = 4;
 }
 message UpdateRouterModelPolicyResponse { RouterModel model = 1; }
+
+// An absent model keeps the admin's choice for that role; an empty one
+// clears it.
+message UpdateModelRouterSettingsRequest {
+  string router_id = 1;
+  optional string default_model = 2;
+  optional string title_model = 3;
+  optional string decision_model = 4;
+}
+message UpdateModelRouterSettingsResponse { ModelRouter router = 1; }

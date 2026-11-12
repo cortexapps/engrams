@@ -19,6 +19,7 @@ vi.mock("@/hooks/useModelRouters", () => ({
   useRouterModels: () => ({ data: { models: [] } }),
 }));
 vi.mock("@/hooks/useAutomationEditor", () => ({
+  useAutomationProviders: () => ["github", "gitlab"],
   useActionCatalog: () => ({
     data: {
       actions: [

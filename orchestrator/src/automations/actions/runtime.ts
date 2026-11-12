@@ -14,7 +14,7 @@
 import type { IntegrationActionRuntime } from "../engine/deps.ts";
 import type { AutomationInstanceStore } from "../../db/automation-instances.ts";
 import { makeAutomationInstanceStore } from "../../db/automation-instances.ts";
-import { canonicalHandle, renderHandleParts } from "../handles.ts";
+import { canonicalIdentifier, renderHandleParts } from "../handles.ts";
 import { IntegrationActionError } from "./errors.ts";
 import {
   executeIntegrationAction,
@@ -57,7 +57,7 @@ export function makeIntegrationActionRuntime(
             return undefined;
           });
           if (rendered === null) continue;
-          const handle = canonicalHandle(input.provider, rendered);
+          const handle = canonicalIdentifier(input.provider, rendered);
           const result = await instances().recordInstanceHandle({
             automationId,
             handle,

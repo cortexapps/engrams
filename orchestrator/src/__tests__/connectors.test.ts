@@ -457,6 +457,68 @@ describe("compileIntegrationPolicy", () => {
     ]);
   });
 
+  test("an operation's own template replaces the credential's on its path", () => {
+    const policy = compileIntegrationPolicy(
+      ["gitlab:repository:read", "gitlab:repository:write"],
+      connectorRegistry(),
+    );
+    const templateFor = (method: string, path: string) =>
+      policy.injects.find((i) => i.methods.includes(method) && i.path_globs.includes(path))
+        ?.header_template;
+    // Git over HTTPS takes the token as a Basic password; the REST API as a bearer.
+    expect(templateFor("GET", "path-query:/*.git/info/refs?service=git-upload-pack")).toBe("Basic {basic:oauth2}");
+    expect(templateFor("POST", "path-query:/*.git/git-receive-pack")).toBe("Basic {basic:oauth2}");
+    expect(templateFor("GET", "/api/v4/projects/*/repository/*")).toBe("Bearer {}");
+    expect(policy.injects.every((i) => i.secret_ref === "gitlab.api_token")).toBe(true);
+
+    // A read grant alone opens fetch and not push.
+    const readOnly = compileIntegrationPolicy(["gitlab:repository:read"], connectorRegistry());
+    expect(readOnly.injects.some((i) => i.path_globs.includes("path-query:/*.git/git-upload-pack"))).toBe(true);
+    expect(readOnly.injects.some((i) => i.path_globs.some((p) => p.includes("receive-pack")))).toBe(false);
+  });
+
+  test("Azure DevOps sends its token as a Basic password on the API and on git", () => {
+    const policy = compileIntegrationPolicy(["azure_devops:code:read"], connectorRegistry());
+    expect(policy.injects.map((i) => [i.methods[0], i.path_globs[0]])).toEqual([
+      ["GET", "/*/_apis/git/*"],
+      ["GET", "path-query:/*/_git/*/info/refs?service=git-upload-pack"],
+      ["POST", "path-query:/*/_git/*/git-upload-pack"],
+      ["GET", "/*/_apis/projects*"],
+    ]);
+    for (const inject of policy.injects) {
+      expect(inject).toMatchObject({
+        hosts: ["dev.azure.com"],
+        header_name: "Authorization",
+        header_template: "Basic {basic:}",
+        secret_ref: "azure_devops.pat",
+      });
+    }
+  });
+
+  test("a template names the secret as {} or {basic:USER}, and only on an inject connector's HTTP match", () => {
+    const withOp = (operation: Record<string, unknown>, raw: Record<string, unknown> = datadogRaw) =>
+      parseConnector({ ...raw, operations: [operation] }, "t");
+    const op = { grants: ["x"], match: { method: "GET", path: "/x" } };
+    const oneHeader = datadogRaw;
+    const twoHeaders = {
+      ...datadogRaw,
+      credential: {
+        source: "inject",
+        injects: [...datadogRaw.credential.injects, { header: "DD-APPLICATION-KEY", secretRef: "datadog-app-key" }],
+      },
+    };
+    expect(() => withOp({ ...op, template: "Basic {basic:}" }, oneHeader)).not.toThrow();
+    // One template cannot render two headers.
+    expect(() => withOp({ ...op, template: "Basic {basic:}" }, twoHeaders)).toThrow(/one header/);
+    expect(() => withOp({ ...op, template: "Basic token" }, oneHeader)).toThrow(/value placeholder/);
+    expect(() => withOp({ ...op, template: "{basic:a:b}" }, oneHeader)).toThrow(/value placeholder/);
+    expect(() => withOp({ ...op, template: "{basic:a:b} {}" }, oneHeader)).toThrow(/value placeholder/);
+    expect(() => withOp({ ...op, template: "{basic:u {}" }, oneHeader)).toThrow(/value placeholder/);
+    expect(() => withOp({ ...op, template: "{}\r\nX: y" }, oneHeader)).toThrow(/newlines/);
+    expect(() => withOp({ grants: ["x"], template: "{}" }, oneHeader)).toThrow(/HTTP match/);
+    expect(() => withOp({ ...op, template: "{}" }, githubRaw)).toThrow(/inject credential/);
+  });
+
   test("an oauth-facet connector compiles to a brokered-source inject (ADR 0106 addendum)", () => {
     const linearRaw = {
       provider: "linear",

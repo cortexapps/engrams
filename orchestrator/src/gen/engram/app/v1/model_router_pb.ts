@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/model_router.proto.
  */
 export const file_engram_app_v1_model_router: GenFile = /*@__PURE__*/
-  fileDesc("CiBlbmdyYW0vYXBwL3YxL21vZGVsX3JvdXRlci5wcm90bxINZW5ncmFtLmFwcC52MSL8AgoLTW9kZWxSb3V0ZXISCgoCaWQYASABKAkSDQoFbGFiZWwYAiABKAkSEwoLZGVzY3JpcHRpb24YAyABKAkSEQoJcHJvdG9jb2xzGAQgAygJEhkKEWNyZWRlbnRpYWxfc2VjcmV0GAUgASgJEhQKDGVncmVzc19ob3N0cxgGIAMoCRIdChVjcmVkZW50aWFsX2NvbmZpZ3VyZWQYByABKAgSJAoXbGFzdF9zdWNjZXNzZnVsX3N5bmNfYXQYCCABKAlIAIgBARIcCg9sYXN0X3N5bmNfZXJyb3IYCSABKAlIAYgBARITCgttb2RlbF9jb3VudBgKIAEoDRIdChVhdmFpbGFibGVfbW9kZWxfY291bnQYCyABKA0SGwoTZW5hYmxlZF9tb2RlbF9jb3VudBgMIAEoDRIVCg1kZWZhdWx0X21vZGVsGA0gASgJQhoKGF9sYXN0X3N1Y2Nlc3NmdWxfc3luY19hdEISChBfbGFzdF9zeW5jX2Vycm9yIpkECgtSb3V0ZXJNb2RlbBIRCglyb3V0ZXJfaWQYASABKAkSCgoCaWQYAiABKAkSFgoOY2Fub25pY2FsX3NsdWcYAyABKAkSDAoEbmFtZRgEIAEoCRITCgZhdXRob3IYBSABKAlIAIgBARIYCgtkZXNjcmlwdGlvbhgGIAEoCUgBiAEBEhYKDmNvbnRleHRfbGVuZ3RoGAcgASgEEhkKDHByb21wdF9wcmljZRgIIAEoCUgCiAEBEh0KEGNvbXBsZXRpb25fcHJpY2UYCSABKAlIA4gBARIYChBpbnB1dF9tb2RhbGl0aWVzGAogAygJEhkKEW91dHB1dF9tb2RhbGl0aWVzGAsgAygJEhwKFHN1cHBvcnRlZF9wYXJhbWV0ZXJzGAwgAygJEhwKD2h1Z2dpbmdfZmFjZV9pZBgNIAEoCUgEiAEBEhEKCWF2YWlsYWJsZRgOIAEoCBIPCgdlbmFibGVkGA8gASgIEhQKDHVzZXJfZW5hYmxlZBgQIAEoCBIUCgx1cHN0cmVhbV91cmwYESABKAkSEgoKdXBkYXRlZF9hdBgSIAEoCRIaChJzdXBwb3J0c19yZWFzb25pbmcYEyABKAhCCQoHX2F1dGhvckIOCgxfZGVzY3JpcHRpb25CDwoNX3Byb21wdF9wcmljZUITChFfY29tcGxldGlvbl9wcmljZUISChBfaHVnZ2luZ19mYWNlX2lkIhkKF0xpc3RNb2RlbFJvdXRlcnNSZXF1ZXN0IkcKGExpc3RNb2RlbFJvdXRlcnNSZXNwb25zZRIrCgdyb3V0ZXJzGAEgAygLMhouZW5ncmFtLmFwcC52MS5Nb2RlbFJvdXRlciJyChdMaXN0Um91dGVyTW9kZWxzUmVxdWVzdBIRCglyb3V0ZXJfaWQYASABKAkSNAoIYXVkaWVuY2UYAiABKA4yIi5lbmdyYW0uYXBwLnYxLlJvdXRlck1vZGVsQXVkaWVuY2USDgoGc2VhcmNoGAMgASgJIkYKGExpc3RSb3V0ZXJNb2RlbHNSZXNwb25zZRIqCgZtb2RlbHMYASADKAsyGi5lbmdyYW0uYXBwLnYxLlJvdXRlck1vZGVsIi8KGlJlZnJlc2hSb3V0ZXJNb2RlbHNSZXF1ZXN0EhEKCXJvdXRlcl9pZBgBIAEoCSJgChtSZWZyZXNoUm91dGVyTW9kZWxzUmVzcG9uc2USEgoKZGlzY292ZXJlZBgBIAEoDRIRCglhdmFpbGFibGUYAiABKA0SGgoSbWFya2VkX3VuYXZhaWxhYmxlGAMgASgNImwKHlVwZGF0ZVJvdXRlck1vZGVsUG9saWN5UmVxdWVzdBIRCglyb3V0ZXJfaWQYASABKAkSEAoIbW9kZWxfaWQYAiABKAkSDwoHZW5hYmxlZBgDIAEoCBIUCgx1c2VyX2VuYWJsZWQYBCABKAgiTAofVXBkYXRlUm91dGVyTW9kZWxQb2xpY3lSZXNwb25zZRIpCgVtb2RlbBgBIAEoCzIaLmVuZ3JhbS5hcHAudjEuUm91dGVyTW9kZWwqrQEKE1JvdXRlck1vZGVsQXVkaWVuY2USJQohUk9VVEVSX01PREVMX0FVRElFTkNFX1VOU1BFQ0lGSUVEEAASHgoaUk9VVEVSX01PREVMX0FVRElFTkNFX1VTRVIQARImCiJST1VURVJfTU9ERUxfQVVESUVOQ0VfUFJPR1JBTU1BVElDEAISJwojUk9VVEVSX01PREVMX0FVRElFTkNFX0FETUlOX0NBVEFMT0cQAzLGAwoSTW9kZWxSb3V0ZXJTZXJ2aWNlEmMKEExpc3RNb2RlbFJvdXRlcnMSJi5lbmdyYW0uYXBwLnYxLkxpc3RNb2RlbFJvdXRlcnNSZXF1ZXN0GicuZW5ncmFtLmFwcC52MS5MaXN0TW9kZWxSb3V0ZXJzUmVzcG9uc2USYwoQTGlzdFJvdXRlck1vZGVscxImLmVuZ3JhbS5hcHAudjEuTGlzdFJvdXRlck1vZGVsc1JlcXVlc3QaJy5lbmdyYW0uYXBwLnYxLkxpc3RSb3V0ZXJNb2RlbHNSZXNwb25zZRJsChNSZWZyZXNoUm91dGVyTW9kZWxzEikuZW5ncmFtLmFwcC52MS5SZWZyZXNoUm91dGVyTW9kZWxzUmVxdWVzdBoqLmVuZ3JhbS5hcHAudjEuUmVmcmVzaFJvdXRlck1vZGVsc1Jlc3BvbnNlEngKF1VwZGF0ZVJvdXRlck1vZGVsUG9saWN5Ei0uZW5ncmFtLmFwcC52MS5VcGRhdGVSb3V0ZXJNb2RlbFBvbGljeVJlcXVlc3QaLi5lbmdyYW0uYXBwLnYxLlVwZGF0ZVJvdXRlck1vZGVsUG9saWN5UmVzcG9uc2ViBnByb3RvMw");
+  fileDesc("CiBlbmdyYW0vYXBwL3YxL21vZGVsX3JvdXRlci5wcm90bxINZW5ncmFtLmFwcC52MSK8AwoLTW9kZWxSb3V0ZXISCgoCaWQYASABKAkSDQoFbGFiZWwYAiABKAkSEwoLZGVzY3JpcHRpb24YAyABKAkSEQoJcHJvdG9jb2xzGAQgAygJEhkKEWNyZWRlbnRpYWxfc2VjcmV0GAUgASgJEhQKDGVncmVzc19ob3N0cxgGIAMoCRIdChVjcmVkZW50aWFsX2NvbmZpZ3VyZWQYByABKAgSJAoXbGFzdF9zdWNjZXNzZnVsX3N5bmNfYXQYCCABKAlIAIgBARIcCg9sYXN0X3N5bmNfZXJyb3IYCSABKAlIAYgBARITCgttb2RlbF9jb3VudBgKIAEoDRIdChVhdmFpbGFibGVfbW9kZWxfY291bnQYCyABKA0SGwoTZW5hYmxlZF9tb2RlbF9jb3VudBgMIAEoDRIVCg1kZWZhdWx0X21vZGVsGA0gASgJEhMKC3RpdGxlX21vZGVsGA4gASgJEhYKDmRlY2lzaW9uX21vZGVsGA8gASgJEhEKCWNvbm5lY3RvchgQIAEoCUIaChhfbGFzdF9zdWNjZXNzZnVsX3N5bmNfYXRCEgoQX2xhc3Rfc3luY19lcnJvciKZBAoLUm91dGVyTW9kZWwSEQoJcm91dGVyX2lkGAEgASgJEgoKAmlkGAIgASgJEhYKDmNhbm9uaWNhbF9zbHVnGAMgASgJEgwKBG5hbWUYBCABKAkSEwoGYXV0aG9yGAUgASgJSACIAQESGAoLZGVzY3JpcHRpb24YBiABKAlIAYgBARIWCg5jb250ZXh0X2xlbmd0aBgHIAEoBBIZCgxwcm9tcHRfcHJpY2UYCCABKAlIAogBARIdChBjb21wbGV0aW9uX3ByaWNlGAkgASgJSAOIAQESGAoQaW5wdXRfbW9kYWxpdGllcxgKIAMoCRIZChFvdXRwdXRfbW9kYWxpdGllcxgLIAMoCRIcChRzdXBwb3J0ZWRfcGFyYW1ldGVycxgMIAMoCRIcCg9odWdnaW5nX2ZhY2VfaWQYDSABKAlIBIgBARIRCglhdmFpbGFibGUYDiABKAgSDwoHZW5hYmxlZBgPIAEoCBIUCgx1c2VyX2VuYWJsZWQYECABKAgSFAoMdXBzdHJlYW1fdXJsGBEgASgJEhIKCnVwZGF0ZWRfYXQYEiABKAkSGgoSc3VwcG9ydHNfcmVhc29uaW5nGBMgASgIQgkKB19hdXRob3JCDgoMX2Rlc2NyaXB0aW9uQg8KDV9wcm9tcHRfcHJpY2VCEwoRX2NvbXBsZXRpb25fcHJpY2VCEgoQX2h1Z2dpbmdfZmFjZV9pZCIZChdMaXN0TW9kZWxSb3V0ZXJzUmVxdWVzdCJHChhMaXN0TW9kZWxSb3V0ZXJzUmVzcG9uc2USKwoHcm91dGVycxgBIAMoCzIaLmVuZ3JhbS5hcHAudjEuTW9kZWxSb3V0ZXIicgoXTGlzdFJvdXRlck1vZGVsc1JlcXVlc3QSEQoJcm91dGVyX2lkGAEgASgJEjQKCGF1ZGllbmNlGAIgASgOMiIuZW5ncmFtLmFwcC52MS5Sb3V0ZXJNb2RlbEF1ZGllbmNlEg4KBnNlYXJjaBgDIAEoCSJGChhMaXN0Um91dGVyTW9kZWxzUmVzcG9uc2USKgoGbW9kZWxzGAEgAygLMhouZW5ncmFtLmFwcC52MS5Sb3V0ZXJNb2RlbCIvChpSZWZyZXNoUm91dGVyTW9kZWxzUmVxdWVzdBIRCglyb3V0ZXJfaWQYASABKAkiYAobUmVmcmVzaFJvdXRlck1vZGVsc1Jlc3BvbnNlEhIKCmRpc2NvdmVyZWQYASABKA0SEQoJYXZhaWxhYmxlGAIgASgNEhoKEm1hcmtlZF91bmF2YWlsYWJsZRgDIAEoDSJsCh5VcGRhdGVSb3V0ZXJNb2RlbFBvbGljeVJlcXVlc3QSEQoJcm91dGVyX2lkGAEgASgJEhAKCG1vZGVsX2lkGAIgASgJEg8KB2VuYWJsZWQYAyABKAgSFAoMdXNlcl9lbmFibGVkGAQgASgIIkwKH1VwZGF0ZVJvdXRlck1vZGVsUG9saWN5UmVzcG9uc2USKQoFbW9kZWwYASABKAsyGi5lbmdyYW0uYXBwLnYxLlJvdXRlck1vZGVsIr0BCiBVcGRhdGVNb2RlbFJvdXRlclNldHRpbmdzUmVxdWVzdBIRCglyb3V0ZXJfaWQYASABKAkSGgoNZGVmYXVsdF9tb2RlbBgCIAEoCUgAiAEBEhgKC3RpdGxlX21vZGVsGAMgASgJSAGIAQESGwoOZGVjaXNpb25fbW9kZWwYBCABKAlIAogBAUIQCg5fZGVmYXVsdF9tb2RlbEIOCgxfdGl0bGVfbW9kZWxCEQoPX2RlY2lzaW9uX21vZGVsIk8KIVVwZGF0ZU1vZGVsUm91dGVyU2V0dGluZ3NSZXNwb25zZRIqCgZyb3V0ZXIYASABKAsyGi5lbmdyYW0uYXBwLnYxLk1vZGVsUm91dGVyKq0BChNSb3V0ZXJNb2RlbEF1ZGllbmNlEiUKIVJPVVRFUl9NT0RFTF9BVURJRU5DRV9VTlNQRUNJRklFRBAAEh4KGlJPVVRFUl9NT0RFTF9BVURJRU5DRV9VU0VSEAESJgoiUk9VVEVSX01PREVMX0FVRElFTkNFX1BST0dSQU1NQVRJQxACEicKI1JPVVRFUl9NT0RFTF9BVURJRU5DRV9BRE1JTl9DQVRBTE9HEAMyxgQKEk1vZGVsUm91dGVyU2VydmljZRJjChBMaXN0TW9kZWxSb3V0ZXJzEiYuZW5ncmFtLmFwcC52MS5MaXN0TW9kZWxSb3V0ZXJzUmVxdWVzdBonLmVuZ3JhbS5hcHAudjEuTGlzdE1vZGVsUm91dGVyc1Jlc3BvbnNlEmMKEExpc3RSb3V0ZXJNb2RlbHMSJi5lbmdyYW0uYXBwLnYxLkxpc3RSb3V0ZXJNb2RlbHNSZXF1ZXN0GicuZW5ncmFtLmFwcC52MS5MaXN0Um91dGVyTW9kZWxzUmVzcG9uc2USbAoTUmVmcmVzaFJvdXRlck1vZGVscxIpLmVuZ3JhbS5hcHAudjEuUmVmcmVzaFJvdXRlck1vZGVsc1JlcXVlc3QaKi5lbmdyYW0uYXBwLnYxLlJlZnJlc2hSb3V0ZXJNb2RlbHNSZXNwb25zZRJ4ChdVcGRhdGVSb3V0ZXJNb2RlbFBvbGljeRItLmVuZ3JhbS5hcHAudjEuVXBkYXRlUm91dGVyTW9kZWxQb2xpY3lSZXF1ZXN0Gi4uZW5ncmFtLmFwcC52MS5VcGRhdGVSb3V0ZXJNb2RlbFBvbGljeVJlc3BvbnNlEn4KGVVwZGF0ZU1vZGVsUm91dGVyU2V0dGluZ3MSLy5lbmdyYW0uYXBwLnYxLlVwZGF0ZU1vZGVsUm91dGVyU2V0dGluZ3NSZXF1ZXN0GjAuZW5ncmFtLmFwcC52MS5VcGRhdGVNb2RlbFJvdXRlclNldHRpbmdzUmVzcG9uc2ViBnByb3RvMw");
 
 /**
  * @generated from message engram.app.v1.ModelRouter
@@ -77,9 +77,29 @@ export type ModelRouter = Message<"engram.app.v1.ModelRouter"> & {
   enabledModelCount: number;
 
   /**
+   * The model in use for each role: the admin's choice, else the router's
+   * built-in model. Empty when the role has no model.
+   *
    * @generated from field: string default_model = 13;
    */
   defaultModel: string;
+
+  /**
+   * @generated from field: string title_model = 14;
+   */
+  titleModel: string;
+
+  /**
+   * @generated from field: string decision_model = 15;
+   */
+  decisionModel: string;
+
+  /**
+   * The connector that holds the router's key and host.
+   *
+   * @generated from field: string connector = 16;
+   */
+  connector: string;
 };
 
 /**
@@ -364,6 +384,58 @@ export const UpdateRouterModelPolicyResponseSchema: GenMessage<UpdateRouterModel
   messageDesc(file_engram_app_v1_model_router, 9);
 
 /**
+ * An absent model keeps the admin's choice for that role; an empty one
+ * clears it.
+ *
+ * @generated from message engram.app.v1.UpdateModelRouterSettingsRequest
+ */
+export type UpdateModelRouterSettingsRequest = Message<"engram.app.v1.UpdateModelRouterSettingsRequest"> & {
+  /**
+   * @generated from field: string router_id = 1;
+   */
+  routerId: string;
+
+  /**
+   * @generated from field: optional string default_model = 2;
+   */
+  defaultModel?: string;
+
+  /**
+   * @generated from field: optional string title_model = 3;
+   */
+  titleModel?: string;
+
+  /**
+   * @generated from field: optional string decision_model = 4;
+   */
+  decisionModel?: string;
+};
+
+/**
+ * Describes the message engram.app.v1.UpdateModelRouterSettingsRequest.
+ * Use `create(UpdateModelRouterSettingsRequestSchema)` to create a new message.
+ */
+export const UpdateModelRouterSettingsRequestSchema: GenMessage<UpdateModelRouterSettingsRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_model_router, 10);
+
+/**
+ * @generated from message engram.app.v1.UpdateModelRouterSettingsResponse
+ */
+export type UpdateModelRouterSettingsResponse = Message<"engram.app.v1.UpdateModelRouterSettingsResponse"> & {
+  /**
+   * @generated from field: engram.app.v1.ModelRouter router = 1;
+   */
+  router?: ModelRouter;
+};
+
+/**
+ * Describes the message engram.app.v1.UpdateModelRouterSettingsResponse.
+ * Use `create(UpdateModelRouterSettingsResponseSchema)` to create a new message.
+ */
+export const UpdateModelRouterSettingsResponseSchema: GenMessage<UpdateModelRouterSettingsResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_model_router, 11);
+
+/**
  * @generated from enum engram.app.v1.RouterModelAudience
  */
 export enum RouterModelAudience {
@@ -431,6 +503,14 @@ export const ModelRouterService: GenService<{
     methodKind: "unary";
     input: typeof UpdateRouterModelPolicyRequestSchema;
     output: typeof UpdateRouterModelPolicyResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.app.v1.ModelRouterService.UpdateModelRouterSettings
+   */
+  updateModelRouterSettings: {
+    methodKind: "unary";
+    input: typeof UpdateModelRouterSettingsRequestSchema;
+    output: typeof UpdateModelRouterSettingsResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_engram_app_v1_model_router, 0);

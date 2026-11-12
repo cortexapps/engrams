@@ -29,12 +29,15 @@ import type { AutomationDefinition, BlockDef, BlockOverrides, InputFieldSpec } f
 import { validateInputValues } from "../inputs.ts";
 import {
   listBuiltinAutomations,
+  DEFAULT_CONNECTION_PLACEHOLDER,
   mergeBuiltinOverrides,
   registerBuiltinAutomation,
   type BuiltinAutomation,
 } from "../engine/builtins.ts";
-import { DEFAULT_CONNECTION_PLACEHOLDER, PR_REVIEW_BUILTIN, PR_REVIEW_BUILTIN_KEY } from "./pr-review.ts";
-import { SLACK_BRAIN_BUILTIN } from "./slack-brain.ts";
+import { reviewVariants } from "../../forges/registry.ts";
+import { reviewBuiltin } from "./review.ts";
+import { chatThreadsBuiltin } from "./chat-threads.ts";
+import { threadsVariants } from "../../chat/registry.ts";
 
 const log = rootLog.child({ component: "builtin-seed" });
 
@@ -310,8 +313,8 @@ let registered = false;
 export function registerShippedBuiltins(): void {
   if (registered) return;
   registered = true;
-  registerBuiltinAutomation(PR_REVIEW_BUILTIN);
-  registerBuiltinAutomation(SLACK_BRAIN_BUILTIN);
+  for (const variant of reviewVariants()) registerBuiltinAutomation(reviewBuiltin(variant));
+  for (const variant of threadsVariants()) registerBuiltinAutomation(chatThreadsBuiltin(variant));
 }
 
 /** Production wiring; fire-and-forget at boot next to the reviewer-profile seed. */

@@ -326,8 +326,8 @@ pub enum SessionEvent {
         at: DateTime<Utc>,
     },
     /// ADR 0056: a third-party integration surfaced a typed asset/action
-    /// into the session. Subsumes the retired `PullRequestOpened` — an
-    /// opened PR is now `provider: "forge"`, `asset_kind: "pull_request"`.
+    /// into the session. An opened PR is the connector's provider (e.g.
+    /// `"github"`) with `asset_kind: "pull_request"`.
     /// `provider` + `asset_kind` discriminate; the web keys its renderer on
     /// that pair (with a generic fallback). The wire carries NO rendering
     /// instructions — presentation lives in the web/orchestrator layer
@@ -335,7 +335,7 @@ pub enum SessionEvent {
     /// reads. Always emitted coordinator-side at the broker seam, never a
     /// guest self-report of arbitrary metadata.
     IntegrationAsset {
-        /// The integration that produced this, e.g. `"forge"`. Namespaces
+        /// The connector provider that produced this, e.g. `"github"`. Namespaces
         /// `asset_kind` so two providers can't collide.
         provider: String,
         /// Provider-scoped type, e.g. `"pull_request"`.

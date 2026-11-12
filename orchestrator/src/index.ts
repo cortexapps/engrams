@@ -15,11 +15,8 @@ import meRoute from "./routes/me.ts";
 import adminRoute from "./routes/admin.ts";
 import integrationOpRoute from "./routes/integration-op.ts";
 import integrationOauthRoute from "./routes/integration-oauth.ts";
-import slackEventsRoute from "./routes/slack-events.ts";
-import slackInteractivityRoute from "./routes/slack-interactivity.ts";
-import githubEventsRoute from "./routes/github-events.ts";
-import linearEventsRoute from "./routes/linear-events.ts";
-import vantaEventsRoute from "./routes/vanta-events.ts";
+import integrationEventsRoute from "./routes/integration-events.ts";
+import { chatSpecs } from "./chat/registry.ts";
 import hooksRoute from "./routes/hooks.ts";
 import reviewsDispatchRoute from "./routes/reviews-dispatch.ts";
 import { makeGoogleOidcRoute } from "./routes/google-oidc.ts";
@@ -27,8 +24,6 @@ import { makeConnectionCredentialBrokerRoute } from "./routes/connection-credent
 import { makeOidcKeyAdminRoute } from "./routes/oidc-key-admin.ts";
 import { startOidcKeyRotation } from "./integrations/oidc-key-rotation.ts";
 import { makeIntegrationOidcKeyStore } from "./db/integration-oidc-keys.ts";
-// Importing registers the Slack adapter on the generic SDK seam.
-import "./integrations/slack.ts";
 import { makeShellUpgradeHandler } from "./routes/shell.ts";
 import { makeVncUpgradeHandler } from "./routes/vnc.ts";
 import { makeIdeRoute, makeIdeUpgradeHandler } from "./routes/ide.ts";
@@ -110,7 +105,7 @@ import { makeIntegrationConnectionStore } from "./db/integration-connections.ts"
 import { makeIntegrationEventStore } from "./db/integration-events.ts";
 import { registerAutomationDraftTools } from "./tools/automation-draft.ts";
 import { makeConnectorStore } from "./db/connectors.ts";
-import { loadRegistry } from "./connectors/registry.ts";
+import { connectorRegistry, declaredIngress, interactivityPath, loadRegistry } from "./connectors/registry.ts";
 import { tools } from "./tools/registry.ts";
 import { makeSessionFilesRoute } from "./routes/session-files.ts";
 import { makeSpecsRoute, PostgresSpecReadStore } from "./routes/specs.ts";
@@ -158,7 +153,7 @@ import {
 } from "./automations/builtins/seed.ts";
 import { retireProviderWebhookSchemes } from "./automations/retire-provider-webhooks.ts";
 import { makeAutomationStore } from "./db/automations.ts";
-import { makeGithubReviewPoster } from "./reviews/github-review.ts";
+import { forgeFor } from "./forges/registry.ts";
 import { DEFAULT_TARGET_HYDRATOR_CONFIG, TargetHydrator } from "./reviews/target-hydrator.ts";
 
 const app = new Hono();
@@ -441,17 +436,24 @@ app.route("/", adminRoute);
 app.route("/", integrationOpRoute);
 // OAuth acquisition for connectors with an `oauth` facet (e.g. Slack "Add to Slack").
 app.route("/", integrationOauthRoute);
-// ADR 0060: Slack external-trigger webhooks (events + interactivity). Both
-// verify every request with the SDK against the slack.signing_secret org secret.
-app.route("/", slackEventsRoute);
-app.route("/", slackInteractivityRoute);
-// ADR 0100: GitHub's signed webhook and the bearer-authenticated CI trigger
-// converge on the same durable per-PR workflow.
-app.route("/", githubEventsRoute);
-// Linear webhook ingress (ADR 0119 D5) — new with the integration-event ledger.
-app.route("/", linearEventsRoute);
-// Vanta webhook ingress: Svix-signed deliveries.
-app.route("/", vantaEventsRoute);
+// Provider event webhooks, verified against each connector's declared ingress.
+app.route("/", integrationEventsRoute);
+// A connector that declares interactivity makes the path public, so a
+// handler must be behind it, and a handler needs the declaration.
+const interactivity = new Map(chatSpecs().map((spec) => [spec.provider, spec.interactivity]));
+for (const provider of connectorRegistry().keys()) {
+  const declared = declaredIngress(provider)?.ingress.interactivity === true;
+  const route = interactivity.get(provider);
+  if (declared !== (route !== undefined)) {
+    throw new Error(`"${provider}": the connector and the chat provider disagree on interactivity`);
+  }
+  if (route) app.route(interactivityPath(provider), route());
+}
+for (const provider of interactivity.keys()) {
+  if (!connectorRegistry().has(provider)) {
+    throw new Error(`chat provider "${provider}" has no built-in connector`);
+  }
+}
 // ADR 0102: dynamically registered webhooks verify their own registration
 // secret and dispatch one-shot AutomationRunWorkflow occurrences.
 app.route("/", hooksRoute);
@@ -688,7 +690,7 @@ if (!config.sweepDisabled) {
 const targetHydrator = new TargetHydrator({
   config: DEFAULT_TARGET_HYDRATOR_CONFIG,
   store: makeReviewTargetHydrationStore(getDb()),
-  github: makeGithubReviewPoster(),
+  forge: forgeFor,
   now: () => new Date(),
   log: log.child({ component: "review-target-hydrator" }),
 });

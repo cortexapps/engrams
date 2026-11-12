@@ -59,6 +59,10 @@ impl Integration for StaticGitHubIntegration {
             expires_at: Utc::now() + Duration::hours(1),
         })
     }
+
+    fn git_forge_host(&self) -> Option<String> {
+        Some("github.com".to_string())
+    }
 }
 
 #[cfg(test)]

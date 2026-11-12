@@ -45,19 +45,18 @@ export function InputsForm({
   );
 }
 
-export function InputField({
-  spec,
-  value,
-  errors,
-  onChange,
-  disabled,
-}: {
+interface InputFieldProps {
   spec: InputFieldSpec;
   value: unknown;
   errors: InputFieldError[];
   onChange: (next: unknown) => void;
   disabled: boolean;
-}) {
+  /** The connection of the automation's trigger, for a map input's key picker. */
+  connectionId?: string;
+}
+
+export function InputField(props: InputFieldProps) {
+  const { spec, errors } = props;
   const topLevel = errors.find((e) => e.path === undefined)?.message;
   return (
     <Field data-invalid={topLevel ? true : undefined} data-testid={`input-${spec.key}`}>
@@ -66,31 +65,13 @@ export function InputField({
         {spec.required && <span className="text-destructive ml-1">*</span>}
       </FieldLabel>
       {spec.help && <FieldDescription>{spec.help}</FieldDescription>}
-      <InputControl
-        spec={spec}
-        value={value}
-        errors={errors}
-        onChange={onChange}
-        disabled={disabled}
-      />
+      <InputControl {...props} />
       {topLevel && <FieldError>{topLevel}</FieldError>}
     </Field>
   );
 }
 
-function InputControl({
-  spec,
-  value,
-  errors,
-  onChange,
-  disabled,
-}: {
-  spec: InputFieldSpec;
-  value: unknown;
-  errors: InputFieldError[];
-  onChange: (next: unknown) => void;
-  disabled: boolean;
-}) {
+function InputControl({ spec, value, errors, onChange, disabled, connectionId }: InputFieldProps) {
   switch (spec.type) {
     case "map":
       return (
@@ -102,6 +83,7 @@ function InputControl({
           onChange={onChange}
           errors={errors}
           disabled={disabled}
+          connectionId={connectionId}
         />
       );
     case "list":

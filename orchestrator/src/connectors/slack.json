@@ -271,7 +271,8 @@
     ],
     "ingress": {
       "scheme": "slack_v0",
-      "secretRef": "slack.signing_secret"
+      "secretRef": "slack.signing_secret",
+      "interactivity": true
     },
     "scope": {
       "key": "channels",

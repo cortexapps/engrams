@@ -2,8 +2,7 @@ import type { ModelRouterStore } from "../db/model-routers.ts";
 import { runIntegrationOp } from "../integrations/run-op.ts";
 import { errorMessage, log } from "../log.ts";
 import { getModelRouterDefinition, listModelRouterDefinitions } from "./registry.ts";
-import { isRouterConnected } from "./connected.ts";
-import { parseOpenRouterCatalog } from "./openrouter.ts";
+import { connectedRoutersOrNone } from "./connected.ts";
 
 export interface RouterCatalogRefreshResult {
   discovered: number;
@@ -25,7 +24,7 @@ export async function refreshRouterCatalog(
   if (!router) throw new Error(`unknown model router "${routerId}"`);
   const now = (deps.now ?? (() => new Date()))();
   try {
-    const response = await (deps.fetch ?? runIntegrationOp)(router.catalog.provider, {
+    const response = await (deps.fetch ?? runIntegrationOp)(router.connector, {
       method: "GET",
       path: router.catalog.path,
     });
@@ -33,7 +32,7 @@ export async function refreshRouterCatalog(
       throw new Error(`catalog returned HTTP ${response.status}`);
     }
     if (response.truncated) throw new Error("catalog response was truncated");
-    const models = parseOpenRouterCatalog(response.body);
+    const models = router.catalog.parse(response.body).map((model) => ({ ...model, routerId }));
     if (models.length === 0) throw new Error("catalog contained no eligible models");
     const { markedUnavailable } = await deps.store.replaceCatalog(routerId, models, now);
     log.info(
@@ -55,15 +54,8 @@ export class ModelRouterCatalogRefresher {
   constructor(private readonly deps: RouterCatalogDeps) {}
 
   async runOnce(): Promise<void> {
-    await Promise.allSettled(
-      listModelRouterDefinitions().map(async (router) => {
-        // A router without its credential is invisible to the product —
-        // refreshing its catalog would only hammer an API we cannot
-        // authenticate to and log failures nobody can act on.
-        if (!(await isRouterConnected(router.id))) return;
-        return refreshRouterCatalog(router.id, this.deps);
-      }),
-    );
+    const routers = await connectedRoutersOrNone();
+    await Promise.allSettled(routers.map((router) => refreshRouterCatalog(router.id, this.deps)));
   }
 
   start(): void {

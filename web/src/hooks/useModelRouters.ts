@@ -5,6 +5,7 @@ import {
   listModelRouters,
   listRouterModels,
   refreshRouterModels,
+  updateModelRouterSettings,
   updateRouterModelPolicy,
 } from "../gen/engram/app/v1/model_router-ModelRouterService_connectquery";
 import { RouterModelAudience } from "../gen/engram/app/v1/model_router_pb";
@@ -53,4 +54,10 @@ export function useRefreshRouterModels(routerId: string, search: string) {
 
 export function useUpdateRouterModelPolicy(routerId: string, search: string) {
   return useMutation(updateRouterModelPolicy, { onSuccess: useInvalidateRouter(routerId, search) });
+}
+
+export function useUpdateModelRouterSettings(routerId: string, search: string) {
+  return useMutation(updateModelRouterSettings, {
+    onSuccess: useInvalidateRouter(routerId, search),
+  });
 }

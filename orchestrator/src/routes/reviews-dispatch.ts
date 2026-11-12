@@ -6,6 +6,7 @@ import { Hono } from "hono";
 import { getSessionFromHeaders } from "../auth/session.ts";
 import { makeAutomationStore } from "../db/automations.ts";
 import { getDb } from "../db/client.ts";
+import { defaultForgeProvider } from "../forges/registry.ts";
 import { dispatchAutomationReview, type ReviewCoordinate } from "../reviews/automation-review.ts";
 import { makeEnrolledRepos, type EnrolledRepos } from "../reviews/enrolled-repos.ts";
 
@@ -15,7 +16,7 @@ type GetSession = (
 
 export interface ReviewsDispatchDeps {
   getSession?: GetSession;
-  /** The PR-review built-in's `repos` input: which repos get reviews. */
+  /** A code-review built-in's `repos` input: which repos get reviews. */
   enrolledRepos?: Pick<EnrolledRepos, "get">;
   /** Admit a built-in run for the coordinate; returns the run id. */
   dispatchAutomation?: (input: ReviewCoordinate) => Promise<string>;
@@ -48,13 +49,14 @@ export function makeReviewsDispatchRoute(
       return c.json({ error: "repo and positive pr_number are required" }, 400);
     }
 
-    if (!(await enrolledRepos().get(repo))) {
+    const provider = defaultForgeProvider();
+    if (!(await enrolledRepos().get(provider, repo))) {
       // A repo the built-in does not list is a stable resource miss, not a
       // transient conflict.
       return c.json({ error: "repo is not enrolled" }, 404);
     }
     // The run id is the DBOS workflow id, so the response shape holds.
-    const runId = await dispatchAutomation({ repo, prNumber });
+    const runId = await dispatchAutomation({ provider, repo, prNumber });
     return c.json({ workflow_id: runId });
   });
 

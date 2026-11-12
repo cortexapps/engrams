@@ -1,0 +1,37 @@
+{
+  "provider": "litellm",
+  "protocol": "http",
+  "display": {
+    "name": "LiteLLM",
+    "category": "AI",
+    "blurb": "LLM inference through your own LiteLLM proxy. Routes sessions to the proxy's models and powers orchestrator-side titles and decisions; grantable to sessions for chat completions.",
+    "icon": { "mono": "LL", "color": "#2f6f4f" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Authorization", "template": "Bearer {}", "secretRef": "litellm.api_key" }
+    ]
+  },
+  "hosts": [],
+  "settings": [
+    {
+      "name": "api_host",
+      "label": "Proxy host",
+      "kind": "host",
+      "options": [],
+      "custom": {
+        "label": "Your proxy",
+        "hint": "The hostname your LiteLLM proxy answers on over HTTPS, for example llm.example.com. No scheme, port, or path."
+      },
+      "hint": "Sessions and the orchestrator reach this host on port 443."
+    }
+  ],
+  "test": { "path": "/v1/models" },
+  "operations": [
+    {
+      "grants": ["chat:write"],
+      "match": { "method": "POST", "path": "/v1/chat/completions" }
+    }
+  ]
+}

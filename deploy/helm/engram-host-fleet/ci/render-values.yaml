@@ -3,6 +3,10 @@
 # `helm template` can never render; this file is the MINIMUM stub set
 # that satisfies the guards. It is not a deployment example. New
 # required-value guards must add a stub here or the lane goes red.
+blob:
+  backend: gcs
+  gcsBucket: ci-render-stub
 egress:
+  caSource: gcp-secret-manager
   caGcpCertSecret: projects/ci/secrets/ci-cert/versions/latest
   caGcpKeySecret: projects/ci/secrets/ci-key/versions/latest

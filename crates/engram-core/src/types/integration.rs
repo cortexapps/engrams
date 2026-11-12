@@ -186,7 +186,7 @@ pub struct IntegrationSecret {
 
 /// One Plane-B injection: on an outbound request to `hosts` matching the
 /// request policy (`methods` + `path_globs`), the proxy injects
-/// `header_name: <header_template with "{}" → the resolved secret>`. The
+/// `header_name: <header_template rendered with the resolved secret>`. The
 /// `secret_ref` is resolved by the coordinator's `SecretStore` host-side.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntegrationInject {

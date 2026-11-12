@@ -13,7 +13,7 @@ import {
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
 } from "@/components/ui/dropdown-menu";
-import { useConnectedRouters } from "@/hooks/useConnectedRouters";
+import { useCanDecide } from "@/hooks/useCanDecide";
 import { groupedBlockKinds, type BlockKindSpec } from "@/lib/automation-blocks";
 
 export interface BlockKindMenuProps {
@@ -33,8 +33,7 @@ function KindItem({ spec, onPick }: { spec: BlockKindSpec; onPick: (kind: string
 }
 
 export function BlockKindMenu({ onPick, align = "center", withAgent = false }: BlockKindMenuProps) {
-  const connectedRouters = useConnectedRouters();
-  const groups = groupedBlockKinds(connectedRouters, { withAgent });
+  const groups = groupedBlockKinds(useCanDecide() === true, { withAgent });
   const advanced = groups.find((group) => group.id === "advanced");
   const plain = groups.filter((group) => group.id !== "advanced");
   return (

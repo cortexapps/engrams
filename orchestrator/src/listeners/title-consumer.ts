@@ -22,20 +22,19 @@
  */
 
 import { and, eq, isNull, ne } from "drizzle-orm";
-import { APICallError, generateObject, RetryError } from "ai";
+import { generateObject } from "ai";
 import { z } from "zod";
 
 import type { CuratedEvent } from "../control-plane/session-events.ts";
 import { getDb } from "../db/client.ts";
 import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
-import { getOpenRouterClient } from "../integrations/openrouter.ts";
-import { isRouterConnected } from "../model-routers/connected.ts";
+import { titleModel } from "../model-routers/client.ts";
+import { isPermanentModelError } from "../model-routers/errors.ts";
 import { log as rootLog } from "../log.ts";
 import type { SessionConsumer } from "./consumer.ts";
 
 const log = rootLog.child({ component: "title-consumer" });
 
-const TITLE_MODEL = "deepseek/deepseek-v4-flash";
 /** Bound on the prompt text sent to the titling model. */
 const PROMPT_SLICE_CHARS = 2000;
 
@@ -81,12 +80,9 @@ export interface TitleConsumerDeps {
    *  Null for child tasks, review workers, ownerless automations, and
    *  unattributed sessions. */
   findTitleableTask(sessionId: string): Promise<TitleableTask | null>;
-  /** Whether the model router behind generateTitle is connected. A
-   *  false skips title generation entirely — the raw prompt title
-   *  stands (fresh deployments have no router key). */
-  routerConnected(): Promise<boolean>;
-  /** Ask the model for the title. May throw. */
-  generateTitle(prompt: string): Promise<string>;
+  /** Ask the model for the title. Null when no model router is connected:
+   *  the raw prompt title stands. May throw. */
+  generateTitle(prompt: string): Promise<string | null>;
   /** Write the title iff `suggested_title` is still NULL. */
   saveSuggestedTitle(taskId: string, title: string): Promise<void>;
   /** True for an error a retry cannot fix (bad key, bad model id). */
@@ -113,12 +109,7 @@ export function makeTitleConsumer(deps: TitleConsumerDeps): SessionConsumer {
       // must see a title written by an earlier event or a user rename.
       const task = await deps.findTitleableTask(ctx.sessionId);
       if (task === null || task.suggestedTitle != null || task.customTitle != null) return;
-      // No connected model router -> no title model to call. Keep the raw
-      // prompt title instead of walking generateTitle into a credential
-      // resolution that cannot succeed (a fresh deployment hits this on
-      // its very first task).
-      if (!(await deps.routerConnected())) return;
-      let title: string;
+      let title: string | null;
       try {
         title = await deps.generateTitle(prompt);
       } catch (err) {
@@ -136,6 +127,7 @@ export function makeTitleConsumer(deps: TitleConsumerDeps): SessionConsumer {
         );
         return;
       }
+      if (title === null) return;
       await deps.saveSuggestedTitle(task.taskId, title);
       log.info(
         { sessionId: ctx.sessionId, taskId: task.taskId, title },
@@ -171,11 +163,11 @@ export function makeProductionTitleConsumer(): SessionConsumer {
         ? { taskId: row.taskId, suggestedTitle: row.suggestedTitle, customTitle: row.customTitle }
         : null;
     },
-    routerConnected: () => isRouterConnected("openrouter"),
     async generateTitle(prompt) {
-      const openrouter = await getOpenRouterClient();
+      const model = await titleModel();
+      if (model === null) return null;
       const { object } = await generateObject({
-        model: openrouter.chat(TITLE_MODEL),
+        model,
         schema: titleSchema,
         system: TITLE_SYSTEM_PROMPT,
         prompt: prompt.slice(0, PROMPT_SLICE_CHARS),
@@ -188,16 +180,6 @@ export function makeProductionTitleConsumer(): SessionConsumer {
         .set({ suggestedTitle: title })
         .where(and(eq(taskTable.id, taskId), isNull(taskTable.suggestedTitle)));
     },
-    isPermanentError,
+    isPermanentError: isPermanentModelError,
   });
-}
-
-/** Permanent = an API rejection a retry cannot fix: an `APICallError` the SDK
- *  itself marks non-retryable (401 bad key, 400/404 bad model id). The SDK's
- *  internal retries surface as a `RetryError`; classify by its last cause.
- *  Everything else (429/5xx, network, an unreachable coordinator) is worth the
- *  pump's backoff — the attempt cap bounds the spend either way. */
-export function isPermanentError(err: unknown): boolean {
-  const cause = RetryError.isInstance(err) ? err.lastError : err;
-  return APICallError.isInstance(cause) && !cause.isRetryable;
 }

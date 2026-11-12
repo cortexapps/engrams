@@ -503,6 +503,50 @@ pub trait SandboxBackend: Send + Sync {
 
 Firecracker has no "exec a command in a running guest" primitive. Every guest runs `engram-agentd` (`crates/engram-agentd`) — a small Rust binary the stage-1 init copies out of its reserved bundle slot to `/run/engram/engram-agentd` and execs (ADR 0080; nothing engrams-owned is baked into the rootfs beyond the shim). It listens on AF_VSOCK port 1024 and proxies exec / stdin / stdout for the host agent. `SandboxBackend::exec_stream` on the Firecracker backend connects to Firecracker's vsock proxy at `<vsock_uds>`, performs the `CONNECT 1024\n` → `OK <peer_port>\n` handshake, sends a `WireExecRequest`, and streams `WireExecEvent`s back. Full design in the [In-guest agent](#in-guest-agent-engram-agentd) section below.
 
+### Integration roles (in `orchestrator/`)
+
+The product features that talk to an outside service go through three role seams. A
+provider's code is under `orchestrator/src/providers/<name>/`; its connector JSON under
+`orchestrator/src/connectors/` declares the hosts, the credential, the webhook, and the
+actions. The guard for each fact is the test named beside it.
+
+| Role | Interface | Registry | Implementations |
+|---|---|---|---|
+| Git forge | `GitForge` (`forges/forge.ts`) | `forges/registry.ts` | GitHub, GitLab |
+| Chat | `ChatProvider` (`chat/chat.ts`) | `chat/registry.ts` | Slack |
+| Model router | `ModelRouterSpec` (`model-routers/registry.ts`) | the same file | OpenRouter, LiteLLM |
+
+- Code outside `providers/` names no provider. Four files are the exception, each with its
+  reason in the test (`only the listed files name a provider outside src/providers`).
+- A role lookup with no implementation is an error or `null`, never another provider. A
+  stored row or block config from before the roles names no provider; it means the
+  provider whose spec has `legacyDefault`.
+- Every provider's webhooks arrive on one route, `/api/v1/integrations/:provider/events`.
+  The connector's `webhook.ingress.scheme` selects the verifier in `automations/verify.ts`;
+  the provider supplies an `IntegrationEventSource` that says what a verified delivery
+  means.
+- A built-in automation is a family: one builder holds the graph, and each provider fills
+  a variant (`ReviewVariant`, `ThreadsVariant`). Each variant is its own built-in row with
+  its own key and settings. The GitHub and Slack variants build the definitions that
+  shipped before the roles (`the PR review definition hash is unchanged`,
+  `the Slack threads definition hash is unchanged`); a changed hash stops every active run
+  of that built-in.
+- A forge builds every link to itself (`GitForge.links`); the review API sends the links
+  and the web does not build them (`GetReview sends the forge's links for the pass and its
+  findings`).
+- A forge that can check a commenter's permission and edit one comment has `typedReview`.
+  Its review variant uses the typed `review_facts` block; GitHub's variant keeps its
+  QuickJS facts step, because its definition hash must not change.
+- A router with no native decisions endpoint answers a `decide` block with a structured
+  chat completion. A router with no built-in model for a role needs an admin's choice
+  before a feature that uses the role is offered.
+- Git credentials follow the session's capabilities. A forge that mints short-lived tokens
+  (GitHub) answers git's credential helper in the guest. A forge with a static token
+  (GitLab, Azure DevOps) has git path rules in its connector, and the egress proxy adds
+  the token; the token is never in the guest.
+- A `pr_ref` row is unique per `(provider, repo, pr_number)`. One connection per provider:
+  an org can use GitHub and GitLab together, but not two GitLab hosts.
+
 ---
 
 ## Communication architecture

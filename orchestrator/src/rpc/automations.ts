@@ -48,7 +48,7 @@ import { inputErrorField, validateInputValues } from "../automations/inputs.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import { makeModelRouterStore, type ModelRouterStore } from "../db/model-routers.ts";
-import { getModelRouterDefinition, selectRouterProtocol } from "../model-routers/registry.ts";
+import { resolveRouterSelection } from "../model-routers/registry.ts";
 import { harnessCatalog as defaultHarnessCatalog } from "../control-plane/client.ts";
 import { log as rootLog } from "../log.ts";
 import type { HarnessCatalogClient } from "./task-create.ts";
@@ -104,7 +104,8 @@ import {
   type AutomationSender,
 } from "../automations/engine/inbox.ts";
 import type { AutomationDispatchStore } from "../db/automations.ts";
-import { getSlackClient } from "../integrations/slack.ts";
+import { defaultChatProvider, requireChat } from "../chat/registry.ts";
+import { defaultForgeProvider } from "../forges/registry.ts";
 import { makeLinearIssueClient } from "../integrations/linear-issues.ts";
 import type { WebhookAliasMapping } from "../automations/template.ts";
 
@@ -432,118 +433,10 @@ function toProtoRegistration(row: WebhookRegistrationRow): ProtoWebhookRegistrat
 // Production input-key options
 // ---------------------------------------------------------------------------
 
-/** The page shape `conversations.list` answers with (the `WebClient` method,
- * narrowed to what the walk reads). */
-export interface SlackChannelPages {
-  conversations: {
-    list(args: {
-      limit: number;
-      exclude_archived: boolean;
-      types: string;
-      cursor?: string;
-    }): Promise<{
-      channels?: Array<{ id?: string; name?: string }>;
-      response_metadata?: { next_cursor?: string };
-    }>;
-  };
-}
-
 const log = rootLog.child({ component: "automations-rpc" });
 
 /** Keys one describe call may carry: a page of threads, not a workspace. */
 const DESCRIBE_INPUT_KEYS_MAX = 200;
-
-/** Slack's ceiling for one `conversations.list` page. */
-const SLACK_CHANNEL_PAGE_SIZE = 1000;
-/** Pages of `conversations.list` to walk before giving up — 100k virtual
- * rows, archived channels included (see below). A workspace past that
- * lists its first 100k and the log says so. */
-const SLACK_CHANNEL_PAGE_LIMIT = 100;
-
-/** `conversations.info`, narrowed to what the lookup reads. */
-export interface SlackChannelInfo {
-  conversations: {
-    info(args: { channel: string }): Promise<{ channel?: { id?: string; name?: string } }>;
-  };
-}
-
-/** Channel names change rarely; a page re-render must not be a Slack call
- * per thread row. */
-const SLACK_CHANNEL_NAME_TTL_MS = 10 * 60_000;
-const SLACK_CHANNEL_LOOKUP_CONCURRENCY = 4;
-const slackChannelNameCache = new Map<string, { label: string; expiresAt: number }>();
-
-/** "#name" for each channel id, by `conversations.info` — a lookup of the
- * ids a page shows, never a walk of the workspace. A channel the app cannot
- * see (not a member of a private one, or gone) is labelled with its id.
- * Request order is kept; duplicates collapse. */
-export async function describeSlackChannels(
-  client: SlackChannelInfo,
-  keys: readonly string[],
-  cache: Map<string, { label: string; expiresAt: number }> = slackChannelNameCache,
-  now: () => number = Date.now,
-): Promise<Array<{ key: string; label: string }>> {
-  const ids = [...new Set(keys)];
-  const labels = new Map<string, string>();
-  const pending: string[] = [];
-  for (const id of ids) {
-    const hit = cache.get(id);
-    if (hit && hit.expiresAt > now()) labels.set(id, hit.label);
-    else pending.push(id);
-  }
-  const lookup = async (id: string) => {
-    let label = id;
-    try {
-      const result = await client.conversations.info({ channel: id });
-      if (result.channel?.name) label = `#${result.channel.name}`;
-    } catch (error) {
-      log.warn({ channel: id, err: error }, "slack channel lookup failed; showing the id");
-    }
-    labels.set(id, label);
-    cache.set(id, { label, expiresAt: now() + SLACK_CHANNEL_NAME_TTL_MS });
-  };
-  for (let i = 0; i < pending.length; i += SLACK_CHANNEL_LOOKUP_CONCURRENCY) {
-    await Promise.all(pending.slice(i, i + SLACK_CHANNEL_LOOKUP_CONCURRENCY).map(lookup));
-  }
-  return ids.map((id) => ({ key: id, label: labels.get(id) ?? id }));
-}
-
-/** Every channel the app can see, public and private alike (a thread in a
- * private channel needs a name as much as a public one's), as key options.
- * Slack pages the list by cursor, and `exclude_archived` is applied AFTER
- * a virtual page of `limit` rows is cut — a workspace with years of
- * archived channels answers every page with a handful of live ones (one
- * in ten was seen in practice). One page is never the whole workspace,
- * so the walk follows `next_cursor` until it is empty. */
-export async function listSlackChannelOptions(
-  client: SlackChannelPages,
-): Promise<Array<{ key: string; label: string }>> {
-  const options: Array<{ key: string; label: string }> = [];
-  let cursor: string | undefined;
-  for (let page = 0; ; page += 1) {
-    if (page === SLACK_CHANNEL_PAGE_LIMIT) {
-      log.warn(
-        { pages: page, channels: options.length },
-        "slack channel list: page cap reached; the list is incomplete",
-      );
-      break;
-    }
-    const result = await client.conversations.list({
-      limit: SLACK_CHANNEL_PAGE_SIZE,
-      exclude_archived: true,
-      types: "public_channel,private_channel",
-      ...(cursor !== undefined ? { cursor } : {}),
-    });
-    for (const c of result.channels ?? []) {
-      if (typeof c.id !== "string") continue;
-      options.push({ key: c.id, label: c.name ? `#${c.name}` : c.id });
-    }
-    const next = result.response_metadata?.next_cursor;
-    if (!next) break;
-    cursor = next;
-  }
-  return options;
-}
 
 function productionInputKeyOptions(
   integrationEvents: () => Pick<IntegrationEventStore, "listObservedScopeValues">,
@@ -553,17 +446,17 @@ function productionInputKeyOptions(
     async list(noun, connectionId) {
       switch (noun) {
         case "repository": {
-          // Repositories observed on the GitHub connection's ledger: the
-          // installation-repos capability is not exposed to the orchestrator.
+          // Repositories observed on the forge connection's ledger: the
+          // orchestrator has no call that lists a forge's repositories.
           const connection = connectionId
             ? { id: connectionId }
-            : await connections().getDefault("github");
+            : await connections().getDefault(defaultForgeProvider());
           if (!connection) return [];
           const repos = await integrationEvents().listObservedScopeValues(connection.id);
           return repos.map((repo) => ({ key: repo, label: repo }));
         }
         case "channel":
-          return listSlackChannelOptions(await getSlackClient());
+          return requireChat(defaultChatProvider()).listChannels();
         case "team": {
           const workspace = await makeLinearIssueClient().readWorkspace();
           return workspace.teams.map((team) => ({ key: team.id, label: team.name }));
@@ -575,7 +468,7 @@ function productionInputKeyOptions(
     async describe(noun, keys, _connectionId) {
       switch (noun) {
         case "channel":
-          return describeSlackChannels(await getSlackClient(), keys);
+          return requireChat(defaultChatProvider()).describeChannels(keys);
         case "team": {
           const workspace = await makeLinearIssueClient().readWorkspace();
           const names = new Map(workspace.teams.map((team) => [team.id, team.name]));
@@ -740,25 +633,17 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
                 : undefined;
             const effort = typeof config["effort"] === "string" ? config["effort"] : undefined;
             if (routerId !== undefined) {
-              const router = getModelRouterDefinition(routerId);
-              if (!router) {
+              const selection = await resolveRouterSelection({
+                routerId,
+                harness,
+                harnessProtocols: descriptor.routerProtocols ?? [],
+                ...(model !== undefined
+                  ? { model: { id: model, exists: async (r, m) => (await modelRouters().getModel(r, m)) !== null } }
+                  : {}),
+              });
+              if (!selection.ok) {
                 throw new BlockValidationError([
-                  blockError(where, "modelRouter", "unknown_router", `model router "${routerId}" is not registered`),
-                ]);
-              }
-              if (!selectRouterProtocol(router, descriptor.routerProtocols ?? [])) {
-                throw new BlockValidationError([
-                  blockError(
-                    where,
-                    "modelRouter",
-                    "unsupported_router",
-                    `harness "${harness}" does not support model router "${router.id}"`,
-                  ),
-                ]);
-              }
-              if (model !== undefined && !(await modelRouters().getModel(router.id, model))) {
-                throw new BlockValidationError([
-                  blockError(where, "model", "unknown_model", `model "${model}" is not in router "${router.id}"`),
+                  blockError(where, selection.field, selection.code, selection.message),
                 ]);
               }
             } else if (model !== undefined && !(descriptor.models ?? []).some((m) => m.id === model)) {

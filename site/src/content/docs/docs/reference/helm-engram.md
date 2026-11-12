@@ -81,9 +81,9 @@ at boot.
 |---|---|
 | `replicaCount`, `image`, `imagePullSecrets` | Coordinator replicas and image. The defaults point at the published images on GHCR. |
 | `mode` | `coordinator` for a real deployment. `all` runs a host agent inside the coordinator pod and is for single-binary development only. |
-| `blob` | `backend` (`gcs`, `s3`, `local`), and the bucket, region, and endpoint for it. The key names match the fleet chart so the two agree. |
-| `kek` | The master-key provider and its key: `env-var` with `envVarName`, or `aws-kms` with `awsKeyId`. |
-| `secrets` | The secret backend, `gcp` with `gcpProjectId` or `aws`. |
+| `blob` | `backend` (`gcs`, `s3`, `local`; required), and the bucket, region, and endpoint for it. The key names match the fleet chart so the two agree. |
+| `kek` | The master-key `provider` (required) and its key: `env-var` with `envVarName`, or `aws-kms` with `awsKeyId`. |
+| `secrets` | The secret `backend` (required): `gcp` with `gcpProjectId`, `aws`, or `env`. |
 | `database` | The Secret and key that hold `DATABASE_URL`. |
 | `auth` | The Secret and key that hold the machine bearer tokens. |
 | `appGrpc` | The coordinator's private RPC port for the orchestrator, and the Secret with its bearer. Required in production; an empty bearer refuses every call. |

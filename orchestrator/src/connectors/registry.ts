@@ -39,7 +39,8 @@ import { join } from "node:path";
 // ---------------------------------------------------------------------------
 
 /** One injected auth header. `{}` in `template` is replaced by the resolved
- * secret value host-side (e.g. `"Bearer {}"`, default `"{}"`). `secretRef` names
+ * secret value host-side (e.g. `"Bearer {}"`, default `"{}"`); `{basic:USER}`
+ * by the HTTP Basic credential base64(`USER:secret`). `secretRef` names
  * the org secret for a static connector; on an oauth-facet connector it is
  * ABSENT — the value is the connector's OAuth access token, resolved and
  * refreshed from the coordinator's sealed credential store (ADR 0106 addendum). */
@@ -123,6 +124,10 @@ export interface Operation {
   grants: string[];
   /** Either an HTTP match (`method`/`path`) or a GraphQL match (`operation`/`field`). */
   match?: HttpMatch | GraphqlMatch;
+  /** Replaces the credential's header template on this operation, for a path
+   * that takes the same secret in another form (git over HTTPS takes a token
+   * as a Basic password). */
+  template?: string;
   asset?: AssetSpec;
 }
 
@@ -458,8 +463,17 @@ export interface WebhookEventSpec {
 /** Provider-owned ingress (ADR 0119 D5): how the integration event route
  * verifies deliveries and which sealed org secret signs them. */
 export interface WebhookIngressSpec {
-  scheme: "github_hmac_sha256" | "slack_v0" | "linear_hmac_sha256" | "svix_hmac_sha256";
+  scheme:
+    | "github_hmac_sha256"
+    | "slack_v0"
+    | "linear_hmac_sha256"
+    | "svix_hmac_sha256"
+    | "gitlab_webhook";
   secretRef: string;
+  /** The provider also sends card clicks, signed the same way, to
+   * `interactivityPath(provider)`. The path takes
+   * requests with no login. */
+  interactivity?: true;
 }
 
 /** Provider-specific coarse scope: one payload path whose value a trigger can
@@ -1518,6 +1532,7 @@ const INGRESS_SCHEMES: ReadonlySet<WebhookIngressSpec["scheme"]> = new Set([
   "slack_v0",
   "linear_hmac_sha256",
   "svix_hmac_sha256",
+  "gitlab_webhook",
 ]);
 const MAX_EVENT_DESCRIPTION_LENGTH = 300;
 const FIELD_SCHEMA_MAX_DEPTH = 8;
@@ -1785,13 +1800,20 @@ export function parseWebhookFacet(where: string, raw: unknown): WebhookFacet {
     ) {
       fail(
         where,
-        '"webhook.ingress.scheme" must be "github_hmac_sha256", "slack_v0", "linear_hmac_sha256", or "svix_hmac_sha256"',
+        `"webhook.ingress.scheme" must be one of ${[...INGRESS_SCHEMES].join(", ")}`,
       );
     }
     if (typeof i.secretRef !== "string" || !/^\S+$/.test(i.secretRef)) {
       fail(where, '"webhook.ingress.secretRef" must be a non-empty org-secret name');
     }
-    ingress = { scheme: i.scheme as WebhookIngressSpec["scheme"], secretRef: i.secretRef };
+    if (i.interactivity !== undefined && i.interactivity !== true) {
+      fail(where, '"webhook.ingress.interactivity" must be true when present');
+    }
+    ingress = {
+      scheme: i.scheme as WebhookIngressSpec["scheme"],
+      secretRef: i.secretRef,
+      ...(i.interactivity === true ? { interactivity: true as const } : {}),
+    };
   }
 
   let scope: WebhookScopeSpec | undefined;
@@ -2027,6 +2049,20 @@ function parseActionIdempotency(where: string, raw: unknown): ActionIdempotency 
   }
 }
 
+/** A header template names the secret as `{}` or as `{basic:USER}`. The
+ * renderer reads a `{basic:` up to the next `}`, so one that is not a whole
+ * placeholder is refused. */
+const TEMPLATE_PLACEHOLDER_RE = /\{\}|\{basic:[A-Za-z0-9_.-]*\}/;
+const MALFORMED_BASIC_RE = /\{basic:(?![A-Za-z0-9_.-]*\})/;
+
+function assertHeaderTemplate(where: string, field: string, value: unknown): asserts value is string {
+  if (typeof value !== "string") fail(where, `"${field}" must be a string`);
+  if (/[\r\n]/.test(value)) fail(where, `"${field}" must not contain newlines`);
+  if (!TEMPLATE_PLACEHOLDER_RE.test(value) || MALFORMED_BASIC_RE.test(value)) {
+    fail(where, `"${field}" must contain the "{}" or "{basic:USER}" value placeholder`);
+  }
+}
+
 /** Validate + narrow one raw connector object. Throws Error on any malformation. */
 export function parseConnector(
   raw: unknown,
@@ -2060,11 +2096,7 @@ export function parseConnector(
         if (typeof inj.secretRef !== "string" || !inj.secretRef) fail(iw, '"secretRef" must be a non-empty string');
         if (/\s/.test(inj.secretRef)) fail(iw, '"secretRef" must not contain whitespace');
       }
-      if (inj.template !== undefined) {
-        if (typeof inj.template !== "string") fail(iw, '"template" must be a string');
-        if (/[\r\n]/.test(inj.template)) fail(iw, '"template" must not contain newlines');
-        if (!inj.template.includes("{}")) fail(iw, '"template" must contain the "{}" value placeholder');
-      }
+      if (inj.template !== undefined) assertHeaderTemplate(iw, "template", inj.template);
       let injectHosts: string[] | undefined;
       if (inj.hosts !== undefined) {
         injectHosts = asStringArray(iw, "hosts", inj.hosts);
@@ -2148,6 +2180,13 @@ export function parseConnector(
         match = { ...(typeof m.method === "string" ? { method: m.method } : {}), ...(typeof m.path === "string" ? { path: m.path } : {}) };
       }
     }
+    if (op.template !== undefined) {
+      assertHeaderTemplate(opWhere, "template", op.template);
+      // One template cannot render two different headers.
+      if (credential.source !== "inject" || credential.injects.length !== 1 || !match || isGraphqlMatch(match)) {
+        fail(opWhere, '"template" needs an inject credential with one header and an HTTP match');
+      }
+    }
     let asset: AssetSpec | undefined;
     if (op.asset !== undefined) {
       if (typeof op.asset !== "object" || op.asset === null) fail(opWhere, '"asset" must be an object');
@@ -2204,7 +2243,12 @@ export function parseConnector(
         ...(urlFallback ? { urlFallback } : {}),
       };
     }
-    return { grants, ...(match ? { match } : {}), ...(asset ? { asset } : {}) };
+    return {
+      grants,
+      ...(match ? { match } : {}),
+      ...(typeof op.template === "string" ? { template: op.template } : {}),
+      ...(asset ? { asset } : {}),
+    };
   });
 
   const display = parseDisplay(where, o.display, o.provider, opts.builtin === true);
@@ -2413,9 +2457,7 @@ export function parseConnector(
       if (typeof inj.header !== "string" || !HEADER_NAME_RE.test(inj.header)) {
         fail(uw, '"inject.header" must be a valid HTTP header name');
       }
-      if (typeof inj.template !== "string" || !inj.template.includes("{}") || /[\r\n]/.test(inj.template)) {
-        fail(uw, '"inject.template" must be a string containing the "{}" placeholder and no newlines');
-      }
+      assertHeaderTemplate(uw, "inject.template", inj.template);
       userInject = { header: inj.header, template: inj.template };
     }
     if (credential.source === "inject") {
@@ -2533,6 +2575,21 @@ function loadFromDisk(): Map<string, Connector> {
 export function connectorRegistry(): Map<string, Connector> {
   if (cachedRegistry === null) cachedRegistry = loadFromDisk();
   return cachedRegistry;
+}
+
+/** Where a chat provider's card clicks arrive. The route mount and the
+ * public-path rule both read it. */
+export function interactivityPath(provider: string): string {
+  return `/api/v1/integrations/${provider}/interactivity`;
+}
+
+/** The ingress a built-in connector declares, if any. */
+export function declaredIngress(
+  provider: string,
+): { displayName: string; ingress: WebhookIngressSpec } | undefined {
+  const connector = connectorRegistry().get(provider);
+  const ingress = connector?.webhook?.ingress;
+  return connector && ingress ? { displayName: connector.display.name, ingress } : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -2695,7 +2752,7 @@ export function compileIntegrationPolicy(
           const entry: IntegrationInjectJson = {
             hosts: inj.hosts ?? hosts,
             header_name: inj.header,
-            header_template: inj.template ?? "{}",
+            header_template: op.template ?? inj.template ?? "{}",
             secret_ref: userScoped ? "" : (inj.secretRef ?? ""),
             mint_source: userScoped
               ? userMintSource()
@@ -2989,6 +3046,9 @@ export interface ProviderCatalogEntry {
    * decide this by hard-coding the one provider it knew was named.
    */
   connectionModel: "singleton" | "named";
+  /** Whether the connector declares webhook events, and actions. */
+  hasEvents: boolean;
+  hasActions: boolean;
   /** ADR 0115: user-scoped credential support, when declared. `tokenHint` is
    * the member-facing setup line for PAT mode. Drives the profile editor's
    * per-integration toggle and the Settings → Credentials cards. */
@@ -3040,6 +3100,8 @@ export function buildProviderCatalog(
       hosts: effectiveHosts(connector, resolveSettings(connector, settingsByProvider[connector.provider])),
       capabilities: [...byAction.values()],
       connectionModel: "singleton",
+      hasEvents: (connector.webhook?.events.length ?? 0) > 0,
+      hasActions: (connector.actions?.length ?? 0) > 0,
       ...(connector.userCredential
         ? {
             userCredential: {
@@ -3082,6 +3144,8 @@ export function buildProviderCatalog(
         ...(operation.endpointRule ? { endpointRule: operation.endpointRule } : {}),
       })),
       connectionModel: "named",
+      hasEvents: false,
+      hasActions: false,
     });
   }
   entries.sort((a, b) => a.provider.localeCompare(b.provider));

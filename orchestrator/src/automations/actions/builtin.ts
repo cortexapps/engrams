@@ -2,60 +2,27 @@
  *
  * Connector `actions[]` entries with `execute.kind: "builtin"` name an id
  * from connectors/builtin-actions-allowlist.ts; this module holds the TS
- * implementations. Every provider call rides an injected seam (runOp, the
- * Slack SDK client, the Linear GraphQL client) so tests never touch the
- * network or the coordinator.
+ * implementations. Every provider call rides an injected seam, so tests
+ * never touch the network or the coordinator.
  */
 
-import {
-  makeGithubReviewPoster,
-  type GithubReviewPoster,
-  type InlineComment,
-} from "../../reviews/github-review.ts";
+import { ForgeRequestError, type GitForge, type InlineComment } from "../../forges/forge.ts";
+import { forgeProviders, requireForge } from "../../forges/registry.ts";
 import {
   runIntegrationOp as defaultRunIntegrationOp,
   type RunOpDeps,
 } from "../../integrations/run-op.ts";
-import type { KnownBlock } from "@slack/types";
-
-import { getSlackClient } from "../../integrations/slack.ts";
-import { buildMessageBlocks } from "../../integrations/slack-blocks.ts";
-import { replyText, type SlackReply } from "../../integrations/slack-message-text.ts";
+import { SLACK_ACTIONS, type SlackChatClient } from "../../providers/slack/actions.ts";
+import { getSlackClient } from "../../providers/slack/client.ts";
 import {
   makeLinearIssueClient,
   type LinearIssueClient,
 } from "../../integrations/linear-issues.ts";
 import { actionClientId } from "./client-id.ts";
 import { IntegrationActionError } from "./errors.ts";
+import { optionalString, requireString } from "./params.ts";
 
 type RunIntegrationOp = typeof defaultRunIntegrationOp;
-
-/** The narrow Slack surface the builtins use (structural, fake-friendly;
- * WebClient satisfies it because these argument shapes inhabit its unions). */
-export interface SlackChatClient {
-  chat: {
-    postMessage(args: {
-      channel: string;
-      text: string;
-      thread_ts?: string;
-    }): Promise<{ ts?: string; channel?: string }>;
-    update(args: {
-      channel: string;
-      ts: string;
-      text: string;
-      blocks: KnownBlock[];
-    }): Promise<{ ts?: string; channel?: string }>;
-  };
-  conversations: {
-    join(args: { channel: string }): Promise<{ channel?: { id?: string } }>;
-    replies(args: {
-      channel: string;
-      ts: string;
-      oldest?: string;
-      limit?: number;
-    }): Promise<{ messages?: SlackReply[] }>;
-  };
-}
 
 export interface BuiltinActionContext {
   runId: string;
@@ -65,8 +32,7 @@ export interface BuiltinActionContext {
 }
 
 export interface BuiltinActionDeps {
-  runOp: RunIntegrationOp;
-  githubPoster(): GithubReviewPoster;
+  forge(provider: string): GitForge;
   slackClient(): Promise<SlackChatClient>;
   linearClient(): LinearIssueClient;
 }
@@ -82,60 +48,29 @@ export type BuiltinActionTable = Record<string, BuiltinActionFn>;
 export function defaultBuiltinActionDeps(runOpDeps?: RunOpDeps): BuiltinActionDeps {
   const runOp: RunIntegrationOp = (provider, req) => defaultRunIntegrationOp(provider, req, runOpDeps);
   return {
-    runOp,
-    githubPoster: () => makeGithubReviewPoster({ runIntegrationOp: runOp }),
+    forge: (provider) => requireForge(provider, { runIntegrationOp: runOp }),
     slackClient: () => getSlackClient(runOpDeps),
     linearClient: () => makeLinearIssueClient({ runIntegrationOp: runOp }),
   };
 }
 
-function requireString(params: Record<string, unknown>, key: string): string {
-  const value = params[key];
-  if (typeof value !== "string" || value === "") {
-    throw new IntegrationActionError(`missing required string "${key}"`, true);
-  }
-  return value;
-}
-
-function optionalString(params: Record<string, unknown>, key: string): string | undefined {
-  const value = params[key];
-  return typeof value === "string" && value !== "" ? value : undefined;
-}
-
-const REVIEW_SCAN_PAGES = 3;
-const REVIEW_SCAN_PER_PAGE = 50;
-
-/** Scan the PR's reviews for a marker string — the crash-window guard between
- * a posted review and its checkpoint (generalizes the review product's
- * alreadyPosted, which hardcodes its own marker shape). */
-async function markerAlreadyPosted(
-  runOp: RunIntegrationOp,
+async function hasReviewWithMarker(
+  forge: GitForge,
   repo: string,
   prNumber: number,
   marker: string,
 ): Promise<boolean> {
-  for (let page = 1; page <= REVIEW_SCAN_PAGES; page += 1) {
-    const response = await runOp("github", {
-      method: "GET",
-      path: `/repos/${repo}/pulls/${prNumber}/reviews?per_page=${REVIEW_SCAN_PER_PAGE}&page=${page}`,
-      contentType: "application/json",
-    });
-    if (response.status < 200 || response.status >= 300) {
-      throw new IntegrationActionError(
-        `list pull request reviews returned ${response.status}`,
-        response.status >= 400 && response.status < 500 && response.status !== 429,
-        response.status,
-      );
-    }
-    const value: unknown = JSON.parse(new TextDecoder().decode(response.body));
-    if (!Array.isArray(value)) return false;
-    for (const review of value) {
-      const body = (review as { body?: unknown }).body;
-      if (typeof body === "string" && body.includes(marker)) return true;
-    }
-    if (value.length < REVIEW_SCAN_PER_PAGE) return false;
+  try {
+    return await forge.hasReviewWithMarker(repo, prNumber, marker);
+  } catch (error) {
+    if (!(error instanceof ForgeRequestError)) throw error;
+    const { status } = error;
+    throw new IntegrationActionError(
+      status >= 400 ? `list pull request reviews returned ${status}` : error.message,
+      status >= 400 && status < 500 && status !== 429,
+      status,
+    );
   }
-  return false;
 }
 
 function readComments(params: Record<string, unknown>): InlineComment[] {
@@ -153,7 +88,7 @@ function readComments(params: Record<string, unknown>): InlineComment[] {
       throw new IntegrationActionError(`comments[${i}] needs path, line, body`, true);
     }
     // A caller with a findings ledger (the PR-review built-in's review_settle
-    // output) names each comment's finding so the ledger row and the GitHub
+    // output) names each comment's finding so the ledger row and the posted
     // comment stay linked; a caller without one gets a positional id.
     const findingId = typeof record["finding_id"] === "string" ? record["finding_id"] : `automation:${i}`;
     const startLine = typeof record["start_line"] === "number" ? record["start_line"] : undefined;
@@ -168,103 +103,123 @@ function readComments(params: Record<string, unknown>): InlineComment[] {
   });
 }
 
-export const BUILTIN_ACTIONS: BuiltinActionTable = {
-  "github.post_pr_review": async (params, ctx, deps) => {
+/** Post a review on a pull request of `provider`'s forge. */
+function postPrReview(provider: string): BuiltinActionFn {
+  return async (params, ctx, deps) => {
+    const forge = deps.forge(provider);
     const repo = requireString(params, "repo");
     const prNumber = params["prNumber"];
     if (typeof prNumber !== "number") {
       throw new IntegrationActionError(`missing required integer "prNumber"`, true);
     }
     const summary = requireString(params, "summary");
-    // The body for the 422 fallback (GitHub refused an inline anchor): a
-    // caller with a findings ledger passes one that re-quotes every finding,
-    // so a summary-only review loses nothing. Without it the summary is the
-    // body either way.
+    // The body for a review the forge takes only without its inline
+    // comments: a caller with a findings ledger passes one that quotes every
+    // finding. Without it the summary is the body either way.
     const fallbackSummary = optionalString(params, "fallbackSummary") ?? summary;
     const marker = ctx.marker ?? `<!-- engrams-automation:${ctx.runId}:${ctx.stepPath} -->`;
-    if (await markerAlreadyPosted(deps.runOp, repo, prNumber, marker)) {
+    // The guard for a crash between a posted review and its checkpoint.
+    if (await hasReviewWithMarker(forge, repo, prNumber, marker)) {
       return { posted: false, already_posted: true };
     }
-    const poster = deps.githubPoster();
     const commitId =
-      optionalString(params, "commitId") ?? (await poster.fetchPrContext(repo, prNumber)).headSha;
-    const result = await poster.postReview({
+      optionalString(params, "commitId") ?? (await forge.fetchPullRequest(repo, prNumber)).headSha;
+    const result = await forge.postReview({
       repo,
       prNumber,
       commitId,
       buildSummary: (inlinePosted) => `${inlinePosted ? summary : fallbackSummary}\n\n${marker}`,
+      marker,
       comments: readComments(params),
     });
     return {
       posted: result.posted,
       inline_posted: result.inlinePosted,
       already_posted: false,
-      ...(result.githubReviewId !== undefined ? { github_review_id: result.githubReviewId } : {}),
+      // The output name is in stored automations; it is the forge's review id.
+      ...(result.providerReviewId !== undefined ? { github_review_id: result.providerReviewId } : {}),
     };
-  },
+  };
+}
 
-  "slack.post_message": async (params, _ctx, deps) => {
-    const client = await deps.slackClient();
-    const threadTs = optionalString(params, "threadTs");
-    const response = await client.chat.postMessage({
-      channel: requireString(params, "channel"),
-      text: requireString(params, "text"),
-      ...(threadTs !== undefined ? { thread_ts: threadTs } : {}),
-    });
-    return { ts: response.ts ?? null, channel: response.channel ?? null };
-  },
+function forgeFailure(error: unknown): never {
+  if (!(error instanceof ForgeRequestError)) throw error;
+  const { status } = error;
+  throw new IntegrationActionError(error.message, status >= 400 && status < 500 && status !== 429, status);
+}
 
-  "slack.join_channel": async (params, _ctx, deps) => {
-    // Rung 2 companion: message events only flow where the bot is a channel
-    // MEMBER, so a flow that claims `slack:<channel>` joins first.
-    // conversations.join is idempotent for public channels (already-in →
-    // ok with a warning); private channels need a human /invite and fail
-    // here with Slack's typed error.
-    const client = await deps.slackClient();
-    const response = await client.conversations.join({
-      channel: requireString(params, "channel"),
-    });
-    return { channel: response.channel?.id ?? null };
-  },
+function requireMarker(ctx: BuiltinActionContext): string {
+  if (ctx.marker === null) {
+    throw new IntegrationActionError("this action needs marker_comment idempotency", true);
+  }
+  return ctx.marker;
+}
 
-  "slack.list_replies": async (params, _ctx, deps) => {
-    // One page of a thread, every content surface of each message rendered
-    // to text (text, blocks, attachments, files — the legacy `replyText`).
-    // The caller folds it into a prompt; this action only reads.
-    const client = await deps.slackClient();
-    const oldest = optionalString(params, "oldest");
-    const response = await client.conversations.replies({
-      channel: requireString(params, "channel"),
-      ts: requireString(params, "threadTs"),
-      ...(oldest !== undefined ? { oldest } : {}),
-      limit: 500,
-    });
-    return {
-      // `subtype` is on every Slack message the API returns but not on the
-      // SDK's reply type; widen the one field honestly.
-      messages: (response.messages ?? []).map((m: SlackReply & { subtype?: string }) => ({
-        ts: m.ts ?? "",
-        user: m.user ?? "",
-        bot_id: m.bot_id ?? "",
-        subtype: m.subtype ?? "",
-        text: replyText(m),
-      })),
-    };
-  },
+function requireComments(forge: GitForge): NonNullable<GitForge["typedReview"]> {
+  if (!forge.typedReview) {
+    throw new IntegrationActionError(`"${forge.provider}" has no comment action`, true);
+  }
+  return forge.typedReview;
+}
 
-  "slack.update_message": async (params, _ctx, deps) => {
-    const client = await deps.slackClient();
-    // The message becomes exactly this text: its blocks are replaced too, so
-    // updating an interactive card (a choice) removes its buttons.
-    const text = requireString(params, "text");
-    const response = await client.chat.update({
-      channel: requireString(params, "channel"),
-      ts: requireString(params, "ts"),
-      text,
-      blocks: buildMessageBlocks(text),
-    });
-    return { ts: response.ts ?? null, channel: response.channel ?? null };
-  },
+/** Post a comment on a pull request once per marker: a later call with the
+ * same marker returns the id of the comment an earlier call posted. */
+function upsertPrComment(provider: string): BuiltinActionFn {
+  return async (params, ctx, deps) => {
+    const forge = deps.forge(provider);
+    const comments = requireComments(forge);
+    const repo = requireString(params, "repo");
+    const number = params["number"];
+    if (typeof number !== "number") {
+      throw new IntegrationActionError(`missing required integer "number"`, true);
+    }
+    const marker = requireMarker(ctx);
+    const existing = await forge.findCommentWithMarker(repo, number, marker);
+    if (existing !== null) return { commentId: String(existing["id"]) };
+    try {
+      const body = `${requireString(params, "body")}\n\n${marker}`;
+      return { commentId: await comments.createComment(repo, number, body) };
+    } catch (error) {
+      return forgeFailure(error);
+    }
+  };
+}
+
+/** Rewrite a comment that `upsert_pr_comment` posted. The marker goes back
+ * on the new body, so a later upsert still finds the comment. */
+function updatePrComment(provider: string): BuiltinActionFn {
+  return async (params, ctx, deps) => {
+    const comments = requireComments(deps.forge(provider));
+    const commentId = requireString(params, "commentId");
+    try {
+      await comments.updateComment(
+        requireString(params, "repo"),
+        commentId,
+        `${requireString(params, "body")}\n\n${requireMarker(ctx)}`,
+      );
+    } catch (error) {
+      return forgeFailure(error);
+    }
+    return { commentId };
+  };
+}
+
+export const BUILTIN_ACTIONS: BuiltinActionTable = {
+  ...Object.fromEntries(
+    forgeProviders().flatMap((provider) => [
+      [`${provider}.post_pr_review`, postPrReview(provider)],
+      // A forge with no comment methods posts its comments as plain HTTP
+      // actions of its connector.
+      ...(requireForge(provider).typedReview
+        ? [
+            [`${provider}.upsert_pr_comment`, upsertPrComment(provider)],
+            [`${provider}.update_pr_comment`, updatePrComment(provider)],
+          ]
+        : []),
+    ]),
+  ),
+
+  ...SLACK_ACTIONS,
 
   "linear.create_issue": async (params, ctx, deps) => {
     // CreateLinearIssueInput takes a caller-minted id (the in-repo spec-ticket

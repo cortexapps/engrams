@@ -1,15 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
-import {
-  DecisionsApiError,
-  makeDecisionsClient,
-  type DecisionsRequest,
-} from "../integrations/openrouter-decisions.ts";
+import { DecisionsApiError } from "../model-routers/decisions.ts";
+import { makeDecisionsClient } from "../providers/openrouter/decisions.ts";
 
-const REQUEST: DecisionsRequest = {
+const REQUEST = {
   model: "typesafe/jev-1.13",
   state: "the build is red on main",
-  questions: { urgent: { type: "noul", instructions: "Is this urgent?" } },
+  questions: { urgent: { type: "noul" as const, instructions: "Is this urgent?" } },
 };
 
 function clientReturning(status: number, body: string, seen?: Request[]) {

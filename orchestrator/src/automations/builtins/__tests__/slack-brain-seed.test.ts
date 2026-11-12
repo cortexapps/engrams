@@ -6,8 +6,12 @@
 import { describe, expect, test } from "bun:test";
 
 import type { AutomationRow, AutomationVersionRow } from "../../../db/automations.ts";
-import { SLACK_BRAIN_BUILTIN, SLACK_BRAIN_BUILTIN_KEY } from "../slack-brain.ts";
+import { chatThreadsBuiltin } from "../chat-threads.ts";
+import { SLACK_THREADS } from "../../../providers/slack/threads-variant.ts";
 import { seedBuiltinAutomations, type BuiltinSeedStore } from "../seed.ts";
+
+const SLACK_BRAIN_BUILTIN = chatThreadsBuiltin(SLACK_THREADS);
+const SLACK_BRAIN_BUILTIN_KEY = SLACK_THREADS.key;
 
 const NOW = new Date("2026-08-21T00:00:00Z");
 

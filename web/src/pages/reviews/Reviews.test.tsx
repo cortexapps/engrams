@@ -25,6 +25,7 @@ const newerPass = {
   finderSessionId: "finder-sess-2",
   verifierSessionId: "verifier-sess-2",
   prTitle: "Bump quinn-proto from 0.11.14 to 0.11.16",
+  prUrl: "https://github.com/cortexapps/engrams/pull/100",
   prAuthor: "dependabot[bot]",
   headBranch: "dependabot/cargo/quinn-proto-0.11.16",
   baseBranch: "main",
@@ -65,6 +66,8 @@ const findings = [
     evidence: ["src/index.ts", "src/validate.ts"],
     state: "posted",
     githubThreadId: "998877",
+    fileUrl: "https://github.com/cortexapps/engrams/blob/cccccccccccccccc/src/index.ts#L10-L12",
+    threadUrl: "https://github.com/cortexapps/engrams/pull/100#discussion_r998877",
     resolution: "fixed",
     sessionId: "finder-sess-1",
   },
@@ -150,6 +153,8 @@ const view: {
    *  from the passes in hand. */
   totalCount: number | undefined;
   hasNextPage: boolean;
+  /** The automation run behind the open pass, as GetReview sends it. */
+  run: { automationRunId: string; automationId?: string } | undefined;
 } = {
   id: "review-1",
   status: "posted",
@@ -158,6 +163,7 @@ const view: {
   others: [],
   totalCount: undefined,
   hasNextPage: false,
+  run: undefined,
 };
 const retryMutate = vi.fn<(input: { id: string }, options?: { onSuccess?: () => void }) => void>();
 /** What the ledger and the rail asked the server for, newest call last. */
@@ -211,6 +217,7 @@ vi.mock("../../hooks/useReviews", () => ({
     data: {
       review: {
         ...olderPass,
+        ...view.run,
         status: view.status,
         active: ["queued", "finding", "verifying"].includes(view.status),
       },
@@ -289,6 +296,7 @@ beforeEach(() => {
   view.others = [];
   view.totalCount = undefined;
   view.hasNextPage = false;
+  view.run = undefined;
   listParams.length = 0;
   observed.length = 0;
   localStorage.clear();
@@ -469,7 +477,7 @@ describe("Reviews ledger", () => {
 });
 
 describe("Review dossier", () => {
-  it("names the PR once, with a single way over to GitHub", async () => {
+  it("names the PR once, with a single way over to the forge", async () => {
     renderWithProviders(<ReviewDossier />);
 
     expect(await screen.findByText("Bump quinn-proto from 0.11.14 to 0.11.16")).toBeTruthy();
@@ -477,9 +485,26 @@ describe("Review dossier", () => {
     expect(screen.getByText("main ← dependabot/cargo/quinn-proto-0.11.16")).toBeTruthy();
     expect(screen.getByText("+12 −4 across 2 files")).toBeTruthy();
 
-    const gh = screen.getAllByRole("link", { name: /GitHub/i });
+    const gh = screen.getAllByRole("link", { name: /Open the pull request/i });
     expect(gh).toHaveLength(1);
     expect(gh[0]!.getAttribute("href")).toBe("https://github.com/cortexapps/engrams/pull/100");
+  });
+
+  it("links a pass to its run in the automation that ran it", async () => {
+    view.run = { automationRunId: "autorun:auto-9:d1", automationId: "auto-9" };
+    renderWithProviders(<ReviewDossier />);
+
+    const run = await screen.findByRole("link", { name: "Run" });
+    expect(run.getAttribute("href")).toContain("/automations/auto-9");
+    expect(decodeURIComponent(run.getAttribute("href") ?? "")).toContain("run=autorun:auto-9:d1");
+  });
+
+  it("shows no run link when the server names no automation", async () => {
+    view.run = { automationRunId: "autorun:auto-9:d1" };
+    renderWithProviders(<ReviewDossier />);
+
+    await screen.findByRole("link", { name: /Open the pull request/i });
+    expect(screen.queryByRole("link", { name: "Run" })).toBeNull();
   });
 
   // A pass is an address, not a section: it costs one line, and its siblings live
@@ -695,8 +720,6 @@ describe("Review dossier", () => {
     renderWithProviders(<ReviewDossier />);
 
     const code = await screen.findByRole("link", { name: /View the code/i });
-    // Pinned to headSha, not a branch: lines that have shifted since are worse
-    // than no link at all.
     expect(code.getAttribute("href")).toBe(
       "https://github.com/cortexapps/engrams/blob/cccccccccccccccc/src/index.ts#L10-L12",
     );

@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
+import { Link } from "@tanstack/react-router";
 import { ExternalLink, KeyRound, RefreshCw, Route, Search } from "lucide-react";
 
 import { PageHeading } from "../page-heading";
@@ -6,6 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import {
   Table,
@@ -21,10 +23,12 @@ import {
   useInvalidateRouter,
   useRefreshRouterModels,
   useRouterModels,
+  useUpdateModelRouterSettings,
   useUpdateRouterModelPolicy,
 } from "@/hooks/useModelRouters";
 import type { ModelRouter, RouterModel } from "@/gen/engram/app/v1/model_router_pb";
 import { EmptyState } from "@/components/empty-state";
+import { errorMessage } from "@/lib/errors";
 import { SkeletonRows } from "@/components/skeleton-rows";
 
 export function ModelRoutersPanel() {
@@ -54,6 +58,7 @@ function RouterCard({ router }: { router: ModelRouter }) {
   const { data, isLoading, error } = useRouterModels(router.id, search);
   const refresh = useRefreshRouterModels(router.id, search);
   const update = useUpdateRouterModelPolicy(router.id, search);
+  const settings = useUpdateModelRouterSettings(router.id, search);
   const putSecret = usePutOrgSecret();
   const invalidate = useInvalidateRouter(router.id, search);
   const [secret, setSecret] = useState("");
@@ -105,7 +110,9 @@ function RouterCard({ router }: { router: ModelRouter }) {
                     : `Set ${router.credentialSecret}`
                 }
                 aria-label={
-                  router.credentialConfigured ? "Replacement OpenRouter key" : "OpenRouter key"
+                  router.credentialConfigured
+                    ? `Replacement ${router.label} key`
+                    : `${router.label} key`
                 }
                 className="border-0 bg-transparent font-mono shadow-none focus-visible:ring-0"
               />
@@ -127,9 +134,36 @@ function RouterCard({ router }: { router: ModelRouter }) {
                 </span>
               ))}
               <span className="mx-1 text-muted-foreground">→</span>
-              <span className="font-mono">{router.egressHosts.join(", ")}</span>
+              {router.egressHosts.length > 0 ? (
+                <span className="font-mono">{router.egressHosts.join(", ")}</span>
+              ) : (
+                <Link
+                  to="/settings/integrations/$provider"
+                  params={{ provider: router.connector }}
+                  className="underline underline-offset-2"
+                >
+                  Set the host
+                </Link>
+              )}
             </div>
           </div>
+
+          <div className="mt-3 grid gap-3 sm:grid-cols-3">
+            {ROLE_FIELDS.map(({ field, label, help }) => (
+              <RoleModelField
+                key={field}
+                id={`${router.id}-${field}`}
+                label={label}
+                help={help}
+                stored={router[field]}
+                models={models}
+                onSave={(model) => settings.mutateAsync({ routerId: router.id, [field]: model })}
+              />
+            ))}
+          </div>
+          <p className="mt-1 text-xs text-muted-foreground">
+            An empty role uses the router&apos;s built-in model, when it has one.
+          </p>
 
           <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-xs text-muted-foreground">
             <span>{router.availableModelCount.toLocaleString()} available</span>
@@ -188,6 +222,94 @@ function RouterCard({ router }: { router: ModelRouter }) {
   );
 }
 
+const ROLE_FIELDS = [
+  { field: "defaultModel", label: "Default model", help: "A routed session with no model." },
+  { field: "titleModel", label: "Title model", help: "Session titles." },
+  { field: "decisionModel", label: "Decision model", help: "Decide blocks and smart routing." },
+] as const;
+
+/** One role's model id. It saves on blur or Enter, and keeps the typed
+ * value until the save succeeds. Escape drops the typed value. An empty
+ * value clears the stored choice. The listed models are suggestions: the
+ * server checks the id. */
+function RoleModelField({
+  id,
+  label,
+  help,
+  stored,
+  models,
+  onSave,
+}: {
+  id: string;
+  label: string;
+  help: string;
+  stored: string;
+  models: RouterModel[];
+  onSave: (model: string) => Promise<unknown>;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  // The fields share one mutation, whose state is that of its last call.
+  // So each field holds the result of its own save.
+  const [error, setError] = useState<string | null>(null);
+  // The value of this field's save in flight: a blur after Enter must not
+  // send it again. Another field, or a newer value, saves on its own.
+  const sent = useRef<string | null>(null);
+  const commit = () => {
+    const next = draft?.trim();
+    if (next === undefined || next === sent.current) return;
+    if (next === stored) {
+      setDraft(null);
+      return;
+    }
+    sent.current = next;
+    setError(null);
+    onSave(next)
+      .then(
+        () => setDraft((now) => (now?.trim() === next ? null : now)),
+        // A newer value is the field's state now; its save reports for it.
+        (cause: unknown) => {
+          if (sent.current === next) setError(errorMessage(cause));
+        },
+      )
+      .finally(() => {
+        if (sent.current === next) sent.current = null;
+      });
+  };
+  return (
+    <div className="space-y-1">
+      <Label htmlFor={id} className="text-xs">
+        {label}
+      </Label>
+      <Input
+        id={id}
+        list={`${id}-models`}
+        value={draft ?? stored}
+        placeholder="none"
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={commit}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") commit();
+          if (event.key === "Escape") setDraft(null);
+        }}
+        className="bg-background/80 font-mono text-xs"
+      />
+      <datalist id={`${id}-models`}>
+        {models
+          .filter((model) => model.available)
+          .map((model) => (
+            <option key={model.id} value={model.id} />
+          ))}
+      </datalist>
+      <p className="text-xs text-muted-foreground">{help}</p>
+      {error && (
+        <EmptyState tone="error" inline>
+          Could not save — {error}
+        </EmptyState>
+      )}
+    </div>
+  );
+}
+
 function ModelTable({
   models,
   busy,
@@ -220,14 +342,16 @@ function ModelTable({
               <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
                 {model.author && <span>{model.author}</span>}
                 <span className="font-mono">{model.id}</span>
-                <a
-                  href={model.upstreamUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  aria-label={`Open ${model.name} on OpenRouter`}
-                >
-                  <ExternalLink className="size-3" />
-                </a>
+                {model.upstreamUrl && (
+                  <a
+                    href={model.upstreamUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    aria-label={`Open the ${model.name} model page`}
+                  >
+                    <ExternalLink className="size-3" />
+                  </a>
+                )}
                 {model.huggingFaceId && (
                   <a
                     className="underline-offset-2 hover:underline"

@@ -9,6 +9,7 @@ import { getSessionFromHeaders } from "../auth/session.ts";
 import { requireUser } from "./require.ts";
 import { makeAutomationStore } from "../db/automations.ts";
 import { getDb } from "../db/client.ts";
+import { forgeFor } from "../forges/registry.ts";
 import { retryAutomationReview } from "../reviews/automation-review.ts";
 import { makeEnrolledRepos, type EnrolledRepos } from "../reviews/enrolled-repos.ts";
 import {
@@ -40,11 +41,17 @@ export type GetSession = (
 export interface ReviewDeps {
   getSession?: GetSession;
   reviews?: ReviewStore;
-  /** The PR-review built-in's `repos` input: which repos get reviews. */
+  /** A code-review built-in's `repos` input: which repos get reviews. */
   enrolledRepos?: Pick<EnrolledRepos, "get">;
   db?: ReturnType<typeof getDb>;
-  /** Admit a fresh built-in run for the review's original trigger. */
-  retryAutomation?: (automationRunId: string) => Promise<string>;
+  /** Admit a fresh run of the forge's built-in for the review's original trigger. */
+  retryAutomation?: (automationRunId: string, provider: string) => Promise<string>;
+  runs?: RunAutomations;
+}
+
+/** Which automation a run belongs to. */
+interface RunAutomations {
+  getRun(id: string): Promise<{ automationId: string } | null>;
 }
 
 function findingCounts(findings: ReviewFindingRow[]): FindingCounts {
@@ -64,7 +71,16 @@ function findingCounts(findings: ReviewFindingRow[]): FindingCounts {
   return counts;
 }
 
+/** The pull request's URL: the stored one, else the one the forge builds
+ * from the coordinates. */
+function prUrlOf(row: ReviewRow): string | undefined {
+  // A stored "" is a URL nobody knew, not a URL.
+  return (row.prUrl || forgeFor(row.provider)?.links.pullRequest(row.repo, row.prNumber)) ?? undefined;
+}
+
 function reviewToProto(row: ReviewRow, counts: FindingCounts): ReviewProto {
+  const links = forgeFor(row.provider)?.links;
+  const prUrl = prUrlOf(row);
   return {
     id: row.id,
     repo: row.repo,
@@ -84,7 +100,10 @@ function reviewToProto(row: ReviewRow, counts: FindingCounts): ReviewProto {
     targetId: row.targetId,
     provider: row.provider,
     ...(row.providerId != null ? { providerId: row.providerId } : {}),
-    ...(row.prUrl != null ? { prUrl: row.prUrl } : {}),
+    ...(prUrl !== undefined ? { prUrl } : {}),
+    ...(links && prUrl !== undefined && row.githubReviewId != null
+      ? { postedReviewUrl: links.review(prUrl, row.githubReviewId) }
+      : {}),
     ...(row.prTitle != null ? { prTitle: row.prTitle } : {}),
     ...(row.prAuthor != null ? { prAuthor: row.prAuthor } : {}),
     ...(row.headBranch != null ? { headBranch: row.headBranch } : {}),
@@ -106,8 +125,23 @@ function listReviewToProto(row: ReviewListRow): ReviewProto {
   return reviewToProto(row, row.findingCounts);
 }
 
-function findingToProto(row: ReviewFindingRow): ReviewFindingProto {
+function findingToProto(row: ReviewFindingRow, review: ReviewRow): ReviewFindingProto {
+  const links = forgeFor(review.provider)?.links;
+  const prUrl = prUrlOf(review);
   return {
+    ...(links && prUrl !== undefined
+      ? {
+          // The commit the pass read: the branch has moved since.
+          fileUrl: links.file(prUrl, {
+            repo: review.repo,
+            sha: review.headSha,
+            path: row.path,
+            startLine: row.startLine,
+            endLine: row.endLine,
+          }),
+          ...(row.githubThreadId != null ? { threadUrl: links.comment(prUrl, row.githubThreadId) } : {}),
+        }
+      : {}),
     id: row.id,
     reviewId: row.reviewId,
     path: row.path,
@@ -155,11 +189,14 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
   let store = deps?.reviews;
   const reviews = (): ReviewStore =>
     (store ??= makeReviewStore(deps?.db ?? getDb()));
+  let automations = deps?.runs;
+  const runs = (): RunAutomations =>
+    (automations ??= makeAutomationStore(deps?.db ?? getDb()));
   let enrolled = deps?.enrolledRepos;
   const enrolledRepos = (): Pick<EnrolledRepos, "get"> =>
     (enrolled ??= makeEnrolledRepos(makeAutomationStore(deps?.db ?? getDb())));
   const retryAutomation =
-    deps?.retryAutomation ?? ((runId: string) => retryAutomationReview(runId));
+    deps?.retryAutomation ?? retryAutomationReview;
 
   router.service(ReviewService, {
     async listReviews(req, ctx) {
@@ -186,13 +223,18 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
       await requireUser(ctx, getSession);
       const detail = await reviews().getReview(req.id);
       if (!detail) throw new ConnectError("not found", Code.NotFound);
-      const [events, passes] = await Promise.all([
+      const { automationRunId } = detail.review;
+      const [events, passes, run] = await Promise.all([
         reviews().listEvents(req.id),
         reviews().listPasses(detail.review.targetId),
+        automationRunId ? runs().getRun(automationRunId) : null,
       ]);
       return {
-        review: reviewToProto(detail.review, findingCounts(detail.findings)),
-        findings: detail.findings.map(findingToProto),
+        review: {
+          ...reviewToProto(detail.review, findingCounts(detail.findings)),
+          ...(run ? { automationId: run.automationId } : {}),
+        },
+        findings: detail.findings.map((finding) => findingToProto(finding, detail.review)),
         verdicts: detail.verdicts.map(verdictToProto),
         events: events.map(eventToProto),
         passes: passes.map(listReviewToProto),
@@ -210,8 +252,8 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
       }
       const detail = await reviews().getReview(id);
       if (!detail) throw new ConnectError("not found", Code.NotFound);
-      const { repo } = detail.review;
-      if (!(await enrolledRepos().get(repo))) {
+      const { provider, repo } = detail.review;
+      if (!(await enrolledRepos().get(provider, repo))) {
         throw new ConnectError("repo is not enrolled", Code.FailedPrecondition);
       }
       // A retry admits a fresh built-in run with the ORIGINAL run's trigger
@@ -223,7 +265,7 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
           Code.FailedPrecondition,
         );
       }
-      const runId = await retryAutomation(detail.review.automationRunId);
+      const runId = await retryAutomation(detail.review.automationRunId, provider);
       return { workflowId: runId };
     },
   });

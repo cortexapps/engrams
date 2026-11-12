@@ -708,6 +708,20 @@
       "when": 1793241391817,
       "tag": "0100_profile_programmatic_only",
       "breakpoints": true
+    },
+    {
+      "idx": 101,
+      "version": "7",
+      "when": 1794414748842,
+      "tag": "0101_router_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 102,
+      "version": "7",
+      "when": 1794419068710,
+      "tag": "0102_pr_ref_provider",
+      "breakpoints": true
     }
   ]
 }
