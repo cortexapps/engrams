@@ -15,9 +15,10 @@
  *      bootstrap-admin list, and better-auth links a first OAuth sign-in to an
  *      existing user by it. A provider that lets a user type any address into
  *      a profile field would otherwise let that user become anyone.
- *      Microsoft Entra ID never sends `email_verified`. For the Entra issuer the
- *      gate accepts its optional claim `xms_edov` (email domain owner
- *      verified) instead, which is Microsoft's own signal for trusting `email`.
+ *      Microsoft Entra ID never sends `email_verified`. For the Entra issuer,
+ *      when `email_verified` is absent, the gate accepts its optional claim
+ *      `xms_edov` (email domain owner verified) instead, which is Microsoft's
+ *      own signal for trusting `email`.
  *
  *   2. The allowlist. A user is allowed when the email is in `emails`, or the
  *      domain the provider vouches for is in `domains`. `domains: ["*"]`
@@ -49,8 +50,16 @@ export type OAuthRejection = "email_missing" | "email_not_verified" | "account_n
 
 const GOOGLE_ISSUER = "https://accounts.google.com";
 
-/** Entra ID's tenant-specific v2 issuer. A token never carries `common` or `organizations`. */
-const ENTRA_ISSUER = /^https:\/\/login\.microsoftonline\.com\/[0-9a-f-]{36}\/v2\.0$/;
+/**
+ * Entra ID's tenant-specific issuers: v2 (`login.microsoftonline.com/<tenant>/v2.0`) and
+ * v1 (`sts.windows.net/<tenant>/`). Both token versions carry `xms_edov`. A token never
+ * carries `common` or `organizations`. National clouds and External ID are left out:
+ * Microsoft does not document `xms_edov` for them.
+ */
+const ENTRA_ISSUERS = [
+  /^https:\/\/login\.microsoftonline\.com\/[0-9a-f-]{36}\/v2\.0$/,
+  /^https:\/\/sts\.windows\.net\/[0-9a-f-]{36}$/,
+];
 
 /** Consumer Gmail: the only addresses Google vouches for without an `hd` claim. */
 const GMAIL_DOMAINS: ReadonlySet<string> = new Set(["gmail.com", "googlemail.com"]);
@@ -92,9 +101,10 @@ export function isGoogleIssuer(issuer: string): boolean {
   return issuer.replace(/\/$/, "") === GOOGLE_ISSUER;
 }
 
-/** Is this issuer a tenant-specific Microsoft Entra ID v2 issuer? (Selects the `xms_edov` rule.) */
+/** Is this issuer a tenant-specific Microsoft Entra ID issuer? (Selects the `xms_edov` rule.) */
 export function isEntraIssuer(issuer: string): boolean {
-  return ENTRA_ISSUER.test(issuer.replace(/\/$/, ""));
+  const normalized = issuer.replace(/\/$/, "");
+  return ENTRA_ISSUERS.some((re) => re.test(normalized));
 }
 
 function isTrue(value: unknown): boolean {
@@ -103,11 +113,13 @@ function isTrue(value: unknown): boolean {
 
 /**
  * Did the provider verify the email? Some providers send the claim as the
- * string "true". Anything else (false, absent, a different string) is not a
- * verification. Entra sends `xms_edov` instead of `email_verified`.
+ * string "true". Anything else (false, a different string) is not a
+ * verification. Entra sends `xms_edov` instead of `email_verified`, so for the
+ * Entra issuer `xms_edov` decides, but only when `email_verified` is absent:
+ * an explicit `email_verified` always wins.
  */
 function emailVerified(profile: Record<string, unknown>, issuer: string): boolean {
-  if (isTrue(profile["email_verified"])) return true;
+  if (profile["email_verified"] !== undefined) return isTrue(profile["email_verified"]);
   return isEntraIssuer(issuer) && isTrue(profile["xms_edov"]);
 }
 

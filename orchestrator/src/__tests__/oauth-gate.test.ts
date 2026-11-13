@@ -18,7 +18,9 @@ import {
 
 const GOOGLE = "https://accounts.google.com";
 const OKTA = "https://corp.okta.com";
-const ENTRA = "https://login.microsoftonline.com/0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0/v2.0";
+const TENANT = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+const ENTRA = `https://login.microsoftonline.com/${TENANT}/v2.0`;
+const ENTRA_V1 = `https://sts.windows.net/${TENANT}/`;
 
 const CORP: EmailAllowlist = { domains: ["corp.com"], emails: [] };
 
@@ -71,11 +73,14 @@ describe("checkOAuthProfile — the verified-email requirement", () => {
 });
 
 describe("isEntraIssuer", () => {
-  test("matches the tenant-specific v2 issuer, nothing else", () => {
+  test("matches the tenant-specific v2 and v1 issuers, nothing else", () => {
     expect(isEntraIssuer(ENTRA)).toBe(true);
     expect(isEntraIssuer(`${ENTRA}/`)).toBe(true);
+    expect(isEntraIssuer(ENTRA_V1)).toBe(true);
     expect(isEntraIssuer("https://login.microsoftonline.com/common/v2.0")).toBe(false);
-    expect(isEntraIssuer("https://login.microsoftonline.com/0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0/")).toBe(false);
+    expect(isEntraIssuer("https://sts.windows.net/common/")).toBe(false);
+    expect(isEntraIssuer(`https://login.microsoftonline.com/${TENANT}/`)).toBe(false);
+    expect(isEntraIssuer(`https://login.microsoftonline.us/${TENANT}/v2.0`)).toBe(false);
     expect(isEntraIssuer(`${ENTRA}.evil.example`)).toBe(false);
     expect(isEntraIssuer(OKTA)).toBe(false);
   });
@@ -96,6 +101,16 @@ describe("checkOAuthProfile — Entra vouches by `xms_edov`", () => {
     expect(checkOAuthProfile({ email: "a@corp.com", xms_edov: true }, OKTA, CORP)).toBe(
       "email_not_verified",
     );
+  });
+
+  test("xms_edov from the v1 Entra issuer → verified", () => {
+    expect(checkOAuthProfile({ email: "a@corp.com", xms_edov: true }, ENTRA_V1, CORP)).toBeNull();
+  });
+
+  test("an explicit email_verified wins over xms_edov", () => {
+    expect(
+      checkOAuthProfile({ email: "a@corp.com", email_verified: false, xms_edov: true }, ENTRA, CORP),
+    ).toBe("email_not_verified");
   });
 
   test("email_verified still counts for Entra", () => {

@@ -584,7 +584,9 @@ orchestrator:
       #   Okta:     https://<org>.okta.com
       #   Entra ID: https://login.microsoftonline.com/<tenant-id>/v2.0 (add the
       #             optional ID-token claims `email` and `xms_edov`; Entra sends
-      #             no `email_verified`, so the gate reads `xms_edov` instead)
+      #             no `email_verified`, so the gate reads `xms_edov` instead.
+      #             Global cloud only; national clouds and External ID are not
+      #             covered.)
       #   Cognito:  https://cognito-idp.<region>.amazonaws.com/<user-pool-id>
       #   Keycloak: https://<host>/realms/<realm>
       issuer: ""
