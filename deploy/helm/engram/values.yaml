@@ -575,7 +575,8 @@ orchestrator:
     #   <orchestrator.publicUrl>/api/auth/oauth2/callback/<providerId>
     #   e.g. https://engrams.example.com/api/auth/oauth2/callback/sso
     #
-    # The provider must return a verified email (`email_verified: true`); a
+    # The provider must return a verified email (`email_verified: true`, or
+    # `xms_edov: true` from Entra ID when `email_verified` is absent); a
     # sign-in without one is refused.
     oauth:
       # The provider's issuer URL; its discovery document is fetched from
