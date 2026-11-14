@@ -1,0 +1,223 @@
+syntax = "proto3";
+package engram.mcp.v1;
+
+import "engram/app/v1/session.proto";
+
+// Dedicated pinned mTLS only. Create reuses the ordinary creation core.
+service SessionPolicyService {
+  rpc ReadManagedCreationState(ReadManagedCreationStateRequest) returns (ReadManagedCreationStateResponse);
+  rpc PrepareManagedBoot(PrepareManagedBootRequest) returns (PrepareManagedBootResponse);
+  rpc RecoverManagedBoot(RecoverManagedBootRequest) returns (RecoverManagedBootResponse);
+  rpc ReadPublishedOperator(ReadPublishedOperatorRequest) returns (ReadPublishedOperatorResponse);
+  rpc ReadManagedBoot(ReadManagedBootRequest) returns (ReadManagedBootResponse);
+  rpc FinalizeManagedBoot(FinalizeManagedBootRequest) returns (FinalizeManagedBootResponse);
+  rpc ReserveManagedCreate(ReserveManagedCreateRequest) returns (ReserveManagedCreateResponse);
+  rpc ReadNativeManifest(ReadNativeManifestRequest) returns (ReadNativeManifestResponse);
+  rpc ReadManagedPolicy(ReadManagedPolicyRequest) returns (ReadManagedPolicyResponse);
+  rpc ApplyManagedPolicy(ApplyManagedPolicyRequest) returns (ApplyManagedPolicyResponse);
+  rpc CreatePolicySession(CreatePolicySessionRequest) returns (CreatePolicySessionResponse);
+  rpc ReadWritePolicy(ReadWritePolicyRequest) returns (ReadWritePolicyResponse);
+  rpc AcceptPlanExit(AcceptPlanExitRequest) returns (AcceptPlanExitResponse);
+  rpc ValidateExecutionIdentity(ValidateExecutionIdentityRequest) returns (ValidateExecutionIdentityResponse);
+  rpc ValidateDispatchFence(ValidateDispatchFenceRequest) returns (ValidateDispatchFenceResponse);
+}
+message CreatePolicySessionRequest {
+  uint32 protocol = 1;
+  engram.app.v1.CreateSessionRequest create = 2;
+  string actor_id = 3;
+  string input_id = 4;
+  optional string parent_session_id = 5;
+}
+message ReadWritePolicyRequest {
+  uint32 protocol = 1;
+  string session_id = 2;
+  optional string plan_tool_call_id = 3;
+}
+message AcceptPlanExitRequest {
+  uint32 protocol = 1;
+  engram.app.v1.McpPlanReview expected = 2;
+  string actor_id = 3;
+  string result_json = 4;
+}
+message ValidateDispatchFenceRequest {
+  uint32 protocol = 1;
+  string session_id = 2;
+  string run_id = 3;
+  string tool_call_id = 4;
+  engram.app.v1.McpWritePolicyRef accepted_policy_ref = 5;
+  string accepted_write_eligibility = 6;
+  repeated engram.app.v1.McpWritePolicyRef ancestor_policy_refs = 7;
+  string model_tool_name = 8;
+  string original_arguments = 9;
+}
+message ValidateDispatchFenceResponse {
+  uint32 protocol = 1;
+  string status = 2;
+}
+
+message CreatePolicySessionResponse {
+  engram.app.v1.CreateSessionResponse session = 1;
+}
+message ReadWritePolicyResponse {
+  engram.app.v1.GetMcpWritePolicyResponse state = 1;
+}
+message AcceptPlanExitResponse {
+  engram.app.v1.McpTrustedWritePolicy policy = 1;
+}
+
+message ValidateExecutionIdentityRequest {
+  uint32 protocol = 1;
+  string session_id = 2;
+  string run_id = 3;
+  string tool_call_id = 4;
+  engram.app.v1.McpWritePolicyRef accepted_policy_ref = 5;
+  string accepted_write_eligibility = 6;
+  repeated engram.app.v1.McpWritePolicyRef ancestor_policy_refs = 7;
+  string model_tool_name = 8;
+  string original_arguments = 9;
+}
+message ValidateExecutionIdentityResponse {
+  uint32 protocol = 1;
+  string status = 2;
+}
+
+// These messages describe a host receipt, not permission to expose guest tools.
+enum ManagedPolicyPhase {
+  MANAGED_POLICY_PHASE_UNSPECIFIED = 0;
+  MANAGED_POLICY_PHASE_BOOTSTRAP = 1;
+  MANAGED_POLICY_PHASE_FINAL = 2;
+}
+message ManagedPolicyTarget {
+  string session_id = 1;
+  string sandbox_id = 2;
+  string host_id = 3;
+  uint64 binding_epoch = 4;
+}
+message ManagedPolicyContext {
+  ManagedPolicyTarget target = 1;
+  uint64 operator_generation = 2;
+  string operator_identity = 3;
+  ManagedPolicyPhase phase = 4;
+  optional string binding_hash = 5;
+}
+message ManagedDenyPolicy {
+  uint32 version = 1;
+  uint64 revision = 2;
+  repeated string hosts = 3;
+  string digest = 4;
+}
+message ManagedAppliedState {
+  ManagedPolicyContext context = 1;
+  ManagedDenyPolicy policy = 2;
+  string host_incarnation = 3;
+  string proxy_incarnation = 4;
+  string state_id = 5;
+  optional ManagedNetworkProof network_proof = 6;
+}
+message ReadManagedPolicyRequest {
+  uint32 protocol = 1;
+  ManagedPolicyTarget target = 2;
+}
+message ReadManagedPolicyResponse {
+  uint32 protocol = 1;
+  optional ManagedAppliedState applied = 2;
+  // Required presence: absence means an unsupported read contract, not no policy.
+  ManagedRetainedDesired retained_desired = 3;
+}
+// Coordinator persistence at the checked read target. This is never an applied ACK.
+message ManagedRetainedDesired {
+  ManagedPolicyTarget target = 1;
+  // Absence inside a present wrapper means no retained policy at this read.
+  optional ManagedDenyPolicy policy = 2;
+}
+message ApplyManagedPolicyRequest {
+  uint32 protocol = 1;
+  ManagedPolicyContext context = 2;
+  ManagedDenyPolicy policy = 3;
+  optional ManagedAppliedState expected = 4;
+}
+message ApplyManagedPolicyResponse {
+  uint32 protocol = 1;
+  ManagedAppliedState applied = 2;
+}
+
+message ManagedNetworkProof {
+  ManagedPolicyTarget target = 1;
+  string guest_ip = 2;
+  string network_identity = 3;
+}
+
+// Exact bytes of CreatePolicySessionRequest, retained by the caller for retries.
+// The coordinator stores only the digest of this payload, which can hold secrets.
+message ReserveManagedCreateRequest {
+  uint32 protocol = 1;
+  bytes creation_request = 2;
+  string task_id = 3;
+  uint32 native_version = 4;
+  string native_digest = 5;
+  string input_digest = 6;
+}
+message ManagedCreateIdentity {
+  string session_id = 1;
+  string task_id = 2;
+  string input_id = 3;
+  string actor_id = 4;
+  optional string parent_session_id = 5;
+  string write_eligibility = 6;
+  string input_digest = 7;
+}
+message ReserveManagedCreateResponse {
+  uint32 protocol = 1;
+  ManagedCreateIdentity identity = 2;
+  // A held queued reservation is not permission to start a sandbox.
+  string state = 3;
+}
+message ReadNativeManifestRequest {
+  uint32 protocol = 1;
+  ManagedCreateIdentity identity = 2;
+}
+message ReadNativeManifestResponse {
+  uint32 protocol = 1;
+  ManagedCreateIdentity identity = 2;
+  uint32 native_version = 3;
+  bytes native_bytes = 4;
+  string native_digest = 5;
+}
+
+message ReadManagedBootRequest { uint32 protocol = 1; ManagedCreateIdentity identity = 2; }
+message ReadManagedBootResponse { uint32 protocol = 1; optional bytes boot_json = 2; }
+// Exact typed ManagedBootFinalizeInput JSON. No guest or profile input is read.
+message FinalizeManagedBootRequest { uint32 protocol = 1; bytes input_json = 2; }
+
+message FinalizeManagedBootResponse { uint32 protocol = 1; optional bytes boot_json = 2; }
+message ReadPublishedOperatorRequest {
+  uint32 protocol = 1;
+}
+message ReadPublishedOperatorResponse {
+  uint32 protocol = 1;
+  bytes publication_json = 2;
+}
+
+message ReadManagedCreationStateRequest {
+  uint32 protocol = 1;
+  ManagedCreateIdentity identity = 2;
+  uint32 native_version = 3;
+  string native_digest = 4;
+}
+message ReadManagedCreationStateResponse { uint32 protocol = 1; bytes state_json = 2; }
+message PrepareManagedBootRequest {
+  uint32 protocol = 1;
+  ManagedCreateIdentity identity = 2;
+  uint32 native_version = 3;
+  string native_digest = 4;
+}
+message PrepareManagedBootResponse { uint32 protocol = 1; bytes state_json = 2; }
+message RecoverManagedBootRequest {
+  uint32 protocol = 1;
+  ManagedCreateIdentity identity = 2;
+  uint32 native_version = 3;
+  string native_digest = 4;
+  bytes expected_source_key_json = 5;
+  string recovery_id = 6;
+}
+message RecoverManagedBootResponse { uint32 protocol = 1; bytes state_json = 2; }

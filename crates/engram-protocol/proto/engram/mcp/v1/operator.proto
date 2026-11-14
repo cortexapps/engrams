@@ -1,0 +1,24 @@
+syntax = "proto3";
+package engram.mcp.v1;
+
+// Only the dedicated operator mTLS listener registers this mutation service.
+service OperatorPublicationService {
+  rpc Stage(OperatorPublicationServiceStageRequest) returns (OperatorPublicationServiceStageResponse);
+  rpc Read(OperatorPublicationServiceReadRequest) returns (OperatorPublicationServiceReadResponse);
+}
+message OperatorPublicationServiceStageRequest {
+  uint32 protocol = 1;
+  optional uint64 expected_generation = 2;
+  string configured_candidate_identity = 3;
+}
+message OperatorPublicationServiceReadRequest {
+  uint32 protocol = 1;
+}
+message OperatorPublicationServiceStageResponse {
+  uint32 protocol = 1;
+  bytes publication_json = 2;
+}
+message OperatorPublicationServiceReadResponse {
+  uint32 protocol = 1;
+  bytes publication_json = 2;
+}

@@ -24,13 +24,15 @@ pub struct CoordinatorConfig {
     // `engram-auth` AuthConfig) is removed along with the whole `engram-auth`
     // crate. The coordinator no longer resolves human identity — `auth_tokens`
     // (the deployment bearer) and `app_grpc_tokens` (the app-gRPC bearer) are
-    // the only machine-caller credentials it knows about.
+    // the generic machine-caller credentials. MCP uses separate mTLS pins.
     /// Local address the harness-channel TCP listener binds to.
     /// Harnesses spawned via `start_agent` on the Process backend dial
     /// this from the same host. `127.0.0.1:0` (default) lets the OS
     /// pick a free port; the coordinator reads back the bound address
     /// and plumbs it into the agent's env at session-create time.
     pub harness_listen_addr: std::net::SocketAddr,
+    /// Optional operator file for the separate MCP mTLS listener. Unset disables it.
+    pub mcp_control_config: Option<PathBuf>,
     /// Address the orchestrator-facing app gRPC server binds to
     /// (ADR 0051 §2.3). Serves Session/ShellRelay/Fleet/Image/Secret
     /// beside the axum API. Loopback by default — the orchestrator is
@@ -77,6 +79,7 @@ impl Default for CoordinatorConfig {
             harness_listen_addr: "127.0.0.1:0"
                 .parse()
                 .expect("default harness_listen_addr must parse"),
+            mcp_control_config: None,
             app_grpc_addr: "127.0.0.1:50061"
                 .parse()
                 .expect("default app_grpc_addr must parse"),

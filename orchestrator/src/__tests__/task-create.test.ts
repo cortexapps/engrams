@@ -26,11 +26,7 @@ import {
   type Db,
 } from "../rpc/task-create.ts";
 import type { ProfileRow, ProfileStore } from "../db/profiles.ts";
-import type {
-  SessionAppStore,
-  SessionAppSpec,
-  SessionAppRow,
-} from "../db/session-apps.ts";
+import type { SessionAppStore, SessionAppSpec, SessionAppRow } from "../db/session-apps.ts";
 import type { ImagesClient } from "../rpc/profiles.ts";
 import type { UserIdentity, UserIdentityStore } from "../db/users.ts";
 import { createToolRegistry } from "../tools/registry.ts";
@@ -144,7 +140,7 @@ const routedModel = (over: Partial<RouterModelRow> = {}): RouterModelRow => ({
 
 const fakeModelRouters = (row = routedModel()): ModelRouterStore => ({
   listModels: async () => [row],
-  getModel: async (_routerId, modelId) => modelId === row.modelId ? row : null,
+  getModel: async (_routerId, modelId) => (modelId === row.modelId ? row : null),
   replaceCatalog: async () => ({ markedUnavailable: 0 }),
   updatePolicy: async () => row,
   getSyncState: async () => null,
@@ -283,9 +279,7 @@ describe("compileSessionCreateInput — user-scoped integrations (ADR 0115)", ()
     ...deps(),
     connectors: { list: async () => [{ provider: "acme", config: acmeConnector }] },
     oauthSubject: { kind: OauthSubjectKind.USER, id: "user-7" },
-    ...(credentials
-      ? { listUserConnectorCredentials: async () => credentials }
-      : {}),
+    ...(credentials ? { listUserConnectorCredentials: async () => credentials } : {}),
   });
   const policyOf = (inp: { integrationPolicyJson?: string }) =>
     JSON.parse(inp.integrationPolicyJson ?? "{}") as {
@@ -296,7 +290,7 @@ describe("compileSessionCreateInput — user-scoped integrations (ADR 0115)", ()
     };
 
   test("a human run with the credential connected stamps oauth_user", async () => {
-const inp = await compileSessionCreateInput(
+    const inp = await compileSessionCreateInput(
       userScopedProfile(),
       userDeps([{ provider: "acme", status: "connected" }]),
     );
@@ -375,13 +369,11 @@ const inp = await compileSessionCreateInput(
     expect(inp.integrationConnections?.map((c) => c.provider)).toEqual(["github"]);
     // No acme inject in the policy, and no org fallback for it.
     const policy = policyOf(inp);
-    expect(
-      (policy.injects ?? []).some((inject) => inject.secret_ref === "acme.token"),
-    ).toBe(false);
+    expect((policy.injects ?? []).some((inject) => inject.secret_ref === "acme.token")).toBe(false);
   });
 
   test("a programmatic run compiles the org credential and never gates", async () => {
-const inp = await compileSessionCreateInput(
+    const inp = await compileSessionCreateInput(
       userScopedProfile(),
       {
         ...userDeps([]),
@@ -397,7 +389,7 @@ const inp = await compileSessionCreateInput(
   });
 
   test("an unscoped grant compiles the org credential for a human run", async () => {
-const inp = await compileSessionCreateInput(
+    const inp = await compileSessionCreateInput(
       profile({
         integrationGrants: [
           { connectionId: "default-acme", operation: "issues:write", resourceConstraints: [] },
@@ -411,7 +403,7 @@ const inp = await compileSessionCreateInput(
   });
 
   test("a capability override compiles org authority and never gates", async () => {
-const inp = await compileSessionCreateInput(
+    const inp = await compileSessionCreateInput(
       userScopedProfile(),
       {
         ...userDeps([]),
@@ -764,10 +756,12 @@ describe("compileSessionCreateInput", () => {
             connections,
             harnessCatalog: {
               listHarnesses: async () => ({
-                harnesses: [{
-                  name: "claude",
-                  descriptor: { models: [], effort: [], routerProtocols: [protocol] },
-                }],
+                harnesses: [
+                  {
+                    name: "claude",
+                    descriptor: { models: [], effort: [], routerProtocols: [protocol] },
+                  },
+                ],
               }),
             },
             orgSecret: { listSecrets: async () => ({ secrets: [{ name: "openrouter.api_key" }] }) },
@@ -849,11 +843,21 @@ describe("compileSessionCreateInput", () => {
       ...deps(),
       harnessCatalog: providerHarnessCatalog(),
       orgSecret: { listSecrets: async () => ({ secrets: [{ name: "openrouter.api_key" }] }) },
-      modelRouters: fakeModelRouters(routedModel({ supportedParameters: ["tools"], userEnabled: false })),
+      modelRouters: fakeModelRouters(
+        routedModel({ supportedParameters: ["tools"], userEnabled: false }),
+      ),
     };
-    const routedProfile = profile({ modelRouter: "openrouter", model: "z-ai/glm-5.2", effort: "high" });
-    await expect(compileSessionCreateInput(routedProfile, providerDeps)).rejects.toMatchObject({ code: Code.PermissionDenied });
-    const input = await compileSessionCreateInput(routedProfile, providerDeps, { programmatic: true });
+    const routedProfile = profile({
+      modelRouter: "openrouter",
+      model: "z-ai/glm-5.2",
+      effort: "high",
+    });
+    await expect(compileSessionCreateInput(routedProfile, providerDeps)).rejects.toMatchObject({
+      code: Code.PermissionDenied,
+    });
+    const input = await compileSessionCreateInput(routedProfile, providerDeps, {
+      programmatic: true,
+    });
     expect(input.effort).toBeUndefined();
     expect(input.harnessEnv?.MAX_THINKING_TOKENS).toBeUndefined();
   });
@@ -897,6 +901,27 @@ describe("compileSessionCreateInput", () => {
     const inp = await compileSessionCreateInput(profile(), deps());
     expect(inp.harnessEnv?.ENGRAM_USER_EMAIL).toBeUndefined();
     expect(inp.harnessEnv?.ENGRAM_USER_NAME).toBeUndefined();
+  });
+
+  test("native tool manifest cannot be replaced by profile or late environment input", async () => {
+    const toolRegistry = createToolRegistry();
+    toolRegistry.register({
+      name: "native_tool",
+      description: "Native tool",
+      input: z.object({}),
+      output: z.object({}),
+      handling: "handled",
+      execution: "sync",
+      handler: async () => ({}),
+    });
+    const result = await compileSessionCreateInput(
+      profile({ envVars: { ENGRAM_TOOLS: '[{"name":"mcp_injected"}]' } }),
+      { ...deps(), toolRegistry },
+      { extraHarnessEnv: { ENGRAM_TOOLS: '[{"name":"late_injected"}]' } },
+    );
+    expect(
+      JSON.parse(result.harnessEnv!.ENGRAM_TOOLS!).map((tool: { name: string }) => tool.name),
+    ).toEqual(["native_tool"]);
   });
 
   test("injects ENGRAM_TOOLS with capability-gated and ungated manifest tools", async () => {
@@ -972,16 +997,14 @@ describe("compileSessionCreateInput", () => {
       { taskType: "spec" },
     );
 
-    expect(JSON.parse(chat.harnessEnv!.ENGRAM_TOOLS!).map((tool: { name: string }) => tool.name))
-      .toEqual(["always_available"]);
-    expect(chat.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).not.toContain(
-      SPEC_MODE_SYSTEM_PROMPT,
-    );
-    expect(JSON.parse(spec.harnessEnv!.ENGRAM_TOOLS!).map((tool: { name: string }) => tool.name))
-      .toEqual(["always_available", "spec_read"]);
-    expect(spec.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toContain(
-      SPEC_MODE_SYSTEM_PROMPT,
-    );
+    expect(
+      JSON.parse(chat.harnessEnv!.ENGRAM_TOOLS!).map((tool: { name: string }) => tool.name),
+    ).toEqual(["always_available"]);
+    expect(chat.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).not.toContain(SPEC_MODE_SYSTEM_PROMPT);
+    expect(
+      JSON.parse(spec.harnessEnv!.ENGRAM_TOOLS!).map((tool: { name: string }) => tool.name),
+    ).toEqual(["always_available", "spec_read"]);
+    expect(spec.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toContain(SPEC_MODE_SYSTEM_PROMPT);
   });
 
   test("carries the spec template into the spec prompt", async () => {
@@ -1406,10 +1429,13 @@ function recordingDb(
       if (throwOnTx) throw new Error("db boom");
       const tx = {
         insert: () => ({
-          values: async (v: Record<string, unknown>) => {
-            insertCount += 1;
-            if (insertCount === failInsertAt) throw new Error("insert boom");
-            records.push(v);
+          values: (v: Record<string, unknown>) => {
+            const result = Promise.resolve().then(() => {
+              insertCount += 1;
+              if (insertCount === failInsertAt) throw new Error("insert boom");
+              records.push(v);
+            });
+            return Object.assign(result, { onConflictDoNothing: () => result });
           },
         }),
         update: () => ({
@@ -1483,10 +1509,12 @@ describe("createTaskWithSession", () => {
     test(`rejects a human ${type} launch before any session or task write`, async () => {
       const sessions = fakeSessions();
       const records: Record<string, unknown>[] = [];
-      await expect(createTaskWithSession(
-        createDeps(sessions, recordingDb(records), { profileOver: { programmaticOnly: true } }),
-        { type, ownerUserId: "u", profileId: "p1" },
-      )).rejects.toMatchObject({ code: Code.PermissionDenied });
+      await expect(
+        createTaskWithSession(
+          createDeps(sessions, recordingDb(records), { profileOver: { programmaticOnly: true } }),
+          { type, ownerUserId: "u", profileId: "p1" },
+        ),
+      ).rejects.toMatchObject({ code: Code.PermissionDenied });
       expect(sessions.createReqs).toEqual([]);
       expect(records).toEqual([]);
     });
@@ -1790,10 +1818,11 @@ describe("createTaskWithSession", () => {
   test("reserves nothing and injects nothing when the profile declares no apps", async () => {
     const apps = fakeSessionApps();
     const sessions = fakeSessions();
-    await createTaskWithSession(
-      createDeps(sessions, recordingDb([]), { sessionApps: apps }),
-      { type: "chat", ownerUserId: "u", profileId: "p1" },
-    );
+    await createTaskWithSession(createDeps(sessions, recordingDb([]), { sessionApps: apps }), {
+      type: "chat",
+      ownerUserId: "u",
+      profileId: "p1",
+    });
     expect(apps.calls).toHaveLength(0);
     const env = (sessions.createReqs[0] as { harnessEnv?: Record<string, string> }).harnessEnv;
     expect(Object.keys(env ?? {}).some((k) => k.endsWith("_INGRESS_URL"))).toBe(false);
@@ -1847,7 +1876,6 @@ describe("createTaskWithSession", () => {
     const env = (sessions.createReqs[0] as { harnessEnv?: Record<string, string> }).harnessEnv;
     expect(env?.ENGRAM_USER_EMAIL).toBeUndefined();
   });
-
 });
 
 describe("createSessionForExistingTask", () => {

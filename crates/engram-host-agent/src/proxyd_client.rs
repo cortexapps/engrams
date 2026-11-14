@@ -121,11 +121,31 @@ impl ProxydHandle {
         }
     }
 
-    /// One request/response round-trip. Serialized behind the mutex —
-    /// the control plane is low-rate (policy applies and removals).
-    /// On any transport error the cached connection is dropped so the
-    /// next call redials (the respawn recovery path).
+    /// Managed requests own separate streams so a session drain cannot block
+    /// another session. Ordinary requests share the cached stream; an error
+    /// drops that connection so the next call redials. No request is retried.
     async fn request(&self, msg: &ToProxyd) -> Result<FromProxyd, ProxydError> {
+        let managed = matches!(
+            msg,
+            ToProxyd::ListManaged
+                | ToProxyd::ReadManaged(_)
+                | ToProxyd::QuarantineManaged(_)
+                | ToProxyd::RetirePrivateNetwork(_)
+                | ToProxyd::HandoffClosedPrivate(_)
+                | ToProxyd::Hello { .. }
+        ) || matches!(msg, ToProxyd::ApplyPolicy(policy) if policy.managed_deny.is_some());
+        if managed {
+            // A session drain must not occupy another session's control stream.
+            let mut stream = tokio::net::UnixStream::connect(&self.control_sock)
+                .await
+                .map_err(|e| ProxydError(format!("managed control connect: {e}")))?;
+            engram_egress_proto::write_frame(&mut stream, msg)
+                .await
+                .map_err(|e| ProxydError(format!("managed control write: {e}")))?;
+            return engram_egress_proto::read_frame(&mut stream)
+                .await
+                .map_err(|e| ProxydError(format!("managed control read: {e}")));
+        }
         let mut guard = self.conn.lock().await;
         if guard.is_none() {
             let stream = tokio::net::UnixStream::connect(&self.control_sock)
@@ -158,6 +178,44 @@ impl ProxydHandle {
         }
     }
 
+    /// Dedicated allocation capability, initially CLOSED. This is not a final
+    /// policy receipt. A new boot or channel loss requires a fresh allocation.
+    pub async fn register_private_network(
+        &self,
+        allocation: &engram_egress_proto::private::Allocation,
+    ) -> Result<engram_egress_proto::private::RegisteredPrivateNetwork, ProxydError> {
+        let stream = tokio::net::UnixStream::connect(&self.control_sock)
+            .await
+            .map_err(|e| ProxydError(format!("private network connect: {e}")))?;
+        engram_egress_proto::private::register(stream, allocation)
+            .await
+            .map_err(|e| ProxydError(format!("private network register: {e}")))
+    }
+
+    /// The response is for this exact allocation on a disposable stream.
+    /// Cancellation drops that stream; the daemon can finish only this retirement.
+    pub async fn retire_private_network(
+        &self,
+        allocation: &engram_egress_proto::private::Allocation,
+    ) -> Result<(), ProxydError> {
+        self.expect_ok(
+            &ToProxyd::RetirePrivateNetwork(Box::new(allocation.clone())),
+            "retire private network",
+        )
+        .await
+    }
+
+    pub async fn handoff_closed_private(
+        &self,
+        request: engram_egress_proto::private::ClosedPolicyHandoff,
+    ) -> Result<(), ProxydError> {
+        self.expect_ok(
+            &ToProxyd::HandoffClosedPrivate(Box::new(request)),
+            "closed policy handoff",
+        )
+        .await
+    }
+
     pub async fn hello(&self) -> Result<HelloInfo, ProxydError> {
         match self
             .request(&ToProxyd::Hello {
@@ -170,6 +228,31 @@ impl ProxydHandle {
         }
     }
 
+    pub async fn managed_sessions(&self) -> Result<Vec<engram_core::SessionId>, ProxydError> {
+        match self.request(&ToProxyd::ListManaged).await? {
+            FromProxyd::ManagedSessions(sessions) => Ok(sessions),
+            _ => Err(ProxydError("invalid managed enumeration response".into())),
+        }
+    }
+    pub async fn read_managed(
+        &self,
+        session: engram_core::SessionId,
+    ) -> Result<Option<engram_core::types::managed_deny::ManagedProxyState>, ProxydError> {
+        match self.request(&ToProxyd::ReadManaged(session)).await? {
+            FromProxyd::ManagedState(state) => Ok(state),
+            _ => Err(ProxydError("invalid managed policy response".into())),
+        }
+    }
+    pub async fn quarantine_managed(
+        &self,
+        session: engram_core::SessionId,
+    ) -> Result<(), ProxydError> {
+        self.expect_ok(
+            &ToProxyd::QuarantineManaged(session),
+            "quarantine managed session",
+        )
+        .await
+    }
     pub async fn apply_policy(
         &self,
         policy: engram_core::types::egress::SessionEgressPolicy,
@@ -565,5 +648,105 @@ async fn await_exit(process: &mut ProxydProcess) {
                 tracing::warn!("adopted daemon on a non-Linux host (unexpected); respawning");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn closed_handoff_does_not_block_independent_control() {
+        use engram_core::types::{
+            egress::SessionEgressPolicy, image::SecretMode, managed_deny::ManagedDenyPolicy,
+        };
+        use engram_egress_proto::private::{Allocation, ClosedPolicyHandoff};
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (received, waiting) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut received = Some(received);
+            let mut tasks = tokio::task::JoinSet::new();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let received = received.take();
+                tasks.spawn(async move {
+                    while let Ok(message) =
+                        engram_egress_proto::read_frame::<_, ToProxyd>(&mut stream).await
+                    {
+                        let reply = match message {
+                            ToProxyd::HandoffClosedPrivate(_) => {
+                                received.unwrap().send(()).unwrap();
+                                std::future::pending::<()>().await;
+                                return;
+                            }
+                            ToProxyd::Health => FromProxyd::HealthReport { sessions: 0 },
+                            ToProxyd::LookupGuest(_) => FromProxyd::Guest(None),
+                            _ => panic!("unexpected control operation"),
+                        };
+                        engram_egress_proto::write_frame(&mut stream, &reply)
+                            .await
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        let handle = Arc::new(ProxydHandle::new(socket));
+        let policy = ManagedDenyPolicy::new(1, ["mcp.example".into()]).unwrap();
+        let allocation = Allocation {
+            version: 1,
+            host_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+            host_incarnation: "host-a".into(),
+            proxy_incarnation: "proxy-a".into(),
+            session_id: "00000000-0000-0000-0000-000000000002".parse().unwrap(),
+            sandbox_id: "00000000-0000-0000-0000-000000000003".parse().unwrap(),
+            boot_attempt: "boot-a".into(),
+            attachment_generation: 1,
+            guest_ip: "198.18.0.2".parse().unwrap(),
+            gateway_ip: "198.18.0.1".parse().unwrap(),
+            policy_revision: policy.revision,
+            policy_digest: policy.digest.clone(),
+        };
+        let request = ClosedPolicyHandoff {
+            policy: SessionEgressPolicy {
+                session_id: allocation.session_id,
+                sandbox_id: allocation.sandbox_id,
+                guest_ip: allocation.guest_ip,
+                network_allow_hosts: vec![],
+                network_allow_host_patterns: vec![],
+                allow_all: false,
+                secrets: vec![],
+                injects: vec![],
+                observes: vec![],
+                guest_services: vec![],
+                tunnels: vec![],
+                secret_mode: SecretMode::Literal,
+                apps: vec![],
+                managed_deny: Some(policy),
+            },
+            allocation,
+        };
+        let handoff_handle = handle.clone();
+        let handoff =
+            tokio::spawn(async move { handoff_handle.handoff_closed_private(request).await });
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        let independent = tokio::time::timeout(Duration::from_secs(1), async {
+            assert_eq!(handle.health().await.unwrap(), 0);
+            assert!(handle
+                .lookup_guest("198.18.1.2".parse().unwrap())
+                .await
+                .unwrap()
+                .is_none());
+        })
+        .await;
+        handoff.abort();
+        server.abort();
+        let _ = handoff.await;
+        let _ = server.await;
+        independent.expect("a held handoff must not block another session or ordinary control");
     }
 }

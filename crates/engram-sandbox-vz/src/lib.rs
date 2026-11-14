@@ -37,6 +37,9 @@
 mod backend;
 
 #[cfg(target_os = "macos")]
+mod managed;
+
+#[cfg(target_os = "macos")]
 mod vm;
 
 #[cfg(target_os = "macos")]
@@ -46,6 +49,9 @@ mod snapshot;
 
 #[cfg(target_os = "macos")]
 pub use backend::{VzBackend, VzConfig};
+
+#[cfg(target_os = "macos")]
+pub use managed::{ManagedHelperArtifact, ManagedVzClosedReceipt, PreparedManagedVz};
 
 #[cfg(not(target_os = "macos"))]
 mod stub {

@@ -8,3 +8,5 @@ pub mod blob_conformance;
 pub mod net;
 pub mod pg;
 pub mod storage;
+
+pub mod operator;

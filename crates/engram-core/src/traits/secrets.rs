@@ -63,6 +63,12 @@ pub struct ResolvedSecret {
 
 #[async_trait]
 pub trait SecretStore: Send + Sync {
+    /// Check purpose before overrides, fallback, or reuse of a cached mint engine.
+    /// Stores with reserved references must reject generic use explicitly.
+    async fn check_access(&self, _name: &str, _schema: &SecretSchema) -> Result<(), SecretError> {
+        Ok(())
+    }
+
     /// Look up a single secret. Returns `Ok(None)` for "not present"
     /// (caller decides if that's fatal based on `schema.required`).
     /// `schema.ref` may be set, in which case the backend should
@@ -94,6 +100,7 @@ pub trait SecretStore: Send + Sync {
     ) -> Result<SecretBundle, SecretError> {
         let mut bundle = SecretBundle::default();
         for (name, sch) in schema {
+            self.check_access(name, sch).await?;
             let override_value = overrides.and_then(|m| m.get(name));
             let resolved = match override_value {
                 Some(v) => Some(v.clone()),
@@ -145,12 +152,20 @@ impl LayeredSecretStore {
 
 #[async_trait]
 impl SecretStore for LayeredSecretStore {
+    async fn check_access(&self, name: &str, schema: &SecretSchema) -> Result<(), SecretError> {
+        for backend in &self.backends {
+            backend.check_access(name, schema).await?;
+        }
+        Ok(())
+    }
+
     async fn get(
         &self,
         ctx: &SecretContext<'_>,
         name: &str,
         schema: &SecretSchema,
     ) -> Result<Option<String>, SecretError> {
+        self.check_access(name, schema).await?;
         for backend in &self.backends {
             if let Some(value) = backend.get(ctx, name, schema).await? {
                 return Ok(Some(value));

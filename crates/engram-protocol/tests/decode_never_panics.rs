@@ -1,20 +1,5 @@
-//! ADR 0099 H4: decode-never-panics property suite for the coord ↔ host
-//! bincode payloads (`engram_protocol::wire`).
-//!
-//! **Lowest priority** of the H4 targets by threat model: this wire is
-//! version-fenced and trusted — coord and host deploy together and a
-//! `WIRE_VERSION` skew is rejected with `failed_precondition` BEFORE any
-//! bincode decode (see `wire.rs`), so an attacker never places bytes here.
-//! Included because it is cheap: the crate's own payload types decode
-//! through the same positional bincode, and a never-panic guard costs
-//! almost nothing.
-//!
-//! These payloads ride inside gRPC `bytes` fields — there is no
-//! length-prefix framing layer in this crate, so the decode entry point is
-//! `bincode::deserialize` directly. Shapes (a) arbitrary bytes and (b)
-//! mutations-of-valid-frames apply; the frame-cap half of (c) lives in the
-//! framed crates (harness/agentd/substrate/migrate), so here (c) is just the
-//! bincode-slice allocation bound.
+//! Arbitrary and mutated bytes must not panic in host payload decoders.
+//! Ordinary policy decoding also rejects incomplete and trailing bytes.
 
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::manifest::ManifestRef;
@@ -31,6 +16,18 @@ use support::wire_exec_request;
 // ---- helpers -----------------------------------------------------------
 
 fn decode_every_type(bytes: &[u8]) {
+    use prost::Message;
+    let _ = engram_protocol::mcp::ReserveManagedCreateRequest::decode(bytes);
+    let _ = engram_protocol::mcp::ReadNativeManifestRequest::decode(bytes);
+    let _ = engram_protocol::mcp::ReadNativeManifestResponse::decode(bytes);
+
+    let _ = engram_protocol::managed_policy::decode::<
+        engram_core::types::managed_deny::ManagedPolicyApply,
+    >(bytes);
+    let _ = engram_protocol::managed_policy::decode::<
+        Option<engram_core::types::managed_deny::ManagedAppliedState>,
+    >(bytes);
+    let _ = engram_protocol::ordinary_policy::decode(bytes);
     // Crate-local payloads.
     let _ = bincode::deserialize::<WireExecRequest>(bytes);
     // A representative slice of the shared engram-core payloads that cross
@@ -72,7 +69,13 @@ fn weighted_blob() -> impl Strategy<Value = Vec<u8>> {
 // ---- shape (a): arbitrary bytes ---------------------------------------
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig {
+        cases: 128,
+        failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::Direct(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/proptest-regressions/decode_never_panics.txt")
+        ))),
+        ..ProptestConfig::default()
+    })]
 
     #[test]
     fn arbitrary_bytes_never_panic(bytes in weighted_blob()) {
@@ -83,7 +86,13 @@ proptest! {
 // ---- shape (b): mutations of valid frames ------------------------------
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig {
+        cases: 128,
+        failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::Direct(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/proptest-regressions/decode_never_panics.txt")
+        ))),
+        ..ProptestConfig::default()
+    })]
 
     #[test]
     fn mutated_exec_request_never_panic(

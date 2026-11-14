@@ -259,6 +259,7 @@ impl rustls::server::ResolvesServerCert for SniResolver {
 /// protocol and miss the other. They used to carry two hand-copied versions of
 /// the gate, which is how HTTP/2 kept its own drift.
 pub struct StreamContext<'a> {
+    pub strict_authority: bool,
     pub sni: &'a str,
     pub port: u16,
     /// Secrets whose `allow` list covers this host, so their placeholders are
@@ -296,6 +297,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let StreamContext {
+        strict_authority,
         sni,
         port,
         secrets,
@@ -351,6 +353,7 @@ where
             client_tls,
             upstream_tls,
             StreamContext {
+                strict_authority,
                 sni,
                 port,
                 secrets,
@@ -365,6 +368,7 @@ where
         .await;
     }
     let context = StreamContext {
+        strict_authority,
         sni,
         port,
         secrets,
@@ -385,6 +389,16 @@ where
     let mut prefix = Vec::with_capacity(8192);
     let mut head_end = read_request_head(&mut client_tls, &mut prefix).await?;
     validate_header_block(&prefix[..head_end])?;
+    if strict_authority {
+        validate_managed_http1_authority(&prefix[..head_end], sni, port)?;
+        // Chunked/upgrade protocols cannot use the one-request adapter safely.
+        if matches!(
+            request_body_framing(&prefix[..head_end]),
+            RequestBodyFraming::Chunked
+        ) {
+            return Err(InterceptError::MalformedRequest);
+        }
+    }
 
     // Policy and upstream TLS identity are selected by SNI. Bind the cleartext
     // HTTP authority to that same name before any credential is attached.
@@ -447,8 +461,17 @@ where
             placeholder: placeholder.to_string(),
         });
     }
-    prefix = substitute_request(&mut client_tls, prefix, sni, secrets).await?;
+    prefix = if strict_authority {
+        substitute_managed_request(&mut client_tls, prefix, sni, secrets).await?
+    } else {
+        substitute_request(&mut client_tls, prefix, sni, secrets).await?
+    };
 
+    let request_remaining = if strict_authority {
+        Some(bound_managed_request(&mut prefix)?)
+    } else {
+        None
+    };
     if !firing.is_empty() {
         let sink = sink.expect("firing observes imply a sink");
         // Force identity encoding + a single, close-delimited response so the
@@ -463,6 +486,7 @@ where
             OBSERVE_RESPONSE_BUDGET,
             &response_redactions,
             head_request,
+            request_remaining,
         )
         .await?;
         let parsed = observe::parse_response(&resp_buf);
@@ -496,7 +520,7 @@ where
     // bytes-after-prefix (no further substitution — a request body mid-stream
     // is fine, a second request dies with the connection), upstream→client
     // is everything.
-    let (mut client_read, mut client_write) = tokio::io::split(client_tls);
+    let (client_read, mut client_write) = tokio::io::split(client_tls);
     let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream_tls);
     // The gated request is already written and checked above. What remains is a
     // body that continues past the buffered head, and it is best-effort: we
@@ -511,7 +535,11 @@ where
     // until it has the whole body would otherwise deadlock against a guest that
     // waits for the response before finishing its own write.
     let request = async {
-        let _ = tokio::io::copy(&mut client_read, &mut upstream_write).await;
+        let _ = tokio::io::copy(
+            &mut client_read.take(request_remaining.unwrap_or(u64::MAX)),
+            &mut upstream_write,
+        )
+        .await;
         let _ = upstream_write.shutdown().await;
     };
     // The response half keeps failing closed: it carries the redaction and the
@@ -563,12 +591,13 @@ where
         .initial_connection_window_size(H2_CONNECTION_WINDOW)
         .handshake(upstream_tls)
         .await?;
-    let upstream = tokio::spawn(connection);
+    tokio::pin!(connection);
     let mut active = FuturesUnordered::new();
     let mut accepting = true;
 
     while accepting || !active.is_empty() {
         tokio::select! {
+            result = &mut connection => { result?; break; }
             incoming = inbound.accept(), if accepting => {
                 match incoming {
                     Some(Ok((request, respond))) => {
@@ -596,8 +625,6 @@ where
         }
     }
 
-    upstream.abort();
-    let _ = upstream.await;
     Ok(())
 }
 
@@ -607,6 +634,24 @@ async fn process_h2_stream(
     mut outbound: h2::client::SendRequest<bytes::Bytes>,
     context: &StreamContext<'_>,
 ) -> Result<(), InterceptError> {
+    if context.strict_authority
+        && (request.method() == http::Method::CONNECT
+            || !request
+                .uri()
+                .authority()
+                .is_some_and(|a| managed_authority_matches(a.as_str(), context.sni, context.port))
+            || request
+                .headers()
+                .get_all(http::header::HOST)
+                .iter()
+                .any(|h| {
+                    !h.to_str()
+                        .is_ok_and(|h| managed_authority_matches(h, context.sni, context.port))
+                }))
+    {
+        deny_h2(&mut respond, http::StatusCode::FORBIDDEN)?;
+        return Err(InterceptError::MalformedRequest);
+    }
     let method = request.method().as_str().to_string();
     let path = request
         .uri()
@@ -1444,6 +1489,18 @@ where
     Ok(out)
 }
 
+/// Bound the original framing before substitution changes Content-Length.
+/// The limited reader also prevents body buffering from consuming a next request.
+async fn substitute_managed_request<C: AsyncRead + Unpin>(
+    client: &mut C,
+    mut prefix: Vec<u8>,
+    sni: &str,
+    secrets: &[&SecretEntry],
+) -> Result<Vec<u8>, InterceptError> {
+    let remaining = bound_managed_request(&mut prefix)?;
+    substitute_request(&mut client.take(remaining), prefix, sni, secrets).await
+}
+
 /// Rewrite the request's `Content-Length` to `length`. The header block is
 /// already validated, so exactly one `Content-Length` is present.
 fn rewrite_content_length(head: &[u8], length: usize) -> Result<Vec<u8>, InterceptError> {
@@ -2160,6 +2217,7 @@ async fn pump_and_observe<C, U>(
     budget: usize,
     response_redactions: &[Vec<u8>],
     head_request: bool,
+    request_remaining: Option<u64>,
 ) -> Result<Vec<u8>, InterceptError>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -2168,16 +2226,19 @@ where
     let (client_rd, mut client_wr) = tokio::io::split(client_tls);
     let (mut up_rd, up_wr) = tokio::io::split(upstream_tls);
 
-    // Detached: drain any remaining request body to upstream. Aborted once the
-    // response is in — by then upstream has the full request (it responded).
-    let c2u = tokio::spawn(async move {
-        let mut client_rd = client_rd;
+    // Own both socket halves until the response completes or the session cancels.
+    let c2u = async move {
         let mut up_wr = up_wr;
-        let _ = tokio::io::copy(&mut client_rd, &mut up_wr).await;
+        let _ = tokio::io::copy(
+            &mut client_rd.take(request_remaining.unwrap_or(u64::MAX)),
+            &mut up_wr,
+        )
+        .await;
         let _ = up_wr.shutdown().await;
-    });
+    };
+    tokio::pin!(c2u);
 
-    let response_result = async {
+    let response = async {
         let mut resp_buf = Vec::new();
         let mut redactor = Http1ResponseRedactor::new(response_redactions, head_request);
         if !response_redactions.is_empty() {
@@ -2235,11 +2296,66 @@ where
         let _ = client_wr.flush().await;
         let _ = client_wr.shutdown().await;
         Ok::<_, InterceptError>(resp_buf)
+    };
+    tokio::pin!(response);
+    tokio::select! {
+        result = &mut response => result,
+        _ = &mut c2u => response.await,
     }
-    .await;
-    c2u.abort();
-    let _ = c2u.await;
-    response_result
+}
+
+fn managed_authority_matches(raw: &str, sni: &str, port: u16) -> bool {
+    let Ok(authority) = raw.parse::<http::uri::Authority>() else {
+        return false;
+    };
+    if raw.contains('@') || authority.port_u16().unwrap_or(443) != port {
+        return false;
+    }
+    let host = engram_core::types::managed_deny::canonical_host(authority.host());
+    host.is_some() && host == engram_core::types::managed_deny::canonical_host(sni)
+}
+fn validate_managed_http1_authority(
+    head: &[u8],
+    sni: &str,
+    port: u16,
+) -> Result<(), InterceptError> {
+    let text = std::str::from_utf8(head).map_err(|_| InterceptError::MalformedRequest)?;
+    let mut lines = text.split("\r\n");
+    if lines.next().is_some_and(|l| l.starts_with("CONNECT ")) {
+        return Err(InterceptError::MalformedRequest);
+    }
+    let mut hosts = 0;
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("host") {
+                hosts += 1;
+                if !managed_authority_matches(value.trim(), sni, port) {
+                    return Err(InterceptError::MalformedRequest);
+                }
+            }
+            if name.eq_ignore_ascii_case("upgrade") {
+                return Err(InterceptError::MalformedRequest);
+            }
+        }
+    }
+    if hosts != 1 {
+        return Err(InterceptError::MalformedRequest);
+    }
+    Ok(())
+}
+/// Keep only this framed request; never forward a pipelined next request unchecked.
+fn bound_managed_request(prefix: &mut Vec<u8>) -> Result<u64, InterceptError> {
+    let head_end = head_end_of(prefix).ok_or(InterceptError::MalformedRequest)?;
+    let body = match request_body_framing(&prefix[..head_end]) {
+        RequestBodyFraming::None => 0,
+        RequestBodyFraming::ContentLength(n) => n,
+        RequestBodyFraming::Chunked => return Err(InterceptError::MalformedRequest),
+    };
+    let end = head_end
+        .checked_add(body)
+        .ok_or(InterceptError::MalformedRequest)?;
+    prefix.truncate(end);
+    Ok((end - prefix.len()) as u64)
 }
 
 #[cfg(test)]
@@ -2523,6 +2639,41 @@ mod hardening_tests {
         assert_eq!(out, request);
     }
 
+    #[tokio::test]
+    async fn managed_substitution_does_not_fold_a_pipelined_request_into_the_body() {
+        let secret = placeholder_secret();
+        let body = b"engram_ph_x";
+        let head = format!(
+            "POST / HTTP/1.1\r\nHost: api.example\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        let next = b"GET /other HTTP/1.1\r\nHost: mcp.example\r\n\r\n";
+        for buffered in [false, true] {
+            let mut prefix = head.clone();
+            let mut unread = Vec::new();
+            if buffered {
+                prefix.extend_from_slice(body);
+                prefix.extend_from_slice(next);
+            } else {
+                unread.extend_from_slice(body);
+                unread.extend_from_slice(next);
+            }
+            let out = substitute_managed_request(
+                &mut unread.as_slice(),
+                prefix,
+                "api.example",
+                &[&secret],
+            )
+            .await
+            .unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert!(text.ends_with("sk-a-much-longer-real-value"));
+            assert!(!text.contains("/other") && !text.contains("mcp.example"));
+            assert!(text.contains("Content-Length: 27\r\n"));
+        }
+    }
+
     #[test]
     fn binds_authority_to_sni_and_removes_duplicates() {
         let request = b"GET /v1 HTTP/1.1\r\nHost: allowed.example\r\nhOsT: attacker.example\r\nAccept: */*\r\n\r\n".to_vec();
@@ -2672,6 +2823,7 @@ mod hardening_tests {
                 proxy_guest_io,
                 proxy_upstream_io,
                 StreamContext {
+                    strict_authority: false,
                     sni: "api.example",
                     port: 443,
                     secrets: &[&secret],

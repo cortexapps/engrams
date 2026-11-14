@@ -33,6 +33,7 @@
 //! image small (one codec).
 
 pub mod attach_token;
+pub mod tool_result;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -469,6 +470,21 @@ pub enum HarnessEvent {
     },
     /// The harness re-attached while this run was in flight.
     RunContinued { run_id: String },
+    /// Best-effort cancellation signal for the original call. The trusted
+    /// runtime must validate session, run and pending tool identity. This
+    /// event neither completes a journal entry nor reverses an effect.
+    ToolCallCancelRequested {
+        run_id: String,
+        call_id: String,
+        name: String,
+    },
+    /// Successful turn suspension on these exact, still-pending deferred calls.
+    /// Appended to preserve existing positional encodings. This is a lifecycle
+    /// association only; the coordinator must still authorize each request.
+    RunDeferred {
+        run_id: String,
+        deferred_tool_call_ids: Vec<String>,
+    },
 }
 
 /// Who emitted an [`HarnessEvent::AgentMessage`].
@@ -497,10 +513,12 @@ impl HarnessEvent {
             | Self::ToolCallStarted { run_id, .. }
             | Self::ToolCallCompleted { run_id, .. }
             | Self::RunCompleted { run_id, .. }
+            | Self::RunDeferred { run_id, .. }
             | Self::RunInterrupted { run_id }
             | Self::AgentMessageChunk { run_id, .. }
             | Self::FileChanged { run_id, .. }
             | Self::ToolCallRequested { run_id, .. }
+            | Self::ToolCallCancelRequested { run_id, .. }
             | Self::BrowserActivity { run_id, .. }
             | Self::Generation { run_id, .. }
             | Self::RunCost { run_id, .. }
@@ -523,6 +541,7 @@ impl HarnessEvent {
             Self::ToolCallStarted { .. } => "tool_call_started",
             Self::ToolCallCompleted { .. } => "tool_call_completed",
             Self::RunCompleted { .. } => "run_completed",
+            Self::RunDeferred { .. } => "run_completed",
             Self::RunInterrupted { .. } => "run_interrupted",
             Self::RunContinued { .. } => "run_continued",
             Self::PromptQueued { .. } => "prompt_queued",
@@ -533,6 +552,7 @@ impl HarnessEvent {
             Self::TitleSuggested { .. } => "title_suggested",
             Self::PromptSteered { .. } => "prompt_steered",
             Self::ToolCallRequested { .. } => "tool_call_requested",
+            Self::ToolCallCancelRequested { .. } => "tool_call_cancel_requested",
             Self::Idle => "harness_idle",
             Self::Parked => "harness_parked",
             Self::Busy => "harness_busy",
@@ -551,7 +571,8 @@ impl HarnessEvent {
             | Self::ToolCallCompleted { tool_call_id, .. }
             | Self::FileChanged { tool_call_id, .. }
             | Self::BrowserActivity { tool_call_id, .. } => Some(tool_call_id.as_str()),
-            Self::ToolCallRequested { call_id, .. } => Some(call_id.as_str()),
+            Self::ToolCallRequested { call_id, .. }
+            | Self::ToolCallCancelRequested { call_id, .. } => Some(call_id.as_str()),
             _ => None,
         }
     }
@@ -1207,6 +1228,14 @@ mod tests {
         assert_eq!(
             HarnessEvent::RunInterrupted { run_id: "x".into() }.kind(),
             "run_interrupted"
+        );
+        assert_eq!(
+            HarnessEvent::RunDeferred {
+                run_id: "x".into(),
+                deferred_tool_call_ids: vec!["t1".into()],
+            }
+            .kind(),
+            "run_completed"
         );
         assert_eq!(
             HarnessEvent::PromptQueued {

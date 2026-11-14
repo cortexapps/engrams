@@ -5,6 +5,10 @@ frontend (default on) to any K8s cluster. The chart is cloud-agnostic
 — cloud-specific bindings (Workload Identity, KMS, LB annotations)
 live in the `values-*.yaml.example` overlays.
 
+Before enabling external MCP OAuth, qualify the deployment's complete logging
+path. See [callback ingress protection](MCP-CALLBACK-INGRESS.md) for the chart's
+controls, local canary, and required checks at the public ingress.
+
 ## What this chart deploys
 
 **Coordinator (always):**

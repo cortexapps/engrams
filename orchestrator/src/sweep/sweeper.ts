@@ -26,7 +26,7 @@ export const ALERT_ONLY_STALE_AFTER_HOURS = 48;
 // dbos_version_heartbeats accrues one row per (version, pod) across deploys
 // and nothing else deletes them. Rows older than the grace window are already
 // dead for liveness, so pruning at a comfortable multiple only bounds growth.
-// INVARIANT: retention must exceed every policy's staleAfterHours — the
+// INVARIANT: retention must exceed every finite policy's staleAfterHours — the
 // heartbeat history is also the staleness clock (a version with no surviving
 // rows reads as abandoned forever), so pruning too aggressively would make a
 // freshly-stranded workflow look ancient.
@@ -115,11 +115,7 @@ const MUTATING_ACTIONS = new Set<SweepDecision["action"]>([
   "cancelled_stale",
 ]);
 
-const ALERT_ACTIONS = new Set<SweepDecision["action"]>([
-  "alert_only",
-  "cancelled_stale",
-  "error",
-]);
+const ALERT_ACTIONS = new Set<SweepDecision["action"]>(["alert_only", "cancelled_stale", "error"]);
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -143,19 +139,14 @@ function logCycle(log: Logger, result: SweepTickResult): void {
   );
 }
 
-export async function runSweepTick(
-  deps: SweepTickDeps,
-): Promise<SweepTickResult> {
+export async function runSweepTick(deps: SweepTickDeps): Promise<SweepTickResult> {
   const result: SweepTickResult = {
     leaseHeld: false,
     liveVersions: [],
     scanned: 0,
     decisions: [],
   };
-  const leaseHeld = await deps.lease.tryAcquire(
-    deps.owner,
-    2 * deps.config.sweepIntervalMs,
-  );
+  const leaseHeld = await deps.lease.tryAcquire(deps.owner, 2 * deps.config.sweepIntervalMs);
   if (!leaseHeld) {
     logCycle(deps.log, result);
     return result;
@@ -163,9 +154,7 @@ export async function runSweepTick(
 
   result.leaseHeld = true;
   try {
-    const liveVersions = await deps.heartbeats.liveVersions(
-      deps.config.graceMs,
-    );
+    const liveVersions = await deps.heartbeats.liveVersions(deps.config.graceMs);
     result.liveVersions = liveVersions;
     const selfVersion = deps.appVersion();
     if (!liveVersions.includes(selfVersion)) {
@@ -188,16 +177,10 @@ export async function runSweepTick(
         Math.max(HEARTBEAT_RETENTION_MS, 2 * deps.config.graceMs),
       );
       if (pruned > 0) {
-        deps.log.info(
-          { component: "dbos-sweep", pruned },
-          "pruned stale version-heartbeat rows",
-        );
+        deps.log.info({ component: "dbos-sweep", pruned }, "pruned stale version-heartbeat rows");
       }
     } catch (error) {
-      deps.log.warn(
-        { error },
-        "failed to prune stale version-heartbeat rows",
-      );
+      deps.log.warn({ error }, "failed to prune stale version-heartbeat rows");
     }
 
     // Staleness is measured from ABANDONMENT — when the workflow's owning
@@ -242,7 +225,11 @@ export async function runSweepTick(
             };
           } else {
             const requeued = await deps.status.requeueStrandedPendingRecording(
-              { workflowUuid: row.workflowUuid, executorId: row.executorId, workflowName: row.name },
+              {
+                workflowUuid: row.workflowUuid,
+                executorId: row.executorId,
+                workflowName: row.name,
+              },
               deps.config.podGraceMs,
             );
             decision = requeued.flipped
@@ -271,10 +258,7 @@ export async function runSweepTick(
         if (MUTATING_ACTIONS.has(decision.action)) actions++;
       }
     } catch (error) {
-      deps.log.warn(
-        { error },
-        "DBOS stranded-executor scan failed; version scan continues",
-      );
+      deps.log.warn({ error }, "DBOS stranded-executor scan failed; version scan continues");
     }
 
     const abandonedMsByVersion = await deps.heartbeats.abandonedMsByVersion();
@@ -285,21 +269,11 @@ export async function runSweepTick(
     let after = cursor?.value;
     let exhausted = false;
 
-    scan: while (
-      actions < deps.config.batchCap &&
-      result.scanned < scanBudget
-    ) {
-      const rows = await deps.status.listNonTerminalOnVersionsNotIn(
-        liveVersions,
-        pageSize,
-        after,
-      );
+    scan: while (actions < deps.config.batchCap && result.scanned < scanBudget) {
+      const rows = await deps.status.listNonTerminalOnVersionsNotIn(liveVersions, pageSize, after);
 
       for (const row of rows) {
-        if (
-          actions >= deps.config.batchCap ||
-          result.scanned >= scanBudget
-        ) {
+        if (actions >= deps.config.batchCap || result.scanned >= scanBudget) {
           break scan;
         }
         result.scanned++;
@@ -325,18 +299,14 @@ export async function runSweepTick(
             // ERROR and is never re-swept; the rare silent zombie is an
             // operator call via the ledger's `suppressed` flag, with
             // sweep_count kept as the evidence trail.
-            const abandonedMs = abandonedMsByVersion.get(
-              row.applicationVersion!,
-            );
+            const abandonedMs = abandonedMsByVersion.get(row.applicationVersion!);
             const abandonedHours =
               abandonedMs === undefined
                 ? Number.POSITIVE_INFINITY
                 : abandonedMs / (60 * 60 * 1_000);
             const staleAfterHours =
-              policy.mode === "alert-only"
-                ? ALERT_ONLY_STALE_AFTER_HOURS
-                : policy.staleAfterHours;
-            if (abandonedHours > staleAfterHours) {
+              policy.mode === "alert-only" ? ALERT_ONLY_STALE_AFTER_HOURS : policy.staleAfterHours;
+            if (staleAfterHours !== null && abandonedHours > staleAfterHours) {
               await deps.ledger.recordSweep(row.workflowUuid, row.name);
               await deps.cancelWorkflow(row.workflowUuid);
               decision = {
@@ -345,8 +315,7 @@ export async function runSweepTick(
                 action: "cancelled_stale",
                 ...(policy.mode === "alert-only"
                   ? {
-                      reason:
-                        "unregistered workflow name past the stale window",
+                      reason: "unregistered workflow name past the stale window",
                     }
                   : {}),
               };
@@ -379,15 +348,14 @@ export async function runSweepTick(
                       reason: "owner became live or row changed",
                     };
               } else if (row.status === "ENQUEUED") {
-                const cleared =
-                  await deps.status.clearVersionOnEnqueuedRecording(
-                    {
-                      workflowUuid: row.workflowUuid,
-                      expectedVersion: row.applicationVersion!,
-                      workflowName: row.name,
-                    },
-                    deps.config.graceMs,
-                  );
+                const cleared = await deps.status.clearVersionOnEnqueuedRecording(
+                  {
+                    workflowUuid: row.workflowUuid,
+                    expectedVersion: row.applicationVersion!,
+                    workflowName: row.name,
+                  },
+                  deps.config.graceMs,
+                );
                 decision = cleared.flipped
                   ? {
                       workflowUuid: row.workflowUuid,
@@ -429,11 +397,7 @@ export async function runSweepTick(
       }
     }
 
-    if (
-      !exhausted &&
-      actions < deps.config.batchCap &&
-      result.scanned >= scanBudget
-    ) {
+    if (!exhausted && actions < deps.config.batchCap && result.scanned >= scanBudget) {
       deps.log.warn(
         {
           component: "dbos-sweep",
@@ -452,20 +416,13 @@ export async function runSweepTick(
           ALERT_ACTIONS.has(decision.action),
         ).length;
       } catch (error) {
-        deps.log.warn(
-          { error },
-          "DBOS sweep decision alerting failed",
-        );
+        deps.log.warn({ error }, "DBOS sweep decision alerting failed");
       }
 
       try {
-        result.failureScan =
-          await deps.alerter.scanTerminalFailures();
+        result.failureScan = await deps.alerter.scanTerminalFailures();
       } catch (error) {
-        deps.log.warn(
-          { error },
-          "DBOS terminal failure scan failed",
-        );
+        deps.log.warn({ error }, "DBOS terminal failure scan failed");
       }
     }
 
@@ -490,10 +447,7 @@ export async function runSweepTick(
 }
 
 export interface SweeperDeps extends SweepTickDeps {
-  setInterval?: (
-    fn: () => void,
-    ms: number,
-  ) => ReturnType<typeof setInterval>;
+  setInterval?: (fn: () => void, ms: number) => ReturnType<typeof setInterval>;
   clearInterval?: (timer: ReturnType<typeof setInterval>) => void;
 }
 
@@ -550,10 +504,7 @@ export interface VersionHeartbeatDeps {
   heartbeats: HeartbeatStore;
   intervalMs: number;
   log: Logger;
-  setInterval?: (
-    fn: () => void,
-    ms: number,
-  ) => ReturnType<typeof setInterval>;
+  setInterval?: (fn: () => void, ms: number) => ReturnType<typeof setInterval>;
   clearInterval?: (timer: ReturnType<typeof setInterval>) => void;
 }
 

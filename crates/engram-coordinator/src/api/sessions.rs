@@ -32,16 +32,14 @@ pub(crate) const DEFAULT_DISK_GIB: u32 = 20;
 /// org-secret backend layered ahead of the deployment one). A `literal` secret
 /// is placed in the guest env; a `broker` secret installs a per-session
 /// placeholder in the env + an egress entry the proxy substitutes on the
-/// secret's `allow_hosts` (the guest never holds the value). A ref that doesn't
-/// resolve is skipped + warn-logged — the session still boots, that one secret
-/// is just absent (mirrors `resolve_inject_entries`).
+/// secret's `allow_hosts` (the guest never holds the value). Missing refs and
+/// secret-store errors block launch and resume.
 ///
 /// Issue #535 (c): the per-secret `SecretStore` round trips are independent
 /// (no secret's resolution depends on another's), so they run concurrently
 /// via `join_all` instead of one-at-a-time — the result folds back into the
 /// SAME order-insensitive (env map + entries vec) shape a serial loop would
 /// have produced.
-/// Missing secrets and store errors block launch and resume.
 pub(crate) async fn resolve_policy_secrets(
     state: &SharedState,
     policy: Option<&engram_core::types::IntegrationPolicy>,
@@ -304,11 +302,10 @@ fn stamp_committer_env(cfg: &crate::config::CoordinatorConfig, env: &mut HashMap
 ///
 /// Async only because of `host.guest_ip`. Pure assembly delegated to
 /// [`assemble_resume_egress_policy`] for testability.
-/// Build the egress policy for a resume. Lossy by design: a
-/// resolution failure degrades to a reduced policy (the session must
-/// come up; the user is present to retry, and the mint refresh seam
-/// re-mints stale entries on first use). `None` = no guest IP for
-/// this sandbox (yet). ADR 0111 removed the strict survivor face:
+/// Policy reads, policy parsing, and required secret resolution fail closed.
+/// Individual inject failures omit those entries. `None` = no guest IP for
+/// an ordinary session (yet). Managed policies require a guest IP.
+/// ADR 0111 removed the strict survivor face:
 /// the host persists every APPLIED policy beside its binding record
 /// and rebuilds its registry locally, so no post-restart rebuild
 /// happens on the coordinator at all.
@@ -318,13 +315,33 @@ pub(crate) async fn build_resume_egress_policy(
     sandbox_id: engram_core::SandboxId,
     image: &str,
 ) -> Result<Option<engram_core::types::egress::SessionEgressPolicy>, ApiError> {
+    let policy = load_session_policy(state, session_id).await?;
     let Some(guest_ip) = state.services.host.guest_ip(sandbox_id).await else {
+        if policy.as_ref().is_some_and(|p| p.managed_deny.is_some()) {
+            return Err(ApiError::BadRequest(
+                "managed policy requires an enforceable guest identity".into(),
+            ));
+        }
         return Ok(None);
     };
+    build_egress_policy_for_guest(state, session_id, sandbox_id, image, guest_ip, policy)
+        .await
+        .map(Some)
+}
+
+/// Compile persisted policy with a guest identity obtained from the host authority.
+pub(crate) async fn build_egress_policy_for_guest(
+    state: &SharedState,
+    session_id: SessionId,
+    sandbox_id: engram_core::SandboxId,
+    image: &str,
+    guest_ip: std::net::Ipv4Addr,
+    policy: Option<engram_core::types::IntegrationPolicy>,
+) -> Result<engram_core::types::egress::SessionEgressPolicy, ApiError> {
     // ADR 0057: re-read the persisted session policy once → network + secrets +
     // injects (resolved host-side) + observes (pure), so a resumed session
     // re-derives its whole egress policy on the new host (same as create).
-    let policy = load_session_policy(state, session_id).await?;
+
     let (repo, tag) = split_image_ref(image);
     let secret_ctx = SecretContext {
         repo,
@@ -351,7 +368,7 @@ pub(crate) async fn build_resume_egress_policy(
         .await?
         .map(|rs| rs.apps)
         .unwrap_or_default();
-    Ok(Some(assemble_resume_egress_policy(
+    let mut result = assemble_resume_egress_policy(
         session_id,
         sandbox_id,
         guest_ip,
@@ -368,7 +385,9 @@ pub(crate) async fn build_resume_egress_policy(
             .map(|policy| policy.tunnels.clone())
             .unwrap_or_default(),
         apps,
-    )))
+    );
+    result.managed_deny = policy.and_then(|p| p.managed_deny);
+    Ok(result)
 }
 
 /// Pure synchronous assembly path for the resume egress policy.
@@ -391,6 +410,7 @@ pub(crate) fn assemble_resume_egress_policy(
     apps: Vec<engram_core::types::egress::AppEndpoint>,
 ) -> engram_core::types::egress::SessionEgressPolicy {
     engram_core::types::egress::SessionEgressPolicy {
+        managed_deny: None,
         session_id,
         sandbox_id,
         guest_ip,
@@ -453,6 +473,11 @@ pub(crate) async fn load_session_secrets(
 
 #[derive(Deserialize)]
 pub struct CreateSessionRequest {
+    /// Supplied only by the dedicated pinned mTLS creation service.
+    #[serde(skip)]
+    pub(crate) managed_creation: Option<engram_core::types::managed_create::ManagedCreation>,
+    #[serde(skip)]
+    pub(crate) mcp_creation: Option<engram_core::types::mcp_policy::McpPolicyCreation>,
     /// ADR 0109: trusted app-gRPC callers can reserve an ID so their external
     /// authorization snapshot exists before the VM starts. The public JSON
     /// surface cannot set this field.
@@ -595,7 +620,15 @@ pub(crate) async fn create_session_core(
             return result;
         }
     };
-    let result = boot_prepared(state, prepared, start, req.oauth_credential.clone()).await;
+    let result = boot_prepared(
+        state,
+        prepared,
+        start,
+        req.oauth_credential.clone(),
+        req.mcp_creation.clone(),
+        req.managed_creation.clone(),
+    )
+    .await;
     let kind = match &result {
         Ok(body) => body.kind,
         Err(_) => "unknown",
@@ -637,8 +670,11 @@ async fn boot_prepared(
     // (now-concurrent, host-side) restore work.
     create_start: std::time::Duration,
     oauth_credential: Option<engram_core::types::oauth::OAuthCredentialKey>,
+    mcp_creation: Option<engram_core::types::mcp_policy::McpPolicyCreation>,
+    managed_creation: Option<engram_core::types::managed_create::ManagedCreation>,
 ) -> Result<CreateSessionResponse, ApiError> {
     let crate::session_boot::PreparedBoot {
+        managed_selection,
         inputs,
         memory_mib,
         cpu_budget_vcpus,
@@ -730,7 +766,19 @@ async fn boot_prepared(
     // Issue #535 (b): the KEK seal is async crypto with no place inside a DB
     // transaction — do it here, once, and hand the SEALED row (not the
     // plaintext) to `reserve_and_persist_create`.
-    let sealed_secrets = match inputs.deferred_session_secrets.as_ref() {
+    // Managed retries use the complete original environment, never current image secrets.
+    let creation_secrets = if managed_creation.is_some() {
+        Some(
+            &inputs
+                .agent
+                .as_ref()
+                .ok_or_else(|| ApiError::Unavailable("managed harness unavailable".into()))?
+                .session_env,
+        )
+    } else {
+        inputs.deferred_session_secrets.as_ref()
+    };
+    let sealed_secrets = match creation_secrets {
         Some(overrides) => Some(seal_session_secrets(state, session_id, overrides).await?),
         None => None,
     };
@@ -742,7 +790,36 @@ async fn boot_prepared(
         None => None,
     };
 
+    if mcp_creation.is_some()
+        && (!matches!(inputs.selected_harness.as_deref(), Some("claude" | "codex"))
+            || inputs.spec.mode != SessionMode::Agent)
+    {
+        return Err(ApiError::BadRequest(
+            "external write policy requires a supported agent harness".into(),
+        ));
+    }
     let write_set = engram_core::traits::SessionCreateWriteSet {
+        managed_boot_selection: if managed_creation.is_some() {
+            let selection = managed_selection.ok_or_else(|| {
+                ApiError::Unavailable("approved cold boot inputs unavailable".into())
+            })?;
+            selection.validate()?;
+            Some(selection)
+        } else {
+            None
+        },
+        managed_initial_prompt: if managed_creation.is_some() {
+            crate::api::prompt::managed_initial_prompt(
+                state,
+                session_id,
+                inputs.prompt.clone(),
+                inputs.harness_mode.clone(),
+            )?
+        } else {
+            None
+        },
+        managed_creation: managed_creation.clone(),
+        mcp_policy: mcp_creation,
         session_id,
         spec: inputs.spec.clone(),
         mem_budget_mib: memory_mib as i64,
@@ -777,6 +854,17 @@ async fn boot_prepared(
         .reserve_and_persist_create(write_set, &candidates.hosts, candidates.affinity_len)
         .await
         .map_err(|e| ApiError::Internal(format!("reserve_and_persist_create: {e}")))?;
+
+    // Held managed creates cannot reach prompt delivery or ordinary boot. The
+    // later physical boot consumer must claim this same durable reservation.
+    if managed_creation.is_some() {
+        return Ok(CreateSessionResponse {
+            session_id,
+            status: SessionState::Queued.as_str(),
+            image_version: image_tag,
+            kind: "queued",
+        });
+    }
 
     // ADR 0073 → ADR 0108 A6: the create-time initial prompt gets its
     // durable accept here (receipt + user echo + outbox row, committed
@@ -899,14 +987,14 @@ async fn boot_prepared(
         async move {
             // ADR 0079: the direct (capacity-available) create pipeline is
             // deliberately out-of-op — see the epoch-0 disposition note in
-            // the host's `check_session_epoch` — so the boot RPCs are
-            // unfenced here. The queued-create path fences via the
-            // create_boot verb.
+            // the host's `check_session_epoch`. Keep the session identity
+            // with epoch zero; this does not claim an op epoch. The
+            // queued-create path fences via the create_boot verb.
             match crate::session_boot::boot_on_reserved_host(
                 &st,
                 inputs,
                 host_id,
-                SessionFence::unfenced(),
+                SessionFence::new(session_id, 0),
             )
             .await
             {
@@ -1015,13 +1103,7 @@ pub(crate) async fn prepare_from_row(
     state: &SharedState,
     session: &Session,
 ) -> Result<crate::session_boot::PreparedBoot, ApiError> {
-    let overrides = load_session_secrets(state, session.id)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(session_id = %session.id, error = %e,
-            "prepare_from_row: secret overrides unavailable; continuing without them");
-            None
-        });
+    let overrides = load_session_secrets(state, session.id).await?;
     // Issue #535 (a): the queued path stays tolerant of a soft-deleted image
     // (the lineage is still pinned) — the cache's `_any` fill is exactly this.
     // Propagate the cache's own error verbatim (missing row / bad manifest /
@@ -1033,25 +1115,8 @@ pub(crate) async fn prepare_from_row(
     // ADR 0056 (B′): re-read the persisted integration policy so the queued
     // boot re-injects (`resolve_inject_entries` resolves its refs again on the
     // new host, via `boot_on_reserved_host`'s overlapped env/egress leg).
-    // A malformed/absent blob → None (no injection).
-    let integration_policy = match state
-        .services
-        .meta
-        .get_session_integration_policy(session.id)
-        .await
-    {
-        Ok(Some(json)) => engram_core::types::IntegrationPolicy::parse(&json).unwrap_or_else(|e| {
-            tracing::warn!(session_id = %session.id, error = %e,
-                    "persisted integration policy failed to parse; booting without injection");
-            None
-        }),
-        Ok(None) => None,
-        Err(e) => {
-            tracing::warn!(session_id = %session.id, error = %e,
-                "integration policy lookup failed; booting without injection");
-            None
-        }
-    };
+    // Read and parse errors block boot; a missing policy is valid absence.
+    let integration_policy = load_session_policy(state, session.id).await?;
     // ADR 0077 phase 3: read the persisted RuntimeSpec so the queued /
     // resumed boot re-resolves the session's dynamic skill NAMES against
     // the current fleet stamp — fixing the ADR 0055 TODO(P1-D) where the
@@ -1408,8 +1473,8 @@ async fn prepare_inner(
 
     // App committer identity (deployment config): stamped after every other
     // layer with `or_insert`, so anything explicit above wins. Resume takes
-    // the same stamp via `resolve_session_env` — deliberately NOT sealed
-    // into `session_secrets` (config is durable and hot-swappable).
+    // the same stamp via `resolve_session_env` for ordinary sessions. Managed
+    // reservations seal the complete original environment in `boot_prepared`.
     stamp_committer_env(&state.cfg, &mut session_env);
 
     let deferred_session_secrets: Option<HashMap<String, String>> = if deferred_map.is_empty() {
@@ -1432,7 +1497,7 @@ async fn prepare_inner(
     // ADR 0062: resolve the per-session harness from the catalog → the AgentSpec
     // the backend execs + the `dyn_0` mount carrying the current catalog
     // generation. `None` for a dev VM (no harness, dyn_0 stays sentinel).
-    let (agent, harness_mount, harness_egress) = match resolve_harness(
+    let (agent, harness_mount, harness_egress, managed_launch) = match resolve_harness(
         state,
         selected_harness.as_deref(),
         mode,
@@ -1443,11 +1508,10 @@ async fn prepare_inner(
     )
     .await?
     {
-        // The CREATE flavor consumes all three fields BY NAME (ADR 0116
-        // B2): the agent spec, the dyn_0 mount for the slot plan, and
-        // the egress to merge into the policy it persists.
-        Some(h) => (Some(h.agent), Some(h.mount), h.egress),
-        None => (None, None, Default::default()),
+        // CREATE retains the launch metadata with dyn_0 and merges its egress
+        // into the session policy before reservation.
+        Some(h) => (Some(h.agent), Some(h.mount), h.egress, Some(h.launch)),
+        None => (None, None, Default::default(), None),
     };
 
     // ADR 0063 addendum: fold the selected harness's declared egress
@@ -1492,7 +1556,36 @@ async fn prepare_inner(
     // the reserve-side `ScheduleContext` on `required_image_digest`.
     let manifest_digest = bundle.enabled.manifest_digest.clone();
 
+    let managed_selection =
+        bundle
+            .base_snapshot
+            .disk_manifest
+            .zip(managed_launch)
+            .map(|(base_manifest, launch)| {
+                let mut mounts = selected_mounts.clone();
+                mounts.sort_by_key(|d| {
+                    (0..engram_core::types::sandbox::AuxRoDrive::RESERVED_SLOTS)
+                        .position(|i| {
+                            d.drive_id == engram_core::types::sandbox::AuxRoDrive::slot_drive_id(i)
+                        })
+                        .unwrap_or(usize::MAX)
+                });
+                engram_core::types::managed_bridge::ManagedBootSelection {
+                    launch,
+                    image: image_uri.into(),
+                    image_digest: manifest_digest.clone(),
+                    base_manifest,
+                    aux_ro_drives: mounts,
+                    vcpus: cpu_budget_vcpus,
+                    memory_mib,
+                    disk_gib: config
+                        .resources
+                        .suggested_disk_gib
+                        .unwrap_or(DEFAULT_DISK_GIB),
+                }
+            });
     Ok(crate::session_boot::PreparedBoot {
+        managed_selection,
         inputs: crate::session_boot::BootInputs {
             session_id,
             spec,
@@ -1983,8 +2076,33 @@ pub(crate) async fn resolve_harness(
         ));
     };
 
-    let (descriptor, exec, mount) = resolve_harness_mount(state, name).await?;
-    validate_harness_mode(&descriptor, name, harness_mode)?;
+    let (descriptor, _exec, mount) = resolve_harness_mount(state, name).await?;
+    let launch = engram_core::types::managed_bridge::ManagedHarnessLaunch {
+        descriptor,
+        workdir,
+    };
+    Ok(Some(resolve_pinned_harness(
+        state,
+        launch,
+        mount,
+        session_id,
+        session_env,
+        harness_mode,
+    )?))
+}
+
+pub(crate) fn resolve_pinned_harness(
+    state: &SharedState,
+    launch: engram_core::types::managed_bridge::ManagedHarnessLaunch,
+    mount: engram_core::types::sandbox::AuxRoDrive,
+    session_id: SessionId,
+    session_env: HashMap<String, String>,
+    harness_mode: Option<&str>,
+) -> Result<ResolvedHarness, ApiError> {
+    let descriptor = &launch.descriptor;
+    validate_harness_mode(descriptor, &descriptor.name, harness_mode)?;
+    let exec = format!("{}/{}", mount.guest_mount.display(), descriptor.exec_path());
+    let workdir = launch.workdir.clone();
 
     // Harness-only extras, layered on top of `session_env` for the harness
     // child. `session_env` already carries ENGRAM_SESSION_ID + the image env +
@@ -2048,11 +2166,12 @@ pub(crate) async fn resolve_harness(
         session_env,
         host_ca_pem: None,
     };
-    Ok(Some(ResolvedHarness {
+    Ok(ResolvedHarness {
         agent,
         mount,
-        egress: descriptor.egress,
-    }))
+        egress: descriptor.egress.clone(),
+        launch,
+    })
 }
 
 /// ADR 0116 B2: `resolve_harness`'s output, with NAMED fields so each
@@ -2060,6 +2179,7 @@ pub(crate) async fn resolve_harness(
 /// tuple-dropping (`let (agent, _mount, _egress) = …`) is how the
 /// cold-boot harness wedge survived review, and it is retired.
 pub(crate) struct ResolvedHarness {
+    pub launch: engram_core::types::managed_bridge::ManagedHarnessLaunch,
     /// The spec the backend execs (argv points into `dyn_0`).
     pub agent: engram_core::types::sandbox::AgentSpec,
     /// The `dyn_0` catalog mount. Consumed by the CREATE flavor's slot
@@ -2139,6 +2259,159 @@ pub(crate) async fn resolve_harness_mount(
 mod tests {
     use super::*;
     use engram_core::SandboxId;
+
+    fn seed_boot_image(meta: &engram_sim::SimMetadataStore, session: &Session) {
+        let id = engram_core::SnapshotId::from(uuid::Uuid::from_u128(72));
+        let now = session.created_at;
+        meta.with_db_mut(|db| {
+            db.enabled_images.insert(
+                session.image.clone(),
+                (
+                    engram_core::types::EnabledImage {
+                        id: uuid::Uuid::from_u128(73),
+                        image_uri: session.image.clone(),
+                        image_config: Default::default(),
+                        oci_defaults: Default::default(),
+                        manifest_digest: "sha256:test".into(),
+                        disk_manifest: None,
+                        base_snapshot_id: Some(id),
+                        base_snapshot_disk_manifest: None,
+                        base_snapshot_memory_manifest: None,
+                        last_refreshed_at: now,
+                        created_at: now,
+                        updated_at: None,
+                        soft_deleted_at: None,
+                    },
+                    None,
+                ),
+            );
+            db.snapshots.insert(
+                id,
+                engram_core::types::SnapshotRecord {
+                    id,
+                    session_id: None,
+                    host_id: None,
+                    image_version: "test".into(),
+                    size_bytes: 0,
+                    created_at: now,
+                    last_accessed_at: now,
+                    swap_manifest: None,
+                    disk_manifest: None,
+                    memory_manifest: None,
+                    recoverable: true,
+                    aux_bundles: Vec::new(),
+                    events_cursor: None,
+                    fc_snapshot_version: None,
+                },
+            );
+        });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_boot_propagates_secret_lookup_failure() {
+        let (state, meta, session, _dir) = crate::session_boot::credential_tests::fixture();
+        meta.set_outage(true);
+        let expected = load_session_secrets(&state, session.id)
+            .await
+            .unwrap_err()
+            .to_string();
+        let error = prepare_from_row(&state, &session)
+            .await
+            .err()
+            .expect("must reject failed secret read");
+        assert_eq!(
+            error.to_string(),
+            expected,
+            "do not proceed to image lookup after a failed secret read"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_boot_rejects_unreadable_sealed_secrets() {
+        let (state, meta, session, _dir) = crate::session_boot::credential_tests::fixture();
+        let cipher = engram_crypto::CredCipher::new(state.services.kek.as_ref());
+        // A valid envelope containing the wrong JSON shape exercises decoding;
+        // corrupting its ciphertext exercises authentication/decryption.
+        let sealed = cipher.seal(b"[]").await.unwrap();
+        let mut row = engram_core::types::SessionSecrets {
+            session_id: session.id,
+            wrapped_dek: sealed.wrapped_dek,
+            nonce: sealed.nonce.to_vec(),
+            ciphertext: sealed.ciphertext,
+            key_id: sealed.key_id,
+            created_at: session.created_at,
+        };
+        for failure in [
+            "deserialize session secrets",
+            "open session secrets",
+            "nonce wrong length",
+        ] {
+            meta.with_db_mut(|db| {
+                db.session_secrets.insert(session.id, row.clone());
+            });
+            let error = prepare_from_row(&state, &session)
+                .await
+                .err()
+                .expect("must reject unreadable secrets");
+            assert!(error.to_string().contains(failure), "{error}");
+            row.ciphertext[0] ^= 1;
+            if failure == "open session secrets" {
+                row.nonce.clear();
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_boot_rejects_malformed_policy_and_preserves_absence() {
+        let (state, meta, session, _dir) = crate::session_boot::credential_tests::fixture();
+        seed_boot_image(&meta, &session);
+        meta.with_db_mut(|db| {
+            db.session_integration_policy.insert(session.id, "{".into());
+        });
+        let error = prepare_from_row(&state, &session)
+            .await
+            .err()
+            .expect("must reject malformed policy");
+        assert!(error.to_string().contains("session policy:"), "{error}");
+        meta.with_db_mut(|db| {
+            db.session_integration_policy.remove(&session.id);
+        });
+        let prepared = prepare_from_row(&state, &session)
+            .await
+            .expect("absent secrets and policy are valid");
+        assert!(prepared.inputs.integration_policy.is_none());
+        assert!(prepared.inputs.deferred_session_secrets.is_none());
+
+        let overrides = HashMap::from([("API_TOKEN".into(), "session-token".into())]);
+        let sealed = seal_session_secrets(&state, session.id, &overrides)
+            .await
+            .unwrap();
+        meta.with_db_mut(|db| {
+            db.session_secrets.insert(session.id, sealed);
+            db.session_integration_policy
+                .insert(session.id, "{}".into());
+        });
+        let prepared = prepare_from_row(&state, &session)
+            .await
+            .expect("valid credentials and policy still prepare");
+        assert_eq!(
+            prepared.inputs.session_env.get("API_TOKEN"),
+            overrides.get("API_TOKEN")
+        );
+        assert_eq!(prepared.inputs.deferred_session_secrets, Some(overrides));
+        assert!(prepared.inputs.integration_policy.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persisted_policy_lookup_failure_is_not_absence() {
+        let (state, meta, session, _dir) = crate::session_boot::credential_tests::fixture();
+        assert!(load_session_policy(&state, session.id)
+            .await
+            .unwrap()
+            .is_none());
+        meta.set_outage(true);
+        assert!(load_session_policy(&state, session.id).await.is_err());
+    }
 
     struct ExplicitRefStore;
 

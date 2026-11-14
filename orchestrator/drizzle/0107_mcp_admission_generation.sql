@@ -1,0 +1,2 @@
+ALTER TABLE "mcp_admission" ADD COLUMN "reservation_id" text DEFAULT gen_random_uuid()::text NOT NULL;--> statement-breakpoint
+CREATE UNIQUE INDEX "mcp_admission_reservation_idx" ON "mcp_admission" USING btree ("reservation_id");

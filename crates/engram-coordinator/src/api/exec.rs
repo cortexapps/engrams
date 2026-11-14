@@ -184,6 +184,8 @@ pub async fn exec_stream_core(
     ),
     ApiError,
 > {
+    crate::managed_boot::gate(state, id, true).await?;
+
     let (base_env, default_workdir) = session_exec_env(state, id).await;
     let wake = req.wake.unwrap_or(true);
     let caller_supplied_exec_id = req.exec_id.is_some();

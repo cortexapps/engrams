@@ -1,0 +1,176 @@
+{{- if .Values.mcpWorker.enabled }}
+{{- range $zone := .Values.mcpWorker.zones }}
+{{- if not $zone.isolationConfirmed }}{{ fail "MCP worker namespace isolation must be verified" }}{{- end }}
+{{- $name := printf "%s-mcp-%s" (include "engram.fullname" $) $zone.policy.id | trunc 63 | trimSuffix "-" }}
+{{- $namespace := required "MCP worker requires a dedicated namespace" $zone.namespace }}
+{{- if eq $namespace $.Release.Namespace }}{{ fail "MCP worker namespace must differ from the application namespace" }}{{- end }}
+{{- $tls := required "MCP worker TLS secret is required" $zone.tlsSecret }}
+{{- $rules := $zone.egressRules }}
+{{- if eq $zone.policy.mode "public" }}
+{{- $deny4 := list "0.0.0.0/8" "10.0.0.0/8" "100.64.0.0/10" "127.0.0.0/8" "169.254.0.0/16" "172.16.0.0/12" "192.0.0.0/24" "192.0.2.0/24" "192.88.99.0/24" "192.168.0.0/16" "198.18.0.0/15" "198.51.100.0/24" "203.0.113.0/24" "224.0.0.0/4" "240.0.0.0/4" "168.63.129.16/32" }}
+{{- $deny6 := list "2001::/23" "2001:db8::/32" "2002::/16" "3fff::/20" }}
+{{- range $deny := $zone.policy.denyCidrs }}
+{{- if not (contains ":" $deny) }}{{- $deny4 = append $deny4 $deny }}
+{{- else if regexMatch "^[23]" $deny }}{{- $deny6 = append $deny6 $deny }}{{- end }}
+{{- end }}
+{{- $rules = list (dict "cidr" "0.0.0.0/0" "except" ($deny4 | uniq)) (dict "cidr" "2000::/3" "except" ($deny6 | uniq)) }}
+{{- end }}
+{{- if not $rules }}{{ fail "MCP worker egress rules are required" }}{{- end }}
+{{- $callers := required "MCP worker caller certificate pins are required" $zone.callers }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ $namespace }}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  namespace: {{ $namespace }}
+data:
+  config.json: {{ dict "zone" $zone.policy "callers" $callers "egressRules" $rules | toJson | quote }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ $namespace }}
+spec:
+  replicas: {{ default 1 $zone.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: mcp-worker
+      engrams.io/mcp-zone: {{ $zone.policy.id }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ $.Release.Name }}
+        app.kubernetes.io/component: mcp-worker
+        engrams.io/mcp-zone: {{ $zone.policy.id }}
+      annotations:
+        checksum/zone-policy: {{ dict "zone" $zone.policy "callers" $callers "egressRules" $rules | toJson | sha256sum }}
+    spec:
+      serviceAccountName: {{ $name }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: "{{ $.Values.mcpWorker.image.repository }}:{{ default $.Chart.AppVersion $.Values.mcpWorker.image.tag }}"
+          imagePullPolicy: {{ $.Values.mcpWorker.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: MCP_WORKER_ENABLED
+              value: {{ default false $zone.dispatchEnabled | quote }}
+          ports:
+            - name: rpc
+              containerPort: 8443
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/mcp-worker
+              readOnly: true
+            - name: tls
+              mountPath: /etc/mcp-worker/tls
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}
+        - name: tls
+          secret:
+            secretName: {{ $tls }}
+            defaultMode: 0440
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ $namespace }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    app.kubernetes.io/component: mcp-worker
+    engrams.io/mcp-zone: {{ $zone.policy.id }}
+  ports:
+    - name: rpc
+      port: 8443
+      targetPort: rpc
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+  namespace: {{ $namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: mcp-worker
+      engrams.io/mcp-zone: {{ $zone.policy.id }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $.Release.Namespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ $.Release.Name }}
+            matchExpressions:
+              - key: app.kubernetes.io/component
+                operator: In
+                values: [coordinator, orchestrator]
+      ports:
+        - protocol: TCP
+          port: 8443
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ required "DNS namespace is required" $zone.dns.namespace }}
+          podSelector:
+            matchLabels:
+              {{- required "DNS pod selector is required" $zone.dns.podLabels | toYaml | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        {{- range $rule := $rules }}
+        - ipBlock:
+            cidr: {{ $rule.cidr }}
+            {{- with $rule.except }}
+            except:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+        {{- end }}
+      ports:
+        {{- range $port := required "Approved HTTPS ports are required" $zone.ports }}
+        - protocol: TCP
+          port: {{ $port }}
+        {{- end }}
+{{- end }}
+{{- end }}

@@ -76,6 +76,7 @@
 #      kind: BackendConfig
 #      metadata: { name: engram-web-iap }
 #      spec:
+#        logging: { enable: false }
 #        iap: { enabled: true }
 #        # 300s is fine here — no sockets or streams ride this host.
 #      ---
@@ -83,6 +84,7 @@
 #      kind: BackendConfig
 #      metadata: { name: engram-api-no-iap }
 #      spec:
+#        logging: { enable: false }
 #        iap: { enabled: false }
 #        # A backend timeout caps a SOCKET'S LIFETIME, not idleness:
 #        # the default 30s (or the web host's 300s) would cut every

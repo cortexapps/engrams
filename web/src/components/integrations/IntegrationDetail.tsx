@@ -70,6 +70,14 @@ export function IntegrationDetail() {
     window.history.replaceState({}, "", window.location.pathname);
   }, []);
 
+  if (provider === "mcp") {
+    return (
+      <div className="mx-auto flex max-w-3xl flex-col gap-4">
+        <BackLink />
+        <p>Manage external MCP connections in Integrations.</p>
+      </div>
+    );
+  }
   if (isLoading) return <SkeletonRows rows={3} />;
   if (!view) {
     return (

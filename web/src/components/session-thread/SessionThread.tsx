@@ -15,6 +15,7 @@ import {
   completeToolCall as completeToolCallMethod,
 } from "../../gen/engram/app/v1/session-SessionService_connectquery";
 import { buildMessages } from "./buildMessages";
+import type { McpPlanReview } from "@/gen/engram/app/v1/session_pb";
 import { SessionStatusContext } from "./session-status";
 import { ComposerActionsContext, type InterruptSource } from "./composer-actions";
 import {
@@ -254,13 +255,14 @@ export function SessionThread({
   // ADR 0107: the generic deferred-tool completion — questions and plan
   // decisions ride the same CompleteToolCall + optimistic set.
   const completeTool = useCallback(
-    (toolCallId: string, result: unknown) => {
+    (toolCallId: string, result: unknown, review?: McpPlanReview, onFailure?: () => void) => {
       if (sendBlocked) return;
       setAnsweredToolCallIds((prev) => new Set(prev).add(toolCallId));
       const completion = completeToolCallMutation.mutateAsync({
         sessionId,
         toolCallId,
         resultJson: JSON.stringify(result),
+        expectedMcpPlanReview: review,
       });
       completion.catch((err) => {
         setAnsweredToolCallIds((prev) => {
@@ -268,6 +270,7 @@ export function SessionThread({
           next.delete(toolCallId);
           return next;
         });
+        onFailure?.();
         console.warn("completeToolCall failed", err);
       });
     },
@@ -414,7 +417,7 @@ export function SessionThread({
             }}
           >
             <QuestionActionsContext.Provider
-              value={{ submitAnswer, completeTool, answeredToolCallIds, sendBlocked }}
+              value={{ sessionId, submitAnswer, completeTool, answeredToolCallIds, sendBlocked }}
             >
               <TranscriptWindowContext.Provider value={transcriptWindow ?? NO_TRANSCRIPT_BACKFILL}>
                 <TooltipProvider>

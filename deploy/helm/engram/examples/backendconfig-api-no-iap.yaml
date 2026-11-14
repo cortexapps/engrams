@@ -30,6 +30,9 @@ kind: BackendConfig
 metadata:
   name: engram-web-iap
 spec:
+  # Protect the initial callback query and referrer at the public backend.
+  logging:
+    enable: false
   iap:
     enabled: true
 ---
@@ -38,6 +41,10 @@ kind: BackendConfig
 metadata:
   name: engram-api-no-iap
 spec:
+  # The split API host receives transient OAuth values in POST bodies.
+  # Body/trace capture must also be disabled in external middleware.
+  logging:
+    enable: false
   iap:
     enabled: false
   timeoutSec: 3600

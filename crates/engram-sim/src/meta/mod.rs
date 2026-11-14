@@ -42,6 +42,8 @@ use engram_core::traits::{Clock, Entropy};
 use engram_core::MetaError;
 use parking_lot::Mutex;
 
+mod managed_operator;
+mod mcp_policy;
 mod store_impl;
 
 /// A would-be `pg_notify` recorded instead of fired. The D5 scheduler
@@ -138,6 +140,8 @@ use engram_core::{HostId, SessionId, SnapshotId};
 /// keeps that the domain type doesn't carry.
 #[derive(Clone, Debug)]
 pub struct SessRow {
+    pub mcp_write_policy: Option<engram_core::types::mcp_policy::StoredWritePolicy>,
+    pub mcp_policy_parent_id: Option<SessionId>,
     pub session: Session,
     pub mem_budget_mib: i64,
     pub cpu_budget_vcpus: i32,
@@ -221,6 +225,17 @@ pub struct SimDb {
     /// `session_broker_tokens`, PK `session_id`).
     pub broker_tokens:
         std::collections::BTreeMap<SessionId, engram_core::types::registry::SessionBrokerToken>,
+    pub org_secret_purposes: std::collections::BTreeMap<
+        String,
+        Option<engram_core::types::org_secret::McpSecretReservation>,
+    >,
+    pub org_secrets: std::collections::BTreeMap<
+        String,
+        (
+            engram_core::types::org_secret::SealedOrgSecret,
+            engram_core::types::org_secret::OrgSecret,
+        ),
+    >,
     /// ADR 0106: sealed payloads keyed by opaque subject + provider.
     pub oauth_credentials: std::collections::BTreeMap<
         engram_core::types::oauth::OAuthCredentialKey,
@@ -231,6 +246,14 @@ pub struct SimDb {
     /// state, not part of the domain credential type.
     pub oauth_refresh_claims:
         std::collections::BTreeMap<engram_core::types::oauth::OAuthCredentialKey, DateTime<Utc>>,
+    pub mcp_refresh_claims: std::collections::BTreeMap<
+        engram_core::types::oauth::OAuthCredentialKey,
+        engram_core::types::mcp::McpRefreshClaim,
+    >,
+    pub mcp_oauth_admission:
+        std::collections::BTreeMap<uuid::Uuid, engram_core::types::mcp::McpOAuthAdmission>,
+    pub mcp_flow_states:
+        std::collections::BTreeMap<uuid::Uuid, engram_core::types::mcp::McpSealedState>,
     pub oauth_flows: std::collections::BTreeMap<uuid::Uuid, engram_core::types::oauth::OAuthFlow>,
     pub session_oauth_bindings:
         std::collections::BTreeMap<SessionId, engram_core::types::oauth::SessionOAuthBinding>,
@@ -260,6 +283,35 @@ pub struct SimDb {
         std::collections::BTreeMap<SessionId, engram_core::types::runtime_spec::RuntimeSpec>,
     pub session_capabilities:
         std::collections::BTreeMap<SessionId, Vec<engram_core::types::capability::Capability>>,
+    pub managed_captures: std::collections::BTreeMap<
+        SnapshotId,
+        (
+            engram_core::types::managed_boot::ManagedCaptureRequest,
+            Option<engram_core::types::managed_boot::ManagedCaptureAuthority>,
+        ),
+    >,
+    pub managed_boots:
+        std::collections::BTreeMap<SessionId, engram_core::types::managed_boot::ManagedBootRecord>,
+    /// Actual published gate state; only explicit test fixtures seed this before a publisher exists.
+    pub managed_operator_gate: Option<(u64, String, bool)>,
+    pub operator_publication: engram_core::types::managed_operator::OperatorPublication,
+    pub operator_readiness: std::collections::BTreeMap<
+        (u64, SessionId),
+        (
+            engram_core::types::managed_operator::OperatorParticipant,
+            Option<engram_core::types::managed_operator::OperatorReadiness>,
+        ),
+    >,
+    pub managed_interrupted_floors: std::collections::BTreeMap<SessionId, i64>,
+    pub managed_interrupted: std::collections::BTreeSet<(SessionId, u64)>,
+    pub managed_boot_selections: std::collections::BTreeMap<
+        SessionId,
+        engram_core::types::managed_bridge::ManagedBootSelection,
+    >,
+    pub managed_boot_intents:
+        std::collections::BTreeMap<String, engram_core::types::managed_bridge::ManagedBootIntent>,
+    pub managed_creations:
+        std::collections::BTreeMap<SessionId, engram_core::types::managed_create::ManagedCreation>,
     pub session_integration_policy: std::collections::BTreeMap<SessionId, String>,
     /// `cold_bases`: content-keyed base snapshots, also pinned against GC.
     pub cold_bases:

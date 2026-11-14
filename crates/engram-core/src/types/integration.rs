@@ -27,6 +27,9 @@ use serde::{Deserialize, Serialize};
 /// policies persisted before 0057 still parse.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntegrationPolicy {
+    /// Mandatory exact-host denies. Retained across all policy merges.
+    #[serde(default)]
+    pub managed_deny: Option<crate::types::managed_deny::ManagedDenyPolicy>,
     /// Plane-B credential injections selected by the session's capabilities.
     #[serde(default)]
     pub injects: Vec<IntegrationInject>,
@@ -608,5 +611,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(entry.mint_source, None);
+    }
+}
+
+#[cfg(test)]
+mod managed_deny_tests {
+    use super::*;
+
+    #[test]
+    fn deny_only_policy_survives_json_and_harness_merge() {
+        let value = serde_json::json!({"managed_deny": crate::types::managed_deny::ManagedDenyPolicy::new(7, ["mcp.example".into()]).unwrap()});
+        let policy: IntegrationPolicy = serde_json::from_value(value.clone()).unwrap();
+        let merged = merge_harness_egress(
+            Some(policy),
+            &crate::types::harness::HarnessEgress {
+                allow_hosts: vec!["allowed.example".into()],
+                allow_host_patterns: vec![],
+            },
+        );
+        let encoded = serde_json::to_value(&merged).unwrap();
+        assert_eq!(encoded.get("managed_deny"), value.get("managed_deny"));
     }
 }

@@ -86,10 +86,8 @@ async function fixture(
   const status = makeInMemoryDbosStatusStore(rows, now, {
     isVersionLive: async (applicationVersion, graceMs) =>
       (await heartbeats.liveVersions(graceMs)).includes(applicationVersion),
-    isPodLive: async (podName, graceMs) =>
-      (await heartbeats.livePods(graceMs)).includes(podName),
-    recordSweep: (workflowUuid, workflowName) =>
-      ledger.recordSweep(workflowUuid, workflowName),
+    isPodLive: async (podName, graceMs) => (await heartbeats.livePods(graceMs)).includes(podName),
+    recordSweep: (workflowUuid, workflowName) => ledger.recordSweep(workflowUuid, workflowName),
   });
   const cancelled: string[] = [];
   const deps: SweepTickDeps = {
@@ -116,7 +114,9 @@ describe("runSweepTick retention", () => {
     const settings = makeInMemoryOrgSettingStore({ [RETENTION_KEY]: { runDetailDays: 7 } });
     const store = makeInMemoryRetentionStore({
       runs: [{ id: "run-old", endedAt: new Date(NOW.getTime() - 8 * DAY_MS), steps: 3 }],
-      workflows: [{ id: "wf-old", status: "SUCCESS", createdAt: new Date(NOW.getTime() - 8 * DAY_MS) }],
+      workflows: [
+        { id: "wf-old", status: "SUCCESS", createdAt: new Date(NOW.getTime() - 8 * DAY_MS) },
+      ],
     });
     const f = await fixture([], { retention: { settings, store, now: () => new Date(NOW) } });
 
@@ -137,7 +137,9 @@ describe("runSweepTick retention", () => {
 
   test("does not prune when the lease is not held", async () => {
     const store = makeInMemoryRetentionStore({
-      workflows: [{ id: "wf-old", status: "SUCCESS", createdAt: new Date(NOW.getTime() - 60 * DAY_MS) }],
+      workflows: [
+        { id: "wf-old", status: "SUCCESS", createdAt: new Date(NOW.getTime() - 60 * DAY_MS) },
+      ],
     });
     const f = await fixture([], {
       retention: { settings: makeInMemoryOrgSettingStore(), store, now: () => new Date(NOW) },
@@ -235,6 +237,26 @@ describe("runSweepTick", () => {
     });
   });
 
+  test("adopts MCP delivery workflows after 48 hours or missing heartbeat history", async () => {
+    for (const lastSeen of [new Date(NOW.getTime() - 72 * HOUR_MS), null]) {
+      const f = await fixture(
+        [
+          row("mcp-request", { name: "McpRequestWorkflow" }),
+          row("mcp-execution", { name: "McpExecWorkflow" }),
+          row("ordinary-stale"),
+        ],
+        {},
+        {},
+        { deadVersionLastSeen: lastSeen },
+      );
+      const result = await runSweepTick(f.deps);
+      expect(result.decisions.filter((x) => x.name.startsWith("Mcp")).map((x) => x.action)).toEqual(
+        ["adopted", "adopted"],
+      );
+      expect(f.cancelled).toEqual(["ordinary-stale"]);
+    }
+  });
+
   test("cancels a stale adopt-policy workflow instead of adopting it", async () => {
     // Staleness = version abandonment: DEAD_VERSION last heartbeat 2h ago,
     // past ToolExecWorkflow's 1h window. The workflow's own age is irrelevant.
@@ -269,9 +291,7 @@ describe("runSweepTick", () => {
 
     expect(result.decisions[0]?.action).toBe("adopted");
     expect(f.cancelled).toEqual([]);
-    expect(
-      f.status.inspect("wf-long-lived-thread")?.applicationVersion,
-    ).toBeNull();
+    expect(f.status.inspect("wf-long-lived-thread")?.applicationVersion).toBeNull();
   });
 
   test("a version with no heartbeat history is abandoned forever", async () => {
@@ -319,9 +339,7 @@ describe("runSweepTick", () => {
   });
 
   test("reports an unknown workflow name without changing it", async () => {
-    const f = await fixture([
-      row("wf-unknown", { name: "DeletedWorkflowName" }),
-    ]);
+    const f = await fixture([row("wf-unknown", { name: "DeletedWorkflowName" })]);
 
     const result = await runSweepTick(f.deps);
 
@@ -330,17 +348,17 @@ describe("runSweepTick", () => {
     expect(await f.deps.ledger.get("wf-unknown")).toBeNull();
   });
 
-  test.each([
-    "temp_workflow-send-message-123",
-    "_dbos_debouncer_workflow",
-  ])("adopts a fresh prefix-covered workflow: %s", async (name) => {
-    const f = await fixture([row("wf-prefix", { name })]);
+  test.each(["temp_workflow-send-message-123", "_dbos_debouncer_workflow"])(
+    "adopts a fresh prefix-covered workflow: %s",
+    async (name) => {
+      const f = await fixture([row("wf-prefix", { name })]);
 
-    const result = await runSweepTick(f.deps);
+      const result = await runSweepTick(f.deps);
 
-    expect(result.decisions[0]?.action).toBe("adopted");
-    expect(f.status.inspect("wf-prefix")?.applicationVersion).toBeNull();
-  });
+      expect(result.decisions[0]?.action).toBe("adopted");
+      expect(f.status.inspect("wf-prefix")?.applicationVersion).toBeNull();
+    },
+  );
 
   test("caps mutating actions and stops examining rows at the cap", async () => {
     const rows = [
@@ -358,10 +376,7 @@ describe("runSweepTick", () => {
     // scanned counts examined rows only: the row after the cap is left for
     // the next tick's cursor, not silently counted as covered.
     expect(result.scanned).toBe(2);
-    expect(result.decisions.map((decision) => decision.action)).toEqual([
-      "alert_only",
-      "adopted",
-    ]);
+    expect(result.decisions.map((decision) => decision.action)).toEqual(["alert_only", "adopted"]);
     expect(f.status.inspect("wf-1")?.applicationVersion).toBeNull();
     expect(f.status.inspect("wf-2")?.applicationVersion).toBe(DEAD_VERSION);
   });
@@ -428,9 +443,7 @@ describe("runSweepTick", () => {
 
     expect(result.scanned).toBe(40);
     expect(result.decisions).toHaveLength(40);
-    expect(f.status.inspect("wf-beyond-budget")?.applicationVersion).toBe(
-      DEAD_VERSION,
-    );
+    expect(f.status.inspect("wf-beyond-budget")?.applicationVersion).toBe(DEAD_VERSION);
     expect(warnings).toEqual([
       "DBOS orphan sweep scan budget exhausted; resuming from the cursor next cycle",
     ]);
@@ -461,18 +474,12 @@ describe("runSweepTick", () => {
 
     const first = await runSweepTick(f.deps);
     expect(first.scanned).toBe(40);
-    expect(f.status.inspect("wf-beyond-budget")?.applicationVersion).toBe(
-      DEAD_VERSION,
-    );
+    expect(f.status.inspect("wf-beyond-budget")?.applicationVersion).toBe(DEAD_VERSION);
     expect(scanCursor.value?.workflowUuid).toBe("wf-unknown-39");
 
     const second = await runSweepTick(f.deps);
-    expect(
-      second.decisions.map((decision) => decision.action),
-    ).toEqual(["adopted"]);
-    expect(
-      f.status.inspect("wf-beyond-budget")?.applicationVersion,
-    ).toBeNull();
+    expect(second.decisions.map((decision) => decision.action)).toEqual(["adopted"]);
+    expect(f.status.inspect("wf-beyond-budget")?.applicationVersion).toBeNull();
     // The pass reached the end of the backlog, so the next tick restarts
     // from the oldest row.
     expect(scanCursor.value).toBeUndefined();
@@ -516,14 +523,10 @@ describe("runSweepTick", () => {
     const sweeper = new Sweeper(f.deps);
 
     await sweeper.runOnce();
-    expect(f.status.inspect("wf-beyond-budget")?.applicationVersion).toBe(
-      DEAD_VERSION,
-    );
+    expect(f.status.inspect("wf-beyond-budget")?.applicationVersion).toBe(DEAD_VERSION);
 
     await sweeper.runOnce();
-    expect(
-      f.status.inspect("wf-beyond-budget")?.applicationVersion,
-    ).toBeNull();
+    expect(f.status.inspect("wf-beyond-budget")?.applicationVersion).toBeNull();
   });
 
   test("a persistently failing stale cancel retries every tick until it lands", async () => {
@@ -632,19 +635,13 @@ describe("runSweepTick", () => {
       () => new Date(NOW),
       {
         isVersionLive: async (applicationVersion, graceMs) =>
-          (await f.heartbeats.liveVersions(graceMs)).includes(
-            applicationVersion,
-          ),
+          (await f.heartbeats.liveVersions(graceMs)).includes(applicationVersion),
       },
     );
     f.deps.status = {
       ...underlying,
       async listNonTerminalOnVersionsNotIn(liveVersions, limit, after) {
-        const listed = await underlying.listNonTerminalOnVersionsNotIn(
-          liveVersions,
-          limit,
-          after,
-        );
+        const listed = await underlying.listNonTerminalOnVersionsNotIn(liveVersions, limit, after);
         await f.heartbeats.beat(DEAD_VERSION, "pod-returned");
         return listed;
       },
@@ -856,7 +853,11 @@ describe("runSweepTick — stranded executors (per-pod recovery)", () => {
   // owner is a pod: "pod-current" beats now, "pod-dead" last beat 30 min
   // ago (the fixture's dead version), "local" (the SDK default id every
   // pod once shared) never beats at all.
-  function stranded(workflowUuid: string, executorId: string, overrides: Partial<InMemoryDbosStatusSeed> = {}) {
+  function stranded(
+    workflowUuid: string,
+    executorId: string,
+    overrides: Partial<InMemoryDbosStatusSeed> = {},
+  ) {
     return row(workflowUuid, {
       applicationVersion: CURRENT_VERSION,
       name: "AutomationRunWorkflow",
@@ -879,7 +880,7 @@ describe("runSweepTick — stranded executors (per-pod recovery)", () => {
     expect((await f.deps.ledger.get("wf-stranded"))?.sweepCount).toBe(1);
   });
 
-  test("the legacy executor id \"local\" is a pod that never beats: its work is re-enqueued once", async () => {
+  test('the legacy executor id "local" is a pod that never beats: its work is re-enqueued once', async () => {
     const f = await fixture([stranded("wf-local", "local")]);
     const result = await runSweepTick(f.deps);
     expect(result.decisions.map((d) => d.action)).toEqual(["requeued"]);
@@ -967,6 +968,8 @@ describe("sweep policy exhaustiveness", () => {
       assertSweepPoliciesExhaustive([
         "ToolExecWorkflow",
         "AutomationRunWorkflow",
+        "McpRequestWorkflow",
+        "McpExecWorkflow",
       ]),
     ).not.toThrow();
   });
@@ -1020,9 +1023,7 @@ describe("VersionHeartbeat", () => {
 
     await heartbeat.start();
 
-    expect(beats).toEqual([
-      { appVersion: CURRENT_VERSION, podName: "pod-a" },
-    ]);
+    expect(beats).toEqual([{ appVersion: CURRENT_VERSION, podName: "pod-a" }]);
     expect(intervalScheduled).toBe(true);
     await heartbeat.stop();
   });

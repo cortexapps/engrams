@@ -7,6 +7,8 @@ import {
   Undo2Icon,
 } from "lucide-react";
 import { useState } from "react";
+import { useQuery } from "@connectrpc/connect-query";
+import { getMcpWritePolicy } from "@/gen/engram/app/v1/session-SessionService_connectquery";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -38,12 +40,37 @@ function planTitle(plan: string): string {
 }
 
 export function PlanCard({ marker }: { marker: PlanMarker }) {
-  const { completeTool, answeredToolCallIds, sendBlocked } = useQuestionActions();
+  const { sessionId, completeTool, answeredToolCallIds, sendBlocked } = useQuestionActions();
+  const policy = useQuery(
+    getMcpWritePolicy,
+    { sessionId, planToolCallId: marker.toolCallId },
+    { enabled: !!sessionId && !marker.resolution },
+  );
+  const review =
+    policy.data?.allowedActions.includes("approve_current_plan") &&
+    policy.data.planReview?.toolCallId === marker.toolCallId &&
+    policy.data.planReview.policyRef?.sessionId === sessionId
+      ? policy.data.planReview
+      : undefined;
+  let trustedPlan: string | undefined;
+  try {
+    const args: unknown = JSON.parse(review?.argsJson ?? "null");
+    if (
+      typeof args === "object" &&
+      args !== null &&
+      "plan" in args &&
+      typeof args.plan === "string"
+    )
+      trustedPlan = args.plan;
+  } catch {
+    /* Invalid review cannot grant write eligibility. */
+  }
   // Feedback is a message to the agent, so it obeys the same send chord the
   // composer does (the user's Enter-to-send preference), not a hardcoded ⌘↵.
   const [enterToSend] = useEnterToSend();
   const [feedbackOpen, setFeedbackOpen] = useState(false);
   const [feedback, setFeedback] = useState("");
+  const [reviewError, setReviewError] = useState("");
   // Optimistic verdict while the RPC + wake round-trips (the VM may take
   // seconds to resume); replaced by the authoritative resolution event.
   const [optimistic, setOptimistic] = useState<"approve" | "reject" | null>(null);
@@ -54,18 +81,36 @@ export function PlanCard({ marker }: { marker: PlanMarker }) {
   const approved = confirmed ? marker.resolution!.approved : optimistic === "approve";
 
   const decide = (decision: "approve" | "reject") => {
-    if (decided || sendBlocked) return;
+    if (decided || sendBlocked || policy.isPending || reviewError) return;
+    setReviewError("");
     setOptimistic(decision);
-    completeTool(marker.toolCallId, {
-      decision,
-      ...(decision === "reject" && feedback.trim() ? { feedback: feedback.trim() } : {}),
-    });
+    completeTool(
+      marker.toolCallId,
+      {
+        decision,
+        ...(decision === "reject" && feedback.trim() ? { feedback: feedback.trim() } : {}),
+      },
+      decision === "approve" && trustedPlan ? review : undefined,
+      () => {
+        setOptimistic(null);
+        setReviewError(
+          "The review could not be completed. The session or permission may have changed; review the latest state.",
+        );
+        void policy.refetch();
+      },
+    );
   };
 
   // Resolved (or optimistically resolved): the one-line receipt, expandable
   // back into the (read-only) document.
   if (decided) {
-    return <PlanReceipt marker={marker} approved={approved} pending={pending} />;
+    return (
+      <PlanReceipt
+        marker={trustedPlan ? { ...marker, plan: trustedPlan } : marker}
+        approved={approved}
+        pending={pending}
+      />
+    );
   }
 
   const live = !sendBlocked;
@@ -88,9 +133,30 @@ export function PlanCard({ marker }: { marker: PlanMarker }) {
         </div>
         <div className="max-h-[32rem] overflow-auto overscroll-contain border-b px-4 py-3">
           <div className="max-w-[70ch] text-sm leading-relaxed">
-            <Markdown text={marker.plan} />
+            <Markdown text={trustedPlan ?? marker.plan} />
           </div>
         </div>
+        <p className="px-4 py-2 text-xs text-muted-foreground">
+          {review && trustedPlan
+            ? "This is the trusted plan review. MCP writes still require separate approval."
+            : "MCP write eligibility is unavailable or unchanged. Plan approval does not approve MCP writes."}{" "}
+          {policy.data?.reason}
+        </p>
+        {reviewError && (
+          <div className="px-4 text-xs">
+            <p role="alert">{reviewError}</p>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={async () => {
+                const next = await policy.refetch();
+                if (!next.isError) setReviewError("");
+              }}
+            >
+              Reload plan review
+            </Button>
+          </div>
+        )}
         {feedbackOpen ? (
           <div className="flex flex-col gap-2 p-3">
             <Textarea
@@ -111,7 +177,11 @@ export function PlanCard({ marker }: { marker: PlanMarker }) {
               }}
             />
             <div className="flex flex-wrap items-center gap-2">
-              <Button size="sm" disabled={sendBlocked} onClick={() => decide("reject")}>
+              <Button
+                size="sm"
+                disabled={sendBlocked || policy.isPending || !!reviewError}
+                onClick={() => decide("reject")}
+              >
                 Send feedback
               </Button>
               <Button size="sm" variant="ghost" onClick={() => setFeedbackOpen(false)}>
@@ -124,13 +194,17 @@ export function PlanCard({ marker }: { marker: PlanMarker }) {
           </div>
         ) : (
           <div className="flex flex-wrap items-center gap-2 p-3">
-            <Button size="sm" disabled={sendBlocked} onClick={() => decide("approve")}>
+            <Button
+              size="sm"
+              disabled={sendBlocked || policy.isPending || !!reviewError}
+              onClick={() => decide("approve")}
+            >
               Approve &amp; build
             </Button>
             <Button
               size="sm"
               variant="outline"
-              disabled={sendBlocked}
+              disabled={sendBlocked || policy.isPending || !!reviewError}
               onClick={() => setFeedbackOpen(true)}
             >
               Request changes

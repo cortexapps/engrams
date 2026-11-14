@@ -35,3 +35,28 @@ pub struct OrgSecret {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+/// The only two uses for reserved organization credentials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpSecretRole {
+    ApiKey,
+    ClientSecret,
+}
+impl McpSecretRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiKey => "api_key",
+            Self::ClientSecret => "client_secret",
+        }
+    }
+}
+
+/// Permanent ownership, with a fence that changes on every value mutation.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct McpSecretReservation {
+    pub name: String,
+    pub connection_id: String,
+    pub role: McpSecretRole,
+    pub generation: i64,
+}

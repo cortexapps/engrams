@@ -224,6 +224,7 @@ fn loopback_policy(
     session_id: engram_core::SessionId,
 ) -> engram_core::types::egress::SessionEgressPolicy {
     engram_core::types::egress::SessionEgressPolicy {
+        managed_deny: None,
         session_id,
         sandbox_id: engram_core::SandboxId::new(),
         guest_ip: std::net::Ipv4Addr::LOCALHOST,

@@ -21,6 +21,7 @@ import { config } from "../config.ts";
 import { makeLeaseStore } from "../listeners/lease-store.ts";
 import { makeListenerWakeInterceptor } from "../listeners/wake-interceptor.ts";
 import { log } from "../log.ts";
+import { makeMcpLifecycleInterceptor } from "../mcp/lifecycle-interceptor.ts";
 
 // Machine identity (ADR §5): one trusted caller, one static credential.
 export const bearerInterceptor: Interceptor = (next) => (req) => {
@@ -67,6 +68,19 @@ export const controlPlaneTransport: Transport = makeTransport(
   config.controlPlaneGrpcUrl,
   config.controlPlaneBearer,
   [
+    makeMcpLifecycleInterceptor(async (sessionId, cause) => {
+      const [{ getDb }, { makeMcpLifecycleInvalidator }, { mcpRecovery }] = await Promise.all([
+        import("../db/client.ts"),
+        import("../mcp/lifecycle-invalidation.ts"),
+        import("../mcp/recovery.ts"),
+      ]);
+      await makeMcpLifecycleInvalidator({
+        db: getDb(),
+        abort: async (id) => {
+          mcpRecovery()?.abortExecution(id);
+        },
+      })(sessionId, cause);
+    }),
     // Every resuming session RPC wakes the session's listener row (ADR 0119
     // amendment): this is the one seam all callers share.
     makeListenerWakeInterceptor(

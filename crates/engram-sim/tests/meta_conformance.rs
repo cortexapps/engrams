@@ -745,6 +745,81 @@ async fn capture_job_scan_boundary(ctx: &Ctx) {
         expired[0].id, placed.id,
         "only placed over-budget rows expire"
     );
+
+    let placed = ctx
+        .meta
+        .reassign_capture_job(placed.id, placed.epoch, &[host])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(placed.epoch, 2);
+    let other_host = HostId::from(uuid::Uuid::from_u128(0xc002));
+    ctx.meta
+        .upsert_host(host_record(
+            other_host,
+            "capture-other-host",
+            ctx.clock.now_utc(),
+        ))
+        .await
+        .unwrap();
+    let other_parent = ctx
+        .meta
+        .create_or_get_enable_job("conf:capture:other", None, &config)
+        .await
+        .unwrap()
+        .id;
+    let other = ctx
+        .meta
+        .insert_capture_job(new_capture(other_parent))
+        .await
+        .unwrap();
+    let other = ctx
+        .meta
+        .place_capture_job(other.id, &[other_host])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(other.host_id, Some(other_host));
+    for (assigned_host, expected) in [
+        (host, vec![(placed.id, 2)]),
+        (other_host, vec![(other.id, 1)]),
+    ] {
+        let assignments = ctx
+            .meta
+            .capture_assignments_for_host(assigned_host)
+            .await
+            .unwrap();
+        assert_eq!(
+            assignments
+                .into_iter()
+                .map(|assignment| (assignment.job_id, assignment.epoch))
+                .collect::<Vec<_>>(),
+            expected,
+            "only this host's nonterminal jobs are assigned, at their current epoch"
+        );
+    }
+    assert!(ctx
+        .meta
+        .record_capture_job_report(&CaptureJobReport {
+            job_id: placed.id,
+            epoch: placed.epoch,
+            stage: CaptureJobStage::Failed,
+            progress: None,
+            fc_snapshot_version: None,
+            terminal: Some(CaptureTerminalReport::Failed {
+                error: "capture failed".into(),
+                error_stage: "assigned".into(),
+                retryable: false,
+            }),
+        })
+        .await
+        .unwrap());
+    assert!(ctx
+        .meta
+        .capture_assignments_for_host(host)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 /// Transition legality: illegal edges are Conflict, transitions return
@@ -1017,16 +1092,13 @@ async fn host_fc_snapshot_version(ctx: &Ctx) {
 /// FIFO by queued_at; the queue drains oldest-first. Sessions enter the
 /// queue via the REAL enqueue path (`reserve_and_persist_create` with no
 /// candidates), which stamps `queue_origin` + `queued_at`.
-///
-/// FINDING (surfaced by this suite): a bare
-/// `transition_session(_, Queued)` — legal per the FSM table — leaves
-/// both columns NULL in PostgresStore, and `list_queued_sessions_fifo`
-/// then fails to DECODE the row (`queue_origin: UnexpectedNullError`),
-/// which would break the queue scanner. Production never enters Queued
-/// that way today; flagged for a follow-up guard.
 async fn queue_fifo(ctx: &Ctx) {
     let meta = &ctx.meta;
     let enqueue = |sid: SessionId| engram_core::traits::metadata::SessionCreateWriteSet {
+        managed_boot_selection: None,
+        managed_initial_prompt: None,
+        managed_creation: None,
+        mcp_policy: None,
         session_id: sid,
         spec: spec("conf:q"),
         mem_budget_mib: 1024,
@@ -2974,53 +3046,112 @@ async fn placement_no_fit(ctx: &Ctx) {
     assert_eq!(details[0].reason, "cpu_full");
 }
 
-/// A host that measures its RAM but reports no cores places a session
-/// that asks for CPU: an unreported core count is no CPU gate.
+/// Missing resource measurements soften only their own placement dimension.
 async fn a_host_without_reported_cores_has_no_cpu_gate(ctx: &Ctx) {
+    use engram_core::traits::{CreateDisposition, SessionCreateWriteSet};
     let meta = &ctx.meta;
-    let now = ctx.clock.now_utc();
     let host = HostId::new();
-    meta.upsert_host(host_record(host, "conf-no-cores", now))
-        .await
-        .unwrap();
+    meta.upsert_host(host_record(
+        host,
+        "conf-soft-measurements",
+        ctx.clock.now_utc(),
+    ))
+    .await
+    .unwrap();
     let mut hb = heartbeat_fixture();
-    hb.utilization =
-        serde_json::from_value(serde_json::json!({"allocatable_mib": 8192})).expect("utilization");
+    hb.utilization.allocatable_mib = 8192;
     hb.total_vcpus = 0;
-    meta.touch_host_heartbeat(host, hb).await.unwrap();
-
+    meta.touch_host_heartbeat(host, hb.clone()).await.unwrap();
+    let mut ws = SessionCreateWriteSet {
+        managed_boot_selection: None,
+        managed_initial_prompt: None,
+        managed_creation: None,
+        mcp_policy: None,
+        session_id: SessionId::new(),
+        spec: spec("conf:soft-measurements"),
+        mem_budget_mib: 4096,
+        cpu_budget_vcpus: 2,
+        sealed_secrets: None,
+        capabilities: Vec::new(),
+        integration_policy_json: None,
+        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+        ),
+        oauth_binding: None,
+    };
     let details = meta
         .placement_no_fit_details(&[host], 4096, 2)
         .await
         .unwrap();
     assert_eq!(details[0].reason, "fits_now");
-    let placed = meta
-        .reserve_and_persist_create(
-            engram_core::traits::metadata::SessionCreateWriteSet {
-                session_id: SessionId::new(),
-                spec: spec("conf:no-cores"),
-                mem_budget_mib: 4096,
-                cpu_budget_vcpus: 2,
-                sealed_secrets: None,
-                capabilities: Vec::new(),
-                integration_policy_json: None,
-                runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(
-                    Vec::new(),
-                    None,
-                    None,
-                    Vec::new(),
-                ),
-                oauth_binding: None,
-            },
-            &[host],
-            0,
-        )
+    assert_eq!(
+        meta.reserve_and_persist_create(ws.clone(), &[host], 0)
+            .await
+            .unwrap(),
+        CreateDisposition::Placed(host)
+    );
+
+    ws.session_id = SessionId::new();
+    ws.mem_budget_mib = 8192;
+    let details = meta
+        .placement_no_fit_details(&[host], 8192, 2)
         .await
         .unwrap();
-    assert!(matches!(
-        placed,
-        engram_core::traits::metadata::CreateDisposition::Placed(_)
-    ));
+    let placed = meta
+        .reserve_and_persist_create(ws.clone(), &[host], 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        (details[0].reason, placed),
+        ("ram_full", CreateDisposition::Queued)
+    );
+
+    hb.utilization.allocatable_mib = 0;
+    hb.total_vcpus = 1;
+    meta.touch_host_heartbeat(host, hb.clone()).await.unwrap();
+    ws.session_id = SessionId::new();
+    ws.cpu_budget_vcpus = 3;
+    let details = meta
+        .placement_no_fit_details(&[host], 8192, 3)
+        .await
+        .unwrap();
+    let placed = meta
+        .reserve_and_persist_create(ws.clone(), &[host], 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        (details[0].reason, placed),
+        ("cpu_full", CreateDisposition::Queued)
+    );
+
+    ws.session_id = SessionId::new();
+    ws.cpu_budget_vcpus = 2;
+    let details = meta
+        .placement_no_fit_details(&[host], 8192, 2)
+        .await
+        .unwrap();
+    assert_eq!(details[0].reason, "unmeasured");
+    assert_eq!(
+        meta.reserve_and_persist_create(ws.clone(), &[host], 0)
+            .await
+            .unwrap(),
+        CreateDisposition::Placed(host)
+    );
+    assert_eq!(meta.per_host_reserved().await.unwrap()[&host].vcpus, 4);
+
+    hb.total_vcpus = 0;
+    meta.touch_host_heartbeat(host, hb).await.unwrap();
+    ws.session_id = SessionId::new();
+    ws.cpu_budget_vcpus = 8;
+    assert_eq!(
+        meta.reserve_and_persist_create(ws, &[host], 0)
+            .await
+            .unwrap(),
+        CreateDisposition::Placed(host)
+    );
 }
 
 /// `session_budget` is the reservation the session was created with. A
@@ -3036,6 +3167,10 @@ async fn session_budget_is_the_create_time_reservation(ctx: &Ctx) {
     let placed = meta
         .reserve_and_persist_create(
             engram_core::traits::metadata::SessionCreateWriteSet {
+                managed_boot_selection: None,
+                managed_initial_prompt: None,
+                managed_creation: None,
+                mcp_policy: None,
                 session_id: budgeted,
                 spec: spec("conf:budget"),
                 mem_budget_mib: 4096,
@@ -4279,6 +4414,10 @@ async fn stale_pending_reservation(ctx: &Ctx) {
     // A placed pending with a queued create_boot op.
     let with_op = SessionId::new();
     let ws = |sid: SessionId| engram_core::traits::metadata::SessionCreateWriteSet {
+        managed_boot_selection: None,
+        managed_initial_prompt: None,
+        managed_creation: None,
+        mcp_policy: None,
         session_id: sid,
         spec: spec("conf:722"),
         mem_budget_mib: 2048,
@@ -4483,9 +4622,7 @@ async fn capturing_disk_manifests_in_flight(ctx: &Ctx) {
 /// `live_enable_work_by_host` is the empty map, while
 /// `list_prestaging_refs`, `capturing_disk_manifests` and
 /// `capture_assignments_for_host` are empty — and registering or
-/// heartbeating a host fabricates none of them. (The sim models no
-/// enable_jobs/capture_jobs table; a fresh PG DB has no such rows — both
-/// stores agree on the empty case, the only one conformance exercises.)
+/// heartbeating a host fabricates none of them.
 async fn live_enable_work_empty(ctx: &Ctx) {
     let meta = &ctx.meta;
     assert!(meta
@@ -6027,6 +6164,10 @@ async fn teleport_reservation_arm_counts_open_rows(ctx: &Ctx) {
     let mut t = teleport_fixture(ctx, source, h).await;
     let pending = SessionId::new();
     let ws = engram_core::traits::metadata::SessionCreateWriteSet {
+        managed_boot_selection: None,
+        managed_initial_prompt: None,
+        managed_creation: None,
+        mcp_policy: None,
         session_id: pending,
         spec: spec("conf:placement"),
         mem_budget_mib: 1,
@@ -6505,6 +6646,10 @@ async fn teleport_admission_fixture(
     }
     let sid = SessionId::new();
     let ws = engram_core::traits::metadata::SessionCreateWriteSet {
+        managed_boot_selection: None,
+        managed_initial_prompt: None,
+        managed_creation: None,
+        mcp_policy: None,
         session_id: sid,
         spec: spec("conf:teleport-machine"),
         mem_budget_mib: 4096,
@@ -7397,4 +7542,5419 @@ async fn capture_job_epoch_fences_reassignment_and_redrive(ctx: &Ctx) {
 conformance!(
     t_capture_job_epoch_fences_reassignment_and_redrive,
     super::capture_job_epoch_fences_reassignment_and_redrive
+);
+
+async fn mcp_org_secret_clock(ctx: &Ctx) {
+    use engram_core::types::org_secret::SealedOrgSecret;
+    let value = SealedOrgSecret {
+        name: "fresh-key".into(),
+        wrapped_dek: vec![1],
+        nonce: vec![0; 12],
+        ciphertext: vec![2],
+        key_id: "test".into(),
+    };
+    let row = ctx.meta.upsert_org_secret(value.clone()).await.unwrap();
+    assert_eq!(row.created_at, ctx.clock.now_utc());
+    ctx.clock.advance(Duration::from_secs(5));
+    let rotated = ctx.meta.upsert_org_secret(value).await.unwrap();
+    assert_eq!(rotated.created_at, row.created_at);
+    assert_eq!(rotated.updated_at, ctx.clock.now_utc());
+    assert_eq!(ctx.meta.list_org_secrets().await.unwrap().len(), 1);
+    assert_eq!(
+        ctx.meta
+            .get_org_secret_sealed("fresh-key")
+            .await
+            .unwrap()
+            .unwrap()
+            .ciphertext,
+        vec![2]
+    );
+    assert!(ctx.meta.delete_org_secret("fresh-key").await.unwrap());
+    assert!(!ctx.meta.delete_org_secret("fresh-key").await.unwrap());
+    assert!(ctx
+        .meta
+        .get_org_secret_sealed("fresh-key")
+        .await
+        .unwrap()
+        .is_none());
+}
+conformance!(t_mcp_org_secret_clock, super::mcp_org_secret_clock);
+
+async fn mcp_org_reservation(ctx: &Ctx) {
+    use engram_core::types::org_secret::{McpSecretRole, SealedOrgSecret};
+    let sealed = |name: &str| SealedOrgSecret {
+        name: name.into(),
+        wrapped_dek: vec![1],
+        nonce: vec![0; 12],
+        ciphertext: vec![2],
+        key_id: "test".into(),
+    };
+    let reserved = ctx
+        .meta
+        .reserve_mcp_org_secret("reserved", "connection-a", McpSecretRole::ApiKey)
+        .await
+        .unwrap();
+    assert_eq!(reserved.generation, 0);
+    assert_eq!(
+        ctx.meta
+            .reserve_mcp_org_secret("reserved", "connection-a", McpSecretRole::ApiKey)
+            .await
+            .unwrap(),
+        reserved
+    );
+    assert!(ctx
+        .meta
+        .reserve_mcp_org_secret("reserved", "connection-b", McpSecretRole::ApiKey)
+        .await
+        .is_err());
+    assert!(ctx
+        .meta
+        .reserve_mcp_org_secret("reserved", "connection-a", McpSecretRole::ClientSecret)
+        .await
+        .is_err());
+    assert!(ctx
+        .meta
+        .upsert_org_secret(sealed("reserved"))
+        .await
+        .is_err());
+    let first = ctx
+        .meta
+        .put_mcp_org_secret(sealed("reserved"), &reserved)
+        .await
+        .unwrap();
+    assert_eq!(first.generation, 1);
+    assert!(ctx
+        .meta
+        .put_mcp_org_secret(sealed("reserved"), &reserved)
+        .await
+        .is_err());
+    assert!(ctx.meta.delete_org_secret("reserved").await.unwrap());
+    let deleted = ctx
+        .meta
+        .get_mcp_org_secret_reservation("reserved")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(deleted.generation, 2);
+    assert!(ctx
+        .meta
+        .get_org_secret_sealed("reserved")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(ctx
+        .meta
+        .put_mcp_org_secret(sealed("reserved"), &first)
+        .await
+        .is_err());
+    assert_eq!(
+        ctx.meta
+            .put_mcp_org_secret(sealed("reserved"), &deleted)
+            .await
+            .unwrap()
+            .generation,
+        3
+    );
+    let concurrent = ctx
+        .meta
+        .reserve_mcp_org_secret("concurrent", "connection-a", McpSecretRole::ApiKey)
+        .await
+        .unwrap();
+    let (a, b) = tokio::join!(
+        ctx.meta
+            .put_mcp_org_secret(sealed("concurrent"), &concurrent),
+        ctx.meta
+            .put_mcp_org_secret(sealed("concurrent"), &concurrent),
+    );
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+    assert_eq!(
+        ctx.meta
+            .get_mcp_org_secret_reservation("concurrent")
+            .await
+            .unwrap()
+            .unwrap()
+            .generation,
+        1
+    );
+    ctx.meta.upsert_org_secret(sealed("exposed")).await.unwrap();
+    ctx.meta.delete_org_secret("exposed").await.unwrap();
+    assert!(ctx
+        .meta
+        .reserve_mcp_org_secret("exposed", "connection-a", McpSecretRole::ApiKey)
+        .await
+        .is_err());
+}
+conformance!(t_mcp_org_reservation, super::mcp_org_reservation);
+
+async fn mcp_guest_binding_rejected(ctx: &Ctx) {
+    use engram_core::types::oauth::{
+        NewSealedOAuthCredential, OAuthAccountMetadata, OAuthCredentialKey, OAuthSubjectKind,
+        SessionOAuthBinding,
+    };
+    let key = OAuthCredentialKey {
+        subject_kind: OAuthSubjectKind::Mcp,
+        subject_id: "connection-a".into(),
+        provider: "mcp".into(),
+    };
+    ctx.meta
+        .put_oauth_credential(
+            NewSealedOAuthCredential {
+                key: key.clone(),
+                wrapped_dek: vec![1],
+                nonce: vec![0; 12],
+                ciphertext: vec![2],
+                key_id: "test".into(),
+                metadata: OAuthAccountMetadata::default(),
+                expires_at: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let sid = SessionId::from(uuid::Uuid::from_u128(4));
+    let ws = engram_core::traits::SessionCreateWriteSet {
+        managed_boot_selection: None,
+        managed_initial_prompt: None,
+        managed_creation: None,
+        mcp_policy: None,
+        session_id: sid,
+        spec: spec("test:mcp"),
+        mem_budget_mib: 1024,
+        cpu_budget_vcpus: 1,
+        sealed_secrets: None,
+        capabilities: vec![],
+        integration_policy_json: None,
+        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(
+            vec![],
+            None,
+            None,
+            vec![],
+        ),
+        oauth_binding: Some(SessionOAuthBinding {
+            session_id: sid,
+            key,
+        }),
+    };
+    assert!(matches!(
+        ctx.meta.reserve_and_persist_create(ws, &[], 0).await,
+        Err(MetaError::Conflict(_))
+    ));
+    assert!(ctx
+        .meta
+        .get_session_oauth_binding(sid)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        ctx.meta.get_session(sid).await,
+        Err(MetaError::NotFound)
+    ));
+}
+conformance!(
+    t_mcp_guest_binding_rejected,
+    super::mcp_guest_binding_rejected
+);
+
+// Consuming a redirect must remove its encrypted state before any exchange.
+async fn mcp_flow_consume(ctx: &Ctx) {
+    use engram_core::types::{mcp::*, oauth::*};
+    let now = ctx.clock.now_utc();
+    let key = OAuthCredentialKey {
+        subject_kind: OAuthSubjectKind::Mcp,
+        subject_id: "connection-a".into(),
+        provider: "registered-a".into(),
+    };
+    let id = uuid::Uuid::from_u128(810);
+    let flow = OAuthFlow {
+        id,
+        key: key.clone(),
+        owner_replica: "replica-a".into(),
+        lease_expires_at: now + chrono::Duration::minutes(10),
+        expires_at: now + chrono::Duration::minutes(10),
+        status: OAuthFlowStatus::Pending,
+        error_code: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let state = McpSealedState {
+        wrapped_dek: vec![1; 32],
+        nonce: vec![2; 12],
+        ciphertext: vec![3; 64],
+        key_id: "test".into(),
+    };
+    assert!(matches!(
+        ctx.meta.consume_mcp_oauth_flow(id, &key).await,
+        Err(MetaError::Conflict(_))
+    ));
+    ctx.meta
+        .create_mcp_oauth_flow(flow.clone(), state.clone())
+        .await
+        .unwrap();
+    let mut wrong = key.clone();
+    wrong.subject_id = "connection-b".into();
+    assert!(ctx.meta.consume_mcp_oauth_flow(id, &wrong).await.is_err());
+    let (a, b) = tokio::join!(
+        ctx.meta.consume_mcp_oauth_flow(id, &key),
+        ctx.meta.consume_mcp_oauth_flow(id, &key)
+    );
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+    assert_eq!(a.or(b).unwrap(), state);
+    assert!(ctx.meta.consume_mcp_oauth_flow(id, &key).await.is_err());
+    ctx.meta
+        .finish_oauth_flow_unowned(id, OAuthFlowStatus::Succeeded, None)
+        .await
+        .unwrap();
+    let mut expired = flow;
+    expired.id = uuid::Uuid::from_u128(811);
+    ctx.meta
+        .create_mcp_oauth_flow(expired, state)
+        .await
+        .unwrap();
+    ctx.clock.advance(Duration::from_secs(600));
+    assert!(ctx
+        .meta
+        .consume_mcp_oauth_flow(uuid::Uuid::from_u128(811), &key)
+        .await
+        .is_err());
+}
+conformance!(t_mcp_flow_consume, mcp_flow_consume);
+
+async fn mcp_admission_and_refresh(ctx: &Ctx) {
+    use engram_core::types::{mcp::*, oauth::*};
+    let now = ctx.clock.now_utc();
+    let key = OAuthCredentialKey {
+        subject_kind: OAuthSubjectKind::Mcp,
+        subject_id: "connection-a".into(),
+        provider: "registered-a".into(),
+    };
+    let candidate = NewSealedOAuthCredential {
+        key: key.clone(),
+        wrapped_dek: vec![1; 32],
+        nonce: vec![2; 12],
+        ciphertext: vec![3; 64],
+        key_id: "test".into(),
+        metadata: OAuthAccountMetadata::default(),
+        expires_at: Some(now),
+    };
+    let row = ctx
+        .meta
+        .put_oauth_credential(candidate.clone(), None)
+        .await
+        .unwrap();
+    let claim = McpRefreshClaim {
+        id: uuid::Uuid::from_u128(901),
+        key: key.clone(),
+        version: row.version,
+        expires_at: now + chrono::Duration::seconds(20),
+    };
+    let (a, b) = tokio::join!(
+        ctx.meta.claim_mcp_refresh(&claim),
+        ctx.meta.claim_mcp_refresh(&claim)
+    );
+    assert_eq!(usize::from(a.unwrap()) + usize::from(b.unwrap()), 1);
+    assert!(ctx
+        .meta
+        .get_oauth_credential(&key)
+        .await
+        .unwrap()
+        .unwrap()
+        .broken_at
+        .is_some());
+    let mut wrong = claim.clone();
+    wrong.id = uuid::Uuid::from_u128(902);
+    assert!(ctx
+        .meta
+        .complete_mcp_refresh(candidate.clone(), &wrong)
+        .await
+        .is_err());
+    let refreshed = ctx
+        .meta
+        .complete_mcp_refresh(candidate.clone(), &claim)
+        .await
+        .unwrap();
+    assert_eq!(refreshed.version, row.version + 1);
+    assert!(refreshed.broken_at.is_none());
+    let mut uncertain = claim;
+    uncertain.version = refreshed.version;
+    assert!(ctx.meta.claim_mcp_refresh(&uncertain).await.unwrap());
+    ctx.clock.advance(Duration::from_secs(21));
+    assert!(ctx
+        .meta
+        .complete_mcp_refresh(candidate, &uncertain)
+        .await
+        .is_err());
+    uncertain.expires_at = ctx.clock.now_utc() + chrono::Duration::seconds(20);
+    assert!(
+        !ctx.meta.claim_mcp_refresh(&uncertain).await.unwrap(),
+        "uncertain rotation must require reconnect"
+    );
+    let lease = |n| McpOAuthAdmission {
+        id: uuid::Uuid::from_u128(n),
+        deployment_id: "deployment-a".into(),
+        connection_id: format!("connection-{n}"),
+        expires_at: ctx.clock.now_utc() + chrono::Duration::seconds(15),
+    };
+    let leases: Vec<_> = (1..=5).map(lease).collect();
+    for item in &leases[..4] {
+        assert!(ctx.meta.acquire_mcp_oauth_admission(item).await.unwrap());
+    }
+    assert!(!ctx
+        .meta
+        .acquire_mcp_oauth_admission(&leases[4])
+        .await
+        .unwrap());
+    ctx.meta
+        .release_mcp_oauth_admission(&leases[0])
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .acquire_mcp_oauth_admission(&leases[4])
+        .await
+        .unwrap());
+    let mut same_connection = leases[4].clone();
+    same_connection.id = uuid::Uuid::from_u128(99);
+    assert!(!ctx
+        .meta
+        .acquire_mcp_oauth_admission(&same_connection)
+        .await
+        .unwrap());
+    ctx.clock.advance(Duration::from_secs(15));
+    same_connection.expires_at = ctx.clock.now_utc() + chrono::Duration::seconds(15);
+    assert!(ctx
+        .meta
+        .acquire_mcp_oauth_admission(&same_connection)
+        .await
+        .unwrap());
+    let contenders: Vec<_> = (201..=205)
+        .map(|n| McpOAuthAdmission {
+            id: uuid::Uuid::from_u128(n),
+            deployment_id: "deployment-race".into(),
+            connection_id: format!("connection-{n}"),
+            expires_at: ctx.clock.now_utc() + chrono::Duration::seconds(15),
+        })
+        .collect();
+    let (a, b, c, d, e) = tokio::join!(
+        ctx.meta.acquire_mcp_oauth_admission(&contenders[0]),
+        ctx.meta.acquire_mcp_oauth_admission(&contenders[1]),
+        ctx.meta.acquire_mcp_oauth_admission(&contenders[2]),
+        ctx.meta.acquire_mcp_oauth_admission(&contenders[3]),
+        ctx.meta.acquire_mcp_oauth_admission(&contenders[4]),
+    );
+    assert_eq!(
+        [a, b, c, d, e]
+            .into_iter()
+            .filter(|r| *r.as_ref().unwrap())
+            .count(),
+        4
+    );
+    // Revocation fences both a dispatched refresh and a late reconnect CAS.
+    let mut replacement = NewSealedOAuthCredential {
+        key: key.clone(),
+        wrapped_dek: vec![1; 32],
+        nonce: vec![2; 12],
+        ciphertext: vec![3; 64],
+        key_id: "test".into(),
+        metadata: OAuthAccountMetadata::default(),
+        expires_at: None,
+    };
+    replacement.key.subject_id = "connection-revoked".into();
+    let row = ctx
+        .meta
+        .put_oauth_credential(replacement.clone(), None)
+        .await
+        .unwrap();
+    let claim = McpRefreshClaim {
+        id: uuid::Uuid::from_u128(903),
+        key: replacement.key.clone(),
+        version: row.version,
+        expires_at: ctx.clock.now_utc() + chrono::Duration::seconds(20),
+    };
+    assert!(ctx.meta.claim_mcp_refresh(&claim).await.unwrap());
+    let receipt = ctx
+        .meta
+        .revoke_oauth_credential(&replacement.key, row.version)
+        .await
+        .unwrap();
+    assert_eq!(receipt.version, row.version + 1);
+    assert!(ctx
+        .meta
+        .complete_mcp_refresh(replacement.clone(), &claim)
+        .await
+        .is_err());
+    assert!(ctx
+        .meta
+        .put_oauth_credential(replacement.clone(), Some(row.version))
+        .await
+        .is_err());
+    assert!(ctx
+        .meta
+        .get_oauth_credential(&replacement.key)
+        .await
+        .unwrap()
+        .unwrap()
+        .revoked_at
+        .is_some());
+}
+conformance!(t_mcp_admission_and_refresh, mcp_admission_and_refresh);
+
+// Cancellation and publication use the same flow row even when no credential exists.
+async fn mcp_flow_cancellation_fences_publication(ctx: &Ctx) {
+    use engram_core::types::{mcp::*, oauth::*};
+    let now = ctx.clock.now_utc();
+    for reconnect in [false, true] {
+        let key = OAuthCredentialKey {
+            subject_kind: OAuthSubjectKind::Mcp,
+            subject_id: format!("cancel-{reconnect}"),
+            provider: "registered-a".into(),
+        };
+        let candidate = NewSealedOAuthCredential {
+            key: key.clone(),
+            wrapped_dek: vec![1; 32],
+            nonce: vec![2; 12],
+            ciphertext: vec![3; 64],
+            key_id: "test".into(),
+            metadata: OAuthAccountMetadata::default(),
+            expires_at: None,
+        };
+        let expected = if reconnect {
+            let old = ctx
+                .meta
+                .put_oauth_credential(candidate.clone(), None)
+                .await
+                .unwrap();
+            ctx.meta
+                .revoke_oauth_credential(&key, old.version)
+                .await
+                .unwrap();
+            Some(
+                ctx.meta
+                    .get_oauth_credential(&key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .version,
+            )
+        } else {
+            None
+        };
+        let base = if reconnect { 920 } else { 910 };
+        let flow = |n: u128| OAuthFlow {
+            id: uuid::Uuid::from_u128(base + n),
+            key: key.clone(),
+            owner_replica: "replica-a".into(),
+            lease_expires_at: now + chrono::Duration::minutes(10),
+            expires_at: now + chrono::Duration::minutes(10),
+            status: OAuthFlowStatus::Pending,
+            error_code: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let state = McpSealedState {
+            wrapped_dek: vec![1; 32],
+            nonce: vec![2; 12],
+            ciphertext: vec![3; 64],
+            key_id: "test".into(),
+        };
+        let old = flow(0);
+        assert!(ctx
+            .meta
+            .complete_mcp_oauth_flow(old.id, candidate.clone(), expected)
+            .await
+            .is_err());
+        ctx.meta
+            .create_mcp_oauth_flow(old.clone(), state.clone())
+            .await
+            .unwrap();
+        // An unknown (lost response) pending attempt blocks same-subject begin.
+        assert!(ctx
+            .meta
+            .create_mcp_oauth_flow(flow(9), state.clone())
+            .await
+            .is_err());
+        let mut wrong = key.clone();
+        wrong.subject_id = "unrelated".into();
+        assert!(ctx
+            .meta
+            .cancel_mcp_oauth_flow(old.id, &wrong)
+            .await
+            .is_err());
+        ctx.meta.cancel_mcp_oauth_flow(old.id, &key).await.unwrap();
+        ctx.meta.cancel_mcp_oauth_flow(old.id, &key).await.unwrap();
+        assert!(ctx
+            .meta
+            .create_mcp_oauth_flow(old.clone(), state.clone())
+            .await
+            .is_err());
+        assert!(ctx.meta.consume_mcp_oauth_flow(old.id, &key).await.is_err());
+        assert!(ctx
+            .meta
+            .complete_mcp_oauth_flow(old.id, candidate.clone(), expected)
+            .await
+            .is_err());
+        let inflight = flow(1);
+        ctx.meta
+            .create_mcp_oauth_flow(inflight.clone(), state.clone())
+            .await
+            .unwrap();
+        ctx.meta
+            .consume_mcp_oauth_flow(inflight.id, &key)
+            .await
+            .unwrap();
+        ctx.meta
+            .cancel_mcp_oauth_flow(inflight.id, &key)
+            .await
+            .unwrap();
+        assert!(ctx
+            .meta
+            .complete_mcp_oauth_flow(inflight.id, candidate.clone(), expected)
+            .await
+            .is_err());
+        // A flow that has not consumed state cannot publish.
+        let untouched = flow(3);
+        ctx.meta
+            .create_mcp_oauth_flow(untouched.clone(), state.clone())
+            .await
+            .unwrap();
+        assert!(ctx
+            .meta
+            .complete_mcp_oauth_flow(untouched.id, candidate.clone(), expected)
+            .await
+            .is_err());
+        ctx.meta
+            .cancel_mcp_oauth_flow(untouched.id, &key)
+            .await
+            .unwrap();
+        let replacement = flow(2);
+        ctx.meta
+            .create_mcp_oauth_flow(replacement.clone(), state)
+            .await
+            .unwrap();
+        ctx.meta
+            .consume_mcp_oauth_flow(replacement.id, &key)
+            .await
+            .unwrap();
+        ctx.meta.cancel_mcp_oauth_flow(old.id, &key).await.unwrap();
+        let mut wrong_candidate = candidate.clone();
+        wrong_candidate.key.subject_id = "unrelated".into();
+        assert!(ctx
+            .meta
+            .complete_mcp_oauth_flow(replacement.id, wrong_candidate, expected)
+            .await
+            .is_err());
+        assert!(ctx
+            .meta
+            .complete_mcp_oauth_flow(replacement.id, candidate.clone(), Some(999))
+            .await
+            .is_err());
+        let published = ctx
+            .meta
+            .complete_mcp_oauth_flow(replacement.id, candidate.clone(), expected)
+            .await
+            .unwrap();
+        assert!(ctx
+            .meta
+            .complete_mcp_oauth_flow(inflight.id, candidate, expected)
+            .await
+            .is_err());
+        assert_eq!(
+            ctx.meta.get_oauth_credential(&key).await.unwrap().unwrap(),
+            published
+        );
+        assert_eq!(
+            ctx.meta
+                .get_oauth_flow(replacement.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            OAuthFlowStatus::Succeeded
+        );
+        // Either transaction may win; a cancellation winner cannot publish.
+        let race = flow(4);
+        ctx.meta
+            .create_mcp_oauth_flow(
+                race.clone(),
+                McpSealedState {
+                    wrapped_dek: vec![1; 32],
+                    nonce: vec![2; 12],
+                    ciphertext: vec![3; 64],
+                    key_id: "test".into(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.meta
+            .consume_mcp_oauth_flow(race.id, &key)
+            .await
+            .unwrap();
+        let candidate = NewSealedOAuthCredential {
+            key: key.clone(),
+            wrapped_dek: vec![4; 32],
+            nonce: vec![5; 12],
+            ciphertext: vec![6; 64],
+            key_id: "test".into(),
+            metadata: OAuthAccountMetadata::default(),
+            expires_at: None,
+        };
+        let (cancel, complete) = tokio::join!(
+            ctx.meta.cancel_mcp_oauth_flow(race.id, &key),
+            ctx.meta
+                .complete_mcp_oauth_flow(race.id, candidate, Some(published.version))
+        );
+        cancel.unwrap();
+        let terminal = ctx
+            .meta
+            .get_oauth_flow(race.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status;
+        assert_eq!(complete.is_ok(), terminal == OAuthFlowStatus::Succeeded);
+        assert!(matches!(
+            terminal,
+            OAuthFlowStatus::Succeeded | OAuthFlowStatus::Cancelled
+        ));
+    }
+}
+conformance!(
+    t_mcp_flow_cancellation_fences_publication,
+    mcp_flow_cancellation_fences_publication
+);
+
+/// Accepted inputs change the server policy; guest events and queued defaults do not.
+async fn mcp_write_policy_prompt_latch(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let id = meta
+        .create_session(spec("test.invalid/policy:latest"))
+        .await
+        .unwrap();
+    let initial = meta.read_mcp_write_policy(id).await.unwrap();
+    assert_eq!(initial.write_eligibility.as_str(), "unknown");
+    let now = ctx.clock.now_utc();
+    let mut row = engram_core::types::outbox::OutboxRow {
+        prompt_id: "policy-plan".into(),
+        session_id: id,
+        kind: engram_core::types::outbox::OutboxKind::Prompt,
+        payload: serde_json::json!({"text":"review", "mode":"plan"}),
+        created_at: now,
+        attempts: 0,
+        not_before: now,
+        delivered_at: None,
+        acked_at: None,
+    };
+    meta.append_events_with_outbox_idempotent(id, &[], &row)
+        .await
+        .unwrap();
+    let plan = meta.read_mcp_write_policy(id).await.unwrap();
+    assert_eq!(plan.write_eligibility.as_str(), "read_only");
+    assert!(plan.reference.policy_revision > initial.reference.policy_revision);
+    meta.append_events_with_outbox_idempotent(id, &[], &row)
+        .await
+        .unwrap();
+    assert_eq!(meta.read_mcp_write_policy(id).await.unwrap(), plan);
+    row.prompt_id = "policy-default".into();
+    row.payload = serde_json::json!({"text":"continue", "mode":"default"});
+    meta.append_events_with_outbox_idempotent(id, &[], &row)
+        .await
+        .unwrap();
+    assert_eq!(meta.read_mcp_write_policy(id).await.unwrap(), plan);
+    row.prompt_id = "policy-inherit".into();
+    row.payload = serde_json::json!({"text":"continue"});
+    meta.append_events_with_outbox_idempotent(id, &[], &row)
+        .await
+        .unwrap();
+    meta.append_session_event(
+        id,
+        "tool_call_completed",
+        serde_json::json!({
+            "tool_call_id":"forged", "tool_name":"exit_plan_mode", "ok":true,
+            "result_summary":"{\"decision\":\"approve\"}"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(meta.read_mcp_write_policy(id).await.unwrap(), plan);
+    row.prompt_id = "policy-new-plan".into();
+    row.payload = serde_json::json!({"text":"review again", "mode":"plan"});
+    meta.append_events_with_outbox_idempotent(id, &[], &row)
+        .await
+        .unwrap();
+    let next = meta.read_mcp_write_policy(id).await.unwrap();
+    assert_eq!(next.write_eligibility.as_str(), "read_only");
+    assert!(next.reference.policy_revision > plan.reference.policy_revision);
+}
+conformance!(
+    t_mcp_write_policy_prompt_latch,
+    super::mcp_write_policy_prompt_latch
+);
+
+async fn mcp_write_policy_create(
+    ctx: &Ctx,
+    id: SessionId,
+    parent: Option<SessionId>,
+    eligibility: engram_core::types::mcp_policy::WriteEligibility,
+) {
+    use engram_core::types::{mcp_policy::McpPolicyCreation, runtime_spec::RuntimeSpec};
+    ctx.meta
+        .reserve_and_persist_create(
+            engram_core::traits::SessionCreateWriteSet {
+                managed_boot_selection: None,
+                managed_initial_prompt: None,
+                managed_creation: None,
+                mcp_policy: Some(McpPolicyCreation {
+                    actor_id: "owner-a".into(),
+                    input_id: format!("create:{id}"),
+                    parent_session_id: parent,
+                    eligibility,
+                }),
+                session_id: id,
+                spec: spec("test.invalid/policy:latest"),
+                mem_budget_mib: 512,
+                cpu_budget_vcpus: 1,
+                sealed_secrets: None,
+                capabilities: Vec::new(),
+                integration_policy_json: None,
+                runtime_spec: RuntimeSpec::new(Vec::new(), Some("claude".into()), None, Vec::new()),
+                oauth_binding: None,
+            },
+            &[],
+            0,
+        )
+        .await
+        .unwrap();
+}
+async fn mcp_write_policy_event(ctx: &Ctx, id: SessionId, call: &str, run: &str, args: &str) {
+    ctx.meta.append_session_event(id,"tool_call_requested",serde_json::json!({"run_id":run,"tool_call_id":call,"name":"exit_plan_mode","args_json":args})).await.unwrap();
+}
+async fn mcp_write_policy_restrict(ctx: &Ctx, id: SessionId, prompt: &str) {
+    let now = ctx.clock.now_utc();
+    ctx.meta
+        .append_events_with_outbox_idempotent(
+            id,
+            &[],
+            &engram_core::types::outbox::OutboxRow {
+                prompt_id: prompt.into(),
+                session_id: id,
+                kind: engram_core::types::outbox::OutboxKind::Prompt,
+                payload: serde_json::json!({"text":"review","mode":"plan"}),
+                created_at: now,
+                attempts: 0,
+                not_before: now,
+                delivered_at: None,
+                acked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+}
+async fn mcp_write_policy_human_exit(ctx: &Ctx) {
+    use engram_core::types::mcp_policy::*;
+    let id = SessionId::new();
+    mcp_write_policy_create(ctx, id, None, WriteEligibility::ReadOnly).await;
+    mcp_write_policy_event(ctx, id, "plan-a", "run-a", "{\"plan\":\"reviewed\"}").await;
+    let review = ctx.meta.read_mcp_plan_review(id, "plan-a").await.unwrap();
+    let input = PlanAcceptance {
+        review: review.clone(),
+        actor_id: "owner-a".into(),
+        result_json: "{\"decision\":\"approve\"}".into(),
+    };
+    let mut rejection = input.clone();
+    rejection.result_json = "{\"decision\":\"reject\"}".into();
+    assert!(ctx.meta.accept_mcp_plan_exit(&rejection).await.is_err());
+    let mut changed = input.clone();
+    changed.review.args_json = "{}".into();
+    assert!(ctx.meta.accept_mcp_plan_exit(&changed).await.is_err());
+    let before = ctx.meta.read_mcp_write_policy(id).await.unwrap();
+    let accepted = ctx.meta.accept_mcp_plan_exit(&input).await.unwrap();
+    assert_eq!(accepted.write_eligibility, WriteEligibility::WriteEligible);
+    assert!(accepted.reference.policy_revision > before.reference.policy_revision);
+    let outbox = ctx
+        .meta
+        .outbox_get(&engram_core::types::outbox::tool_result_outbox_id(
+            id, "plan-a",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outbox.payload["result_json"], input.result_json);
+    let events = ctx
+        .meta
+        .list_session_events_since(id, -1, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.kind == "tool_result_submitted")
+            .count(),
+        1
+    );
+    assert_eq!(
+        ctx.meta.accept_mcp_plan_exit(&input).await.unwrap(),
+        accepted
+    );
+    assert_eq!(
+        ctx.meta
+            .list_session_events_since(id, -1, 100)
+            .await
+            .unwrap()
+            .len(),
+        events.len()
+    );
+    mcp_write_policy_restrict(ctx, id, "new-plan").await;
+    let newer = ctx.meta.read_mcp_write_policy(id).await.unwrap();
+    assert_eq!(
+        ctx.meta.accept_mcp_plan_exit(&input).await.unwrap(),
+        newer,
+        "retry cannot relax a newer plan"
+    );
+    assert_eq!(newer.write_eligibility, WriteEligibility::ReadOnly);
+    mcp_write_policy_event(ctx, id, "plan-b", "run-b", "{}").await;
+    let stale = ctx.meta.read_mcp_plan_review(id, "plan-b").await.unwrap();
+    mcp_write_policy_restrict(ctx, id, "newer-plan").await;
+    assert!(ctx
+        .meta
+        .accept_mcp_plan_exit(&PlanAcceptance {
+            review: stale,
+            ..input
+        })
+        .await
+        .is_err());
+    assert!(
+        ctx.meta.read_mcp_plan_review(id, "plan-b").await.is_err(),
+        "old call cannot authorize new restriction"
+    );
+}
+conformance!(
+    t_mcp_write_policy_human_exit,
+    super::mcp_write_policy_human_exit
+);
+async fn mcp_write_policy_projections_and_fences(ctx: &Ctx) {
+    use engram_core::types::mcp_policy::*;
+    let parent = SessionId::new();
+    let child = SessionId::new();
+    mcp_write_policy_create(ctx, parent, None, WriteEligibility::ReadOnly).await;
+    mcp_write_policy_create(ctx, child, Some(parent), WriteEligibility::WriteEligible).await;
+    let pre = ctx.meta.read_mcp_write_policy(child).await.unwrap();
+    assert_eq!(pre.write_eligibility, WriteEligibility::ReadOnly);
+    assert_eq!(pre.ancestor_policy_refs.len(), 1);
+    for status in [
+        SessionState::Pending,
+        SessionState::Created,
+        SessionState::Active,
+    ] {
+        ctx.meta
+            .transition_session(child, status, BindingDisposition::Retain)
+            .await
+            .unwrap();
+    }
+    ctx.meta
+        .append_session_event(child, "run_started", serde_json::json!({"run_id":"run-a"}))
+        .await
+        .unwrap();
+    mcp_write_policy_event(ctx, child, "write-a", "run-a", "{}").await;
+    let frozen = RequestPolicyContext {
+        session_id: child,
+        run_id: "run-a".into(),
+        tool_call_id: "write-a".into(),
+        accepted_policy_ref: pre.reference,
+        accepted_write_eligibility: pre.write_eligibility,
+        ancestor_policy_refs: pre.ancestor_policy_refs,
+    };
+    mcp_write_policy_event(ctx, parent, "plan-a", "run-a", "{}").await;
+    let review = ctx
+        .meta
+        .read_mcp_plan_review(parent, "plan-a")
+        .await
+        .unwrap();
+    ctx.meta
+        .accept_mcp_plan_exit(&PlanAcceptance {
+            review,
+            actor_id: "owner-a".into(),
+            result_json: "{\"decision\":\"approve\"}".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .validate_mcp_dispatch_fence(
+                &frozen,
+                &ExecutionRequest {
+                    model_tool_name: "exit_plan_mode".into(),
+                    original_arguments: "{}".into()
+                }
+            )
+            .await
+            .unwrap(),
+        DispatchFence::Unknown,
+        "earlier read-only request cannot gain writes"
+    );
+    let p = ctx.meta.read_mcp_write_policy(child).await.unwrap();
+    assert_eq!(p.write_eligibility, WriteEligibility::WriteEligible);
+    let current = RequestPolicyContext {
+        accepted_policy_ref: p.reference,
+        accepted_write_eligibility: p.write_eligibility,
+        ancestor_policy_refs: p.ancestor_policy_refs,
+        ..frozen
+    };
+    assert_eq!(
+        ctx.meta
+            .validate_mcp_dispatch_fence(
+                &current,
+                &ExecutionRequest {
+                    model_tool_name: "exit_plan_mode".into(),
+                    original_arguments: "{}".into()
+                }
+            )
+            .await
+            .unwrap(),
+        DispatchFence::Current
+    );
+    let mut forged = current.clone();
+    forged.run_id = "other-run".into();
+    assert_eq!(
+        ctx.meta
+            .validate_mcp_dispatch_fence(
+                &forged,
+                &ExecutionRequest {
+                    model_tool_name: "exit_plan_mode".into(),
+                    original_arguments: "{}".into()
+                }
+            )
+            .await
+            .unwrap(),
+        DispatchFence::Stale
+    );
+    forged = current.clone();
+    forged.ancestor_policy_refs.clear();
+    assert_eq!(
+        ctx.meta
+            .validate_mcp_dispatch_fence(
+                &forged,
+                &ExecutionRequest {
+                    model_tool_name: "exit_plan_mode".into(),
+                    original_arguments: "{}".into()
+                }
+            )
+            .await
+            .unwrap(),
+        DispatchFence::Stale
+    );
+    mcp_write_policy_restrict(ctx, parent, "parent-plan").await;
+    assert_ne!(
+        ctx.meta
+            .validate_mcp_dispatch_fence(
+                &current,
+                &ExecutionRequest {
+                    model_tool_name: "exit_plan_mode".into(),
+                    original_arguments: "{}".into()
+                }
+            )
+            .await
+            .unwrap(),
+        DispatchFence::Current
+    );
+    assert_eq!(
+        ctx.meta
+            .read_mcp_write_policy(child)
+            .await
+            .unwrap()
+            .write_eligibility,
+        WriteEligibility::ReadOnly
+    );
+    let legacy = ctx
+        .meta
+        .create_session(spec("test.invalid/legacy:latest"))
+        .await
+        .unwrap();
+    mcp_write_policy_restrict(ctx, legacy, "legacy-plan").await;
+    mcp_write_policy_event(ctx, legacy, "legacy-call", "run-a", "{}").await;
+    assert!(ctx
+        .meta
+        .read_mcp_plan_review(legacy, "legacy-call")
+        .await
+        .is_err());
+    let id = SessionId::new();
+    mcp_write_policy_create(ctx, id, None, WriteEligibility::ReadOnly).await;
+    mcp_write_policy_event(ctx, id, "plan", "run", "{}").await;
+    let reviewed = ctx.meta.read_mcp_plan_review(id, "plan").await.unwrap();
+    mcp_write_policy_event(ctx, id, "plan", "run", "{\"changed\":true}").await;
+    assert!(ctx
+        .meta
+        .accept_mcp_plan_exit(&PlanAcceptance {
+            review: reviewed,
+            actor_id: "owner-a".into(),
+            result_json: "{\"decision\":\"approve\"}".into()
+        })
+        .await
+        .is_err());
+}
+conformance!(
+    t_mcp_write_policy_projections_and_fences,
+    super::mcp_write_policy_projections_and_fences
+);
+
+async fn mcp_write_policy_deferred_execution_identity(ctx: &Ctx) {
+    use engram_core::types::mcp_policy::*;
+    use serde_json::json;
+
+    let deferred = json!({"run_id":"run-a","ok":true,"deferred_tool_call_ids":["write-a"]});
+    for (name, completion, followup, expected) in [
+        (
+            "ordinary",
+            json!({"run_id":"run-a","ok":true}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "parked marker only",
+            json!({"run_id":"run-a","ok":true}),
+            Some(("harness_parked", json!({}))),
+            DispatchFence::Stale,
+        ),
+        (
+            "empty association",
+            json!({"run_id":"run-a","ok":true,"deferred_tool_call_ids":[]}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "unrelated call",
+            json!({"run_id":"run-a","ok":true,"deferred_tool_call_ids":["write-b"]}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "failed run",
+            json!({"run_id":"run-a","ok":false,"deferred_tool_call_ids":["write-a"]}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "wrong run",
+            json!({"run_id":"run-b","ok":true,"deferred_tool_call_ids":["write-a"]}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "duplicate call",
+            json!({"run_id":"run-a","ok":true,"deferred_tool_call_ids":["write-a","write-a"]}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "empty call",
+            json!({"run_id":"run-a","ok":true,"deferred_tool_call_ids":["write-a",""]}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "long call",
+            json!({"run_id":"run-a","ok":true,"deferred_tool_call_ids":["write-a","x".repeat(257)]}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "nonstring call",
+            json!({"run_id":"run-a","ok":true,"deferred_tool_call_ids":["write-a",1]}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "nonarray association",
+            json!({"run_id":"run-a","ok":true,"deferred_tool_call_ids":"write-a"}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "too many calls",
+            json!({"run_id":"run-a","ok":true,"deferred_tool_call_ids": std::iter::once("write-a".to_owned()).chain((0..128).map(|n| format!("call-{n}"))).collect::<Vec<_>>()}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "interrupted",
+            deferred.clone(),
+            Some(("run_interrupted", json!({"run_id":"run-a"}))),
+            DispatchFence::Stale,
+        ),
+        (
+            "new run",
+            deferred.clone(),
+            Some(("run_started", json!({"run_id":"run-b"}))),
+            DispatchFence::Stale,
+        ),
+        (
+            "submitted result",
+            deferred.clone(),
+            Some((
+                "tool_result_submitted",
+                json!({"tool_call_id":"write-a","result_json":"{}"}),
+            )),
+            DispatchFence::Stale,
+        ),
+        (
+            "completed call",
+            deferred.clone(),
+            Some((
+                "tool_call_completed",
+                json!({"run_id":"run-a","tool_call_id":"write-a","ok":true}),
+            )),
+            DispatchFence::Stale,
+        ),
+        (
+            "canceled call",
+            deferred.clone(),
+            Some((
+                "tool_call_cancel_requested",
+                json!({"run_id":"run-a","tool_call_id":"write-a","name":"mcp__fixture__write"}),
+            )),
+            DispatchFence::Stale,
+        ),
+        (
+            "changed request",
+            deferred.clone(),
+            Some((
+                "tool_call_requested",
+                json!({"run_id":"run-a","tool_call_id":"write-a","name":"mcp__fixture__write","args_json":"{\"changed\":true}"}),
+            )),
+            DispatchFence::Stale,
+        ),
+        (
+            "request after completion",
+            deferred.clone(),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "deferred before parked marker",
+            deferred.clone(),
+            None,
+            DispatchFence::Current,
+        ),
+        (
+            "maximum association",
+            json!({"run_id":"run-a","ok":true,"deferred_tool_call_ids": std::iter::once("write-a".to_owned()).chain((0..127).map(|n| format!("call-{n}"))).collect::<Vec<_>>()}),
+            None,
+            DispatchFence::Current,
+        ),
+    ] {
+        let id = SessionId::new();
+        mcp_write_policy_create(ctx, id, None, WriteEligibility::WriteEligible).await;
+        for status in [
+            SessionState::Pending,
+            SessionState::Created,
+            SessionState::Active,
+        ] {
+            ctx.meta
+                .transition_session(id, status, BindingDisposition::Retain)
+                .await
+                .unwrap();
+        }
+        ctx.meta
+            .append_session_event(id, "run_started", json!({"run_id":"run-a"}))
+            .await
+            .unwrap();
+        let call = json!({"run_id":"run-a","tool_call_id":"write-a","name":"mcp__fixture__write","args_json":"{}"});
+        if name != "request after completion" {
+            ctx.meta
+                .append_session_event(id, "tool_call_requested", call.clone())
+                .await
+                .unwrap();
+        }
+        let policy = ctx.meta.read_mcp_write_policy(id).await.unwrap();
+        let request = RequestPolicyContext {
+            session_id: id,
+            run_id: "run-a".into(),
+            tool_call_id: "write-a".into(),
+            accepted_policy_ref: policy.reference,
+            accepted_write_eligibility: policy.write_eligibility,
+            ancestor_policy_refs: policy.ancestor_policy_refs,
+        };
+        let execution = ExecutionRequest {
+            model_tool_name: "mcp__fixture__write".into(),
+            original_arguments: "{}".into(),
+        };
+        ctx.meta
+            .append_session_event(id, "run_completed", completion)
+            .await
+            .unwrap();
+        if name == "request after completion" {
+            ctx.meta
+                .append_session_event(id, "tool_call_requested", call)
+                .await
+                .unwrap();
+        }
+        if let Some((kind, payload)) = followup {
+            ctx.meta
+                .append_session_event(id, kind, payload)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            ctx.meta
+                .validate_mcp_execution_identity(&request, &execution)
+                .await
+                .unwrap(),
+            expected,
+            "{name}"
+        );
+        assert_eq!(
+            ctx.meta
+                .validate_mcp_dispatch_fence(&request, &execution)
+                .await
+                .unwrap(),
+            expected,
+            "{name}"
+        );
+        if expected == DispatchFence::Current {
+            let mut forged = request.clone();
+            forged.run_id = "other-run".into();
+            assert_eq!(
+                ctx.meta
+                    .validate_mcp_execution_identity(&forged, &execution)
+                    .await
+                    .unwrap(),
+                DispatchFence::Stale
+            );
+            for changed in [
+                ExecutionRequest {
+                    model_tool_name: "mcp__fixture__other".into(),
+                    ..execution.clone()
+                },
+                ExecutionRequest {
+                    original_arguments: "{ }".into(),
+                    ..execution.clone()
+                },
+            ] {
+                assert_eq!(
+                    ctx.meta
+                        .validate_mcp_execution_identity(&request, &changed)
+                        .await
+                        .unwrap(),
+                    DispatchFence::Stale
+                );
+            }
+            ctx.meta.rewind_session_to_cursor(id, 0).await.unwrap();
+            assert_eq!(
+                ctx.meta
+                    .validate_mcp_execution_identity(&request, &execution)
+                    .await
+                    .unwrap(),
+                DispatchFence::Stale
+            );
+        }
+    }
+}
+conformance!(
+    t_mcp_write_policy_deferred_execution_identity,
+    super::mcp_write_policy_deferred_execution_identity
+);
+
+async fn mcp_write_policy_restore_and_generic_results(ctx: &Ctx) {
+    use engram_core::types::mcp_policy::*;
+    let id = SessionId::new();
+    mcp_write_policy_create(ctx, id, None, WriteEligibility::ReadOnly).await;
+    mcp_write_policy_event(ctx, id, "automatic-plan", "run-a", "{}").await;
+    let now = ctx.clock.now_utc();
+    let row = engram_core::types::outbox::OutboxRow {
+        prompt_id: engram_core::types::outbox::tool_result_outbox_id(id, "automatic-plan"),
+        session_id: id,
+        kind: engram_core::types::outbox::OutboxKind::ToolResult,
+        payload: serde_json::json!({"tool_call_id":"automatic-plan","result_json":"{\"decision\":\"approve\"}"}),
+        created_at: now,
+        attempts: 0,
+        not_before: now,
+        delivered_at: None,
+        acked_at: None,
+    };
+    ctx.meta.append_session_event_and_outbox(id,"tool_result_submitted",serde_json::json!({"tool_call_id":"automatic-plan","result_json":"{\"decision\":\"approve\"}"}),&row).await.unwrap();
+    assert_eq!(
+        ctx.meta
+            .read_mcp_write_policy(id)
+            .await
+            .unwrap()
+            .write_eligibility,
+        WriteEligibility::ReadOnly
+    );
+    assert!(ctx
+        .meta
+        .read_mcp_plan_review(id, "automatic-plan")
+        .await
+        .is_err());
+    mcp_write_policy_event(ctx, id, "restored-plan", "run-a", "{}").await;
+    let review = ctx
+        .meta
+        .read_mcp_plan_review(id, "restored-plan")
+        .await
+        .unwrap();
+    ctx.meta.rewind_session_to_cursor(id, -1).await.unwrap();
+    assert!(ctx
+        .meta
+        .accept_mcp_plan_exit(&PlanAcceptance {
+            review,
+            actor_id: "owner-a".into(),
+            result_json: "{\"decision\":\"approve\"}".into()
+        })
+        .await
+        .is_err());
+    assert_eq!(
+        ctx.meta
+            .read_mcp_write_policy(id)
+            .await
+            .unwrap()
+            .write_eligibility,
+        WriteEligibility::ReadOnly
+    );
+    mcp_write_policy_event(ctx, id, "current-plan", "run-b", "{}").await;
+    let review = ctx
+        .meta
+        .read_mcp_plan_review(id, "current-plan")
+        .await
+        .unwrap();
+    ctx.meta
+        .accept_mcp_plan_exit(&PlanAcceptance {
+            review,
+            actor_id: "owner-a".into(),
+            result_json: "{\"decision\":\"approve\"}".into(),
+        })
+        .await
+        .unwrap();
+    for status in [
+        SessionState::Pending,
+        SessionState::Created,
+        SessionState::Active,
+    ] {
+        ctx.meta
+            .transition_session(id, status, BindingDisposition::Retain)
+            .await
+            .unwrap();
+    }
+    ctx.meta
+        .append_session_event(id, "run_started", serde_json::json!({"run_id":"run-b"}))
+        .await
+        .unwrap();
+    mcp_write_policy_event(ctx, id, "write-b", "run-b", "{}").await;
+    let p = ctx.meta.read_mcp_write_policy(id).await.unwrap();
+    let frozen = RequestPolicyContext {
+        session_id: id,
+        run_id: "run-b".into(),
+        tool_call_id: "write-b".into(),
+        accepted_policy_ref: p.reference.clone(),
+        accepted_write_eligibility: p.write_eligibility,
+        ancestor_policy_refs: p.ancestor_policy_refs.clone(),
+    };
+    assert_eq!(
+        ctx.meta
+            .validate_mcp_dispatch_fence(
+                &frozen,
+                &ExecutionRequest {
+                    model_tool_name: "exit_plan_mode".into(),
+                    original_arguments: "{}".into()
+                }
+            )
+            .await
+            .unwrap(),
+        DispatchFence::Current
+    );
+    ctx.meta
+        .fenced_assign_sandbox(id, 0, Some(engram_core::SandboxId::new()), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .validate_mcp_dispatch_fence(
+                &frozen,
+                &ExecutionRequest {
+                    model_tool_name: "exit_plan_mode".into(),
+                    original_arguments: "{}".into()
+                }
+            )
+            .await
+            .unwrap(),
+        DispatchFence::Stale
+    );
+    let restored = ctx.meta.read_mcp_write_policy(id).await.unwrap();
+    assert_eq!(
+        restored.reference.policy_revision,
+        p.reference.policy_revision
+    );
+    assert_eq!(restored.write_eligibility, WriteEligibility::WriteEligible);
+    if let Some(db) = &ctx._pg {
+        let reopened = engram_postgres::PostgresStore::connect(&db.url)
+            .await
+            .unwrap()
+            .with_clock(ctx.clock.clone());
+        assert_eq!(
+            reopened.read_mcp_write_policy(id).await.unwrap(),
+            restored,
+            "new connection reads durable policy after restore"
+        );
+    }
+}
+conformance!(
+    t_mcp_write_policy_restore_and_generic_results,
+    super::mcp_write_policy_restore_and_generic_results
+);
+
+async fn mcp_write_policy_restriction_race(ctx: &Ctx) {
+    use engram_core::types::mcp_policy::*;
+    let id = SessionId::new();
+    mcp_write_policy_create(ctx, id, None, WriteEligibility::WriteEligible).await;
+    for status in [
+        SessionState::Pending,
+        SessionState::Created,
+        SessionState::Active,
+    ] {
+        ctx.meta
+            .transition_session(id, status, BindingDisposition::Retain)
+            .await
+            .unwrap();
+    }
+    ctx.meta
+        .append_session_event(id, "run_started", serde_json::json!({"run_id":"run-a"}))
+        .await
+        .unwrap();
+    mcp_write_policy_event(ctx, id, "call-a", "run-a", "{}").await;
+    let p = ctx.meta.read_mcp_write_policy(id).await.unwrap();
+    let frozen = RequestPolicyContext {
+        session_id: id,
+        run_id: "run-a".into(),
+        tool_call_id: "call-a".into(),
+        accepted_policy_ref: p.reference,
+        accepted_write_eligibility: p.write_eligibility,
+        ancestor_policy_refs: p.ancestor_policy_refs,
+    };
+    let expected = ExecutionRequest {
+        model_tool_name: "exit_plan_mode".into(),
+        original_arguments: "{}".into(),
+    };
+    let (fence, ()) = tokio::join!(
+        ctx.meta.validate_mcp_dispatch_fence(&frozen, &expected),
+        mcp_write_policy_restrict(ctx, id, "race-plan")
+    );
+    assert!(
+        matches!(
+            fence.unwrap(),
+            DispatchFence::Current | DispatchFence::Unknown
+        ),
+        "the lock defines which operation is admitted first"
+    );
+    assert_ne!(
+        ctx.meta
+            .validate_mcp_dispatch_fence(
+                &frozen,
+                &ExecutionRequest {
+                    model_tool_name: "exit_plan_mode".into(),
+                    original_arguments: "{}".into()
+                }
+            )
+            .await
+            .unwrap(),
+        DispatchFence::Current,
+        "a committed restriction blocks every later fence"
+    );
+}
+conformance!(
+    t_mcp_write_policy_restriction_race,
+    super::mcp_write_policy_restriction_race
+);
+
+async fn mcp_write_policy_history_bound(ctx: &Ctx) {
+    use engram_core::types::mcp_policy::WriteEligibility;
+    let id = SessionId::new();
+    mcp_write_policy_create(ctx, id, None, WriteEligibility::ReadOnly).await;
+    ctx.meta
+        .append_session_event(id, "run_started", serde_json::json!({"run_id":"run-bound"}))
+        .await
+        .unwrap();
+    let request = serde_json::json!({"run_id":"run-bound","tool_call_id":"bounded-plan","name":"exit_plan_mode","args_json":"{}"});
+    let events: Vec<_> = (0..1023)
+        .map(|_| ("tool_call_requested".to_string(), request.clone()))
+        .collect();
+    let now = ctx.clock.now_utc();
+    ctx.meta
+        .append_events_with_outbox_idempotent(
+            id,
+            &events,
+            &engram_core::types::outbox::OutboxRow {
+                prompt_id: "bounded-request-input".into(),
+                session_id: id,
+                kind: engram_core::types::outbox::OutboxKind::Prompt,
+                payload: serde_json::json!({"text":"test history"}),
+                created_at: now,
+                attempts: 0,
+                not_before: now,
+                delivered_at: None,
+                acked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .read_mcp_plan_review(id, "bounded-plan")
+        .await
+        .is_ok());
+    ctx.meta
+        .append_session_event(id, "tool_call_requested", request)
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .read_mcp_plan_review(id, "bounded-plan")
+        .await
+        .is_err());
+}
+conformance!(
+    t_mcp_write_policy_history_bound,
+    super::mcp_write_policy_history_bound
+);
+
+async fn mcp_write_policy_parent_lifecycle(ctx: &Ctx) {
+    use engram_core::types::mcp_policy::WriteEligibility;
+    let parent = SessionId::new();
+    let child = SessionId::new();
+    mcp_write_policy_create(ctx, parent, None, WriteEligibility::WriteEligible).await;
+    mcp_write_policy_create(ctx, child, Some(parent), WriteEligibility::WriteEligible).await;
+    ctx.meta
+        .transition_session(parent, SessionState::Pending, BindingDisposition::Retain)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            ctx.meta.delete_pending_session(parent).await,
+            Err(engram_core::MetaError::Db(_))
+        ),
+        "immutable parent FK must preserve ancestry"
+    );
+    assert_eq!(
+        ctx.meta
+            .read_mcp_write_policy(child)
+            .await
+            .unwrap()
+            .write_eligibility,
+        WriteEligibility::WriteEligible
+    );
+    ctx.meta
+        .transition_session(parent, SessionState::Failed, BindingDisposition::Retain)
+        .await
+        .unwrap();
+    let policy = ctx.meta.read_mcp_write_policy(child).await.unwrap();
+    assert_eq!(policy.write_eligibility, WriteEligibility::Unknown);
+    assert!(!policy.current);
+    assert_eq!(policy.ancestor_policy_refs.len(), 1);
+}
+conformance!(
+    t_mcp_write_policy_parent_lifecycle,
+    super::mcp_write_policy_parent_lifecycle
+);
+
+async fn mcp_read_execution_identity(ctx: &Ctx) {
+    use engram_core::types::mcp_policy::*;
+    for eligibility in [
+        WriteEligibility::Unknown,
+        WriteEligibility::ReadOnly,
+        WriteEligibility::WriteEligible,
+    ] {
+        let parent = SessionId::new();
+        let id = SessionId::new();
+        mcp_write_policy_create(ctx, parent, None, eligibility).await;
+        mcp_write_policy_create(ctx, id, Some(parent), eligibility).await;
+        for status in [
+            SessionState::Pending,
+            SessionState::Created,
+            SessionState::Active,
+        ] {
+            ctx.meta
+                .transition_session(id, status, BindingDisposition::Retain)
+                .await
+                .unwrap();
+        }
+        ctx.meta
+            .append_session_event(id, "run_started", serde_json::json!({"run_id":"run-a"}))
+            .await
+            .unwrap();
+        mcp_write_policy_event(ctx, id, "call-a", "run-a", "{ \"value\": 1 }").await;
+        let p = ctx.meta.read_mcp_write_policy(id).await.unwrap();
+        let frozen = RequestPolicyContext {
+            session_id: id,
+            run_id: "run-a".into(),
+            tool_call_id: "call-a".into(),
+            accepted_policy_ref: p.reference,
+            accepted_write_eligibility: p.write_eligibility,
+            ancestor_policy_refs: p.ancestor_policy_refs,
+        };
+        let expected = ExecutionRequest {
+            model_tool_name: "exit_plan_mode".into(),
+            original_arguments: "{ \"value\": 1 }".into(),
+        };
+        assert_eq!(
+            ctx.meta
+                .validate_mcp_execution_identity(&frozen, &expected)
+                .await
+                .unwrap(),
+            DispatchFence::Current
+        );
+        let mut changed = expected.clone();
+        changed.original_arguments = "{\"value\":1}".into();
+        assert_eq!(
+            ctx.meta
+                .validate_mcp_execution_identity(&frozen, &changed)
+                .await
+                .unwrap(),
+            DispatchFence::Stale
+        );
+        changed = expected.clone();
+        changed.model_tool_name = "different".into();
+        assert_eq!(
+            ctx.meta
+                .validate_mcp_execution_identity(&frozen, &changed)
+                .await
+                .unwrap(),
+            DispatchFence::Stale
+        );
+        let mut stale = frozen.clone();
+        stale.ancestor_policy_refs.clear();
+        assert_eq!(
+            ctx.meta
+                .validate_mcp_execution_identity(&stale, &expected)
+                .await
+                .unwrap(),
+            DispatchFence::Stale
+        );
+        ctx.meta
+            .append_session_event(id, "run_interrupted", serde_json::json!({"run_id":"run-a"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.meta
+                .validate_mcp_execution_identity(&frozen, &expected)
+                .await
+                .unwrap(),
+            DispatchFence::Stale
+        );
+    }
+}
+conformance!(
+    t_mcp_read_execution_identity,
+    super::mcp_read_execution_identity
+);
+
+async fn managed_deny_retention(ctx: &Ctx) {
+    use engram_core::types::managed_deny::*;
+    let meta = &ctx.meta;
+    let sid = meta
+        .create_session(spec("test.invalid/managed:latest"))
+        .await
+        .unwrap();
+    let hid = HostId::new();
+    meta.upsert_host(host_record(hid, "managed-host", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    meta.assign_session_host(sid, Some(hid)).await.unwrap();
+    let sandbox = engram_core::SandboxId::new();
+    let epoch = meta.transition_session_created(sid, sandbox).await.unwrap();
+    let target = ManagedPolicyTarget {
+        session_id: sid,
+        sandbox_id: sandbox,
+        host_id: hid,
+        binding_epoch: epoch,
+    };
+    assert_eq!(meta.managed_policy_target(sid).await.unwrap(), target);
+    let one = ManagedDenyPolicy::new(1, ["a.example".into()]).unwrap();
+    meta.retain_managed_deny(&target, &one).await.unwrap();
+    meta.retain_managed_deny(&target, &one).await.unwrap();
+    assert!(meta
+        .bind_session_integration_policy(sid, "{}")
+        .await
+        .is_err());
+    let smaller = ManagedDenyPolicy::new(2, ["b.example".into()]).unwrap();
+    assert!(meta.retain_managed_deny(&target, &smaller).await.is_err());
+    let union = ManagedDenyPolicy::new(2, ["a.example".into(), "b.example".into()]).unwrap();
+    meta.retain_managed_deny(&target, &union).await.unwrap();
+    assert!(meta.retain_managed_deny(&target, &one).await.is_err());
+    let mut stale = target.clone();
+    stale.binding_epoch += 1;
+    assert!(meta.retain_managed_deny(&stale, &union).await.is_err());
+    let stored: engram_core::types::integration::IntegrationPolicy = serde_json::from_str(
+        &meta
+            .get_session_integration_policy(sid)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stored.managed_deny, Some(union.clone()));
+    assert_eq!(
+        meta.managed_policy_target(sid).await.unwrap(),
+        target,
+        "deny updates must not change physical epoch"
+    );
+    meta.transition_session(sid, SessionState::Failed, BindingDisposition::Detach)
+        .await
+        .unwrap();
+    assert!(meta.managed_policy_target(sid).await.is_err());
+    assert!(meta.retain_managed_deny(&target, &union).await.is_err());
+}
+conformance!(t_managed_deny_retention, super::managed_deny_retention);
+
+fn managed_creation_ws(id: SessionId) -> engram_core::traits::SessionCreateWriteSet {
+    use engram_core::types::{managed_create::*, mcp_policy::*, runtime_spec::RuntimeSpec};
+    let policy = McpPolicyCreation {
+        actor_id: "owner-a".into(),
+        input_id: format!("create:{id}"),
+        parent_session_id: None,
+        eligibility: WriteEligibility::ReadOnly,
+    };
+    let bytes = br#" [ {"name":"native","description":"all fields","inputSchema":{},"execution":"sync","nativeBindings":{"codex":"native"},"extra":true} ] "#.to_vec();
+    engram_core::traits::SessionCreateWriteSet {
+        managed_boot_selection: None,
+        managed_initial_prompt: None,
+        managed_creation: Some(ManagedCreation {
+            identity: ManagedCreateIdentity {
+                session_id: id,
+                task_id: "task-a".into(),
+                policy: policy.clone(),
+                input_digest: digest(b"exact original create input"),
+            },
+            native: FrozenNativeManifest {
+                version: 1,
+                digest: digest(&bytes),
+                bytes,
+            },
+        }),
+        mcp_policy: Some(policy),
+        session_id: id,
+        spec: spec("test.invalid/managed:latest"),
+        mem_budget_mib: 512,
+        cpu_budget_vcpus: 1,
+        sealed_secrets: None,
+        capabilities: Vec::new(),
+        integration_policy_json: None,
+        runtime_spec: RuntimeSpec::new(Vec::new(), Some("claude".into()), None, Vec::new()),
+        oauth_binding: None,
+    }
+}
+
+async fn managed_creation_exact_retry_and_held_queue(ctx: &Ctx) {
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
+    use engram_core::traits::CreateDisposition;
+    let ws = managed_creation_ws(SessionId::new());
+    let frozen = ws.managed_creation.clone().unwrap();
+    let host = HostId::new();
+    ctx.meta
+        .upsert_host(host_record(host, "managed-host", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .reserve_and_persist_create(ws.clone(), &[host], 0)
+            .await
+            .unwrap(),
+        CreateDisposition::Queued
+    );
+    assert_eq!(
+        ctx.meta
+            .read_managed_creation(&frozen.identity)
+            .await
+            .unwrap(),
+        frozen
+    );
+    assert_eq!(
+        ctx.meta.get_session(ws.session_id).await.unwrap().status,
+        SessionState::Queued
+    );
+    assert!(ctx
+        .meta
+        .list_queued_sessions_fifo()
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| r.session.id != ws.session_id));
+    assert_eq!(
+        ctx.meta
+            .place_queued_session(ws.session_id, 512, 1, &[host], 0)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        ctx.meta
+            .reserve_and_persist_create(ws.clone(), &[host], 0)
+            .await
+            .unwrap(),
+        CreateDisposition::Queued
+    );
+    let (a, b) = tokio::join!(
+        ctx.meta.reserve_and_persist_create(ws.clone(), &[], 0),
+        ctx.meta.reserve_and_persist_create(ws.clone(), &[], 0)
+    );
+    assert_eq!(a.unwrap(), CreateDisposition::Queued);
+    assert_eq!(b.unwrap(), CreateDisposition::Queued);
+    assert_eq!(
+        ctx.meta
+            .read_mcp_write_policy(ws.session_id)
+            .await
+            .unwrap()
+            .write_eligibility
+            .as_str(),
+        "read_only"
+    );
+    if let Some(db) = &ctx._pg {
+        // A fresh store and connection pool recover the same exact bytes.
+        let reopened = engram_postgres::PostgresStore::connect(&db.url)
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .read_managed_creation(&frozen.identity)
+                .await
+                .unwrap(),
+            frozen
+        );
+        let pool = sqlx::PgPool::connect(&db.url).await.unwrap();
+        assert!(sqlx::query(
+            "UPDATE session_managed_creations SET native_bytes=$2 WHERE session_id=$1"
+        )
+        .bind(ws.session_id.as_uuid())
+        .bind(b"[]".as_slice())
+        .execute(&pool)
+        .await
+        .is_err());
+        assert_eq!(
+            reopened
+                .read_managed_creation(&frozen.identity)
+                .await
+                .unwrap(),
+            frozen
+        );
+        pool.close().await;
+    }
+}
+conformance!(
+    t_managed_creation_exact_retry_and_held_queue,
+    super::managed_creation_exact_retry_and_held_queue
+);
+
+async fn managed_creation_rejects_changes_and_rolls_back(ctx: &Ctx) {
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
+    use engram_core::types::managed_create::digest;
+    let ws = managed_creation_ws(SessionId::new());
+    let original = ws.managed_creation.clone().unwrap();
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    for change in 0..8 {
+        let mut bad = ws.clone();
+        let authority = bad.managed_creation.as_mut().unwrap();
+        match change {
+            0 => {
+                authority.native.bytes = b"[]".to_vec();
+                authority.native.digest = digest(b"[]");
+            }
+            1 => authority.native.version = 2,
+            2 => authority.native.digest = digest(b"other"),
+            3 => authority.identity.input_digest = digest(b"other"),
+            4 => authority.identity.task_id = "other-task".into(),
+            5 => {
+                authority.identity.policy.actor_id = "other-owner".into();
+                bad.mcp_policy = Some(authority.identity.policy.clone());
+            }
+            6 => {
+                authority.identity.policy.input_id = "other-input".into();
+                bad.mcp_policy = Some(authority.identity.policy.clone());
+            }
+            _ => {
+                let id = SessionId::new();
+                bad.session_id = id;
+                authority.identity.session_id = id;
+            }
+        }
+        assert!(
+            ctx.meta
+                .reserve_and_persist_create(bad.clone(), &[], 0)
+                .await
+                .is_err(),
+            "change {change}"
+        );
+        if bad.session_id != ws.session_id {
+            assert!(ctx.meta.get_session(bad.session_id).await.is_err());
+        }
+    }
+    let mut wrong = original.identity.clone();
+    wrong.task_id = "other-task".into();
+    assert!(ctx.meta.read_managed_creation(&wrong).await.is_err());
+    wrong = original.identity.clone();
+    wrong.session_id = SessionId::new();
+    assert!(ctx.meta.read_managed_creation(&wrong).await.is_err());
+    let legacy = ctx
+        .meta
+        .create_session(spec("test.invalid/legacy:latest"))
+        .await
+        .unwrap();
+    wrong.session_id = legacy;
+    assert!(ctx.meta.read_managed_creation(&wrong).await.is_err());
+    let adopt = managed_creation_ws(legacy);
+    let adopt_identity = adopt.managed_creation.as_ref().unwrap().identity.clone();
+    assert!(ctx
+        .meta
+        .reserve_and_persist_create(adopt, &[], 0)
+        .await
+        .is_err());
+    assert!(ctx
+        .meta
+        .read_managed_creation(&adopt_identity)
+        .await
+        .is_err());
+    let mut bad = managed_creation_ws(SessionId::new());
+    let id = bad.session_id;
+    bad.mcp_policy.as_mut().unwrap().parent_session_id = Some(SessionId::new());
+    bad.managed_creation.as_mut().unwrap().identity.policy = bad.mcp_policy.clone().unwrap();
+    assert!(ctx
+        .meta
+        .reserve_and_persist_create(bad.clone(), &[], 0)
+        .await
+        .is_err());
+    assert!(ctx.meta.get_session(id).await.is_err());
+    assert!(ctx
+        .meta
+        .read_managed_creation(&bad.managed_creation.as_ref().unwrap().identity)
+        .await
+        .is_err());
+    bad.mcp_policy.as_mut().unwrap().parent_session_id = None;
+    bad.managed_creation.as_mut().unwrap().identity.policy = bad.mcp_policy.clone().unwrap();
+    ctx.meta
+        .reserve_and_persist_create(bad, &[], 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .read_managed_creation(&original.identity)
+            .await
+            .unwrap(),
+        original
+    );
+}
+conformance!(
+    t_managed_creation_rejects_changes_and_rolls_back,
+    super::managed_creation_rejects_changes_and_rolls_back
+);
+
+async fn managed_creation_race_parent_and_late_rollback(ctx: &Ctx) {
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
+    use engram_core::types::{managed_create::digest, mcp_policy::WriteEligibility, oauth::*};
+    let parent = SessionId::new();
+    mcp_write_policy_create(ctx, parent, None, WriteEligibility::ReadOnly).await;
+    let mut ws = managed_creation_ws(SessionId::new());
+    ws.mcp_policy.as_mut().unwrap().parent_session_id = Some(parent);
+    ws.mcp_policy.as_mut().unwrap().eligibility = WriteEligibility::WriteEligible;
+    ws.managed_creation.as_mut().unwrap().identity.policy = ws.mcp_policy.clone().unwrap();
+    let mut other = ws.clone();
+    other
+        .managed_creation
+        .as_mut()
+        .unwrap()
+        .identity
+        .input_digest = digest(b"different original input");
+    let (a, b) = tokio::join!(
+        ctx.meta.reserve_and_persist_create(ws.clone(), &[], 0),
+        ctx.meta.reserve_and_persist_create(other.clone(), &[], 0)
+    );
+    assert_ne!(a.is_ok(), b.is_ok());
+    let winner = if a.is_ok() { ws.clone() } else { other };
+    let identity = winner.managed_creation.as_ref().unwrap().identity.clone();
+    assert_eq!(
+        ctx.meta.read_managed_creation(&identity).await.unwrap(),
+        winner.managed_creation.unwrap()
+    );
+    assert_eq!(
+        ctx.meta
+            .read_mcp_write_policy(ws.session_id)
+            .await
+            .unwrap()
+            .write_eligibility,
+        WriteEligibility::ReadOnly
+    );
+    let mut bad_parent = identity;
+    bad_parent.policy.parent_session_id = None;
+    assert!(ctx.meta.read_managed_creation(&bad_parent).await.is_err());
+
+    // Missing OAuth credential fails after session/native/runtime writes in PG.
+    // The simulator checks the same condition before its atomic in-memory write.
+    let mut failed = managed_creation_ws(SessionId::new());
+    failed.oauth_binding = Some(SessionOAuthBinding {
+        session_id: failed.session_id,
+        key: OAuthCredentialKey {
+            subject_kind: OAuthSubjectKind::User,
+            subject_id: "missing-user".into(),
+            provider: "missing-provider".into(),
+        },
+    });
+    let frozen = failed.managed_creation.clone().unwrap();
+    assert!(ctx
+        .meta
+        .reserve_and_persist_create(failed.clone(), &[], 0)
+        .await
+        .is_err());
+    assert!(ctx.meta.get_session(failed.session_id).await.is_err());
+    assert!(ctx
+        .meta
+        .read_managed_creation(&frozen.identity)
+        .await
+        .is_err());
+    assert!(ctx
+        .meta
+        .get_session_runtime_spec(failed.session_id)
+        .await
+        .unwrap()
+        .is_none());
+    failed.oauth_binding = None;
+    ctx.meta
+        .reserve_and_persist_create(failed, &[], 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .read_managed_creation(&frozen.identity)
+            .await
+            .unwrap(),
+        frozen
+    );
+}
+conformance!(
+    t_managed_creation_race_parent_and_late_rollback,
+    super::managed_creation_race_parent_and_late_rollback
+);
+
+async fn managed_creation_denies_stale_session(ctx: &Ctx) {
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
+    let ws = managed_creation_ws(SessionId::new());
+    let identity = ws.managed_creation.as_ref().unwrap().identity.clone();
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    ctx.meta
+        .transition_session(
+            ws.session_id,
+            SessionState::Failed,
+            BindingDisposition::Detach,
+        )
+        .await
+        .unwrap();
+    assert!(ctx.meta.read_managed_creation(&identity).await.is_err());
+    assert!(ctx
+        .meta
+        .reserve_and_persist_create(ws, &[], 0)
+        .await
+        .is_err());
+}
+conformance!(
+    t_managed_creation_denies_stale_session,
+    super::managed_creation_denies_stale_session
+);
+
+async fn managed_creation_held_retry_denies_requeued_epoch(ctx: &Ctx) {
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
+    let ws = managed_creation_ws(SessionId::new());
+    let frozen = ws.managed_creation.clone().unwrap();
+    let id = ws.session_id;
+    assert!(matches!(
+        ctx.meta.read_held_managed_creation(&frozen.identity).await,
+        Err(MetaError::NotFound)
+    ));
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .read_held_managed_creation(&frozen.identity)
+            .await
+            .unwrap(),
+        frozen
+    );
+    let mut wrong = frozen.identity.clone();
+    wrong.task_id = "another-task".into();
+    assert!(matches!(
+        ctx.meta.read_held_managed_creation(&wrong).await,
+        Err(MetaError::Conflict(_))
+    ));
+    ctx.meta
+        .transition_session(
+            id,
+            SessionState::Pending,
+            BindingDisposition::RequireUnbound,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .transition_session_created(id, engram_core::SandboxId::new())
+            .await
+            .unwrap(),
+        1
+    );
+    ctx.meta
+        .transition_session(id, SessionState::Idle, BindingDisposition::Detach)
+        .await
+        .unwrap();
+    ctx.meta
+        .transition_session(id, SessionState::Queued, BindingDisposition::RequireUnbound)
+        .await
+        .unwrap();
+    let session = ctx.meta.get_session(id).await.unwrap();
+    assert_eq!(session.status, SessionState::Queued);
+    assert!(session.host_id.is_none() && session.sandbox_id.is_none());
+    assert_eq!(
+        ctx.meta
+            .read_managed_creation(&frozen.identity)
+            .await
+            .unwrap(),
+        frozen
+    );
+    assert!(matches!(
+        ctx.meta.read_held_managed_creation(&frozen.identity).await,
+        Err(MetaError::Conflict(_))
+    ));
+    assert!(matches!(
+        ctx.meta.reserve_and_persist_create(ws, &[], 0).await,
+        Err(MetaError::Conflict(_))
+    ));
+}
+conformance!(
+    t_managed_creation_held_retry_denies_requeued_epoch,
+    super::managed_creation_held_retry_denies_requeued_epoch
+);
+
+fn managed_boot_request(
+    ws: &engram_core::traits::SessionCreateWriteSet,
+    host: HostId,
+) -> engram_core::types::managed_boot::ManagedBootPrepare {
+    use engram_core::types::{managed_boot::*, managed_cold::*, managed_deny::*, sandbox::*};
+    let creation = ws.managed_creation.as_ref().unwrap();
+    let sandbox_id = engram_core::SandboxId::new();
+    let disk = engram_core::types::manifest::ManifestRef::new();
+    let drives: Vec<_> = (0..3)
+        .map(|i| AuxRoDrive {
+            drive_id: AuxRoDrive::slot_drive_id(i),
+            guest_mount: AuxRoDrive::slot_guest_mount(i),
+            fs_type: "squashfs".into(),
+            sha256: Some("a".repeat(64)),
+        })
+        .collect();
+    let spec = SandboxSpec {
+        image: ws.spec.image.clone(),
+        rootfs_source: Some("disk.ext4".into()),
+        image_uri: None,
+        rootfs_manifest: Some(disk),
+        cpu: CpuLimit { vcpus: 1 },
+        memory: MemoryLimit { max_mib: 512 },
+        disk: DiskLimit { max_gib: 1 },
+        ttl: None,
+        env: Default::default(),
+        workdir: None,
+        network: Default::default(),
+        aux_ro_drives: drives.clone(),
+        swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
+    };
+    ManagedBootPrepare {
+        capture_authority: None,
+        bootstrap_policy: ManagedDenyPolicy::new(1, ["tools.example".into()]).unwrap(),
+        key: ManagedBootKey {
+            creation: creation.identity.clone(),
+            context: ManagedPolicyContext {
+                target: ManagedPolicyTarget {
+                    session_id: ws.session_id,
+                    host_id: host,
+                    sandbox_id,
+                    binding_epoch: 1,
+                },
+                operator_generation: 1,
+                operator_identity: engram_testkit::operator::candidate().identity().unwrap(),
+                binding_hash: None,
+            },
+            boot_attempt: format!("boot-{}", ws.session_id),
+            native_digest: creation.native.digest.clone(),
+        },
+        cold: ManagedColdPrepare {
+            version: 1,
+            session_id: ws.session_id,
+            sandbox_id,
+            boot_attempt: format!("boot-{}", ws.session_id),
+            image: spec.image.clone(),
+            disk: ManagedColdDisk {
+                manifest: disk,
+                sha256: "b".repeat(64),
+                size_bytes: 4096,
+                source: ManagedColdSource::FreshImage {
+                    base_manifest: engram_core::types::manifest::ManifestRef::new(),
+                },
+            },
+            kernel_sha256: "c".repeat(64),
+            aux_ro_drives: drives,
+        },
+        sandbox_spec_json: serde_json::to_string(&spec).unwrap(),
+    }
+}
+async fn managed_boot_claim_is_atomic_and_exact(ctx: &Ctx) {
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
+    use engram_core::types::managed_boot::*;
+    let ws = managed_creation_ws(SessionId::new());
+    let host = HostId::new();
+    ctx.meta
+        .upsert_host(host_record(host, "managed-host", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta.managed_boot_open(ws.session_id).await.unwrap(),
+        Some(false)
+    );
+    let request = managed_boot_request(&ws, host);
+    managed_operator_gate_fixture(ctx, &request.key, false).await;
+    assert!(ctx.meta.claim_managed_boot(request.clone()).await.is_err());
+    managed_operator_gate_fixture(ctx, &request.key, true).await;
+    for field in ["image", "cpu", "memory"] {
+        let mut invalid = request.clone();
+        let mut spec = invalid.spec().unwrap();
+        match field {
+            "image" => {
+                spec.image = "test.invalid/another:latest".into();
+                invalid.cold.image = spec.image.clone();
+            }
+            "cpu" => spec.cpu.vcpus = u32::try_from(ws.cpu_budget_vcpus).unwrap() + 1,
+            _ => spec.memory.max_mib = u32::try_from(ws.mem_budget_mib).unwrap() + 1,
+        }
+        invalid.sandbox_spec_json = serde_json::to_string(&spec).unwrap();
+        assert!(ctx.meta.claim_managed_boot(invalid).await.is_err());
+        assert!(ctx
+            .meta
+            .get_managed_boot(&request.key.creation)
+            .await
+            .unwrap()
+            .is_none());
+    }
+    let (a, b) = tokio::join!(
+        ctx.meta.claim_managed_boot(request.clone()),
+        ctx.meta.claim_managed_boot(request.clone())
+    );
+    assert_eq!(a.unwrap().revision, 1);
+    assert_eq!(b.unwrap().revision, 1);
+    let row = ctx.meta.read_managed_boot(&request.key).await.unwrap();
+    assert_eq!(row.phase, ManagedBootPhase::Claimed);
+    assert_eq!(
+        ctx.meta.managed_policy_target(ws.session_id).await.unwrap(),
+        request.key.context.target
+    );
+    assert!(ctx
+        .meta
+        .read_held_managed_creation(&request.key.creation)
+        .await
+        .is_err());
+    assert_eq!(
+        ctx.meta.list_managed_boots(None, 10).await.unwrap(),
+        vec![request.key.clone()]
+    );
+    for n in 0..8 {
+        let mut wrong = request.clone();
+        match n {
+            0 => wrong.key.boot_attempt.push('x'),
+            1 => wrong.key.context.target.binding_epoch += 1,
+            2 => wrong.key.context.operator_generation += 1,
+            3 => wrong.key.native_digest = engram_core::types::managed_create::digest(b"wrong"),
+            4 => wrong.key.creation.task_id.push('x'),
+            5 => wrong.key.context.target.host_id = HostId::new(),
+            6 => wrong.key.context.target.sandbox_id = engram_core::SandboxId::new(),
+            _ => wrong.key.creation.policy.parent_session_id = Some(SessionId::new()),
+        }
+        assert!(ctx.meta.claim_managed_boot(wrong.clone()).await.is_err());
+        assert!(ctx.meta.read_managed_boot(&wrong.key).await.is_err());
+    }
+    assert_eq!(
+        ctx.meta
+            .read_managed_boot(&request.key)
+            .await
+            .unwrap()
+            .revision,
+        1
+    );
+}
+conformance!(
+    t_managed_boot_claim_is_atomic_and_exact,
+    super::managed_boot_claim_is_atomic_and_exact
+);
+
+// Fixture only: this exercises the real transactional predicate, not the
+// authenticated publisher or public admission (which remain closed).
+async fn managed_operator_gate_fixture(
+    ctx: &Ctx,
+    key: &engram_core::types::managed_boot::ManagedBootKey,
+    open: bool,
+) {
+    if let Some(sim) = &ctx.sim {
+        sim.with_db_mut(|db| {
+            db.managed_operator_gate = Some((
+                key.context.operator_generation,
+                key.context.operator_identity.clone(),
+                open,
+            ))
+        });
+    } else {
+        sqlx::query("UPDATE managed_operator_generation_gate SET published_generation=$1,published_identity=$2,admission_open=$3 WHERE singleton")
+            .bind(key.context.operator_generation as i64).bind(&key.context.operator_identity).bind(open)
+            .execute(ctx._pg.as_ref().unwrap().store.pool()).await.unwrap();
+    }
+}
+
+async fn managed_boot_prepared_fixture(
+    ctx: &Ctx,
+) -> (
+    engram_core::traits::SessionCreateWriteSet,
+    engram_core::types::managed_boot::ManagedBootRecord,
+) {
+    use engram_core::types::{managed_boot::*, managed_create::digest};
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
+    let ws = managed_creation_ws(SessionId::new());
+    let host = HostId::new();
+    ctx.meta
+        .upsert_host(host_record(host, "managed-host", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    let request = managed_boot_request(&ws, host);
+    managed_operator_gate_fixture(ctx, &request.key, true).await;
+    let row = ctx.meta.claim_managed_boot(request.clone()).await.unwrap();
+    let prepared = ManagedBootPreparedReceipt {
+        request,
+        host_incarnation: "host-incarnation".into(),
+        network_identity: digest(b"network"),
+        guest_ip: "192.0.2.2".parse().unwrap(),
+        receipt_id: digest(b"prepared"),
+    };
+    let row = ctx
+        .meta
+        .advance_managed_boot(
+            &row.request.key,
+            row.revision,
+            ManagedBootAdvance::Prepared(Box::new(prepared)),
+        )
+        .await
+        .unwrap();
+    (ws, row)
+}
+async fn managed_boot_target_read_is_exact(ctx: &Ctx) {
+    use engram_core::types::managed_deny::ManagedPolicyTarget;
+    let (_ws, row) = managed_boot_prepared_fixture(ctx).await;
+    let target = row.request.key.context.target.clone();
+    let read = ctx
+        .meta
+        .read_managed_boot_for_target(&target)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&read).unwrap(),
+        serde_json::to_value(&row).unwrap()
+    );
+    for field in ["session", "host", "sandbox", "epoch"] {
+        let mut changed = target.clone();
+        match field {
+            "session" => changed.session_id = SessionId::new(),
+            "host" => changed.host_id = HostId::new(),
+            "sandbox" => changed.sandbox_id = engram_core::SandboxId::new(),
+            "epoch" => changed.binding_epoch += 1,
+            _ => unreachable!(),
+        }
+        assert!(
+            ctx.meta
+                .read_managed_boot_for_target(&changed)
+                .await
+                .is_err(),
+            "accepted changed {field}"
+        );
+    }
+    // A physical target from an ordinary session supplies no managed boot authority.
+    let ordinary = ctx
+        .meta
+        .create_session(spec("test.invalid/ordinary:latest"))
+        .await
+        .unwrap();
+    ctx.meta
+        .assign_session_host(ordinary, Some(target.host_id))
+        .await
+        .unwrap();
+    let sandbox = engram_core::SandboxId::new();
+    let epoch = ctx
+        .meta
+        .transition_session_created(ordinary, sandbox)
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .read_managed_boot_for_target(&ManagedPolicyTarget {
+            session_id: ordinary,
+            host_id: target.host_id,
+            sandbox_id: sandbox,
+            binding_epoch: epoch,
+        })
+        .await
+        .is_err());
+    ctx.meta
+        .advance_managed_boot(
+            &row.request.key,
+            row.revision,
+            engram_core::types::managed_boot::ManagedBootAdvance::Interrupt,
+        )
+        .await
+        .unwrap();
+    // Interruption remains readable as state, never permission to apply or start.
+    assert_eq!(
+        ctx.meta
+            .read_managed_boot_for_target(&target)
+            .await
+            .unwrap()
+            .phase,
+        engram_core::types::managed_boot::ManagedBootPhase::Interrupted
+    );
+}
+conformance!(
+    t_managed_boot_target_read_is_exact,
+    super::managed_boot_target_read_is_exact
+);
+
+async fn managed_boot_target_read_finalized_and_stale(ctx: &Ctx) {
+    let row = managed_boot_finalized_fixture(ctx).await;
+    let target = row.request.key.context.target.clone();
+    assert_eq!(
+        ctx.meta
+            .read_managed_boot_for_target(&target)
+            .await
+            .unwrap()
+            .phase,
+        engram_core::types::managed_boot::ManagedBootPhase::Finalized
+    );
+    // A later physical placement makes the retained old receipt unusable.
+    let sandbox = engram_core::SandboxId::new();
+    if let Some(sim) = &ctx.sim {
+        sim.with_db_mut(|db| {
+            db.sessions
+                .get_mut(&target.session_id)
+                .unwrap()
+                .session
+                .sandbox_id = Some(sandbox);
+        });
+    } else {
+        sqlx::query("UPDATE sessions SET sandbox_id=$2 WHERE id=$1")
+            .bind(target.session_id.as_uuid())
+            .bind(sandbox.as_uuid())
+            .execute(ctx._pg.as_ref().unwrap().store.pool())
+            .await
+            .unwrap();
+    }
+    assert!(ctx
+        .meta
+        .read_managed_boot_for_target(&target)
+        .await
+        .is_err());
+}
+conformance!(
+    t_managed_boot_target_read_finalized_and_stale,
+    super::managed_boot_target_read_finalized_and_stale
+);
+
+async fn managed_boot_finalized_fixture(
+    ctx: &Ctx,
+) -> engram_core::types::managed_boot::ManagedBootRecord {
+    use engram_core::types::{managed_boot::*, managed_create::digest, managed_deny::*};
+    let (ws, row) = managed_boot_prepared_fixture(ctx).await;
+    let prepared = row.prepared.clone().unwrap();
+    let mut context = row.request.key.context.clone();
+    context.binding_hash = Some(digest(b"binding"));
+    let policy = ManagedAppliedState::new(
+        context.clone(),
+        row.request.bootstrap_policy.clone(),
+        prepared.host_incarnation.clone(),
+        "proxy-incarnation".into(),
+        Some(ManagedNetworkProof {
+            target: context.target,
+            guest_ip: "192.0.2.2".parse().unwrap(),
+            network_identity: prepared.network_identity.clone(),
+        }),
+    )
+    .unwrap();
+    let bytes = ws.managed_creation.unwrap().native.bytes;
+    let f = ManagedBootFinalization {
+        prepared,
+        policy,
+        native_version: 1,
+        combined_manifest_digest: digest(&bytes),
+        combined_manifest: bytes,
+        agent_digest: digest(b"sealed fixture agent"),
+    };
+    let sealed_agent = ManagedBootSealedAgent {
+        wrapped_dek: vec![1],
+        nonce: vec![2; 12],
+        ciphertext: vec![3],
+        key_id: "fixture".into(),
+    };
+    let write_policy = ctx.meta.read_mcp_write_policy(ws.session_id).await.unwrap();
+    for bad_policy in [
+        ManagedDenyPolicy::new(2, []).unwrap(),
+        ManagedDenyPolicy::new(0, ["tools.example".into()]).unwrap(),
+    ] {
+        let mut wrong = f.clone();
+        wrong.policy = ManagedAppliedState::new(
+            wrong.policy.context.clone(),
+            bad_policy,
+            wrong.policy.host_incarnation.clone(),
+            wrong.policy.proxy_incarnation.clone(),
+            wrong.policy.network_proof.clone(),
+        )
+        .unwrap();
+        assert!(ctx
+            .meta
+            .advance_managed_boot(
+                &row.request.key,
+                row.revision,
+                ManagedBootAdvance::Finalize {
+                    finalization: Box::new(wrong),
+                    sealed_agent: sealed_agent.clone(),
+                    write_policy: write_policy.clone(),
+                }
+            )
+            .await
+            .is_err());
+    }
+    let command = ManagedBootAdvance::Finalize {
+        finalization: Box::new(f.clone()),
+        sealed_agent,
+        write_policy,
+    };
+    managed_operator_gate_fixture(ctx, &row.request.key, false).await;
+    assert!(ctx
+        .meta
+        .advance_managed_boot(&row.request.key, row.revision, command.clone())
+        .await
+        .is_err());
+    managed_operator_gate_fixture(ctx, &row.request.key, true).await;
+    let finalized = ctx
+        .meta
+        .advance_managed_boot(&row.request.key, row.revision, command)
+        .await
+        .unwrap();
+    let receipt = ManagedBootFinalReceipt {
+        key: row.request.key.clone(),
+        prepared_receipt_id: f.prepared.receipt_id.clone(),
+        finalization_digest: f.digest().unwrap(),
+        host_incarnation: f.prepared.host_incarnation,
+        network_identity: f.prepared.network_identity,
+        receipt_id: digest(b"final"),
+    };
+    let mut wrong = receipt.clone();
+    wrong.finalization_digest = digest(b"wrong");
+    assert!(ctx
+        .meta
+        .advance_managed_boot(
+            &row.request.key,
+            finalized.revision,
+            ManagedBootAdvance::Finalized(wrong)
+        )
+        .await
+        .is_err());
+    ctx.meta
+        .advance_managed_boot(
+            &row.request.key,
+            finalized.revision,
+            ManagedBootAdvance::Finalized(receipt),
+        )
+        .await
+        .unwrap()
+}
+async fn managed_boot_start_is_single_cas_and_generation_gated(ctx: &Ctx) {
+    use engram_core::types::{managed_boot::*, managed_create::digest};
+    let row = managed_boot_finalized_fixture(ctx).await;
+    let key = &row.request.key;
+    let start = ManagedBootStart {
+        receipt: row.receipt.clone().unwrap(),
+        start_id: digest(b"start"),
+    };
+    managed_operator_gate_fixture(ctx, key, false).await;
+    assert!(ctx
+        .meta
+        .advance_managed_boot(
+            key,
+            row.revision,
+            ManagedBootAdvance::IssueStart(start.clone())
+        )
+        .await
+        .is_err());
+    managed_operator_gate_fixture(ctx, key, true).await;
+    let (a, b) = tokio::join!(
+        ctx.meta.advance_managed_boot(
+            key,
+            row.revision,
+            ManagedBootAdvance::IssueStart(start.clone())
+        ),
+        ctx.meta.advance_managed_boot(
+            key,
+            row.revision,
+            ManagedBootAdvance::IssueStart(start.clone())
+        )
+    );
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+    let issued = ctx.meta.read_managed_boot(key).await.unwrap();
+    assert_eq!(issued.phase, ManagedBootPhase::StartIssued);
+    assert_eq!(
+        ctx.meta
+            .managed_boot_open(key.creation.session_id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    let mut wrong = start.clone();
+    wrong.start_id = digest(b"other start");
+    assert!(ctx
+        .meta
+        .advance_managed_boot(key, issued.revision, ManagedBootAdvance::Started(wrong))
+        .await
+        .is_err());
+    managed_operator_gate_fixture(ctx, key, false).await;
+    assert!(ctx
+        .meta
+        .advance_managed_boot(
+            key,
+            issued.revision,
+            ManagedBootAdvance::Started(start.clone())
+        )
+        .await
+        .is_err());
+    managed_operator_gate_fixture(ctx, key, true).await;
+    let started = ctx
+        .meta
+        .advance_managed_boot(key, issued.revision, ManagedBootAdvance::Started(start))
+        .await
+        .unwrap();
+    assert_eq!(started.phase, ManagedBootPhase::Started);
+    assert_eq!(
+        ctx.meta
+            .managed_boot_open(key.creation.session_id)
+            .await
+            .unwrap(),
+        Some(true)
+    );
+    assert_eq!(
+        ctx.meta
+            .managed_sandbox_open(key.context.target.sandbox_id)
+            .await
+            .unwrap(),
+        Some(true)
+    );
+    managed_operator_gate_fixture(ctx, key, false).await;
+    assert_eq!(
+        ctx.meta
+            .managed_boot_open(key.creation.session_id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    assert_eq!(
+        ctx.meta
+            .managed_sandbox_open(key.context.target.sandbox_id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    assert_eq!(
+        ctx.meta.list_managed_boots(None, 128).await.unwrap(),
+        vec![key.clone()]
+    );
+    assert!(ctx
+        .meta
+        .list_managed_boots(Some(key.creation.session_id), 128)
+        .await
+        .unwrap()
+        .is_empty());
+}
+conformance!(
+    t_managed_boot_start_is_single_cas_and_generation_gated,
+    super::managed_boot_start_is_single_cas_and_generation_gated
+);
+
+async fn managed_boot_interrupt_capture_and_recovery(ctx: &Ctx) {
+    use engram_core::types::{managed_boot::*, managed_cold::ManagedColdSource};
+    let (_, row) = managed_boot_prepared_fixture(ctx).await;
+    let key = &row.request.key;
+    let sid = key.creation.session_id;
+    let request = ManagedCaptureRequest {
+        key: key.clone(),
+        capture_id: SnapshotId::new(),
+    };
+    assert!(ctx.meta.reserve_managed_capture(&request).await.is_err());
+    ctx.meta
+        .append_session_event(sid, "run_started", serde_json::json!({"run_id":"run-old"}))
+        .await
+        .unwrap();
+    ctx.meta
+        .append_session_event(
+            sid,
+            "tool_call_requested",
+            serde_json::json!({"tool_call_id":"call-old","run_id":"run-old"}),
+        )
+        .await
+        .unwrap();
+    assert!(!ctx
+        .meta
+        .managed_tool_target_gone(sid, "call-old")
+        .await
+        .unwrap());
+    let now = ctx.clock.now_utc();
+    let result = engram_core::types::outbox::OutboxRow {
+        prompt_id: format!("tool_result:{sid}:call-old"),
+        session_id: sid,
+        kind: engram_core::types::outbox::OutboxKind::ToolResult,
+        payload: serde_json::json!({"tool_call_id":"call-old","result_json":"{}"}),
+        created_at: now,
+        not_before: now,
+        attempts: 0,
+        delivered_at: None,
+        acked_at: None,
+    };
+    ctx.meta
+        .append_session_event_and_outbox(
+            sid,
+            "tool_result_submitted",
+            serde_json::json!({"tool_call_id":"call-old"}),
+            &result,
+        )
+        .await
+        .unwrap();
+    let mut pending = result.clone();
+    pending.prompt_id = format!("pending:{sid}");
+    pending.kind = engram_core::types::outbox::OutboxKind::Prompt;
+    pending.payload = serde_json::json!({"text":"next"});
+    ctx.meta.outbox_enqueue(&pending).await.unwrap();
+    ctx.meta
+        .advance_managed_boot(key, row.revision, ManagedBootAdvance::Interrupt)
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .outbox_get(&result.prompt_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .acked_at
+        .is_some());
+    assert!(ctx
+        .meta
+        .outbox_get(&pending.prompt_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .acked_at
+        .is_none());
+    assert!(ctx
+        .meta
+        .append_session_event_and_outbox(
+            sid,
+            "tool_result_submitted",
+            serde_json::json!({"tool_call_id":"call-old"}),
+            &result
+        )
+        .await
+        .is_err());
+    let events = ctx
+        .meta
+        .list_session_events_since(sid, -1, 20)
+        .await
+        .unwrap();
+    assert!(events
+        .iter()
+        .any(|e| e.kind == "run_interrupted" && e.payload["run_id"] == "run-old"));
+    assert_eq!(
+        events
+            .iter()
+            .find(|e| e.kind == "run_interrupted")
+            .unwrap()
+            .payload["type"],
+        "harness_run_interrupted"
+    );
+    assert!(ctx.meta.managed_delivery_target_gone(sid, 1).await.unwrap());
+    assert!(ctx
+        .meta
+        .managed_tool_target_gone(sid, "call-old")
+        .await
+        .unwrap());
+    assert!(!ctx.meta.managed_delivery_target_gone(sid, 2).await.unwrap());
+    assert!(ctx
+        .meta
+        .reserve_managed_capture(&request)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(ctx
+        .meta
+        .list_managed_disk_manifests()
+        .await
+        .unwrap()
+        .contains(&request.disk_manifest()));
+    let mut competing = request.clone();
+    competing.capture_id = SnapshotId::new();
+    assert!(ctx.meta.reserve_managed_capture(&competing).await.is_err());
+    let cold = &row.request.cold;
+    let mut authority = ManagedCaptureAuthority {
+        version: 1,
+        request: request.clone(),
+        host_incarnation: row.prepared.unwrap().host_incarnation,
+        disk_manifest: request.disk_manifest(),
+        disk_sha256: "d".repeat(64),
+        disk_size_bytes: 4096,
+        image: cold.image.clone(),
+        kernel_sha256: cold.kernel_sha256.clone(),
+        aux_ro_drives: cold.aux_ro_drives.clone(),
+        consistency: ManagedDiskConsistency::CrashConsistentDiskCutV1,
+        source_state: ManagedCapturedSourceState::Destroyed,
+        record_digest: String::new(),
+    };
+    authority.record_digest = authority.digest().unwrap();
+    let mut wrong = authority.clone();
+    wrong.host_incarnation = "unknown".into();
+    wrong.record_digest = wrong.digest().unwrap();
+    assert!(ctx.meta.record_managed_capture(&wrong).await.is_err());
+    ctx.meta.record_managed_capture(&authority).await.unwrap();
+    ctx.meta.record_managed_capture(&authority).await.unwrap();
+    assert_eq!(
+        ctx.meta.reserve_managed_capture(&request).await.unwrap(),
+        Some(authority.clone())
+    );
+    let mut next = row.request.clone();
+    next.key.context.target.binding_epoch += 1;
+    next.key.context.target.sandbox_id = engram_core::SandboxId::new();
+    next.key.boot_attempt.push_str("-next");
+    next.cold.boot_attempt = next.key.boot_attempt.clone();
+    next.cold.sandbox_id = next.key.context.target.sandbox_id;
+    next.cold.disk.manifest = authority.disk_manifest;
+    next.cold.disk.sha256 = authority.disk_sha256.clone();
+    next.cold.disk.source = ManagedColdSource::Capture {
+        capture_id: request.capture_id,
+        session_id: sid,
+        sandbox_id: key.context.target.sandbox_id,
+        binding_epoch: 1,
+        record_digest: authority.record_digest.clone(),
+    };
+    let mut spec = next.spec().err();
+    assert!(
+        spec.take().is_some(),
+        "capture-shaped input without authority is rejected"
+    );
+    let mut sandbox: engram_core::types::sandbox::SandboxSpec =
+        serde_json::from_str(&next.sandbox_spec_json).unwrap();
+    sandbox.rootfs_manifest = Some(authority.disk_manifest);
+    next.sandbox_spec_json = serde_json::to_string(&sandbox).unwrap();
+    next.capture_authority = Some(authority.clone());
+    next.spec().unwrap();
+    let recovered = ctx.meta.claim_managed_boot(next.clone()).await.unwrap();
+    assert_eq!(recovered.phase, ManagedBootPhase::Claimed);
+    assert_eq!(recovered.request.key.context.target.binding_epoch, 2);
+    assert_eq!(
+        ctx.meta.reserve_managed_capture(&request).await.unwrap(),
+        Some(authority)
+    );
+    ctx.meta
+        .append_session_event(
+            sid,
+            "tool_call_requested",
+            serde_json::json!({"tool_call_id":"call-old","run_id":"run-new"}),
+        )
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .managed_tool_target_gone(sid, "call-old")
+        .await
+        .unwrap());
+    assert!(ctx.meta.read_managed_boot(key).await.is_err());
+    assert_eq!(
+        ctx.meta
+            .managed_sandbox_open(key.context.target.sandbox_id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    assert!(ctx
+        .meta
+        .managed_tool_target_gone(sid, "call-old")
+        .await
+        .unwrap());
+}
+conformance!(
+    t_managed_boot_interrupt_capture_and_recovery,
+    super::managed_boot_interrupt_capture_and_recovery
+);
+
+async fn managed_boot_initial_prompt_is_atomic(ctx: &Ctx) {
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
+    use engram_core::{
+        traits::metadata::ManagedInitialPrompt,
+        types::outbox::{OutboxKind, OutboxRow},
+    };
+    let mut ws = managed_creation_ws(SessionId::new());
+    let now = ctx.clock.now_utc();
+    let prompt_id = format!("create:{}", ws.session_id);
+    ws.managed_initial_prompt = Some(ManagedInitialPrompt {
+        row: OutboxRow {
+            session_id: ws.session_id,
+            prompt_id: prompt_id.clone(),
+            kind: OutboxKind::Prompt,
+            payload: serde_json::json!({"text":"first prompt","mode":"plan"}),
+            created_at: now,
+            not_before: now,
+            attempts: 0,
+            delivered_at: None,
+            acked_at: None,
+        },
+        events: vec![(
+            "prompt_received".into(),
+            serde_json::json!({"prompt_id":prompt_id}),
+        )],
+    });
+    let mut bad = ws.clone();
+    bad.managed_initial_prompt.as_mut().unwrap().row.session_id = SessionId::new();
+    assert!(ctx
+        .meta
+        .reserve_and_persist_create(bad, &[], 0)
+        .await
+        .is_err());
+    assert!(ctx.meta.get_session(ws.session_id).await.is_err());
+    assert!(ctx.meta.outbox_get(&prompt_id).await.unwrap().is_none());
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    let row = ctx.meta.outbox_get(&prompt_id).await.unwrap().unwrap();
+    assert_eq!(row.payload["text"], "first prompt");
+    assert!(row.acked_at.is_none() && row.delivered_at.is_none());
+    assert_eq!(
+        ctx.meta
+            .list_session_events_since(ws.session_id, -1, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let mut changed = ws.clone();
+    changed.managed_initial_prompt.as_mut().unwrap().row.payload["text"] =
+        serde_json::json!("changed");
+    assert!(ctx
+        .meta
+        .reserve_and_persist_create(changed, &[], 0)
+        .await
+        .is_err());
+    let mut absent = ws.clone();
+    absent.managed_initial_prompt = None;
+    assert!(ctx
+        .meta
+        .reserve_and_persist_create(absent, &[], 0)
+        .await
+        .is_err());
+    assert_eq!(
+        ctx.meta.managed_boot_open(ws.session_id).await.unwrap(),
+        Some(false)
+    );
+}
+conformance!(
+    t_managed_boot_initial_prompt_is_atomic,
+    super::managed_boot_initial_prompt_is_atomic
+);
+
+async fn managed_boot_retirement_preserves_source_and_next_deny(ctx: &Ctx) {
+    use engram_core::types::{
+        managed_boot::*, managed_create::digest, managed_deny::ManagedDenyPolicy,
+    };
+    for newer_desired in [false, true] {
+        let (_, row) = managed_boot_prepared_fixture(ctx).await;
+        let key = &row.request.key;
+        let receipt = ManagedBootRetiredReceipt {
+            prepared: row.prepared.clone().unwrap(),
+            retained_policy: ManagedDenyPolicy::new(
+                2,
+                ["tools.example".into(), "next.example".into()],
+            )
+            .unwrap(),
+            receipt_id: digest(b"retired"),
+        };
+        let mut wrong = receipt.clone();
+        wrong.prepared.host_incarnation = "different".into();
+        assert!(ctx
+            .meta
+            .advance_managed_boot(
+                key,
+                row.revision,
+                ManagedBootAdvance::Retired(Box::new(wrong))
+            )
+            .await
+            .is_err());
+        let expected_policy = if newer_desired {
+            let newer = ManagedDenyPolicy::new(
+                3,
+                [
+                    "tools.example".into(),
+                    "next.example".into(),
+                    "later.example".into(),
+                ],
+            )
+            .unwrap();
+            ctx.meta
+                .bind_session_integration_policy(
+                    key.creation.session_id,
+                    &serde_json::json!({"managed_deny":newer}).to_string(),
+                )
+                .await
+                .unwrap();
+            newer
+        } else {
+            receipt.retained_policy.clone()
+        };
+        let closed = ctx
+            .meta
+            .advance_managed_boot(
+                key,
+                row.revision,
+                ManagedBootAdvance::Retired(Box::new(receipt.clone())),
+            )
+            .await
+            .unwrap();
+        assert_eq!(closed.phase, ManagedBootPhase::Interrupted);
+        assert_eq!(closed.retired, Some(receipt.clone()));
+        let retained: serde_json::Value = serde_json::from_str(
+            &ctx.meta
+                .get_session_integration_policy(key.creation.session_id)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            retained["managed_deny"],
+            serde_json::to_value(expected_policy).unwrap()
+        );
+        assert!(ctx
+            .meta
+            .reserve_managed_capture(&ManagedCaptureRequest {
+                key: key.clone(),
+                capture_id: SnapshotId::new()
+            })
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            ctx.meta
+                .managed_boot_open(key.creation.session_id)
+                .await
+                .unwrap(),
+            Some(false)
+        );
+    }
+}
+conformance!(
+    t_managed_boot_retirement_preserves_source_and_next_deny,
+    super::managed_boot_retirement_preserves_source_and_next_deny
+);
+
+async fn managed_boot_ingestion_is_serialized_with_interruption(ctx: &Ctx) {
+    use engram_core::types::{event::ManagedHarnessEvent, managed_boot::*, managed_create::digest};
+    let row = managed_boot_finalized_fixture(ctx).await;
+    let key = row.request.key.clone();
+    let start = ManagedBootStart {
+        receipt: row.receipt.unwrap(),
+        start_id: digest(b"event-start"),
+    };
+    let row = ctx
+        .meta
+        .advance_managed_boot(
+            &key,
+            row.revision,
+            ManagedBootAdvance::IssueStart(start.clone()),
+        )
+        .await
+        .unwrap();
+    let row = ctx
+        .meta
+        .advance_managed_boot(&key, row.revision, ManagedBootAdvance::Started(start))
+        .await
+        .unwrap();
+    let sid = key.creation.session_id;
+    let now = ctx.clock.now_utc();
+    let pending = engram_core::types::outbox::OutboxRow {
+        prompt_id: format!("paused:{sid}"),
+        session_id: sid,
+        kind: engram_core::types::outbox::OutboxKind::Prompt,
+        payload: serde_json::json!({"text":"pending"}),
+        created_at: now,
+        not_before: now,
+        attempts: 0,
+        delivered_at: None,
+        acked_at: None,
+    };
+    ctx.meta.outbox_enqueue(&pending).await.unwrap();
+    let original = ManagedHarnessEvent {
+        target: key.context.target.clone(),
+        incarnation: 1,
+        seq: 1,
+        kind: "run_started".into(),
+        payload: serde_json::json!({"type":"harness_run_started","run_id":"old-run","prompt_id":null,"at":now}),
+        ack_id: None,
+    };
+    let first = ctx
+        .meta
+        .append_managed_harness_event(&original)
+        .await
+        .unwrap();
+    assert!(first.idx.is_some());
+    assert!(!first.outbox_acked);
+    assert!(ctx
+        .meta
+        .append_managed_harness_event(&original)
+        .await
+        .unwrap()
+        .idx
+        .is_none());
+    let mut mismatch = original.clone();
+    mismatch.target.sandbox_id = engram_core::SandboxId::new();
+    assert!(ctx
+        .meta
+        .append_managed_harness_event(&mismatch)
+        .await
+        .is_err());
+    let mut changed = original.clone();
+    changed.payload["prompt_id"] = pending.prompt_id.clone().into();
+    changed.ack_id = Some(pending.prompt_id.clone());
+    assert!(ctx
+        .meta
+        .append_managed_harness_event(&changed)
+        .await
+        .is_err());
+
+    let mut consumed = pending.clone();
+    consumed.prompt_id = format!("consumed:{sid}");
+    ctx.meta.outbox_enqueue(&consumed).await.unwrap();
+    let acknowledged = ManagedHarnessEvent {
+        target: key.context.target.clone(),
+        incarnation: 1,
+        seq: 4,
+        kind: "prompt_steered".into(),
+        payload: serde_json::json!({"type":"harness_prompt_steered","prompt_id":consumed.prompt_id,"at":now}),
+        ack_id: Some(consumed.prompt_id.clone()),
+    };
+    let accepted = ctx
+        .meta
+        .append_managed_harness_event(&acknowledged)
+        .await
+        .unwrap();
+    assert!(accepted.idx.is_some() && accepted.outbox_acked);
+    assert!(ctx
+        .meta
+        .outbox_get(&consumed.prompt_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .acked_at
+        .is_some());
+    let mut replay = acknowledged.clone();
+    replay.payload["at"] = serde_json::to_value(now + chrono::Duration::seconds(1)).unwrap();
+    let accepted = ctx
+        .meta
+        .append_managed_harness_event(&replay)
+        .await
+        .unwrap();
+    assert!(accepted.idx.is_none() && !accepted.outbox_acked);
+
+    // Both ingestions have observed Started before interruption. The barriers
+    // pause them at the transaction boundary without sleeps or scheduler guesses.
+    let paused = Arc::new(tokio::sync::Barrier::new(3));
+    let resume = Arc::new(tokio::sync::Barrier::new(3));
+    let mut tasks = Vec::new();
+    for (seq, kind, payload, ack_id) in [
+        (
+            2,
+            "tool_call_requested",
+            serde_json::json!({"type":"harness_tool_call_requested","tool_call_id":"late-call","run_id":"old-run","at":now}),
+            None,
+        ),
+        (
+            3,
+            "run_started",
+            serde_json::json!({"type":"harness_run_started","run_id":"late-run","prompt_id":pending.prompt_id,"at":now}),
+            Some(pending.prompt_id.clone()),
+        ),
+    ] {
+        let meta = ctx.meta.clone();
+        let paused = paused.clone();
+        let resume = resume.clone();
+        let target = key.context.target.clone();
+        tasks.push(tokio::spawn(async move {
+            assert_eq!(meta.managed_boot_open(sid).await.unwrap(), Some(true));
+            assert_eq!(meta.managed_policy_target(sid).await.unwrap(), target);
+            paused.wait().await;
+            resume.wait().await;
+            meta.append_managed_harness_event(&ManagedHarnessEvent {
+                target,
+                incarnation: 1,
+                seq,
+                kind: kind.into(),
+                payload,
+                ack_id,
+            })
+            .await
+        }));
+    }
+    paused.wait().await;
+    ctx.meta
+        .advance_managed_boot(&key, row.revision, ManagedBootAdvance::Interrupt)
+        .await
+        .unwrap();
+    resume.wait().await;
+    for task in tasks {
+        assert!(task.await.unwrap().is_err());
+    }
+    assert!(
+        ctx.meta
+            .append_managed_harness_event(&original)
+            .await
+            .is_err(),
+        "stale replay must not acknowledge after interruption"
+    );
+    let completed = ManagedHarnessEvent {
+        target: key.context.target.clone(),
+        incarnation: 1,
+        seq: 5,
+        kind: "tool_call_completed".into(),
+        payload: serde_json::json!({"type":"harness_tool_call_completed","tool_call_id":"late-call","at":now}),
+        ack_id: Some(engram_core::types::outbox::tool_result_outbox_id(
+            sid,
+            "late-call",
+        )),
+    };
+    assert!(ctx
+        .meta
+        .append_managed_harness_event(&completed)
+        .await
+        .is_err());
+    let events = ctx
+        .meta
+        .list_session_events_since(sid, -1, 100)
+        .await
+        .unwrap();
+    assert!(!events
+        .iter()
+        .any(|e| e.payload["tool_call_id"] == "late-call" || e.payload["run_id"] == "late-run"));
+    assert!(ctx
+        .meta
+        .outbox_get(&pending.prompt_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .acked_at
+        .is_none());
+    assert!(ctx
+        .meta
+        .managed_tool_target_gone(sid, "late-call")
+        .await
+        .unwrap());
+    let interrupted = events.iter().find(|e| e.kind == "run_interrupted").unwrap();
+    assert_eq!(interrupted.payload["type"], "harness_run_interrupted");
+}
+conformance!(
+    t_managed_boot_ingestion_is_serialized_with_interruption,
+    super::managed_boot_ingestion_is_serialized_with_interruption
+);
+
+fn operator_candidate() -> engram_core::types::managed_operator::OperatorCandidate {
+    use engram_core::types::managed_operator::*;
+    let d = engram_core::types::managed_create::digest(b"operator fixture");
+    OperatorCandidate { version:1, deployment_identity:d.clone(),network_identity:d.clone(),trust_identity:d.clone(),ca_content_digests:[("fixture-root".into(),d.clone())].into(),zones:[("unused-zone".into(),OperatorZone { revision:"1".into(),worker_digest:d,authorities:vec!["api.example".into(),"unused.example:8443".into()],aliases:vec!["alias.example".into()],configuration:serde_json::json!({"id":"unused-zone","revision":"1","authorities":["api.example","unused.example:8443"],"aliases":["alias.example"],"mode":"public","cidrs":[],"denyCidrs":["127.0.0.0/8"]}) })].into() }
+}
+async fn operator_stage_retry_publish(ctx: &Ctx) {
+    let candidate = operator_candidate();
+    assert!(
+        !ctx.meta
+            .read_operator_publication()
+            .await
+            .unwrap()
+            .admission_open
+    );
+    let staged = ctx
+        .meta
+        .stage_operator_publication(None, candidate.clone())
+        .await
+        .unwrap();
+    assert!(!staged.admission_open);
+    assert_eq!(
+        staged,
+        ctx.meta
+            .stage_operator_publication(None, candidate.clone())
+            .await
+            .unwrap()
+    );
+    let mut wrong = candidate.clone();
+    wrong.network_identity = engram_core::types::managed_create::digest(b"different network");
+    assert!(ctx
+        .meta
+        .stage_operator_publication(None, wrong)
+        .await
+        .is_err());
+    assert!(ctx
+        .meta
+        .stage_operator_publication(Some(1), candidate.clone())
+        .await
+        .is_err());
+    assert_eq!(staged, ctx.meta.read_operator_publication().await.unwrap());
+    let g = staged.pending.unwrap();
+    assert_eq!(
+        g.candidate.hosts().unwrap(),
+        ["alias.example", "api.example", "unused.example"]
+    );
+    let published = ctx.meta.publish_operator_generation(&g).await.unwrap();
+    assert!(published.admission_open);
+    assert_eq!(
+        published,
+        ctx.meta
+            .stage_operator_publication(None, candidate)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        published,
+        ctx.meta.publish_operator_generation(&g).await.unwrap()
+    );
+}
+conformance!(
+    t_operator_stage_retry_publish,
+    super::operator_stage_retry_publish
+);
+
+async fn operator_all_sessions_retired_and_dormant(ctx: &Ctx) {
+    use engram_core::types::{managed_boot::*, managed_create::digest, managed_operator::*};
+    let (owned, row) = managed_boot_prepared_fixture(ctx).await;
+    let held = managed_creation_ws(SessionId::new());
+    ctx.meta
+        .reserve_and_persist_create(held.clone(), &[], 0)
+        .await
+        .unwrap();
+    let next = ctx
+        .meta
+        .stage_operator_publication(Some(1), operator_candidate())
+        .await
+        .unwrap();
+    let g = next.pending.unwrap();
+    assert!(
+        !ctx.meta
+            .read_operator_publication()
+            .await
+            .unwrap()
+            .admission_open
+    );
+    assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+    assert!(ctx
+        .meta
+        .reserve_and_persist_create(managed_creation_ws(SessionId::new()), &[], 0)
+        .await
+        .is_err());
+    // Lost reservation replies still reconcile while fresh admission is closed.
+    ctx.meta
+        .reserve_and_persist_create(held.clone(), &[], 0)
+        .await
+        .unwrap();
+    let mut ids = vec![held.session_id, owned.session_id];
+    ids.sort();
+    assert_eq!(
+        ctx.meta.list_operator_participants(None, 1).await.unwrap(),
+        ids[..1]
+    );
+    assert_eq!(
+        ctx.meta
+            .list_operator_participants(Some(ids[0]), 1)
+            .await
+            .unwrap(),
+        ids[1..]
+    );
+    assert_eq!(
+        ctx.meta.list_operator_participants(None, 64).await.unwrap(),
+        ids
+    );
+    let dormant = ctx
+        .meta
+        .retain_operator_participant(&g, held.session_id)
+        .await
+        .unwrap();
+    assert!(dormant.dormant());
+    assert!(dormant.policy.denies("unused.example"));
+    assert!(dormant.policy.denies("tools.example"));
+    ctx.meta
+        .record_operator_readiness(&g, &dormant, OperatorReadiness::NeverAllocated)
+        .await
+        .unwrap();
+    let p = ctx
+        .meta
+        .retain_operator_participant(&g, owned.session_id)
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .record_operator_readiness(&g, &p, OperatorReadiness::NeverAllocated)
+        .await
+        .is_err());
+    assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+    // A permanent retirement can predate the candidate expansion. It proves
+    // nonrunning only; the next-boot union is the newer durable policy above.
+    let receipt = ManagedBootRetiredReceipt {
+        prepared: row.prepared.unwrap(),
+        retained_policy: row.request.bootstrap_policy.clone(),
+        receipt_id: digest(b"retired source"),
+    };
+    // Even before the prepared reply is stored, the full registered source is immutable.
+    let mut claimed = p.clone();
+    claimed.boot.as_mut().unwrap().2 = None;
+    let mut different_source = receipt.clone();
+    different_source
+        .prepared
+        .request
+        .sandbox_spec_json
+        .push(' ');
+    different_source.prepared.validate().unwrap();
+    assert!(OperatorReadiness::Retired(Box::new(different_source))
+        .validate(&g, &claimed)
+        .is_err());
+    let mut wrong = receipt.clone();
+    wrong.prepared.host_incarnation = "other-incarnation".into();
+    assert!(ctx
+        .meta
+        .record_operator_readiness(&g, &p, OperatorReadiness::Retired(Box::new(wrong)))
+        .await
+        .is_err());
+    ctx.meta
+        .record_operator_readiness(
+            &g,
+            &p,
+            OperatorReadiness::Retired(Box::new(receipt.clone())),
+        )
+        .await
+        .unwrap();
+    // A boot transition after the observation invalidates the exact snapshot.
+    ctx.meta
+        .advance_managed_boot(
+            &row.request.key,
+            row.revision,
+            ManagedBootAdvance::Retired(Box::new(receipt.clone())),
+        )
+        .await
+        .unwrap();
+    assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+    let fresh = ctx
+        .meta
+        .retain_operator_participant(&g, owned.session_id)
+        .await
+        .unwrap();
+    ctx.meta
+        .record_operator_readiness(&g, &fresh, OperatorReadiness::Retired(Box::new(receipt)))
+        .await
+        .unwrap();
+    let published = ctx.meta.publish_operator_generation(&g).await.unwrap();
+    assert!(published.admission_open);
+    // Publication does not authorize the retired old-generation guest to restart.
+    assert_eq!(
+        ctx.meta.managed_boot_open(owned.session_id).await.unwrap(),
+        Some(false)
+    );
+    assert!(ctx.meta.claim_managed_boot(row.request).await.is_err());
+    let retained: serde_json::Value = serde_json::from_str(
+        &ctx.meta
+            .get_session_integration_policy(owned.session_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(retained["managed_deny"]["hosts"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("tools.example")));
+}
+conformance!(
+    t_operator_all_sessions_retired_and_dormant,
+    super::operator_all_sessions_retired_and_dormant
+);
+
+async fn operator_stage_races_registered_claim(ctx: &Ctx) {
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
+    let ws = managed_creation_ws(SessionId::new());
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    let host = HostId::new();
+    ctx.meta
+        .upsert_host(host_record(host, "claim-race", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    let request = managed_boot_request(&ws, host);
+    let (staged, claim) = tokio::join!(
+        ctx.meta
+            .stage_operator_publication(Some(1), operator_candidate()),
+        ctx.meta.claim_managed_boot(request.clone())
+    );
+    let g = staged.unwrap().pending.unwrap();
+    assert_eq!(
+        ctx.meta.list_operator_participants(None, 64).await.unwrap(),
+        vec![ws.session_id]
+    );
+    let p = ctx
+        .meta
+        .retain_operator_participant(&g, ws.session_id)
+        .await
+        .unwrap();
+    assert_eq!(p.boot.is_some(), claim.is_ok());
+    assert_eq!(p.dormant(), claim.is_err());
+    assert!(ctx.meta.claim_managed_boot(request).await.is_err());
+    assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+}
+conformance!(
+    t_operator_stage_races_registered_claim,
+    super::operator_stage_races_registered_claim
+);
+
+async fn operator_stage_races_start_and_terminal_owner(ctx: &Ctx) {
+    use engram_core::types::{managed_boot::*, managed_create::digest, managed_operator::*};
+    let row = managed_boot_finalized_fixture(ctx).await;
+    let key = &row.request.key;
+    let intent = ManagedBootStart {
+        receipt: row.receipt.unwrap(),
+        start_id: digest(b"operator race start"),
+    };
+    let (staged, issued) = tokio::join!(
+        ctx.meta
+            .stage_operator_publication(Some(1), operator_candidate()),
+        ctx.meta.advance_managed_boot(
+            key,
+            row.revision,
+            ManagedBootAdvance::IssueStart(intent.clone())
+        )
+    );
+    let g = staged.unwrap().pending.unwrap();
+    if let Ok(issued) = issued {
+        assert!(ctx
+            .meta
+            .advance_managed_boot(key, issued.revision, ManagedBootAdvance::Started(intent))
+            .await
+            .is_err());
+    }
+    assert_eq!(
+        ctx.meta
+            .managed_boot_open(key.creation.session_id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    // A terminal SQL label cannot remove the physical owner from the scan.
+    ctx.meta
+        .transition_session(
+            key.creation.session_id,
+            SessionState::Failed,
+            BindingDisposition::Detach,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta.list_operator_participants(None, 64).await.unwrap(),
+        vec![key.creation.session_id]
+    );
+    let p = ctx
+        .meta
+        .retain_operator_participant(&g, key.creation.session_id)
+        .await
+        .unwrap();
+    assert!(!p.dormant());
+    assert!(ctx
+        .meta
+        .record_operator_readiness(&g, &p, OperatorReadiness::NeverAllocated)
+        .await
+        .is_err());
+    assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+}
+conformance!(
+    t_operator_stage_races_start_and_terminal_owner,
+    super::operator_stage_races_start_and_terminal_owner
+);
+
+async fn operator_stage_races_started(ctx: &Ctx) {
+    use engram_core::types::{managed_boot::*, managed_create::digest};
+    let row = managed_boot_finalized_fixture(ctx).await;
+    let key = &row.request.key;
+    let start = ManagedBootStart {
+        receipt: row.receipt.unwrap(),
+        start_id: digest(b"delayed started"),
+    };
+    let issued = ctx
+        .meta
+        .advance_managed_boot(
+            key,
+            row.revision,
+            ManagedBootAdvance::IssueStart(start.clone()),
+        )
+        .await
+        .unwrap();
+    let (stage, started) = tokio::join!(
+        ctx.meta
+            .stage_operator_publication(Some(1), operator_candidate()),
+        ctx.meta.advance_managed_boot(
+            key,
+            issued.revision,
+            ManagedBootAdvance::Started(start.clone())
+        )
+    );
+    let g = stage.unwrap().pending.unwrap();
+    let current = ctx.meta.read_managed_boot(key).await.unwrap();
+    assert_eq!(
+        current.phase,
+        if started.is_ok() {
+            ManagedBootPhase::Started
+        } else {
+            ManagedBootPhase::StartIssued
+        }
+    );
+    assert_eq!(
+        ctx.meta.list_operator_participants(None, 64).await.unwrap(),
+        vec![key.creation.session_id]
+    );
+    assert_eq!(
+        ctx.meta
+            .managed_boot_open(key.creation.session_id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    assert!(ctx
+        .meta
+        .advance_managed_boot(key, current.revision, ManagedBootAdvance::Started(start))
+        .await
+        .is_err());
+    assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+}
+conformance!(
+    t_operator_stage_races_started,
+    super::operator_stage_races_started
+);
+
+async fn operator_readiness_invalidates_policy_and_recovers_restart(ctx: &Ctx) {
+    use engram_core::types::{
+        managed_boot::*, managed_create::digest, managed_deny::*, managed_operator::*,
+    };
+    let (_, row) = managed_boot_prepared_fixture(ctx).await;
+    let mut candidate = engram_testkit::operator::candidate();
+    candidate.network_identity = digest(b"same hosts new route");
+    let g = ctx
+        .meta
+        .stage_operator_publication(Some(1), candidate.clone())
+        .await
+        .unwrap()
+        .pending
+        .unwrap();
+    let sid = row.request.key.creation.session_id;
+    let p = ctx.meta.retain_operator_participant(&g, sid).await.unwrap();
+    assert_eq!(p.policy.revision, 2);
+    assert_eq!(
+        ctx.meta
+            .retain_operator_participant(&g, sid)
+            .await
+            .unwrap()
+            .policy,
+        p.policy,
+        "restart/retry keeps one durable required revision"
+    );
+    let retired = OperatorReadiness::Retired(Box::new(ManagedBootRetiredReceipt {
+        prepared: row.prepared.unwrap(),
+        retained_policy: row.request.bootstrap_policy,
+        receipt_id: digest(b"permanent retirement"),
+    }));
+    ctx.meta
+        .record_operator_readiness(&g, &p, retired.clone())
+        .await
+        .unwrap();
+    let expanded =
+        ManagedDenyPolicy::new(3, ["tools.example".into(), "orphan.example".into()]).unwrap();
+    let raw = serde_json::json!({"managed_deny":expanded,"observes":[]}).to_string();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        ctx.meta.bind_session_integration_policy(sid, &raw),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+    let fresh = ctx.meta.retain_operator_participant(&g, sid).await.unwrap();
+    assert_eq!(fresh.policy, expanded);
+    assert!(ctx
+        .meta
+        .record_operator_readiness(&g, &p, retired.clone())
+        .await
+        .is_err());
+    ctx.meta
+        .record_operator_readiness(&g, &fresh, retired)
+        .await
+        .unwrap();
+    if let Some(db) = &ctx._pg {
+        let reopened = engram_postgres::PostgresStore::connect(&db.url)
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.read_operator_publication().await.unwrap().pending,
+            Some(g.clone())
+        );
+        assert!(
+            reopened
+                .publish_operator_generation(&g)
+                .await
+                .unwrap()
+                .admission_open
+        );
+    } else {
+        assert!(
+            ctx.meta
+                .publish_operator_generation(&g)
+                .await
+                .unwrap()
+                .admission_open
+        );
+    }
+    assert!(
+        ctx.meta
+            .stage_operator_publication(Some(1), candidate)
+            .await
+            .unwrap()
+            .admission_open,
+        "exact retry after restart returns original publication"
+    );
+}
+conformance!(
+    t_operator_readiness_invalidates_policy_and_recovers_restart,
+    super::operator_readiness_invalidates_policy_and_recovers_restart
+);
+
+async fn operator_new_legacy_registration_requires_complete_published_set(ctx: &Ctx) {
+    use engram_core::types::managed_deny::ManagedDenyPolicy;
+    let candidate = operator_candidate();
+    let staged = ctx
+        .meta
+        .stage_operator_publication(None, candidate.clone())
+        .await
+        .unwrap();
+    ctx.meta
+        .publish_operator_generation(&staged.pending.unwrap())
+        .await
+        .unwrap();
+    let sid = ctx
+        .meta
+        .create_session(spec("test.invalid/operator:latest"))
+        .await
+        .unwrap();
+    let incomplete = ManagedDenyPolicy::new(1, ["api.example".into()]).unwrap();
+    assert!(ctx
+        .meta
+        .bind_session_integration_policy(
+            sid,
+            &serde_json::json!({"managed_deny":incomplete}).to_string()
+        )
+        .await
+        .is_err());
+    assert!(ctx
+        .meta
+        .list_operator_participants(None, 64)
+        .await
+        .unwrap()
+        .is_empty());
+    let complete = ManagedDenyPolicy::new(1, candidate.hosts().unwrap()).unwrap();
+    let raw = serde_json::json!({"managed_deny":complete}).to_string();
+    ctx.meta
+        .bind_session_integration_policy(sid, &raw)
+        .await
+        .unwrap();
+    let second = ctx
+        .meta
+        .create_session(spec("test.invalid/operator:latest"))
+        .await
+        .unwrap();
+    ctx.meta
+        .stage_operator_publication(Some(1), candidate)
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .bind_session_integration_policy(second, &raw)
+        .await
+        .is_err());
+    assert_eq!(
+        ctx.meta.list_operator_participants(None, 64).await.unwrap(),
+        vec![sid]
+    );
+}
+conformance!(
+    t_operator_new_legacy_registration_requires_complete_published_set,
+    super::operator_new_legacy_registration_requires_complete_published_set
+);
+
+async fn operator_placement_change_invalidates_readiness(ctx: &Ctx) {
+    use engram_core::types::{managed_boot::*, managed_create::digest, managed_operator::*};
+    let (_, row) = managed_boot_prepared_fixture(ctx).await;
+    let sid = row.request.key.creation.session_id;
+    let g = ctx
+        .meta
+        .stage_operator_publication(Some(1), operator_candidate())
+        .await
+        .unwrap()
+        .pending
+        .unwrap();
+    let p = ctx.meta.retain_operator_participant(&g, sid).await.unwrap();
+    let proof = OperatorReadiness::Retired(Box::new(ManagedBootRetiredReceipt {
+        prepared: row.prepared.unwrap(),
+        retained_policy: row.request.bootstrap_policy,
+        receipt_id: digest(b"permanent source"),
+    }));
+    ctx.meta
+        .record_operator_readiness(&g, &p, proof.clone())
+        .await
+        .unwrap();
+    ctx.meta
+        .transition_session(sid, SessionState::Failed, BindingDisposition::Detach)
+        .await
+        .unwrap();
+    assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+    assert!(ctx
+        .meta
+        .record_operator_readiness(&g, &p, proof.clone())
+        .await
+        .is_err());
+    let next = ctx.meta.retain_operator_participant(&g, sid).await.unwrap();
+    assert_eq!(next.target().unwrap(), p.target().unwrap());
+    assert_ne!(next, p);
+    ctx.meta
+        .record_operator_readiness(&g, &next, proof)
+        .await
+        .unwrap();
+    assert!(
+        ctx.meta
+            .publish_operator_generation(&g)
+            .await
+            .unwrap()
+            .admission_open
+    );
+}
+conformance!(
+    t_operator_placement_change_invalidates_readiness,
+    super::operator_placement_change_invalidates_readiness
+);
+
+async fn operator_captured_source_requires_exact_destroyed_owner(ctx: &Ctx) {
+    use engram_core::types::{managed_boot::*, managed_operator::*};
+    let (_, row) = managed_boot_prepared_fixture(ctx).await;
+    let sid = row.request.key.creation.session_id;
+    let g = ctx
+        .meta
+        .stage_operator_publication(Some(1), operator_candidate())
+        .await
+        .unwrap()
+        .pending
+        .unwrap();
+    let p = ctx.meta.retain_operator_participant(&g, sid).await.unwrap();
+    let request = ManagedCaptureRequest {
+        key: row.request.key.clone(),
+        capture_id: SnapshotId::new(),
+    };
+    let mut authority = ManagedCaptureAuthority {
+        version: 1,
+        request: request.clone(),
+        host_incarnation: row.prepared.unwrap().host_incarnation,
+        disk_manifest: request.disk_manifest(),
+        disk_sha256: "d".repeat(64),
+        disk_size_bytes: 4096,
+        image: row.request.cold.image,
+        kernel_sha256: row.request.cold.kernel_sha256,
+        aux_ro_drives: row.request.cold.aux_ro_drives,
+        consistency: ManagedDiskConsistency::CrashConsistentDiskCutV1,
+        source_state: ManagedCapturedSourceState::Destroyed,
+        record_digest: String::new(),
+    };
+    authority.record_digest = authority.digest().unwrap();
+    let mut wrong = authority.clone();
+    wrong.host_incarnation = "other-owner".into();
+    wrong.record_digest = wrong.digest().unwrap();
+    assert!(ctx
+        .meta
+        .record_operator_readiness(&g, &p, OperatorReadiness::Captured(Box::new(wrong)))
+        .await
+        .is_err());
+    ctx.meta
+        .record_operator_readiness(&g, &p, OperatorReadiness::Captured(Box::new(authority)))
+        .await
+        .unwrap();
+    assert!(
+        ctx.meta
+            .publish_operator_generation(&g)
+            .await
+            .unwrap()
+            .admission_open
+    );
+    // Publication consumes destruction evidence; it does not invent a pinned recovery artifact.
+    assert!(ctx.meta.reserve_managed_capture(&request).await.is_err());
+}
+conformance!(
+    t_operator_captured_source_requires_exact_destroyed_owner,
+    super::operator_captured_source_requires_exact_destroyed_owner
+);
+
+async fn operator_policy_only_lineage_blocks_stale_and_fresh_live_receipts(ctx: &Ctx) {
+    use engram_core::types::{managed_deny::*, managed_operator::*};
+    let sid = ctx
+        .meta
+        .create_session(spec("test.invalid/legacy:latest"))
+        .await
+        .unwrap();
+    let hid = HostId::new();
+    ctx.meta
+        .upsert_host(host_record(hid, "legacy-host", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    ctx.meta.assign_session_host(sid, Some(hid)).await.unwrap();
+    let sandbox = engram_core::SandboxId::new();
+    let epoch = ctx
+        .meta
+        .transition_session_created(sid, sandbox)
+        .await
+        .unwrap();
+    ctx.meta
+        .transition_session(sid, SessionState::Idle, BindingDisposition::Retain)
+        .await
+        .unwrap();
+    let target = ManagedPolicyTarget {
+        session_id: sid,
+        host_id: hid,
+        sandbox_id: sandbox,
+        binding_epoch: epoch,
+    };
+    ctx.meta
+        .retain_managed_deny(
+            &target,
+            &ManagedDenyPolicy::new(1, ["history.example".into()]).unwrap(),
+        )
+        .await
+        .unwrap();
+    let g = ctx
+        .meta
+        .stage_operator_publication(None, operator_candidate())
+        .await
+        .unwrap()
+        .pending
+        .unwrap();
+    let p = ctx.meta.retain_operator_participant(&g, sid).await.unwrap();
+    assert_eq!(p.status, "idle");
+    assert!(p.boot.is_none());
+    let receipt = ManagedAppliedState::new(
+        ManagedPolicyContext {
+            target: target.clone(),
+            operator_generation: g.generation,
+            operator_identity: g.identity.clone(),
+            binding_hash: None,
+        },
+        p.policy.clone(),
+        "host-incarnation".into(),
+        "proxy-incarnation".into(),
+        Some(ManagedNetworkProof {
+            target,
+            guest_ip: "192.0.2.2".parse().unwrap(),
+            network_identity: engram_core::types::managed_create::digest(b"actual network proof"),
+        }),
+    )
+    .unwrap();
+    let original_policy = ctx.meta.get_session_integration_policy(sid).await.unwrap();
+    for (host, proxy) in [
+        ("host-incarnation", "proxy-incarnation"),
+        ("next-host", "proxy-incarnation"),
+        ("host-incarnation", "next-proxy"),
+        ("next-host", "next-proxy"),
+    ] {
+        let live = ManagedAppliedState::new(
+            receipt.context.clone(),
+            receipt.policy.clone(),
+            host.into(),
+            proxy.into(),
+            receipt.network_proof.clone(),
+        )
+        .unwrap();
+        live.validate().unwrap();
+        let saved = serde_json::json!({"Applied":live});
+        // Neither an old receipt nor a fresh receipt has durable lifetime authority.
+        assert!(serde_json::from_value::<OperatorReadiness>(saved.clone()).is_err());
+        assert!(ctx
+            .meta
+            .record_operator_readiness(&g, &p, OperatorReadiness::NeverAllocated)
+            .await
+            .is_err());
+        if let Some(db) = &ctx._pg {
+            // Model an existing pending proof written by the earlier implementation.
+            // Sim cannot construct the removed enum variant; both stores reject it
+            // at their typed/JSON boundary and keep this participant unready.
+            sqlx::query("UPDATE managed_operator_readiness SET proof=$3 WHERE generation=$1 AND session_id=$2")
+                .bind(g.generation as i64).bind(sid.as_uuid()).bind(saved).execute(db.store.pool()).await.unwrap();
+        }
+        assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+        assert!(
+            !ctx.meta
+                .read_operator_publication()
+                .await
+                .unwrap()
+                .admission_open
+        );
+        assert_eq!(
+            ctx.meta.managed_policy_target(sid).await.unwrap(),
+            receipt.context.target
+        );
+        assert_eq!(
+            ctx.meta.get_session_integration_policy(sid).await.unwrap(),
+            original_policy
+        );
+    }
+    // Terminal labels do not remove unsupported lineage from the barrier.
+    ctx.meta
+        .transition_session(sid, SessionState::Completed, BindingDisposition::Detach)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta.list_operator_participants(None, 64).await.unwrap(),
+        vec![sid]
+    );
+    let terminal = ctx.meta.retain_operator_participant(&g, sid).await.unwrap();
+    assert!(terminal.policy.denies("history.example"));
+    assert!(terminal.policy.denies("unused.example"));
+    assert!(!terminal.dormant());
+    assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+}
+conformance!(
+    t_operator_policy_only_lineage_blocks_stale_and_fresh_live_receipts,
+    super::operator_policy_only_lineage_blocks_stale_and_fresh_live_receipts
+);
+
+async fn operator_started_owner_progresses_after_permanent_retirement(ctx: &Ctx) {
+    use engram_core::types::{managed_boot::*, managed_create::digest, managed_operator::*};
+    let row = managed_boot_finalized_fixture(ctx).await;
+    let key = &row.request.key;
+    let intent = ManagedBootStart {
+        receipt: row.receipt.clone().unwrap(),
+        start_id: digest(b"started owner"),
+    };
+    let issued = ctx
+        .meta
+        .advance_managed_boot(
+            key,
+            row.revision,
+            ManagedBootAdvance::IssueStart(intent.clone()),
+        )
+        .await
+        .unwrap();
+    ctx.meta
+        .advance_managed_boot(key, issued.revision, ManagedBootAdvance::Started(intent))
+        .await
+        .unwrap();
+    let g = ctx
+        .meta
+        .stage_operator_publication(Some(1), operator_candidate())
+        .await
+        .unwrap()
+        .pending
+        .unwrap();
+    let p = ctx
+        .meta
+        .retain_operator_participant(&g, key.creation.session_id)
+        .await
+        .unwrap();
+    assert_eq!(p.status, "active");
+    assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+    let proof = OperatorReadiness::Retired(Box::new(ManagedBootRetiredReceipt {
+        prepared: row.prepared.unwrap(),
+        retained_policy: row.request.bootstrap_policy.clone(),
+        receipt_id: digest(b"permanent started owner retirement"),
+    }));
+    ctx.meta
+        .record_operator_readiness(&g, &p, proof)
+        .await
+        .unwrap();
+    assert!(
+        ctx.meta
+            .publish_operator_generation(&g)
+            .await
+            .unwrap()
+            .admission_open
+    );
+    assert_eq!(
+        ctx.meta
+            .managed_boot_open(key.creation.session_id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+}
+conformance!(
+    t_operator_started_owner_progresses_after_permanent_retirement,
+    super::operator_started_owner_progresses_after_permanent_retirement
+);
+
+async fn managed_bridge_identity_state(ctx: &Ctx) {
+    use engram_core::types::managed_bridge::*;
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
+    let ws = managed_creation_ws(SessionId::new());
+    let c = ws.managed_creation.clone().unwrap();
+    let q = ManagedCreationQuery {
+        identity: c.identity,
+        native_version: c.native.version,
+        native_digest: c.native.digest,
+    };
+    assert_eq!(
+        ctx.meta
+            .read_managed_creation_state(&q)
+            .await
+            .unwrap()
+            .state,
+        ManagedCreationPhase::Absent
+    );
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .read_managed_creation_state(&q)
+            .await
+            .unwrap()
+            .state,
+        ManagedCreationPhase::Held
+    );
+    let mut wrong = q.clone();
+    wrong.native_digest = engram_core::types::managed_create::digest(b"wrong");
+    assert!(matches!(
+        ctx.meta.read_managed_creation_state(&wrong).await,
+        Err(MetaError::Conflict(_))
+    ));
+    ctx.meta
+        .transition_session(
+            ws.session_id,
+            SessionState::Failed,
+            engram_core::types::BindingDisposition::Detach,
+        )
+        .await
+        .unwrap();
+    let terminal = ctx.meta.read_managed_creation_state(&q).await.unwrap();
+    assert_eq!(terminal.state, ManagedCreationPhase::Terminal);
+    assert_eq!(terminal.terminal_reason.as_deref(), Some("failed"));
+    let finalized = managed_boot_finalized_fixture(ctx).await;
+    assert!(finalized.sealed_agent.is_some());
+    let query = ManagedCreationQuery {
+        identity: finalized.request.key.creation.clone(),
+        native_version: 1,
+        native_digest: finalized.request.key.native_digest.clone(),
+    };
+    let view = ctx.meta.read_managed_creation_state(&query).await.unwrap();
+    assert!(view.boot.as_ref().unwrap().sealed_agent.is_none());
+    assert_eq!(
+        view.boot
+            .as_ref()
+            .unwrap()
+            .finalization
+            .as_ref()
+            .unwrap()
+            .combined_manifest_digest,
+        finalized.finalization.unwrap().combined_manifest_digest
+    );
+    assert!(!serde_json::to_string(&view).unwrap().contains("ciphertext"));
+}
+conformance!(
+    t_managed_bridge_identity_state,
+    managed_bridge_identity_state
+);
+
+fn bridge_intent(
+    ws: &engram_core::traits::SessionCreateWriteSet,
+) -> engram_core::types::managed_bridge::ManagedBootIntent {
+    use engram_core::types::{managed_bridge::*, managed_create::digest};
+    let c = ws.managed_creation.as_ref().unwrap();
+    let request = managed_boot_request(ws, HostId::new());
+    let base = match request.cold.disk.source {
+        engram_core::types::managed_cold::ManagedColdSource::FreshImage { base_manifest } => {
+            base_manifest
+        }
+        _ => unreachable!(),
+    };
+    ManagedBootIntent {
+        query: ManagedCreationQuery {
+            identity: c.identity.clone(),
+            native_version: c.native.version,
+            native_digest: c.native.digest.clone(),
+        },
+        intent_id: uuid::Uuid::new_v4().to_string(),
+        revision: 1,
+        selection: ManagedBootSelection {
+            launch: ManagedHarnessLaunch {
+                descriptor: engram_core::types::harness::HarnessDescriptor {
+                    name: "claude".into(),
+                    ..Default::default()
+                },
+                workdir: None,
+            },
+            image: ws.spec.image.clone(),
+            image_digest: digest(b"approved image"),
+            base_manifest: base,
+            aux_ro_drives: request.cold.aux_ro_drives,
+            vcpus: 1,
+            memory_mib: 128,
+            disk_gib: 1,
+        },
+        sandbox_id: engram_core::SandboxId::new(),
+        binding_epoch: 1,
+        disk_manifest: engram_core::types::ManifestRef::new(),
+        recovery: None,
+        host_id: None,
+        assets: None,
+        completed: false,
+    }
+}
+async fn managed_bridge_intent_cas_pins_and_gate(ctx: &Ctx) {
+    use engram_core::types::managed_bridge::*;
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
+    let mut ws = managed_creation_ws(SessionId::new());
+    let i = bridge_intent(&ws);
+    ws.managed_boot_selection = Some(i.selection.clone());
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    let mut wrong_query = i.query.clone();
+    wrong_query.native_digest = engram_core::types::managed_create::digest(b"other native");
+    assert!(ctx
+        .meta
+        .read_managed_boot_selection(&wrong_query)
+        .await
+        .is_err());
+    assert_eq!(
+        ctx.meta
+            .read_managed_boot_selection(&i.query)
+            .await
+            .unwrap(),
+        i.selection
+    );
+    // Lost reserve reply uses the immutable selected inputs; a new catalog value cannot replace them.
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    let mut changed_selection = ws.clone();
+    changed_selection
+        .managed_boot_selection
+        .as_mut()
+        .unwrap()
+        .base_manifest = engram_core::types::ManifestRef::new();
+    assert!(ctx
+        .meta
+        .reserve_and_persist_create(changed_selection, &[], 0)
+        .await
+        .is_err());
+    let mut changed = i.clone();
+    changed.intent_id = uuid::Uuid::new_v4().to_string();
+    changed.disk_manifest = engram_core::types::ManifestRef::new();
+    changed.sandbox_id = engram_core::SandboxId::new();
+    let (a, b) = tokio::join!(
+        ctx.meta.begin_managed_boot_intent(i.clone()),
+        ctx.meta.begin_managed_boot_intent(changed)
+    );
+    let a = a.unwrap();
+    assert_eq!(a, b.unwrap());
+    assert_eq!(
+        ctx.meta
+            .read_managed_boot_intent(&i.query, "initial")
+            .await
+            .unwrap(),
+        Some(a.clone())
+    );
+    assert_eq!(
+        ctx.meta.list_managed_boot_intents(None, 10).await.unwrap(),
+        vec![a.clone()]
+    );
+    let refs = ctx.meta.list_managed_disk_manifests().await.unwrap();
+    assert!(refs.contains(&a.selection.base_manifest));
+    assert!(refs.contains(&a.disk_manifest));
+    let pins = ctx.meta.bundle_pin_set().await.unwrap();
+    for d in &a.selection.aux_ro_drives {
+        assert!(pins
+            .iter()
+            .any(|p| p.drive_id == d.drive_id && Some(&p.sha256) == d.sha256.as_ref()));
+    }
+    assert_eq!(
+        ctx.meta
+            .read_managed_creation_state(&i.query)
+            .await
+            .unwrap()
+            .state,
+        ManagedCreationPhase::Preparing
+    );
+    assert!(ctx
+        .meta
+        .advance_managed_boot_intent(&a.intent_id, a.revision, ManagedIntentAdvance::Complete)
+        .await
+        .is_err());
+    let host = HostId::new();
+    let full = HostId::new();
+    for (id, capacity) in [(full, 64), (host, 1024)] {
+        ctx.meta
+            .upsert_host(host_record(id, "bridge-candidate", ctx.clock.now_utc()))
+            .await
+            .unwrap();
+        let mut heartbeat = heartbeat_fixture();
+        heartbeat.utilization.allocatable_mib = capacity;
+        ctx.meta.touch_host_heartbeat(id, heartbeat).await.unwrap();
+    }
+    assert!(
+        ctx.meta
+            .advance_managed_boot_intent(
+                &a.intent_id,
+                a.revision,
+                ManagedIntentAdvance::SelectHost(full)
+            )
+            .await
+            .is_err(),
+        "full candidate must not become pinned"
+    );
+    let cordoned = HostId::new();
+    ctx.meta
+        .upsert_host(host_record(cordoned, "cordoned-host", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    let mut heartbeat = heartbeat_fixture();
+    heartbeat.utilization.allocatable_mib = 1024;
+    ctx.meta
+        .touch_host_heartbeat(cordoned, heartbeat)
+        .await
+        .unwrap();
+    ctx.meta
+        .set_host_cordon(
+            cordoned,
+            Some(engram_core::types::host::CordonOwner::Admin),
+            Some("capacity fixture"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        ctx.meta
+            .advance_managed_boot_intent(
+                &a.intent_id,
+                a.revision,
+                ManagedIntentAdvance::SelectHost(cordoned)
+            )
+            .await
+            .is_err(),
+        "held creation must reject a cordoned host"
+    );
+    let mut heartbeat = heartbeat_fixture();
+    heartbeat.utilization.allocatable_mib = 1024;
+    ctx.meta
+        .touch_host_heartbeat(host, heartbeat)
+        .await
+        .unwrap();
+    let (x, y) = tokio::join!(
+        ctx.meta.advance_managed_boot_intent(
+            &a.intent_id,
+            a.revision,
+            ManagedIntentAdvance::SelectHost(host)
+        ),
+        ctx.meta.advance_managed_boot_intent(
+            &a.intent_id,
+            a.revision,
+            ManagedIntentAdvance::SelectHost(host)
+        )
+    );
+    assert_eq!(usize::from(x.is_ok()) + usize::from(y.is_ok()), 1);
+    let mut next = ctx
+        .meta
+        .read_managed_boot_intent(&i.query, "initial")
+        .await
+        .unwrap()
+        .unwrap();
+    let req = next.assets_request().unwrap();
+    let receipt = engram_core::types::managed_assets::ManagedColdAssetsReceipt {
+        request: req.clone(),
+        host_incarnation: "fixture-incarnation".into(),
+        backend: engram_core::types::managed_assets::ManagedColdBackend::Firecracker,
+        kernel_sha256: "c".repeat(64),
+        disk_sha256: "d".repeat(64),
+        disk_size_bytes: 4096,
+    };
+    let mut wrong = receipt.clone();
+    wrong.request.disk_manifest = engram_core::types::ManifestRef::new();
+    assert!(ctx
+        .meta
+        .advance_managed_boot_intent(
+            &next.intent_id,
+            next.revision,
+            ManagedIntentAdvance::Assets(Box::new(wrong))
+        )
+        .await
+        .is_err());
+    next = ctx
+        .meta
+        .advance_managed_boot_intent(
+            &next.intent_id,
+            next.revision,
+            ManagedIntentAdvance::Assets(Box::new(receipt.clone())),
+        )
+        .await
+        .unwrap();
+    ctx.meta
+        .set_host_cordon(
+            host,
+            Some(engram_core::types::host::CordonOwner::Admin),
+            Some("fixture"),
+        )
+        .await
+        .unwrap();
+    let mut heartbeat = heartbeat_fixture();
+    heartbeat.utilization.allocatable_mib = 1024;
+    ctx.meta
+        .touch_host_heartbeat(full, heartbeat)
+        .await
+        .unwrap();
+    let stale = next.clone();
+    next = ctx
+        .meta
+        .advance_managed_boot_intent(
+            &next.intent_id,
+            next.revision,
+            ManagedIntentAdvance::SelectHost(full),
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.sandbox_id, a.sandbox_id);
+    assert_eq!(next.disk_manifest, a.disk_manifest);
+    assert!(next.assets.is_none());
+    assert!(ctx
+        .meta
+        .advance_managed_boot_intent(
+            &next.intent_id,
+            stale.revision,
+            ManagedIntentAdvance::Assets(Box::new(receipt.clone()))
+        )
+        .await
+        .is_err());
+    assert!(ctx
+        .meta
+        .advance_managed_boot_intent(
+            &next.intent_id,
+            next.revision,
+            ManagedIntentAdvance::Assets(Box::new(receipt))
+        )
+        .await
+        .is_err());
+    // Actual publication stage closes the shared gate before any further intent CAS.
+    let p = ctx.meta.read_operator_publication().await.unwrap();
+    let g = p.published.unwrap();
+    ctx.meta
+        .stage_operator_publication(Some(g.generation), operator_candidate())
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .advance_managed_boot_intent(
+            &next.intent_id,
+            next.revision,
+            ManagedIntentAdvance::Complete
+        )
+        .await
+        .is_err());
+    let mut another = bridge_intent(&ws);
+    another.query = i.query.clone();
+    assert!(ctx.meta.begin_managed_boot_intent(another).await.is_err());
+}
+conformance!(
+    t_managed_bridge_intent_cas_pins_and_gate,
+    managed_bridge_intent_cas_pins_and_gate
+);
+
+async fn managed_bridge_detached_retired_source_can_capture(ctx: &Ctx) {
+    use engram_core::types::{managed_boot::*, managed_create::digest};
+    let (_, row) = managed_boot_prepared_fixture(ctx).await;
+    let key = &row.request.key;
+    let receipt = ManagedBootRetiredReceipt {
+        prepared: row.prepared.clone().unwrap(),
+        retained_policy: row.request.bootstrap_policy.clone(),
+        receipt_id: digest(b"retained source"),
+    };
+    ctx.meta
+        .advance_managed_boot(
+            key,
+            row.revision,
+            ManagedBootAdvance::Retired(Box::new(receipt)),
+        )
+        .await
+        .unwrap();
+    ctx.meta
+        .transition_session(
+            key.creation.session_id,
+            SessionState::Idle,
+            BindingDisposition::Detach,
+        )
+        .await
+        .unwrap();
+    let retained = ctx
+        .meta
+        .read_managed_boot(key)
+        .await
+        .expect("permanent exact source retirement survives detach");
+    assert_eq!(retained.phase, ManagedBootPhase::Interrupted);
+    assert_eq!(
+        ctx.meta
+            .managed_boot_open(key.creation.session_id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    let request = ManagedCaptureRequest {
+        key: key.clone(),
+        capture_id: SnapshotId::new(),
+    };
+    assert!(ctx
+        .meta
+        .reserve_managed_capture(&request)
+        .await
+        .unwrap()
+        .is_none());
+    let mut authority = ManagedCaptureAuthority {
+        version: 1,
+        request: request.clone(),
+        host_incarnation: row.prepared.unwrap().host_incarnation,
+        disk_manifest: request.disk_manifest(),
+        disk_sha256: "d".repeat(64),
+        disk_size_bytes: 4096,
+        image: row.request.cold.image.clone(),
+        kernel_sha256: row.request.cold.kernel_sha256.clone(),
+        aux_ro_drives: row.request.cold.aux_ro_drives.clone(),
+        consistency: ManagedDiskConsistency::CrashConsistentDiskCutV1,
+        source_state: ManagedCapturedSourceState::Destroyed,
+        record_digest: String::new(),
+    };
+    authority.record_digest = authority.digest().unwrap();
+    ctx.meta.record_managed_capture(&authority).await.unwrap();
+    assert_eq!(
+        ctx.meta.reserve_managed_capture(&request).await.unwrap(),
+        Some(authority.clone())
+    );
+    let mut next = row.request.clone();
+    next.key.context.target.binding_epoch = 2;
+    next.key.context.target.sandbox_id = engram_core::SandboxId::new();
+    next.key.boot_attempt.push_str("-recovered");
+    next.cold.boot_attempt = next.key.boot_attempt.clone();
+    next.cold.sandbox_id = next.key.context.target.sandbox_id;
+    next.cold.disk.manifest = authority.disk_manifest;
+    next.cold.disk.sha256 = authority.disk_sha256.clone();
+    next.cold.disk.source = engram_core::types::managed_cold::ManagedColdSource::Capture {
+        capture_id: request.capture_id,
+        session_id: key.creation.session_id,
+        sandbox_id: key.context.target.sandbox_id,
+        binding_epoch: 1,
+        record_digest: authority.record_digest.clone(),
+    };
+    let mut spec: engram_core::types::sandbox::SandboxSpec =
+        serde_json::from_str(&next.sandbox_spec_json).unwrap();
+    spec.rootfs_manifest = Some(authority.disk_manifest);
+    next.sandbox_spec_json = serde_json::to_string(&spec).unwrap();
+    next.capture_authority = Some(authority.clone());
+    ctx.meta.claim_managed_boot(next.clone()).await.unwrap();
+    assert!(
+        ctx.meta.read_managed_boot(key).await.is_err(),
+        "retained old proof cannot become current target authority"
+    );
+    assert_eq!(
+        ctx.meta.reserve_managed_capture(&request).await.unwrap(),
+        Some(authority)
+    );
+    assert_eq!(
+        ctx.meta.read_managed_boot(&next.key).await.unwrap().phase,
+        ManagedBootPhase::Claimed
+    );
+    let (_, unknown) = managed_boot_prepared_fixture(ctx).await;
+    ctx.meta
+        .advance_managed_boot(
+            &unknown.request.key,
+            unknown.revision,
+            ManagedBootAdvance::Interrupt,
+        )
+        .await
+        .unwrap();
+    ctx.meta
+        .transition_session(
+            unknown.request.key.creation.session_id,
+            SessionState::Idle,
+            BindingDisposition::Detach,
+        )
+        .await
+        .unwrap();
+    assert!(
+        ctx.meta
+            .read_managed_boot(&unknown.request.key)
+            .await
+            .is_err(),
+        "interruption alone is not permanent source proof"
+    );
+}
+conformance!(
+    t_managed_bridge_detached_retired_source_can_capture,
+    managed_bridge_detached_retired_source_can_capture
+);
+
+async fn managed_bridge_claim_reconcile_and_recovery(ctx: &Ctx) {
+    use engram_core::types::{
+        managed_assets::*, managed_boot::*, managed_bridge::*, managed_cold::ManagedColdSource,
+        managed_create::digest,
+    };
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
+    let mut ws = managed_creation_ws(SessionId::new());
+    let mut i = bridge_intent(&ws);
+    ws.managed_boot_selection = Some(i.selection.clone());
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    let host = HostId::new();
+    ctx.meta
+        .upsert_host(host_record(host, "bridge-host", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    let mut request = managed_boot_request(&ws, host);
+    assert!(
+        ctx.meta.claim_managed_boot(request.clone()).await.is_err(),
+        "selected creation cannot bypass durable intent"
+    );
+    i = ctx.meta.begin_managed_boot_intent(i).await.unwrap();
+    i = ctx
+        .meta
+        .advance_managed_boot_intent(
+            &i.intent_id,
+            i.revision,
+            ManagedIntentAdvance::SelectHost(host),
+        )
+        .await
+        .unwrap();
+    let assets = ManagedColdAssetsReceipt {
+        request: i.assets_request().unwrap(),
+        host_incarnation: "asset-owner".into(),
+        backend: ManagedColdBackend::Firecracker,
+        kernel_sha256: "c".repeat(64),
+        disk_sha256: "d".repeat(64),
+        disk_size_bytes: 4096,
+    };
+    i = ctx
+        .meta
+        .advance_managed_boot_intent(
+            &i.intent_id,
+            i.revision,
+            ManagedIntentAdvance::Assets(Box::new(assets.clone())),
+        )
+        .await
+        .unwrap();
+    request.key.boot_attempt = i.intent_id.clone();
+    request.key.context.target.sandbox_id = i.sandbox_id;
+    request.cold.boot_attempt = i.intent_id.clone();
+    request.cold.sandbox_id = i.sandbox_id;
+    request.cold.disk.manifest = i.disk_manifest;
+    request.cold.disk.sha256 = assets.disk_sha256;
+    request.cold.disk.source = ManagedColdSource::FreshImage {
+        base_manifest: i.selection.base_manifest,
+    };
+    let mut spec: engram_core::types::sandbox::SandboxSpec =
+        serde_json::from_str(&request.sandbox_spec_json).unwrap();
+    spec.rootfs_manifest = Some(i.disk_manifest);
+    spec.memory.max_mib = i.selection.memory_mib;
+    request.sandbox_spec_json = serde_json::to_string(&spec).unwrap();
+    let mut wrong = request.clone();
+    wrong.cold.disk.sha256 = "e".repeat(64);
+    assert!(ctx.meta.claim_managed_boot(wrong).await.is_err());
+    let row = ctx.meta.claim_managed_boot(request.clone()).await.unwrap();
+    let alternative = HostId::new();
+    ctx.meta
+        .upsert_host(host_record(
+            alternative,
+            "alternative-host",
+            ctx.clock.now_utc(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        ctx.meta
+            .advance_managed_boot_intent(
+                &i.intent_id,
+                i.revision,
+                ManagedIntentAdvance::SelectHost(alternative)
+            )
+            .await
+            .is_err(),
+        "claim fences relocation before completion"
+    );
+    // Commit succeeded but the caller lost its reply: exact retry returns the same owner.
+    assert_eq!(
+        serde_json::to_value(ctx.meta.claim_managed_boot(request.clone()).await.unwrap()).unwrap(),
+        serde_json::to_value(&row).unwrap()
+    );
+    let prepared = ManagedBootPreparedReceipt {
+        request: request.clone(),
+        host_incarnation: "asset-owner".into(),
+        network_identity: digest(b"network"),
+        guest_ip: "192.0.2.2".parse().unwrap(),
+        receipt_id: digest(b"prepared"),
+    };
+    let mut wrong = prepared.clone();
+    wrong.host_incarnation = "restarted-host".into();
+    assert!(ctx
+        .meta
+        .advance_managed_boot(
+            &request.key,
+            row.revision,
+            ManagedBootAdvance::Prepared(Box::new(wrong))
+        )
+        .await
+        .is_err());
+    let row = ctx
+        .meta
+        .advance_managed_boot(
+            &request.key,
+            row.revision,
+            ManagedBootAdvance::Prepared(Box::new(prepared)),
+        )
+        .await
+        .unwrap();
+    i = ctx
+        .meta
+        .advance_managed_boot_intent(&i.intent_id, i.revision, ManagedIntentAdvance::Complete)
+        .await
+        .unwrap();
+    assert!(i.completed);
+    assert!(ctx
+        .meta
+        .list_managed_boot_intents(None, 10)
+        .await
+        .unwrap()
+        .is_empty());
+    let capture_id = SnapshotId::new();
+    let mut recovery = ManagedBootIntent {
+        query: i.query.clone(),
+        intent_id: uuid::Uuid::new_v4().to_string(),
+        revision: 1,
+        selection: i.selection.clone(),
+        sandbox_id: engram_core::SandboxId::new(),
+        binding_epoch: 2,
+        disk_manifest: engram_core::types::ManifestRef {
+            manifest_id: capture_id.as_uuid(),
+            version: 1,
+        },
+        recovery: Some(ManagedRecoveryIntent {
+            recovery_id: "recovery-one".into(),
+            source: request.key.clone(),
+            capture_id,
+        }),
+        host_id: None,
+        assets: None,
+        completed: false,
+    };
+    let mut substituted = recovery.clone();
+    substituted
+        .selection
+        .launch
+        .descriptor
+        .args
+        .push("changed-argument".into());
+    assert!(ctx
+        .meta
+        .begin_managed_boot_intent(substituted)
+        .await
+        .is_err());
+    recovery = ctx.meta.begin_managed_boot_intent(recovery).await.unwrap();
+    assert_eq!(
+        ctx.meta
+            .read_managed_creation_state(&i.query)
+            .await
+            .unwrap()
+            .state,
+        ManagedCreationPhase::Recovering
+    );
+    let mut retry = recovery.clone();
+    retry.intent_id = uuid::Uuid::new_v4().to_string();
+    retry.sandbox_id = engram_core::SandboxId::new();
+    assert_eq!(
+        ctx.meta.begin_managed_boot_intent(retry).await.unwrap(),
+        recovery
+    );
+    let mut competing = recovery.clone();
+    competing.intent_id = uuid::Uuid::new_v4().to_string();
+    competing.recovery.as_mut().unwrap().recovery_id = "other-recovery".into();
+    assert!(matches!(
+        ctx.meta.begin_managed_boot_intent(competing).await,
+        Err(engram_core::MetaError::Conflict(_))
+    ));
+    assert!(ctx
+        .meta
+        .list_managed_disk_manifests()
+        .await
+        .unwrap()
+        .contains(&recovery.disk_manifest));
+    assert_eq!(
+        serde_json::to_value(ctx.meta.read_managed_boot(&request.key).await.unwrap()).unwrap(),
+        serde_json::to_value(&row).unwrap(),
+        "intent does not itself interrupt a guest"
+    );
+    ctx.meta
+        .advance_managed_boot(&request.key, row.revision, ManagedBootAdvance::Interrupt)
+        .await
+        .unwrap();
+    ctx.meta
+        .reserve_managed_capture(&ManagedCaptureRequest {
+            key: request.key.clone(),
+            capture_id,
+        })
+        .await
+        .unwrap();
+    ctx.meta
+        .transition_session(
+            ws.session_id,
+            SessionState::Failed,
+            BindingDisposition::Detach,
+        )
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .advance_managed_boot_intent(
+            &recovery.intent_id,
+            recovery.revision,
+            ManagedIntentAdvance::SelectHost(host)
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        ctx.meta
+            .read_managed_creation_state(&i.query)
+            .await
+            .unwrap()
+            .state,
+        ManagedCreationPhase::Terminal
+    );
+    let history = managed_history(ctx, ws.session_id).await;
+    ctx.meta
+        .set_host_status(host, HostStatus::Dead)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta.delete_host(host).await.unwrap(),
+        engram_core::types::host::DeleteHostOutcome::Deleted
+    );
+    assert!(ctx.meta.get_host(host).await.unwrap().is_none());
+    assert!(matches!(
+        ctx.meta.claim_managed_boot(request.clone()).await,
+        Err(MetaError::NotFound)
+    ));
+    assert_eq!(managed_history(ctx, ws.session_id).await, history);
+    assert_eq!(
+        ctx.meta.managed_sandbox_open(i.sandbox_id).await.unwrap(),
+        Some(false)
+    );
+    let mut held = managed_creation_ws(SessionId::new());
+    held.spec.image = ws.spec.image.clone();
+    ctx.meta
+        .reserve_and_persist_create(held.clone(), &[], 0)
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .claim_managed_boot(managed_boot_request(&held, host))
+        .await
+        .is_err());
+    assert!(ctx
+        .meta
+        .get_managed_boot(&held.managed_creation.unwrap().identity)
+        .await
+        .unwrap()
+        .is_none());
+}
+conformance!(
+    t_managed_bridge_claim_reconcile_and_recovery,
+    managed_bridge_claim_reconcile_and_recovery
+);
+
+async fn managed_history(ctx: &Ctx, sid: SessionId) -> serde_json::Value {
+    if let Some(sim) = &ctx.sim {
+        sim.with_db(|db| serde_json::json!({
+            "boot": db.managed_boots.get(&sid),
+            "captures": db.managed_captures.values().filter(|(r, _)| r.key.creation.session_id == sid).collect::<Vec<_>>(),
+            "intents": db.managed_boot_intents.values().filter(|i| i.query.identity.session_id == sid).collect::<Vec<_>>(),
+            "selection": db.managed_boot_selections.get(&sid),
+        }))
+    } else {
+        sqlx::query_scalar("SELECT jsonb_build_object('boot',(SELECT record FROM session_managed_boots WHERE session_id=$1),'captures',(SELECT jsonb_agg(jsonb_build_array(request,authority) ORDER BY capture_id) FROM session_managed_captures WHERE session_id=$1),'intents',(SELECT jsonb_agg(record ORDER BY intent_id) FROM session_managed_boot_intents WHERE session_id=$1),'selection',(SELECT selection FROM session_managed_boot_selections WHERE session_id=$1))")
+            .bind(sid.as_uuid()).fetch_one(ctx._pg.as_ref().unwrap().store.pool()).await.unwrap()
+    }
+}
+
+async fn wait_for_placement_lock(db: &engram_testkit::pg::TestDb, advisory: bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND CASE WHEN $1 THEN wait_event='advisory' ELSE query LIKE '%hosts%' END)")
+                .bind(advisory).fetch_one(db.store.pool()).await.unwrap();
+            if waiting { return; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("placement did not reach its lock barrier");
+}
+
+async fn managed_placement_and_policy_child(ctx: &Ctx, claim: bool) {
+    use engram_core::types::managed_bridge::*;
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
+    let host = HostId::new();
+    ctx.meta
+        .upsert_host(host_record(
+            host,
+            &format!("placement-{claim}"),
+            ctx.clock.now_utc(),
+        ))
+        .await
+        .unwrap();
+    let mut heartbeat = heartbeat_fixture();
+    heartbeat.utilization.allocatable_mib = 1024;
+    ctx.meta
+        .touch_host_heartbeat(host, heartbeat)
+        .await
+        .unwrap();
+    let mut parent = managed_creation_ws(SessionId::new());
+    let intent = bridge_intent(&parent);
+    if !claim {
+        parent.managed_boot_selection = Some(intent.selection.clone());
+    }
+    ctx.meta
+        .reserve_and_persist_create(parent.clone(), &[], 0)
+        .await
+        .unwrap();
+    if !claim {
+        ctx.meta
+            .begin_managed_boot_intent(intent.clone())
+            .await
+            .unwrap();
+    }
+    let request = managed_boot_request(&parent, host);
+    managed_operator_gate_fixture(ctx, &request.key, true).await;
+    let mut child = managed_creation_ws(SessionId::new());
+    child.managed_creation = None;
+    child.mcp_policy.as_mut().unwrap().parent_session_id = Some(parent.session_id);
+    let child_id = child.session_id;
+    let mut barrier = None;
+    if let Some(db) = &ctx._pg {
+        // The child holds its host row before it can lock the policy parent.
+        let trigger = format!("CREATE OR REPLACE FUNCTION wait_policy_child() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.id='{}'::uuid THEN PERFORM pg_advisory_xact_lock(80402); END IF; RETURN NEW; END; $$", child_id);
+        sqlx::query(&trigger)
+            .execute(db.store.pool())
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER wait_policy_child BEFORE INSERT ON sessions FOR EACH ROW EXECUTE FUNCTION wait_policy_child()")
+            .execute(db.store.pool()).await.unwrap();
+        let mut tx = db.store.pool().begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(80402)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        barrier = Some(tx);
+    }
+    let child_meta = ctx.meta.clone();
+    let child_task = tokio::spawn(async move {
+        child_meta
+            .reserve_and_persist_create(child, &[host], 0)
+            .await
+    });
+    if let Some(db) = &ctx._pg {
+        wait_for_placement_lock(db, true).await;
+    }
+    let retry = request.clone();
+    let parent_meta = ctx.meta.clone();
+    let parent_task = tokio::spawn(async move {
+        if claim {
+            parent_meta.claim_managed_boot(request).await.map(|_| ())
+        } else {
+            parent_meta
+                .advance_managed_boot_intent(
+                    &intent.intent_id,
+                    intent.revision,
+                    ManagedIntentAdvance::SelectHost(host),
+                )
+                .await
+                .map(|_| ())
+        }
+    });
+    if let Some(db) = &ctx._pg {
+        wait_for_placement_lock(db, false).await;
+    }
+    if let Some(tx) = barrier {
+        tx.commit().await.unwrap();
+    }
+    let (child_result, parent_result) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(child_task, parent_task)
+    })
+    .await
+    .expect("placement operations did not complete");
+    assert!(
+        child_result.as_ref().unwrap().is_ok(),
+        "policy child creation failed: {child_result:?}"
+    );
+    assert!(
+        parent_result.as_ref().unwrap().is_ok(),
+        "managed placement failed: {parent_result:?}"
+    );
+    assert_eq!(
+        ctx.meta.get_session(child_id).await.unwrap().host_id,
+        Some(host)
+    );
+    if claim {
+        assert_eq!(
+            ctx.meta.per_host_reserved().await.unwrap()[&host].mem_mib,
+            1024
+        );
+        assert!(
+            ctx.meta.claim_managed_boot(retry).await.is_ok(),
+            "an exact retry needs no extra capacity"
+        );
+    }
+    if let Some(db) = &ctx._pg {
+        sqlx::query("DROP TRIGGER wait_policy_child ON sessions")
+            .execute(db.store.pool())
+            .await
+            .unwrap();
+    }
+}
+async fn managed_placement_and_policy_child_do_not_deadlock(ctx: &Ctx) {
+    managed_placement_and_policy_child(ctx, false).await;
+}
+async fn managed_claim_and_policy_child_do_not_deadlock(ctx: &Ctx) {
+    managed_placement_and_policy_child(ctx, true).await;
+}
+
+conformance!(
+    t_managed_placement_and_policy_child_do_not_deadlock,
+    managed_placement_and_policy_child_do_not_deadlock
+);
+
+conformance!(
+    t_managed_claim_and_policy_child_do_not_deadlock,
+    managed_claim_and_policy_child_do_not_deadlock
+);
+
+async fn teleport_and_ordinary_policy_child(ctx: &Ctx, commit: bool) {
+    use engram_core::traits::CreateDisposition;
+    use engram_core::types::teleport::*;
+
+    let source = HostId::new();
+    let dest = HostId::new();
+    for host in [source, dest] {
+        ctx.meta
+            .upsert_host(host_record(host, "policy-teleport", ctx.clock.now_utc()))
+            .await
+            .unwrap();
+        let mut heartbeat = heartbeat_fixture();
+        heartbeat.utilization.allocatable_mib = 4096;
+        ctx.meta
+            .touch_host_heartbeat(host, heartbeat)
+            .await
+            .unwrap();
+    }
+    let mut parent = managed_creation_ws(SessionId::new());
+    parent.managed_creation = None;
+    assert_eq!(
+        ctx.meta
+            .reserve_and_persist_create(parent.clone(), &[source], 0)
+            .await
+            .unwrap(),
+        CreateDisposition::Placed(source)
+    );
+    assert_eq!(
+        ctx.meta.managed_boot_open(parent.session_id).await.unwrap(),
+        None
+    );
+    let policy = ctx
+        .meta
+        .read_mcp_write_policy(parent.session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        policy.write_eligibility,
+        engram_core::types::mcp_policy::WriteEligibility::ReadOnly
+    );
+    ctx.meta
+        .transition_session_created(parent.session_id, engram_core::SandboxId::new())
+        .await
+        .unwrap();
+    ctx.meta
+        .transition_session(
+            parent.session_id,
+            SessionState::Active,
+            BindingDisposition::Retain,
+        )
+        .await
+        .unwrap();
+    let mut child = managed_creation_ws(SessionId::new());
+    child.managed_creation = None;
+    child.mcp_policy.as_mut().unwrap().parent_session_id = Some(parent.session_id);
+    let child_id = child.session_id;
+    let request = TeleportAdmitRequest {
+        id: engram_core::TeleportId::new(),
+        session_id: parent.session_id,
+        reason: TeleportReason::Ui,
+        epoch: 0,
+        candidates: vec![source, dest],
+        pinned_dest: Some(dest),
+        mem_budget_mib: parent.mem_budget_mib,
+        cpu_budget_vcpus: i64::from(parent.cpu_budget_vcpus),
+        max_open_per_dest: 1,
+        kind: TeleportKind::Live,
+    };
+    if commit {
+        admit_teleport(ctx, request.clone()).await;
+        for (from, to, patch) in [
+            (
+                TeleportPhase::Admitted,
+                TeleportPhase::Captured,
+                TeleportPatch::default(),
+            ),
+            (
+                TeleportPhase::Captured,
+                TeleportPhase::Restored,
+                TeleportPatch {
+                    dest_sandbox_id: Some(engram_core::SandboxId::new()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            assert!(ctx
+                .meta
+                .teleport_advance(request.id, from, to, patch, 0)
+                .await
+                .unwrap());
+        }
+    }
+    let mut barrier = None;
+    if let Some(db) = &ctx._pg {
+        // Pause the real create method after it locks H, before policy ancestry P.
+        let trigger = format!("CREATE FUNCTION wait_teleport_policy_child() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.id='{}'::uuid THEN PERFORM pg_advisory_xact_lock(80403); END IF; RETURN NEW; END; $$", child_id);
+        sqlx::query(&trigger)
+            .execute(db.store.pool())
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER wait_teleport_policy_child BEFORE INSERT ON sessions FOR EACH ROW EXECUTE FUNCTION wait_teleport_policy_child()")
+            .execute(db.store.pool()).await.unwrap();
+        let mut tx = db.store.pool().begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(80403)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        barrier = Some(tx);
+    }
+    let child_meta = ctx.meta.clone();
+    let child_task = tokio::spawn(async move {
+        child_meta
+            .reserve_and_persist_create(child, &[dest], 0)
+            .await
+    });
+    if let Some(db) = &ctx._pg {
+        wait_for_placement_lock(db, true).await;
+    }
+    let parent_meta = ctx.meta.clone();
+    let mut parent_task = tokio::spawn(async move {
+        if commit {
+            assert!(parent_meta.teleport_commit(request.id, 0).await?.is_some());
+            Ok(None)
+        } else {
+            parent_meta.teleport_admit(request).await.map(Some)
+        }
+    });
+    let completed_parent = if commit {
+        // FK checks can finish while a placement writer still holds the host.
+        Some(
+            tokio::time::timeout(Duration::from_secs(5), &mut parent_task)
+                .await
+                .expect("teleport commit blocked behind child placement"),
+        )
+    } else {
+        if let Some(db) = &ctx._pg {
+            wait_for_placement_lock(db, false).await;
+        }
+        None
+    };
+    if let Some(tx) = barrier {
+        tx.commit().await.unwrap();
+    }
+    let child_result = tokio::time::timeout(Duration::from_secs(5), child_task)
+        .await
+        .expect("policy child did not complete");
+    let parent_result = match completed_parent {
+        Some(result) => result,
+        None => tokio::time::timeout(Duration::from_secs(5), parent_task)
+            .await
+            .expect("teleport admission did not complete"),
+    };
+    assert_eq!(
+        child_result.unwrap().unwrap(),
+        CreateDisposition::Placed(dest)
+    );
+    let parent_result = parent_result
+        .unwrap()
+        .expect("ordinary policy-parent teleport failed");
+    if let Some(parent_result) = parent_result {
+        let TeleportAdmitOutcome::Admitted(row) = parent_result else {
+            panic!("teleport refused: {parent_result:?}")
+        };
+        assert_eq!(row.source_host_id, source);
+        assert_eq!(row.dest_host_id, dest);
+    } else {
+        assert_eq!(
+            ctx.meta
+                .get_session(parent.session_id)
+                .await
+                .unwrap()
+                .host_id,
+            Some(dest)
+        );
+    }
+    assert_eq!(
+        ctx.meta.get_session(child_id).await.unwrap().host_id,
+        Some(dest)
+    );
+    assert_eq!(
+        ctx.meta.per_host_reserved().await.unwrap()[&dest].mem_mib,
+        1024
+    );
+    if let Some(db) = &ctx._pg {
+        sqlx::query("DROP TRIGGER wait_teleport_policy_child ON sessions")
+            .execute(db.store.pool())
+            .await
+            .unwrap();
+        sqlx::query("DROP FUNCTION wait_teleport_policy_child()")
+            .execute(db.store.pool())
+            .await
+            .unwrap();
+    }
+}
+
+async fn teleport_and_ordinary_policy_child_do_not_deadlock(ctx: &Ctx) {
+    teleport_and_ordinary_policy_child(ctx, false).await;
+}
+async fn teleport_commit_and_ordinary_policy_child_do_not_deadlock(ctx: &Ctx) {
+    teleport_and_ordinary_policy_child(ctx, true).await;
+}
+
+async fn teleport_destination_refusals_preserve_session_precedence(ctx: &Ctx) {
+    use engram_core::types::teleport::*;
+    let mut request = teleport_admission_fixture(ctx).await;
+    let dest = request.candidates[1];
+    request.pinned_dest = Some(HostId::new());
+    assert!(matches!(
+        ctx.meta.teleport_admit(request.clone()).await.unwrap(),
+        TeleportAdmitOutcome::NoFit
+    ));
+    let mut missing_session = request.clone();
+    missing_session.session_id = SessionId::new();
+    assert!(matches!(
+        ctx.meta.teleport_admit(missing_session).await.unwrap(),
+        TeleportAdmitOutcome::Fenced
+    ));
+    let mut stale = request.clone();
+    stale.epoch += 1;
+    assert!(matches!(
+        ctx.meta.teleport_admit(stale).await.unwrap(),
+        TeleportAdmitOutcome::Fenced
+    ));
+    assert!(ctx
+        .meta
+        .request_host_retirement(
+            dest,
+            engram_core::types::host::CordonOwner::Operator,
+            "retire",
+            ctx.clock.now_utc()
+        )
+        .await
+        .unwrap());
+    ctx.clock.advance(Duration::from_secs(1));
+    ctx.meta
+        .touch_host_heartbeat(dest, heartbeat_fixture())
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .grant_host_retirement(dest, ctx.clock.now_utc())
+            .await
+            .unwrap(),
+        engram_core::types::host::RetirementGrant::Granted
+    );
+    request.pinned_dest = Some(dest);
+    assert!(matches!(
+        ctx.meta.teleport_admit(request.clone()).await.unwrap(),
+        TeleportAdmitOutcome::NoFit
+    ));
+    ctx.meta
+        .transition_session(
+            request.session_id,
+            SessionState::Evicting,
+            BindingDisposition::Retain,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        ctx.meta.teleport_admit(request.clone()).await.unwrap(),
+        TeleportAdmitOutcome::SessionNotActive(SessionState::Evicting)
+    ));
+    request.epoch += 1;
+    assert!(matches!(
+        ctx.meta.teleport_admit(request).await.unwrap(),
+        TeleportAdmitOutcome::Fenced
+    ));
+    let mut open = teleport_admission_fixture(ctx).await;
+    admit_teleport(ctx, open.clone()).await;
+    open.pinned_dest = Some(HostId::new());
+    assert!(matches!(
+        ctx.meta.teleport_admit(open).await,
+        Err(MetaError::Conflict(_))
+    ));
+}
+
+conformance!(
+    t_teleport_and_ordinary_policy_child_do_not_deadlock,
+    teleport_and_ordinary_policy_child_do_not_deadlock
+);
+conformance!(
+    t_teleport_destination_refusals_preserve_session_precedence,
+    teleport_destination_refusals_preserve_session_precedence
+);
+
+conformance!(
+    t_teleport_commit_and_ordinary_policy_child_do_not_deadlock,
+    teleport_commit_and_ordinary_policy_child_do_not_deadlock
 );

@@ -30,6 +30,7 @@ pub mod idle_detector;
 pub mod idle_evictor;
 pub mod integration_ops;
 pub mod integrations;
+pub mod mcp;
 pub mod metrics;
 pub mod oauth;
 pub mod oauth_client_credentials;
@@ -217,6 +218,7 @@ pub async fn run_with_registry_and_local(
     // Push-driven via `queue_wake` (see above); polling is the fallback.
     // ADR 0073 phase 2: the outbox delivery driver — resume-behind-
     // enqueue + at-least-once forward + redelivery-until-acked.
+    let _managed_boot = managed_boot::spawn(state.clone());
     let _outbox_delivery = outbox_delivery::spawn(state.clone(), state.outbox_wake.clone());
     // ADR 0079: the session-op executor — the lifecycle kernel.
     let _session_ops = session_ops::spawn(state.clone(), state.session_ops_wake.clone());
@@ -373,6 +375,20 @@ pub async fn run_with_registry_and_local(
         state.services.host.set_upload_sink(sink);
     }
 
+    // The optional credential service has its own authenticated listener.
+    let mcp_control = mcp::startup::start_with_policy(
+        cfg.mcp_control_config.as_deref(),
+        state.oauth.clone(),
+        state.subscribe_shutdown(),
+        Some(state.clone()),
+    )
+    .await
+    .map_err(|_| {
+        CoordinatorError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid MCP control configuration",
+        ))
+    })?;
     // ADR 0051 B: the orchestrator-facing app gRPC surface, served
     // BESIDE the axum API (additive — no REST route changes). Spawned so
     // a runtime serve crash doesn't take the web surface down with it
@@ -443,10 +459,12 @@ pub async fn run_with_registry_and_local(
         .await
         .map_err(CoordinatorError::Io)?;
 
-    // Graceful shutdown drains both servers: axum has returned, now
-    // wait for the app gRPC serve loop to finish its own drain. A
+    // Axum has drained. Wait for both control listeners to finish. A
     // JoinError here means the spawned task panicked — log it rather
     // than turning a clean web-side shutdown into a process error.
+    if let Some(task) = mcp_control {
+        let _ = task.await;
+    }
     if let Err(e) = app_grpc.await {
         tracing::error!(error = %e, "app gRPC server task panicked");
     }
@@ -617,6 +635,8 @@ impl std::error::Error for CoordinatorError {
     }
 }
 
+pub mod managed_boot;
+mod managed_bridge;
 impl From<engram_upgrade_drain::DrainError> for CoordinatorError {
     fn from(e: engram_upgrade_drain::DrainError) -> Self {
         Self::UpgradeDrain(e)

@@ -84,6 +84,8 @@ message Profile {
   repeated SessionApp apps = 24;
   // When true, only automations, API keys, and admins can start sessions.
   bool programmatic_only = 25;
+  // Revision for explicit MCP grant publication; zero means no publication.
+  int64 mcp_grant_revision = 26;
 }
 
 // ADR 0118: one service a session hosts, published at
@@ -144,6 +146,7 @@ message ProfileIntegrationGrant {
   // user's personal credential (human launches then require it; programmatic
   // sessions always use the org credential).
   string credential_scope = 4;
+  McpToolGrant mcp = 5;
 }
 
 // ADR 0057: a profile's egress network allow-list. `default` is the posture for
@@ -230,6 +233,8 @@ message CreateProfileRequest {
   repeated SessionApp apps = 20;
   // When true, only automations, API keys, and admins can start sessions.
   bool programmatic_only = 21;
+  // Presence requests explicit MCP grant publication. First publication expects zero.
+  optional int64 expected_mcp_grant_revision = 22;
 }
 
 message CreateProfileResponse {
@@ -265,6 +270,8 @@ message UpdateProfileRequest {
   // When true, only automations, API keys, and admins can start sessions.
   // Omit to preserve the current setting.
   optional bool programmatic_only = 22;
+  // Presence requests publication or republication of the exact MCP grants.
+  optional int64 expected_mcp_grant_revision = 23;
 }
 
 message UpdateProfileResponse {
@@ -276,3 +283,14 @@ message DeleteProfileRequest {
 }
 
 message DeleteProfileResponse {}
+
+message McpToolGrant {
+  string upstream_name = 1;
+  bool automation_write = 2;
+  reserved 3;
+  reserved "argument_constraints_json";
+  bool unrestricted = 4;
+  // Every document must pass in its own dialect and resource scope.
+  // An empty list requires an explicit unrestricted choice.
+  repeated string argument_constraint_documents_json = 5;
+}

@@ -2,13 +2,6 @@
 //! chunked-OCI image cache / session volumes / egress proxy, runs the
 //! snapshot manager and resource governor, and heartbeats the
 //! coordinator with capacity + local-snapshot state.
-//!
-//! Phase 1 wires create/exec/destroy through the SandboxBackend trait —
-//! currently `engram-sandbox-process` for fast dev loops, with
-//! `engram-sandbox-firecracker` filling in the production path. Phase 2
-//! lights up the snapshot manager. Phase 3 turns heartbeats into a real
-//! gRPC channel; today they go through an in-process trait object so
-//! the `--mode=all` single-binary path works.
 
 use std::sync::Arc;
 
@@ -114,6 +107,8 @@ pub use config::{HostAgentConfig, DEFAULT_DISK_HYDRATION_WINDOW_CHUNKS};
 
 pub struct HostAgent {
     pub cfg: HostAgentConfig,
+    managed_ownership: Option<Arc<managed_policy::ManagedOwnership>>,
+    managed_backend: Option<managed_boot::ManagedBackend>,
     pub sandbox: Arc<dyn SandboxBackend>,
     pub cloud: Arc<dyn CloudBackend>,
     /// Local egress proxy. The production binary refuses to start
@@ -152,6 +147,8 @@ impl HostAgent {
     ) -> Self {
         Self {
             cfg,
+            managed_ownership: None,
+            managed_backend: None,
             sandbox,
             cloud,
             egress: None,
@@ -218,9 +215,51 @@ impl HostAgent {
         self
     }
 
+    pub fn with_managed_backend(mut self, backend: managed_boot::ManagedBackend) -> Self {
+        self.managed_backend = Some(backend);
+        self
+    }
+
+    pub fn with_managed_ownership(
+        mut self,
+        ownership: Option<Arc<managed_policy::ManagedOwnership>>,
+    ) -> Self {
+        self.managed_ownership = ownership;
+        self
+    }
+
     /// Run until ctrl-c: the reattach pass, the background drivers, and
     /// the coordinator dialer when `coordinator_endpoint` is set.
     pub async fn run(self) -> Result<(), HostAgentError> {
+        let managed_ownership = match self.managed_ownership.clone() {
+            Some(owner) => Some(owner),
+            None => managed_policy::ManagedOwnership::for_mode(
+                &self.cfg.work_dir.join("bindings"),
+                self.cfg.managed_tls.is_some(),
+            )?,
+        };
+        let managed_server = if let Some(tls) = &self.cfg.managed_tls {
+            if self.cfg.grpc_listen_addr.is_none()
+                || !self
+                    .cfg
+                    .grpc_advertise_addr
+                    .as_ref()
+                    .is_some_and(|a| a.starts_with("https://"))
+                || self.egress.is_none()
+                || self.host_id.is_none()
+            {
+                return Err(HostAgentError::Config("managed host mode requires an HTTPS lifecycle listener, stable host identity, and egress proxy".into()));
+            }
+            Some(
+                grpc_server::PreparedHostServer::bind(
+                    self.cfg.grpc_listen_addr.expect("managed listener checked"),
+                    Some(tls.clone()),
+                )
+                .map_err(|error| HostAgentError::Config(error.to_string()))?,
+            )
+        } else {
+            None
+        };
         tracing::info!(?self.cfg.work_dir, "host-agent starting");
         let _ = self.cloud.host_metadata().await;
 
@@ -372,7 +411,10 @@ impl HostAgent {
                 // (2026-07-13 incident: a survivor's evict capture ran
                 // 40+ minutes).
                 arc.rehydrate_chain_heads().await;
-                arc.reconcile_volumes().await;
+                let bindings =
+                    crate::bindings::BindingStore::open(self.cfg.work_dir.join("bindings"))
+                        .map_err(HostAgentError::Io)?;
+                arc.reconcile_volumes(&bindings).await;
                 arc
             };
             // ADR 0084 P1b: the capture-job executor + durable-record
@@ -688,6 +730,29 @@ impl HostAgent {
                 .expect("open binding store under work_dir (ADR 0073)");
             let harness_hub =
                 std::sync::Arc::new(crate::harness::HarnessHub::new(event_sink, bindings));
+            let managed_policy = if self.cfg.managed_tls.is_some() {
+                use engram_core::traits::Entropy;
+                let managed = crate::managed_policy::ManagedPolicyHost::new(
+                    host_id,
+                    engram_core::traits::OsEntropy.uuid().to_string(),
+                    harness_hub.binding_store(),
+                    pooled.clone(),
+                    self.egress.clone().expect("managed configuration checked"),
+                    managed_ownership
+                        .clone()
+                        .expect("managed ownership acquired"),
+                )?;
+                Some(Arc::new(managed))
+            } else {
+                None
+            };
+            if let Some(managed) = &managed_policy {
+                managed
+                    .recover_all()
+                    .await
+                    .map_err(|e| HostAgentError::Config(e.to_string()))?;
+            }
+
             // Plumb the hub into the FC/VZ backend's vsock-accept
             // sink so inbound harness connections land on the local
             // hub's adapter loop. Without this the FC backend drops
@@ -709,6 +774,9 @@ impl HostAgent {
             match harness_hub.persisted_egress_policies() {
                 Ok(policies) => pooled.rebuild_egress_from_policies(policies).await,
                 Err(e) => {
+                    if self.cfg.managed_tls.is_some() {
+                        return Err(HostAgentError::Io(e));
+                    }
                     tracing::warn!(error = %e, "list persisted egress policies failed");
                 }
             }
@@ -728,11 +796,19 @@ impl HostAgent {
                 // persisted policies. Not armed until here because the
                 // replay needs the pooled backend.
                 let hub_for_replay = harness_hub.clone();
+                let managed_for_replay = managed_policy.clone();
                 let pooled_for_replay = pooled.clone();
                 egress.spawn_supervisor(std::sync::Arc::new(move || {
                     let hub = hub_for_replay.clone();
+                    let managed = managed_for_replay.clone();
                     let pooled = pooled_for_replay.clone();
                     Box::pin(async move {
+                        if let Some(managed) = managed {
+                            if let Err(error) = managed.recover_all().await {
+                                tracing::error!(%error, "managed proxy recovery failed; admission remains closed");
+                                return;
+                            }
+                        }
                         match hub.persisted_egress_policies() {
                             Ok(policies) => pooled.rebuild_egress_from_policies(policies).await,
                             Err(e) => {
@@ -782,7 +858,7 @@ impl HostAgent {
                     });
                 },
             );
-            pooled.set_forge_sink(forge_sink);
+            pooled.set_forge_sink(forge_sink.clone());
 
             // ADR 0026 split-mode artifact forwarding. Like forge above,
             // the upload sink can't live on the host (needs the coord's
@@ -832,19 +908,49 @@ impl HostAgent {
             pooled.set_upload_sink(upload_sink);
             // ADR 0015 M5: warm-pool retired. LocalHostClient is just
             // the cold-create dispatch wrapper now.
-            let local_host: Arc<dyn engram_core::traits::HostClient> =
-                Arc::new(crate::host_client::LocalHostClient::new(
+            let mut local = crate::host_client::LocalHostClient::new(
+                pooled.clone(),
+                harness_hub.clone(),
+                self.cfg.idle_eviction_harness,
+            );
+            if let Some(managed) = managed_policy {
+                local = local.with_managed_policy(managed);
+            }
+            let mut managed_boot_host = None;
+            if self.cfg.managed_tls.is_some() {
+                use engram_core::traits::Entropy;
+                let backend = self.managed_backend.clone().ok_or_else(|| {
+                    HostAgentError::Config("managed backend is not installed".into())
+                })?;
+                let fill = self
+                    .fill
+                    .as_ref()
+                    .ok_or_else(|| {
+                        HostAgentError::Config("managed disk storage is not installed".into())
+                    })?
+                    .clone();
+                let boot = managed_boot::ManagedBootHost::new(
+                    managed_boot::ManagedBootHostConfig {
+                        host_id,
+                        incarnation: engram_core::traits::OsEntropy.uuid().to_string(),
+                        directory: self.cfg.work_dir.join("managed-boots"),
+                    },
+                    backend,
                     pooled.clone(),
+                    self.egress.clone().expect("managed egress checked"),
                     harness_hub.clone(),
-                    self.cfg.idle_eviction_harness,
-                ));
-            // ADR 0009 §2: populate `running_sandboxes` from
-            // `backend.list()` on each heartbeat tick. The coord
-            // intersects this against expected-active sessions to
-            // detect divergence (missing sandbox → flip session per
-            // §3). On `list()` error, ship an empty list — the
-            // 3-strike grace window (15s) absorbs transient errors
-            // without flipping live sessions.
+                    forge_sink,
+                    fill,
+                )
+                .map_err(|e| HostAgentError::Config(e.to_string()))?;
+                let boot = Arc::new(boot);
+                managed_boot_host = Some(boot.clone());
+                local = local.with_managed_boot(boot);
+            }
+            let tombstone_host = Arc::new(local);
+            let local_host: Arc<dyn engram_core::traits::HostClient> = tombstone_host.clone();
+            // The coordinator compares known inventory against active sessions.
+            // A failed read reports unknown inventory and cannot prove absence.
             // Seed capacity once at startup (/proc/meminfo on Linux,
             // hw.memsize on macOS). Used by the scheduler's fit check —
             // without this the coord sees `total_mib=0` and rejects
@@ -902,13 +1008,16 @@ impl HostAgent {
             // the `grpc_self_connect` probe, and a probe that runs before
             // the bind fails, which keeps the host out of placement until
             // the next heartbeat. The server starts serving it below.
-            let grpc_incoming = self.cfg.grpc_listen_addr.and_then(|addr| {
-                grpc_server::bind(addr)
-                    .inspect_err(|e| {
-                        tracing::error!(addr = %addr, error = %e, "gRPC listener bind failed");
-                    })
-                    .ok()
-            });
+            let host_server = match managed_server {
+                Some(server) => Some(server),
+                None => self.cfg.grpc_listen_addr.and_then(|addr| {
+                    grpc_server::PreparedHostServer::bind(addr, None)
+                        .inspect_err(|e| {
+                            tracing::error!(addr = %addr, error = %e, "gRPC listener bind failed");
+                        })
+                        .ok()
+                }),
+            };
             let mut registration_task: Option<tokio::task::JoinHandle<()>> = None;
             if let Some(advertise_addr) = self.cfg.grpc_advertise_addr.clone() {
                 // hostname: prefer the env-supplied value (set by
@@ -1027,7 +1136,7 @@ impl HostAgent {
             // via /api/hosts/register) to dispatch coord→host
             // RPCs. Required in production; mode=all leaves
             // `grpc_listen_addr=None`.
-            let grpc_task = grpc_incoming.map(|incoming| {
+            let grpc_task = host_server.map(|server| {
                 let local_for_grpc = local_host.clone();
                 let peer_for_grpc = peer_serve.clone();
                 // ADR 0079: the per-session fencing-epoch high-water,
@@ -1036,9 +1145,7 @@ impl HostAgent {
                     session_epochs::SessionEpochStore::open(self.cfg.work_dir.join("epochs"))
                         .expect("open session epoch store under work_dir (ADR 0079)");
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        grpc_server::serve(incoming, local_for_grpc, epochs, peer_for_grpc).await
-                    {
+                    if let Err(e) = server.serve(local_for_grpc, epochs, peer_for_grpc).await {
                         tracing::error!(error = %e, "gRPC server terminated with error");
                     }
                 })
@@ -1223,6 +1330,7 @@ impl HostAgent {
             // heartbeat/registration path anyway.)
             const HEARTBEAT_FAILURES_BEFORE_ESCALATION: u32 = 6; // ~30s at 5s cadence
             let mut consecutive_heartbeat_failures: u32 = 0;
+            let managed_list_host = local_host.clone();
             // The enabled-images channel starts empty, which is not an ack.
             // The first ack always notifies, even when the set is empty, so
             // the supervisors can tell "no images" from "not told yet".
@@ -1246,7 +1354,7 @@ impl HostAgent {
                     // coord skips reconcile for this heartbeat instead of
                     // mistaking the empty set for a real running set.
                     // Residents include running and tearing-down sandboxes.
-                    let (running_sandboxes, running_sandboxes_known) = match pooled_for_heartbeat
+                    let (running_sandboxes, running_sandboxes_known) = match managed_list_host
                         .list()
                         .await
                     {
@@ -1285,13 +1393,7 @@ impl HostAgent {
                         ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_PARKED_RSS_BYTES)
                             .set(mem.parked_rss_bytes as f64);
                     }
-                    // Issue #540: one RAM-ledger snapshot per tick — the
-                    // meminfo read, the guest-PSS running/parked split
-                    // above, and this ledger's own pending base-shm
-                    // charges. Both `UtilizationProbe::sample` (below) and
-                    // the idle-evictor's pressure gate (via the watch
-                    // channel) derive their numbers from THIS snapshot, so
-                    // the two can never disagree.
+                    // The heartbeat and RAM gauges use this same ledger snapshot.
                     let ram_snapshot = ram_ledger_for_heartbeat.sample(
                         base_shm_dir_for_heartbeat.as_deref(),
                         &guest_mem.unwrap_or_default(),
@@ -1542,9 +1644,9 @@ impl HostAgent {
                             // capture-assignment arm: its `None` case
                             // `continue`s the loop.
                             for &sandbox_id in &resp.tombstoned_sandboxes {
-                                let backend = pooled_for_heartbeat.clone();
+                                let host = tombstone_host.clone();
                                 tokio::spawn(async move {
-                                    match backend.destroy(sandbox_id).await {
+                                    match host.destroy_tombstoned(sandbox_id).await {
                                         Ok(()) => tracing::info!(
                                             %sandbox_id,
                                             "destroyed tombstoned sandbox (coordinator disowned it)",
@@ -1632,20 +1734,8 @@ impl HostAgent {
                 }
             });
 
-            // ADR 0073 phase 4: no host-side idle detection. The
-            // coordinator's PG-derived idle detector (idle_detector.rs)
-            // is the ONLY detection plane — same soft/hard TTL
-            // semantics, sourced from the durable event log instead of
-            // hub memory (which went amnesiac on every detach/restart;
-            // the reason the L3 backstop existed). The disk-pressure
-            // brake and pressure-aware gating moved with it, reading
-            // the heartbeat-persisted hosts.utilization.
-            // Issue #540 note: the RAM ledger still feeds the heartbeat's
-            // allocatable_mib (its watch channel is consumed by the
-            // heartbeat tick above); the deleted eviction tick was its
-            // OTHER consumer, and that pressure gate now lives in the
-            // coordinator's detector reading hosts.utilization — the
-            // same ledger numbers, one hop later.
+            // The coordinator's idle detector reads the durable event log.
+            // Its pressure gate reads host utilization from heartbeats.
 
             shutdown_signal().await;
             // Quiesce captures first. From here no capture may START —
@@ -1657,6 +1747,9 @@ impl HostAgent {
             // exact post-bitmap failure this quiesce exists to prevent.
             // In-flight captures are drained (bounded) below instead.
             pooled.quiesce_captures_for_shutdown();
+            if let Some(boot) = &managed_boot_host {
+                boot.shutdown().await;
+            }
             // ADR 0116 A-D2: declare the handoff BEFORE the heartbeat
             // task dies — the coordinator must learn "this exit is
             // planned; hold the lease" while our channel to it is still
@@ -1747,8 +1840,6 @@ fn stages_images_gate(has_chunk_store: bool, has_chunk_cache: bool) -> bool {
     has_chunk_store && has_chunk_cache
 }
 
-/// Await either SIGINT (ctrl-c) or SIGTERM (Kubernetes shutdown).
-/// On non-unix platforms, falls back to ctrl-c only.
 /// ADR 0116 A-D2: the SIGTERM ladder's handoff declaration. Writes the
 /// durable marker first (atomic tmp+rename+fsync in the bindings dir —
 /// the successor adopts and reports it), then makes ONE bounded (2 s)
@@ -1834,6 +1925,8 @@ fn adopt_handoff_marker(
     Some(marker)
 }
 
+/// Await either SIGINT (ctrl-c) or SIGTERM (Kubernetes shutdown).
+/// On non-unix platforms, falls back to ctrl-c only.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -1972,5 +2065,114 @@ mod tests {
         assert!(adopted.declared_at_unix_ms > 0);
         // Adoption is consume-once.
         assert!(adopt_handoff_marker(dir.path()).is_none());
+    }
+}
+
+pub mod managed_policy;
+
+pub mod managed_tls;
+
+mod managed_assets;
+pub mod managed_boot;
+
+#[cfg(test)]
+mod managed_startup_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct StartupBoundary(AtomicBool);
+    #[async_trait::async_trait]
+    impl CloudBackend for StartupBoundary {
+        async fn host_metadata(
+            &self,
+        ) -> Result<engram_core::types::host::HostMetadata, engram_core::BackendError> {
+            self.0.store(true, Ordering::SeqCst);
+            std::future::pending().await
+        }
+        async fn provision_host(
+            &self,
+            _: engram_core::types::host::HostSpec,
+        ) -> Result<engram_core::HostId, engram_core::BackendError> {
+            unreachable!()
+        }
+        async fn deprovision_host(
+            &self,
+            _: engram_core::HostId,
+        ) -> Result<(), engram_core::BackendError> {
+            unreachable!()
+        }
+    }
+
+    async fn rejects_before_startup(malformed: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let ca = engram_egress_proxy::Ca::load_or_generate(&temp.path().join("ca")).unwrap();
+        let certificate = temp.path().join("host.pem");
+        let key = temp.path().join("host.key");
+        std::fs::write(
+            &certificate,
+            if malformed {
+                "not a certificate"
+            } else {
+                &ca.cert_pem
+            },
+        )
+        .unwrap();
+        std::fs::write(&key, ca.key_pair.serialize_pem()).unwrap();
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = occupied.local_addr().unwrap();
+        // Malformed TLS must fail even with an available listener.
+        let occupied = if malformed {
+            drop(occupied);
+            None
+        } else {
+            Some(occupied)
+        };
+        let cloud = Arc::new(StartupBoundary(AtomicBool::new(false)));
+        let config = HostAgentConfig {
+            managed_tls: Some(managed_tls::ManagedHostTls {
+                certificate: certificate.clone(),
+                key,
+                client_ca: certificate,
+                coordinator_pins: std::collections::BTreeSet::from(["a".repeat(64)]),
+            }),
+            work_dir: temp.path().join("host"),
+            grpc_listen_addr: Some(addr),
+            grpc_advertise_addr: Some(format!("https://{addr}")),
+            coordinator_endpoint: Some("http://127.0.0.1:1".into()),
+            ..HostAgentConfig::default()
+        };
+        let agent = HostAgent::new(
+            config,
+            Arc::new(engram_sandbox_process::ProcessBackend::new(
+                temp.path().join("ordinary"),
+            )),
+            cloud.clone(),
+        )
+        .with_host_id("00000000-0000-0000-0000-000000000001".parse().unwrap())
+        .with_egress(Arc::new(egress::HostEgress::new(
+            Arc::new(proxyd_client::ProxydHandle::new(
+                temp.path().join("absent.sock"),
+            )),
+            ca.cert_pem,
+            None,
+        )));
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), agent.run()).await;
+        drop(occupied);
+        assert!(
+            outcome.is_ok_and(|result| result.is_err()),
+            "invalid managed listener must fail startup"
+        );
+        assert!(
+            !cloud.0.load(Ordering::SeqCst),
+            "failure must precede startup work and coordinator registration"
+        );
+    }
+    #[tokio::test]
+    async fn malformed_managed_tls_cannot_reach_registration() {
+        rejects_before_startup(true).await;
+    }
+    #[tokio::test]
+    async fn occupied_managed_listener_cannot_reach_registration() {
+        rejects_before_startup(false).await;
     }
 }

@@ -73,6 +73,7 @@ cp -p deploy/harness-claude/harness.toml "$out/harness-claude/harness.toml"
 codex_version="$(sed -n 's/^version=//p' deploy/harness-codex/fetch-codex.sh)"
 codex_stamp="$out/harness-codex/.engram-codex-version"
 if [[ ! -x "$out/harness-codex/codex" ]] \
+    || [[ ! -x "$out/harness-codex/codex-code-mode-host" ]] \
     || [[ ! -f "$codex_stamp" ]] \
     || [[ "$(<"$codex_stamp")" != "$codex_version-$host_arch" ]]; then
     # A missing or stale CLI needs stage.sh's schema check and therefore a

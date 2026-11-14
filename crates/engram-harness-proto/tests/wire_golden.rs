@@ -202,6 +202,12 @@ fn ev_run_completed() -> HarnessEvent {
         ok: true,
     }
 }
+fn ev_run_deferred() -> HarnessEvent {
+    HarnessEvent::RunDeferred {
+        run_id: "r1".into(),
+        deferred_tool_call_ids: vec!["t1".into()],
+    }
+}
 fn ev_run_continued() -> HarnessEvent {
     HarnessEvent::RunContinued {
         run_id: "r1".into(),
@@ -322,6 +328,14 @@ fn cmd_tool_result() -> HarnessCommand {
     }
 }
 
+fn ev_tool_call_cancel_requested() -> HarnessEvent {
+    HarnessEvent::ToolCallCancelRequested {
+        run_id: "run-1".into(),
+        call_id: "call-1".into(),
+        name: "remote_inventory".into(),
+    }
+}
+
 // ---- tests -------------------------------------------------------------
 
 #[test]
@@ -348,6 +362,17 @@ fn harness_frame_golden_and_variant_indices() {
 
 #[test]
 fn harness_event_golden_and_variant_indices() {
+    assert_golden("event_run_deferred", &ev_run_deferred());
+    assert_variant_index(&ev_run_deferred(), 22, "HarnessEvent::RunDeferred");
+    assert_golden(
+        "event_tool_call_cancel_requested",
+        &ev_tool_call_cancel_requested(),
+    );
+    assert_variant_index(
+        &ev_tool_call_cancel_requested(),
+        21,
+        "HarnessEvent::ToolCallCancelRequested",
+    );
     assert_golden("event_run_continued", &ev_run_continued());
     assert_variant_index(&ev_run_continued(), 20, "HarnessEvent::RunContinued");
     assert_golden("event_run_started", &ev_run_started());
@@ -633,7 +658,12 @@ fn regen_golden() {
     );
     write("frame_event_ack", &HarnessFrame::EventAck { seq: 42 });
 
+    write(
+        "event_tool_call_cancel_requested",
+        &ev_tool_call_cancel_requested(),
+    );
     write("event_run_continued", &ev_run_continued());
+    write("event_run_deferred", &ev_run_deferred());
     write("event_run_started", &ev_run_started());
     write("event_agent_message", &ev_agent_message());
     write("event_tool_call_started", &ev_tool_call_started());

@@ -132,3 +132,68 @@ pub struct ArtifactRow {
     pub file_name: Option<String>,
     pub created_at: DateTime<Utc>,
 }
+
+/// Sequenced managed event authority supplied by the authenticated harness route.
+/// The replay key is derived from these fields; it is never parsed for authority.
+#[derive(Clone, Debug)]
+pub struct ManagedHarnessEvent {
+    pub target: super::managed_deny::ManagedPolicyTarget,
+    pub incarnation: u64,
+    pub seq: u64,
+    pub kind: String,
+    pub payload: serde_json::Value,
+    pub ack_id: Option<String>,
+}
+impl ManagedHarnessEvent {
+    pub fn key(&self) -> String {
+        format!(
+            "harness:{}:{}:{}",
+            self.target.binding_epoch, self.incarnation, self.seq
+        )
+    }
+    /// Ingestion assigns `at` anew on replay. All guest fields must still match.
+    pub fn matches_replay(&self, kind: &str, payload: &serde_json::Value) -> bool {
+        let mut stored = payload.clone();
+        let mut incoming = self.payload.clone();
+        for value in [&mut stored, &mut incoming] {
+            if let Some(object) = value.as_object_mut() {
+                object.remove("at");
+                object.remove("idempotency_key");
+            }
+        }
+        self.kind == kind && stored == incoming
+    }
+    pub fn validate(&self) -> Result<(), crate::MetaError> {
+        if self.target.binding_epoch == 0
+            || self.target.binding_epoch > 9_007_199_254_740_991
+            || !self.payload.is_object()
+            || self.payload.get("idempotency_key").is_some()
+        {
+            return Err(crate::MetaError::Conflict("invalid managed event".into()));
+        }
+        let expected = match self.kind.as_str() {
+            "run_started" | "prompt_steered" | "prompt_dequeued" => self
+                .payload
+                .get("prompt_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            "tool_call_completed" => self
+                .payload
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .map(|call| super::outbox::tool_result_outbox_id(self.target.session_id, call)),
+            _ => None,
+        };
+        if self.ack_id != expected {
+            return Err(crate::MetaError::Conflict(
+                "managed event acknowledgement mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedHarnessEventAccepted {
+    pub idx: Option<i64>,
+    pub outbox_acked: bool,
+}

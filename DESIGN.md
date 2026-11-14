@@ -134,7 +134,7 @@ Snapshot store has **two tiers** (ADR 0005). **Hot tier** lives on each host's l
   - `engram-sandbox-firecracker` — Linux + KVM. Production. Firecracker's HTTP-over-Unix-socket API + UFFD-backed memory restore.
   - `engram-sandbox-vz` — macOS Apple Silicon. Apple Virtualization.framework via `objc2-virtualization` bindings. APFS clone-based snapshots. Mac dev with real microVM isolation. (ADR 0003.)
   - `engram-sandbox-process` — anywhere. Subprocesses, no isolation. Fastest iteration loop for orchestration-layer work.
-- Maintains the chunked-OCI image cache + tiered chunk resolver (host-side `PooledBackend` wrapper, agnostic of which `SandboxBackend` is wrapped), `HarnessHub` TCP listener for in-VM harness adapters dialing back. Heartbeats `(capacity, utilization, draining)` to the coordinator.
+- Maintains the image cache, chunk store, and fill engine (host-side `PooledBackend` wrapper, agnostic of which `SandboxBackend` is wrapped), `HarnessHub` TCP listener for in-VM harness adapters dialing back. Heartbeats `(capacity, utilization, draining)` to the coordinator.
 - **`engram-agentd`**: in-VM exec daemon + harness supervisor (PID 1 after the init shim). Length-prefixed bincode over the configured transport. Verbs: `Exec` (streaming), `Stat`, `Upload`, `Download`, `StartShell`, `Ping`, `Shutdown`, `SpawnHarness`. First-frame token handshake (server side) gates non-trivial verbs. Owns the harness child process; each `SpawnHarness` kills the previous child and exec's a fresh one — clean re-spawn point on resume. On startup, dials the host's per-sandbox ready UDS so the host can block on `accept()` rather than poll for "is the in-VM listener bound."
 - **`engram-transport`**: backend-agnostic transport trait. `VsockTransport` (FC) and `ConsoleTransport` (VZ); chosen at runtime via `ENGRAM_TRANSPORT` set by the stage-1 init shim (injected by the materializer, ADR 0080).
 - **`engram-rootfs-materializer`**: host-side OCI→rootfs materializer (ADR 0080). Pulls a standard OCI/Docker image, applies whiteout-aware layer semantics to an in-memory namespace, declares the stage-1 `/sbin/engram-init` shim (the only engrams-owned file baked in), seals a deterministic pure-Rust ext4 layout (`mkext4`, ADR 0093), and streams the fill directly into chunked `BlobStorage` — no tree, no image file. Driven by the `MaterializeImage` host RPC at enable/rebase time — agentd, the harness, and ttyd are *not* injected; they ride host-staged bundle slots.
@@ -184,8 +184,8 @@ Git is **not** in this table. Agents that want their work to land in a remote do
 ### Host agent (`engram-host-agent`)
 
 **Responsibilities:**
-- Host-side `PooledBackend` wrapper composes the image cache, the chunk store, egress proxy, and the session-disk pool (see [Session disk](#session-disk)) onto any `SandboxBackend` (FC / VZ / process). Each session-create resolves the image's rootfs through the chunk store before delegating to the underlying backend. A chunk comes from the local NVMe cache, a peer host, or the object store; the host's fill engine (`engram-fill`) admits and schedules the object-store fetches. The OCI registry is not a chunk tier: no session read goes to it. The `PooledBackend` is what the host-agent's `LocalHostClient` wraps as its `SandboxBackend` inner; `LocalHostClient` itself adds harness routing (`bind_session`/`unbind_session`/`send_prompt`) by referencing a shared `HarnessHub` (ADR 0011).
-- Drive sandbox lifecycle through `SandboxBackend` (`create`/`destroy`/`exec_stream`/`snapshot`/`restore`/`start_agent`/`set_harness_sink`); harness routing through `HarnessHub` (`bind_session`/`unbind_session`/`send_prompt`/`accept_via_session_lookup`). The hub's `EventSink` ships every per-session event over the WS as `NotifyKind::HarnessEvent`; the coord's read loop re-emits those into its in-proc hub so SSE subscribers see the same stream as mode=all.
+- Host-side `PooledBackend` wrapper composes the image cache, the chunk store, egress proxy, and the session-disk pool (see [Session disk](#session-disk)) onto any `SandboxBackend` (FC / VZ / process). Each ordinary session-create resolves the image's rootfs through the chunk store before delegating to the underlying backend. A chunk comes from the local NVMe cache, a peer host, or the object store; the host's fill engine (`engram-fill`) admits and schedules the object-store fetches. The OCI registry is not a chunk tier: no session read goes to it. The `PooledBackend` is what the host-agent's `LocalHostClient` wraps as its `SandboxBackend` inner; `LocalHostClient` itself adds harness routing (`bind_session`/`unbind_session`/`send_prompt`) by referencing a shared `HarnessHub` (ADR 0011).
+- Drive ordinary sandbox lifecycle through `SandboxBackend` (`create`/`destroy`/`exec_stream`/`snapshot`/`restore`/`start_agent`/`set_harness_sink`); harness routing through `HarnessHub` (`bind_session`/`unbind_session`/`send_prompt`/`accept_via_session_lookup`). The hub's `EventSink` ships every per-session event over the WS as `NotifyKind::HarnessEvent`; the coord's read loop re-emits those into its in-proc hub so SSE subscribers see the same stream as mode=all.
 - Run snapshot manager (host-local; see below).
 - Run the `HarnessHub` TCP listener: in-VM harness adapters dial back via `engram-transport` (vsock or virtio-console) → host-side TCP forwarding → `session_events` ingestion.
 - Enforce per-VM resource limits via the production backend (Firecracker enforces RAM/CPU/disk at the VMM boundary; the dev backend ignores them with a documented caveat).
@@ -203,10 +203,12 @@ Git is **not** in this table. Agents that want their work to land in a remote do
 A session's disk is a volume the kernel owns. On Linux it is a thin volume in a
 device-mapper pool that node-prep builds (`thinPool` in the host-fleet chart; a Firecracker
 host agent refuses to start without one); on macOS
-it is a sparse file under the work dir. Both sit behind `engram_host_core::SessionDisk`
-and the two flows in `engram_host_core::disk_flows`: `stage` turns a chunk-store manifest
-into a volume, and `checkpoint` turns a volume into a manifest. The guard for each fact is
-the test named beside it.
+it is a sparse file under the work dir. Ordinary FC and VZ sessions use
+`engram_host_core::SessionDisk` and the two flows in `engram_host_core::disk_flows`:
+`stage` turns a chunk-store manifest into a volume, and `checkpoint` turns a volume
+into a manifest. The facts below describe ordinary session lifecycles and shared pool
+behavior. Managed external-MCP sessions have the narrower lifecycle described after
+these facts. The guard for each fact is the test named beside it.
 
 - No userspace process is in the data path. The host agent holds a volume only while it
   stages or checkpoints it; a volume outlives every handle to it and reopens by name
@@ -341,7 +343,43 @@ the test named beside it.
 
 ADR 0125 records the decision and what it replaced.
 
+**Managed external-MCP sessions:** Managed Firecracker uses the same production
+`SessionDisk` instance, but imports the exact verified cold disk into a new root
+volume and attaches its block device. Capture stops and reaps the VM before it
+exports a transient volume snapshot. The host durably records the exported file's
+hash and size before it can release the source
+(`exported_capture_keeps_source_until_host_records_its_hash_and_size`).
+
+Both managed backends permit only explicit disk-only cold recovery with the exact
+stored capture authority. They do not restore saved memory or device state, or
+replay pending external effects. Ordinary checkpoint, eviction, resume, and migration
+paths remain closed. A missing managed owner fails closed; a host restart does not
+adopt that owner. Durable markers protect managed FC volumes from the ordinary
+startup sweep (`startup_keeps_managed_volumes_and_sweeps_unowned_volumes`). Failed
+or uncertain capture retains its source; an authorized normal FC destroy releases
+its volumes only after owner cleanup succeeds
+(`started_normal_destroy_releases_disks_but_uncertain_capture_does_not`).
+
+An incompatible-upgrade drain stops before deployment changes if it cannot
+checkpoint or evict a managed session. An unchanged reattach generation and wire
+version checks do not establish managed-session upgrade or adoption support.
+External MCP remains disabled pending its upgrade, recovery, and rollback gates,
+source-matched Firecracker and VZ qualification, current-head CI, and final
+acceptance review. A manual Firecracker matrix passed all 24 cases at
+`c5dc8e7b`, with verified cleanup. That result and the earlier VZ result at
+`b75b0d7f` qualify only their recorded source, not the later upstream integration.
+Ordinary coordinator/host traffic uses the version-38 policy contract. Its wire
+conversion refuses managed deny data. Dedicated managed RPCs additionally require
+the exact managed protocol-43 marker and pinned mTLS; neither the ordinary
+version nor that marker supplies authority. The ordinary mixed-release path
+keeps its existing transport with managed creation disabled. A TLS-only managed
+listener cutover and managed-session rollback require separate qualification.
+Proxy replacement can preserve a VM while closing its active proxy streams.
+VZ parity is a separate gate. ADR 0127 records these limits.
+
 ### Snapshot manager (lives inside host agent)
+
+The snapshot and eviction flows in this section apply to ordinary sessions.
 
 **Two tiers (ADR 0005)**: hot tier on local NVMe for same-host fast resume, cold tier in `BlobStorage` for cross-host durability. ADR 0001 retired the cold tier; ADR 0005 reintroduced it once the premise shifted from "30-second-preemption replication" (infeasible math) to "minutes-budget disk-pressure flush" (trivial math).
 
@@ -370,7 +408,7 @@ ADR 0125 records the decision and what it replaced.
 
 ADR 0080 retired the `engram-image-builder` bake path: a session image is now a plain `docker build && docker push` of a standard OCI image, and the OCI→rootfs conversion moved host-side, off the per-session path.
 
-- Runs at **enable/rebase time** as the `MaterializeImage` host RPC (a sibling of `build_base_snapshot`), never per-session — so per-session latency is zero.
+- Runs at **enable/rebase time** as the `MaterializeImage` host RPC, outside the per-session path.
 - Pulls the standard OCI/Docker image (platform by host arch), whiteout-aware-flattens the layers (xattrs / hardlinks / setuid / ownership, `FollowSymlinkInScope` semantics), extracts the OCI config blob → `OciRuntimeDefaults` (Dockerfile `ENV`/`WORKDIR`), declares the stage-1 `/sbin/engram-init` shim, seals a deterministic pure-Rust ext4 layout (`mkext4`, ADR 0093), and stream-fills the result into the host chunk store / `BlobStorage`.
 - Host safeguards keep host disk bounded: ADR 0078 disk-veto host pick, a ~2.5× image-size scratch budget integrated with chunk-cache accounting, scrub on all exit paths, an enable-time image-size cap, and ≤1 concurrent materialize per host.
 - The only engrams-owned file it bakes into the rootfs is the init shim; agentd, the harness, and ttyd ride host-staged bundle slots and are swapped in per-session (zero image re-bakes when they change).
@@ -849,7 +887,7 @@ A small set of Dockerfile concepts don't translate cleanly to a microVM rootfs, 
 
 ### Materialization (`engram-rootfs-materializer` + `MaterializeImage`)
 
-There is no bake step and no `engram-image-builder` (ADR 0080). The OCI→rootfs conversion runs **host-side, at enable/rebase time** as the server-streaming `MaterializeImage` host RPC (a sibling of `build_base_snapshot`), off the per-session path:
+The OCI→rootfs conversion runs **host-side, at enable/rebase time** as the server-streaming `MaterializeImage` host RPC, outside the per-session path:
 
 1. **Pull** the standard OCI/Docker image, platform-selected by host arch.
 2. **Flatten** the layers, whiteout-aware (`.wh.` / opaque dirs, xattrs / hardlinks / setuid, ownership; `FollowSymlinkInScope` symlink resolution).

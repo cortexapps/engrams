@@ -30,6 +30,7 @@ use crate::grpc_client::GrpcHostClient;
 /// coordinator; each coord pod gets its own.
 pub struct GrpcHostPool {
     entries: DashMap<HostId, PooledHost>,
+    tls: Option<crate::host_tls::HostClientTls>,
     /// HTTP/2 keepalive interval. Default 15s — short enough that
     /// idle connections stay healthy through L4-LB / NAT timeouts,
     /// long enough that the chatter is invisible in production.
@@ -60,10 +61,16 @@ impl GrpcHostPool {
     pub fn new() -> Self {
         Self {
             entries: DashMap::new(),
+            tls: None,
             keepalive_interval: Duration::from_secs(15),
             keepalive_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(2),
         }
+    }
+
+    pub fn with_tls(mut self, tls: crate::host_tls::HostClientTls) -> Self {
+        self.tls = Some(tls);
+        self
     }
 
     /// Idempotent warm-up: ensure a `Channel` exists for `host_id` at
@@ -72,9 +79,9 @@ impl GrpcHostPool {
     /// handler, coordinator startup, and the host registry's read-through
     /// of the `hosts` row.
     ///
-    /// `host_addr` example: `http://10.10.0.42:9101`. Plain HTTP/2
-    /// (h2c) — TLS off, bearer-token auth happens per-RPC via tonic
-    /// interceptors that the call sites attach.
+    /// Managed mode requires the configured HTTPS endpoint, CA, server name,
+    /// leaf pins, and client identity. Ordinary development can use HTTP/2
+    /// without TLS. An HTTPS address never falls back to plaintext.
     pub async fn warm(&self, host_id: HostId, host_addr: String) -> Result<(), SandboxError> {
         // If we already have an entry for this addr, leave it alone.
         // If the addr changed (host re-registered with a fresh IP
@@ -96,11 +103,15 @@ impl GrpcHostPool {
             self.keepalive_interval,
             self.keepalive_timeout,
         )?;
-        // `connect_lazy` returns immediately; the first RPC pays the
-        // TCP+H2 handshake. We follow up with `ping` below to force
-        // the handshake before the first real RPC.
-        let channel = endpoint.connect_lazy();
-        let client = GrpcHostClient::new(channel);
+        let client = match &self.tls {
+            Some(tls) => GrpcHostClient::with_pinned_tls(host_id, &host_addr, endpoint, tls)?,
+            None if host_addr.starts_with("https://") => {
+                return Err(SandboxError::InvalidSpec(
+                    "host TLS identity is not configured".into(),
+                ));
+            }
+            None => GrpcHostClient::new(endpoint.connect_lazy()),
+        };
 
         self.entries.insert(
             host_id,
