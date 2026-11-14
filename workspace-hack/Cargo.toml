@@ -206,7 +206,7 @@ libc = { version = "0.2", features = ["extra_traits", "use_std"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 nom = { version = "7" }
-prettyplease = { version = "0.2", default-features = false, features = ["verbatim"] }
+prettyplease = { version = "0.3", default-features = false, features = ["verbatim"] }
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
 rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "stdio", "termios", "time"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
@@ -235,7 +235,7 @@ libc = { version = "0.2", features = ["extra_traits", "use_std"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 nom = { version = "7" }
-prettyplease = { version = "0.2", default-features = false, features = ["verbatim"] }
+prettyplease = { version = "0.3", default-features = false, features = ["verbatim"] }
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
 rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "stdio", "termios", "time"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
