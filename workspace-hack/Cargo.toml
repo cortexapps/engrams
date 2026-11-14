@@ -198,7 +198,7 @@ tower = { version = "0.5", default-features = false, features = ["timeout"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 
 [target.x86_64-unknown-linux-gnu.build-dependencies]
-bindgen = { version = "0.69" }
+bindgen = { version = "0.73" }
 concurrent-queue = { version = "2" }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
@@ -227,7 +227,7 @@ tower = { version = "0.5", default-features = false, features = ["timeout"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 
 [target.x86_64-unknown-linux-musl.build-dependencies]
-bindgen = { version = "0.69" }
+bindgen = { version = "0.73" }
 concurrent-queue = { version = "2" }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
