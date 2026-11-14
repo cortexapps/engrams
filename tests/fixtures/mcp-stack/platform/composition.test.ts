@@ -1,0 +1,4479 @@
+import { poolFixture } from "./fc-thin-fixture.ts";
+import { test, expect, spyOn } from "bun:test";
+import {
+  mkdtemp,
+  mkdir,
+  chmod,
+  writeFile,
+  readFile,
+  realpath,
+  stat,
+  rm,
+} from "node:fs/promises";
+import { createServer } from "node:net";
+import { join } from "node:path";
+import { Engine } from "./engine.ts";
+import { hash, PlatformFailure, put, type Pin } from "./owned.ts";
+import { BINARIES, IMAGES, parseInputs, type Inputs } from "./preflight.ts";
+
+test("engine operations pin socket/config and exclude parent credentials", async () => {
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/engine-"),
+  );
+  const config = join(root, "config");
+  await mkdir(config, { mode: 0o700 });
+  const socket = join(root, "engine.sock");
+  const server = createServer();
+  await new Promise<void>((r) => server.listen(socket, r));
+  const script = join(root, "docker");
+  const output = join(root, "args.json");
+  await writeFile(
+    script,
+    `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} -e 'require("fs").writeFileSync(${JSON.stringify(output)},JSON.stringify({args:process.argv.slice(1),env:process.env}));process.stdout.write(JSON.stringify({ID:"engine-identity-123"}))' -- "$@"\n`,
+    { mode: 0o700 },
+  );
+  const inputs = {
+    engineSocket: socket,
+    engineConfig: config,
+    engineId: "engine-identity-123",
+    binaries: {
+      docker: { path: script, sha256: hash(await readFile(script)) },
+    },
+  } as Inputs;
+  const old = process.env.AWS_SECRET_ACCESS_KEY;
+  process.env.AWS_SECRET_ACCESS_KEY = "forbidden-parent-value";
+  try {
+    const engine = new Engine(inputs, root, "mcp-123456789012345678901234");
+    await engine.call(["info", "--format", "{{json .}}"]);
+    const got = JSON.parse(await readFile(output, "utf8"));
+    expect(got.args).toEqual([
+      "--config",
+      config,
+      "--host",
+      `unix://${socket}`,
+      "info",
+      "--format",
+      "{{json .}}",
+    ]);
+    expect(got.env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+    expect(got.env.HOME).toBeUndefined();
+    expect(got.env.DOCKER_HOST).toBeUndefined();
+    await writeFile(join(config, "config.json"), "{}");
+    await expect(engine.call(["info"])).rejects.toThrow(
+      "engine_config_not_empty",
+    );
+  } finally {
+    if (old === undefined) delete process.env.AWS_SECRET_ACCESS_KEY;
+    else process.env.AWS_SECRET_ACCESS_KEY = old;
+    await new Promise<void>((r) => server.close(() => r()));
+    await rm(root, { recursive: true });
+  }
+});
+
+test("private cleanup logs capture stderr with shared bounds and owned cancellation", async () => {
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/private-logs-"),
+  );
+  const config = join(root, "config");
+  await mkdir(config, { mode: 0o700 });
+  const socket = join(root, "engine.sock");
+  const server = createServer();
+  await new Promise<void>((resolve) => server.listen(socket, resolve));
+  const script = join(root, "docker"),
+    started = join(root, "started"),
+    descendant = join(root, "descendant");
+  await writeFile(
+    script,
+    `#!${Bun.which("node")}
+const fs = require("node:fs");
+const args = process.argv.slice(2 + 4);
+const mode = args[0] === "fail" ? "d" : args[0] === "logs" ? args[3]?.[0] : "a";
+if (mode !== "e") fs.writeFileSync(${JSON.stringify(started)}, String(process.pid));
+if (mode === "b") {
+  process.stderr.write(Buffer.alloc(4 * 1024 * 1024 + 1, 120));
+} else if (mode === "c") {
+  process.stdout.write(Buffer.alloc(2 * 1024 * 1024 + 1, 120));
+  process.stderr.write(Buffer.alloc(2 * 1024 * 1024, 120));
+} else if (mode === "e") {
+  const child = require("node:child_process").spawn("/bin/sleep", ["30"]);
+  fs.writeFileSync(${JSON.stringify(descendant)}, String(child.pid));
+  process.on("SIGTERM", () => child.kill("SIGTERM"));
+  child.on("exit", () => process.exit(0));
+  process.stderr.write("private-stderr-marker");
+  setInterval(() => process.stderr.write("private-stderr-marker"), 10);
+} else {
+  process.stdout.write("private-stdout-marker");
+  process.stderr.write("private-stderr-marker");
+  if (mode === "d") process.exitCode = 1;
+}
+if (mode === "e") fs.writeFileSync(${JSON.stringify(started)}, String(process.pid));
+`,
+    { mode: 0o700 },
+  );
+  const inputs = {
+    engineSocket: socket,
+    engineConfig: config,
+    binaries: {
+      docker: { path: script, sha256: hash(await readFile(script)) },
+    },
+  } as Inputs;
+  const controller = new AbortController();
+  try {
+    const engine = new Engine(inputs, root, "mcp-123456789012345678901234");
+    const logs = (mode: string) => ["logs", "--tail", "10000", mode.repeat(64)];
+    const bytes = await engine.call(logs("a"));
+    const artifact = join(root, "retained-probe.log");
+    await put(artifact, bytes);
+    const retained = await readFile(artifact, "utf8");
+    expect(retained).toContain("private-stdout-marker");
+    expect(retained).toContain("private-stderr-marker");
+    expect((await stat(artifact)).mode & 0o777).toBe(0o600);
+    for (const args of [
+      ["info"],
+      ["exec", "a".repeat(64), "probe"],
+      ["logs", "--tail", "10000", "A".repeat(64)],
+      ["logs", "--tail", "9999", "a".repeat(64)],
+      [...logs("a"), "extra"],
+    ])
+      expect((await engine.call(args)).toString()).toBe(
+        "private-stdout-marker",
+      );
+    for (const args of [logs("b"), logs("c"), logs("d"), ["fail"], logs("e")]) {
+      await expect(
+        engine.call(args, undefined, args[3]?.[0] === "e" ? 500 : 2000),
+      ).rejects.toThrow(/^INVALID_CONTEXT:engine_command$/);
+      const pid = Number(await readFile(started, "utf8"));
+      expect(() => process.kill(pid, 0)).toThrow();
+      expect(() => process.kill(-pid, 0)).toThrow();
+    }
+    const deadlineChild = Number(await readFile(descendant, "utf8"));
+    expect(() => process.kill(deadlineChild, 0)).toThrow();
+    await rm(started);
+    const running = engine.controlled(controller.signal, () =>
+      engine.call(logs("e"), undefined, 30000),
+    );
+    const outcome = running.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    const deadline = performance.now() + 2000;
+    while (!(await readFile(started).catch(() => undefined))) {
+      if (performance.now() >= deadline)
+        throw new Error("controlled child did not start");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const pid = Number(await readFile(started, "utf8"));
+    controller.abort();
+    const error = await outcome;
+    expect(error).toBeInstanceOf(PlatformFailure);
+    expect(String(error)).toBe("Error: INVALID_CONTEXT:engine_command");
+    expect(String(error)).not.toContain("private-stderr-marker");
+    expect(() => process.kill(pid, 0)).toThrow();
+    expect(() => process.kill(-pid, 0)).toThrow();
+    const childPid = Number(await readFile(descendant, "utf8"));
+    expect(() => process.kill(childPid, 0)).toThrow();
+    await expect(
+      engine.controlled(new AbortController().signal, () =>
+        engine.call(logs("a")),
+      ),
+    ).resolves.toHaveLength(bytes.length);
+  } finally {
+    controller.abort();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(root, { recursive: true });
+  }
+});
+
+test("guest manifest identity is mandatory and cannot alias the config id by omission", async () => {
+  const { parseInputs, BINARIES, IMAGES } = await import("./preflight.ts");
+  const pin = { path: "/owned/binary", sha256: "a".repeat(64) };
+  const value = {
+    version: 1,
+    backend: "vz",
+    proxy: pin,
+    nativeProbe: pin,
+    architecture: "arm64",
+    sourceCommit: "b".repeat(40),
+    engineSocket: "/owned/socket",
+    engineConfig: "/owned/config",
+    engineId: "engine-identity-123",
+    registryPort: 32000,
+    subnet: "10.42.3.0/24",
+    nativeHostIp: "10.42.4.1",
+    binaries: Object.fromEntries(BINARIES.map((k) => [k, pin])),
+    images: Object.fromEntries(
+      IMAGES.map((k) => [
+        k,
+        {
+          archive: pin,
+          id: `sha256:${"c".repeat(64)}`,
+          manifestDigest: `sha256:${"d".repeat(64)}`,
+        },
+      ]),
+    ),
+  };
+  expect(parseInputs(value, "vz").images.guest.manifestDigest).toBe(
+    `sha256:${"d".repeat(64)}`,
+  );
+  expect(() =>
+    parseInputs(
+      {
+        ...value,
+        images: {
+          ...value.images,
+          guest: { archive: pin, id: `sha256:${"c".repeat(64)}` },
+        },
+      },
+      "vz",
+    ),
+  ).toThrow();
+  expect(() =>
+    parseInputs(
+      { ...value, images: { ...value.images, hostAgent: value.images.guest } },
+      "vz",
+    ),
+  ).toThrow();
+});
+
+test("native ownership rejects foreign executables, UID and incomplete birth identity", async () => {
+  const { parseNativeIdentities } = await import("./launch.ts");
+  const base = {
+    pid: 1234,
+    uid: process.getuid!(),
+    parent: 12,
+    group: 12,
+    seconds: "1730000000",
+    microseconds: "123456",
+    executable: "/owned/run/assets/hostAgent",
+  };
+  expect(parseNativeIdentities([base], "/owned/run")[0]?.microseconds).toBe(
+    "123456",
+  );
+  for (const change of [
+    { uid: base.uid + 1 },
+    { microseconds: "1000000" },
+    { seconds: 1730000000 },
+    { executable: "/foreign/hostAgent" },
+    { executable: "/owned/run/host/../../foreign/netstack" },
+    { pid: [1234] },
+  ])
+    expect(() =>
+      parseNativeIdentities([{ ...base, ...change }], "/owned/run"),
+    ).toThrow();
+});
+
+// Replace the native inventory and signal boundaries. No host or VM is started.
+async function nativeCleanupFixture() {
+  const { Stack, parseNativeIdentities } = await import("./launch.ts");
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/native-cleanup-"),
+  );
+  const stack = new Stack(
+    { backend: "vz" } as Inputs,
+    root,
+    {} as ConstructorParameters<typeof Stack>[2],
+    {
+      binaries: { hostAgent: { path: join(root, "assets/hostAgent") } },
+    } as ConstructorParameters<typeof Stack>[3],
+    {} as ConstructorParameters<typeof Stack>[4],
+    {} as ConstructorParameters<typeof Stack>[5],
+  );
+  const leader = {
+    pid: 41001,
+    uid: process.getuid!(),
+    parent: 1,
+    group: 41001,
+    seconds: "1730000000",
+    microseconds: "123456",
+    executable: join(root, "assets/hostAgent"),
+  };
+  let identities = [
+    leader,
+    { ...leader, pid: 41002, executable: join(root, "assets/proxy") },
+  ];
+  let alive = true;
+  let finish!: () => void;
+  const events: string[] = [];
+  const done = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  const complete = () => {
+    alive = false;
+    identities = identities.filter((p) => p.pid !== leader.pid);
+    events.push("host-complete");
+    finish();
+  };
+  Reflect.set(stack, "host", {
+    child: { pid: leader.pid },
+    running: () => alive,
+    done,
+    stop: () => {
+      throw new Error("group stop must not run");
+    },
+  });
+  Reflect.set(stack, "nativeIdentities", new Map([[leader.pid, leader]]));
+  let scan = () => identities;
+  Reflect.set(stack, "nativeProcesses", async () =>
+    parseNativeIdentities(scan(), root),
+  );
+  const actualKill = process.kill.bind(process);
+  const kill = spyOn(process, "kill").mockImplementation((pid, signal) => {
+    if (pid < 0) return actualKill(pid, signal);
+    expect(pid).toBeGreaterThan(1);
+    events.push(`${pid}:${signal}`);
+    if (pid === leader.pid) complete();
+    else identities = identities.filter((p) => p.pid !== pid);
+    return true;
+  });
+  return {
+    stack,
+    leader,
+    events,
+    complete,
+    alive: () => alive,
+    identities: () => identities,
+    setIdentities: (next: typeof identities) => {
+      identities = next;
+    },
+    setScan: (next: typeof scan) => {
+      scan = next;
+    },
+    kill,
+    close: async () => {
+      kill.mockRestore();
+      await rm(root, { recursive: true });
+    },
+  };
+}
+
+test("native cleanup waits for host completion before scanning and signaling replacement proxies", async () => {
+  const fixture = await nativeCleanupFixture();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  fixture.kill.mockImplementation((pid, signal) => {
+    fixture.events.push(`${pid}:${signal}`);
+    if (pid === fixture.leader.pid) {
+      // The supervisor replaces its proxy while the leader still exits.
+      fixture.setIdentities([
+        fixture.leader,
+        {
+          ...fixture.identities()[1]!,
+          pid: 41003,
+        },
+      ]);
+      timer = setTimeout(fixture.complete, 5);
+    } else {
+      fixture.events.push(
+        fixture.alive() ? "proxy-before-completion" : "proxy-after-completion",
+      );
+      fixture.setIdentities(fixture.identities().filter((p) => p.pid !== pid));
+    }
+    return true;
+  });
+  try {
+    await fixture.stack.cleanupHost();
+    expect(fixture.events).toEqual([
+      "41001:SIGTERM",
+      "host-complete",
+      "41003:SIGTERM",
+      "proxy-after-completion",
+    ]);
+    expect(fixture.identities()).toEqual([]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    await fixture.close();
+  }
+});
+
+test("native cleanup refuses a host inventory without its retained handle", async () => {
+  const fixture = await nativeCleanupFixture();
+  Reflect.set(fixture.stack, "host", undefined);
+  try {
+    await expect(fixture.stack.cleanupHost()).rejects.toThrow(
+      "native_host_handle_missing",
+    );
+    expect(fixture.events).toEqual([]);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("native cleanup does not adopt a reused PID after an uncaptured host exits", async () => {
+  const fixture = await nativeCleanupFixture();
+  fixture.complete();
+  fixture.events.length = 0;
+  Reflect.set(fixture.stack, "nativeIdentities", new Map());
+  fixture.setIdentities([
+    { ...fixture.leader, seconds: "1730000001" },
+    fixture.identities()[0]!,
+  ]);
+  try {
+    await expect(fixture.stack.cleanupHost()).rejects.toThrow(
+      "native_host_survivor",
+    );
+    expect(fixture.events).toEqual([]);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("native cleanup removes remaining proxies when no host exists", async () => {
+  const fixture = await nativeCleanupFixture();
+  Reflect.set(fixture.stack, "host", undefined);
+  fixture.setIdentities(
+    fixture.identities().filter((p) => p.pid !== fixture.leader.pid),
+  );
+  try {
+    await fixture.stack.cleanupHost();
+    expect(fixture.events).toEqual(["41002:SIGTERM"]);
+    expect(fixture.identities()).toEqual([]);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("native cleanup kills a TERM-resistant host before signaling its proxy", async () => {
+  const fixture = await nativeCleanupFixture();
+  fixture.kill.mockImplementation((pid, signal) => {
+    fixture.events.push(`${pid}:${signal}`);
+    if (pid === fixture.leader.pid) {
+      if (signal === "SIGKILL") fixture.complete();
+    } else {
+      fixture.events.push(
+        fixture.alive() ? "proxy-before-completion" : "proxy-after-completion",
+      );
+      fixture.setIdentities(fixture.identities().filter((p) => p.pid !== pid));
+    }
+    return true;
+  });
+  try {
+    await fixture.stack.cleanupHost();
+    expect(fixture.events).toEqual([
+      "41001:SIGTERM",
+      "41001:SIGKILL",
+      "host-complete",
+      "41002:SIGTERM",
+      "proxy-after-completion",
+    ]);
+  } finally {
+    await fixture.close();
+  }
+});
+
+for (const change of [
+  { seconds: "1730000001" },
+  { executable: "/foreign/hostAgent" },
+]) {
+  test(`native cleanup sends no signal when the retained host changes (${Object.keys(change)[0]})`, async () => {
+    const fixture = await nativeCleanupFixture();
+    let scans = 0;
+    fixture.setScan(() =>
+      ++scans === 1
+        ? fixture.identities()
+        : [{ ...fixture.leader, ...change }, fixture.identities()[1]!],
+    );
+    try {
+      await expect(fixture.stack.cleanupHost()).rejects.toThrow();
+      expect(fixture.events).toEqual([]);
+    } finally {
+      await fixture.close();
+    }
+  });
+}
+
+test("cancelled engine control runs no command and drains its control lease", async () => {
+  const engine = new Engine(
+    {} as Inputs,
+    "/owned/run",
+    "mcp-123456789012345678901234",
+  );
+  const abort = new AbortController();
+  abort.abort();
+  let called = false;
+  await expect(
+    engine.controlled(abort.signal, async () => {
+      called = true;
+    }),
+  ).rejects.toThrow();
+  expect(called).toBe(false);
+  await engine.controlled(new AbortController().signal, async () => {
+    called = true;
+  });
+  expect(called).toBe(true);
+});
+
+function inspectedContainer(
+  imageRole: (typeof IMAGES)[number] = "worker",
+  firecrackerPool?: string,
+) {
+  const pin = { path: "/owned/binary", sha256: "a".repeat(64) };
+  const inputs = parseInputs(
+    {
+      version: 1,
+      backend: firecrackerPool ? "firecracker" : "vz",
+      architecture: firecrackerPool ? "amd64" : "arm64",
+      sourceCommit: "b".repeat(40),
+      engineSocket: "/owned/socket",
+      engineConfig: "/owned/config",
+      engineId: "engine-identity-123",
+      registryPort: 32000,
+      subnet: "10.42.3.0/24",
+      nativeHostIp: "10.42.4.1",
+      proxy: pin,
+      ...(firecrackerPool
+        ? {
+            firecracker: pin,
+            thinPool: { name: "suite", directory: firecrackerPool },
+          }
+        : { nativeProbe: pin }),
+      binaries: Object.fromEntries(BINARIES.map((role) => [role, pin])),
+      images: {
+        ...Object.fromEntries(
+          IMAGES.map((role, index) => [
+            role,
+            {
+              archive: pin,
+              id: `sha256:${index.toString(16).repeat(64)}`,
+              manifestDigest: `sha256:${"d".repeat(64)}`,
+            },
+          ]),
+        ),
+        ...(firecrackerPool
+          ? {
+              hostAgent: {
+                archive: pin,
+                id: `sha256:${"c".repeat(64)}`,
+                manifestDigest: `sha256:${"d".repeat(64)}`,
+              },
+            }
+          : {}),
+      },
+    },
+    firecrackerPool ? "firecracker" : "vz",
+  );
+  const id = "a".repeat(64),
+    image = firecrackerPool
+      ? inputs.images.hostAgent!.id
+      : inputs.images[imageRole].id,
+    runId = "mcp-123456789012345678901234";
+  const state = {
+    Id: id,
+    AppArmorProfile: "",
+    Image: image,
+    Config: {
+      Labels: { "engrams.mcp.run": runId },
+      User: "1000:1000",
+      Env: ["PATH=/usr/bin:/bin"],
+      Entrypoint: ["/bin/sleep"],
+      Cmd: ["infinity"],
+    },
+    HostConfig: {
+      RestartPolicy: { Name: "no" },
+      Privileged: false,
+      ReadonlyRootfs: true,
+      PidsLimit: 128,
+      Memory: 805306368,
+      NanoCpus: 2000000000,
+      NetworkMode: "none",
+      PidMode: "",
+      IpcMode: "private",
+      CgroupnsMode: "private",
+      CapDrop: ["ALL"],
+      CapAdd: Array<string>(),
+      SecurityOpt: ["no-new-privileges"],
+      MaskedPaths: ["/proc/kcore"],
+      ReadonlyPaths: ["/proc/sys"],
+      Binds: [],
+      VolumesFrom: [],
+      Devices: [],
+      DeviceRequests: [],
+      Tmpfs: { "/tmp": "rw,nosuid,nodev,size=4m" },
+    },
+    Mounts: [],
+    State: { Running: true, Pid: 42 },
+  };
+  const imageState = {
+    Id: image,
+    Config: {
+      Env: ["PATH=/usr/bin:/bin"],
+      Entrypoint: ["/bin/sleep"],
+      Cmd: ["infinity"],
+    },
+  };
+  class Inspector extends Engine {
+    override async call(args: string[]): Promise<Buffer> {
+      if (args[0] === "create") return Buffer.from(id);
+      if (args[0] === "container" && args[1] === "inspect")
+        return Buffer.from(JSON.stringify([state]));
+      if (args[0] === "image") return Buffer.from(JSON.stringify([imageState]));
+      if (args[0] === "start") return Buffer.from(id);
+      throw new Error("unexpected fixed test operation");
+    }
+  }
+  const engine = new Inspector(inputs, "/owned/run", runId);
+  const options = [
+    "--network",
+    "none",
+    "--user",
+    "1000:1000",
+    "--read-only",
+    "--tmpfs",
+    "/tmp:rw,nosuid,nodev,size=4m",
+  ];
+  return { engine, state, imageState, id, image, options };
+}
+
+async function inspectedHost(firecrackerPool?: string) {
+  const fixture = inspectedContainer("worker", firecrackerPool);
+  const { engine, state, image, options } = fixture;
+  Object.assign(state.HostConfig, {
+    PidsLimit: 1024,
+    Memory: 8589934592,
+    NanoCpus: 4000000000,
+    PidMode: firecrackerPool ? "host" : "",
+    CapAdd: ["CAP_NET_ADMIN", "CAP_SYS_ADMIN", "CAP_MKNOD"],
+  });
+  if (firecrackerPool) {
+    state.AppArmorProfile = "unconfined";
+    state.HostConfig.SecurityOpt = ["no-new-privileges", "apparmor=unconfined"];
+    state.HostConfig.MaskedPaths = [];
+    state.HostConfig.ReadonlyPaths = [];
+    state.HostConfig.CapAdd.push("CAP_NET_BIND_SERVICE");
+  }
+  state.Config.User = "0:0";
+  options[options.indexOf("--user") + 1] = "0:0";
+  let createdOptions: string[] = [];
+  const call = engine.call.bind(engine);
+  const intercepted = spyOn(engine, "call").mockImplementation(async (args) => {
+    if (args[0] === "create") {
+      createdOptions = args.flatMap((arg, i) =>
+        arg === "--security-opt" ? [args[i + 1]!] : [],
+      );
+      state.Config.Entrypoint = [args[args.indexOf("--entrypoint") + 1]!];
+      state.Config.Cmd = args.slice(args.indexOf(image) + 1);
+    }
+    if (args[0] === "start") throw Error("test stop before start");
+    return call(args);
+  });
+  try {
+    await expect(
+      engine.create("host-agent", image, [
+        ...options,
+        ...(firecrackerPool ? ["--pid", "host"] : []),
+        "--cgroupns",
+        "private",
+        ...[
+          "NET_ADMIN",
+          "SYS_ADMIN",
+          "MKNOD",
+          ...(firecrackerPool ? ["NET_BIND_SERVICE"] : []),
+        ].flatMap((capability) => ["--cap-add", capability]),
+      ]),
+    ).rejects.toThrow("test stop before start");
+  } finally {
+    intercepted.mockRestore();
+  }
+  expect(createdOptions).toEqual(
+    firecrackerPool
+      ? ["no-new-privileges", "apparmor=unconfined", "systempaths=unconfined"]
+      : ["no-new-privileges"],
+  );
+  return fixture;
+}
+
+test("FC host PID audit accepts only the exact managed namespace posture", async () => {
+  const directory = await realpath(
+    await mkdtemp(
+      join(process.cwd(), "var/mcp-platform-composition/host-label-"),
+    ),
+  );
+  try {
+    const { engine, state, id } = await inspectedHost(directory);
+    const required = ["no-new-privileges", "apparmor=unconfined"];
+    for (const options of [
+      required,
+      [...required, "label=disable"],
+      ["label=disable", ...required.slice().reverse()],
+    ]) {
+      state.HostConfig.SecurityOpt = options;
+      expect(await engine.audit(id)).toBeDefined();
+    }
+    for (const options of [
+      [...required, "systempaths=unconfined"],
+      [...required, "systempaths=other"],
+      [...required, "seccomp=unconfined"],
+      [...required, "apparmor=other"],
+      [...required, "label=disable", "label=disable"],
+      [],
+      ["no-new-privileges"],
+      ["apparmor=unconfined"],
+      ["no-new-privileges", "label=disable"],
+      ["no-new-privileges", "apparmor=unconfined", "apparmor=unconfined"],
+      [
+        "no-new-privileges",
+        "apparmor=unconfined",
+        "label=disable",
+        "label=disable",
+      ],
+      ["no-new-privileges", "apparmor=unconfined", "apparmor=other"],
+      ["no-new-privileges", "apparmor=unconfined", "seccomp=unconfined"],
+      ["no-new-privileges", "apparmor=unconfined", "label=type:container_t"],
+    ]) {
+      state.HostConfig.SecurityOpt = options;
+      await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+    }
+    state.HostConfig.SecurityOpt = [...required, "label=disable"];
+    for (const paths of ["MaskedPaths", "ReadonlyPaths"] as const) {
+      state.HostConfig[paths] = ["/proc/sys"];
+      await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+      state.HostConfig[paths] = [];
+    }
+    const exactCapabilities = [...state.HostConfig.CapAdd];
+    for (const capabilities of [
+      exactCapabilities.filter((value) => value !== "CAP_NET_BIND_SERVICE"),
+      [...exactCapabilities, "CAP_NET_BIND_SERVICE"],
+      [...exactCapabilities, "CAP_SYS_PTRACE"],
+    ]) {
+      state.HostConfig.CapAdd = capabilities;
+      await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+    }
+    state.HostConfig.CapAdd = exactCapabilities;
+    for (const profile of ["", "docker-default", "other"]) {
+      state.AppArmorProfile = profile;
+      await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+    }
+    state.AppArmorProfile = "unconfined";
+    state.HostConfig.CapAdd.push("CAP_SYS_PTRACE");
+    await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+    state.HostConfig.CapAdd.pop();
+    state.HostConfig.Privileged = true;
+    await expect(engine.audit(id)).rejects.toThrow("container_resources");
+    state.HostConfig.Privileged = false;
+    state.HostConfig.PidMode = "";
+    await expect(engine.audit(id)).rejects.toThrow("container_namespace");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("ordinary containers and VZ hosts reject Docker's host PID label option", async () => {
+  const directory = await realpath(
+    await mkdtemp(
+      join(process.cwd(), "var/mcp-platform-composition/nonhost-label-"),
+    ),
+  );
+  try {
+    const ordinary = inspectedContainer("worker", directory);
+    await ordinary.engine.create("probe", ordinary.image, ordinary.options);
+    const vz = await inspectedHost();
+    for (const { engine, state, id } of [ordinary, vz]) {
+      for (const options of [
+        ["no-new-privileges", "label=disable"],
+        ["no-new-privileges", "systempaths=unconfined"],
+        ["no-new-privileges", "apparmor=unconfined", "systempaths=unconfined"],
+        ["no-new-privileges", "apparmor=unconfined"],
+        ["no-new-privileges", "apparmor=unconfined", "label=disable"],
+      ]) {
+        state.HostConfig.SecurityOpt = options;
+        await expect(engine.audit(id)).rejects.toThrow(
+          "container_capabilities",
+        );
+      }
+      state.HostConfig.SecurityOpt = ["no-new-privileges"];
+      for (const paths of ["MaskedPaths", "ReadonlyPaths"] as const) {
+        const protectedPaths = state.HostConfig[paths];
+        state.HostConfig[paths] = [];
+        await expect(engine.audit(id)).rejects.toThrow(
+          "container_capabilities",
+        );
+        state.HostConfig[paths] = protectedPaths;
+      }
+      state.HostConfig.CapAdd.push("CAP_NET_BIND_SERVICE");
+      await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+      state.HostConfig.CapAdd.pop();
+      state.AppArmorProfile = "unconfined";
+      await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+const pinnedImageDefaults = [
+  {
+    imageRole: "guard",
+    entry: "HOME=/tmp",
+    wrong: ["HOME=/root", "HOME=/private/home"],
+  },
+  {
+    imageRole: "orchestrator",
+    entry: "BUN_INSTALL_BIN=/usr/local/bin",
+    wrong: ["BUN_INSTALL_BIN=/tmp/bin"],
+  },
+  {
+    imageRole: "orchestrator",
+    entry: "BUN_RUNTIME_TRANSPILER_CACHE_PATH=0",
+    wrong: [
+      "BUN_RUNTIME_TRANSPILER_CACHE_PATH=/tmp/cache",
+      "BUN_RUNTIME_TRANSPILER_CACHE_PATH=1",
+    ],
+  },
+  {
+    imageRole: "dns",
+    entry: "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+    wrong: ["SSL_CERT_FILE=/tmp/ca.pem"],
+  },
+] satisfies {
+  imageRole: (typeof IMAGES)[number];
+  entry: string;
+  wrong: string[];
+}[];
+
+test.each(pinnedImageDefaults)(
+  "pinned image default $entry passes its exact image audit",
+  async ({ imageRole, entry }) => {
+    const { engine, state, imageState, image, options, id } =
+      inspectedContainer(imageRole);
+    imageState.Config.Env.push(entry);
+    state.Config.Env.push(entry);
+    await engine.create("probe", image, options, ["infinity"], "/bin/sleep");
+    await expect(engine.audit(id)).resolves.toBeDefined();
+    state.Config.Env.push("DATABASE_URL=forbidden");
+    await expect(engine.audit(id)).rejects.toThrow("container_environment");
+    state.Config.Env.pop();
+    state.Config.Env[1] = entry + "-changed";
+    await expect(engine.audit(id)).rejects.toThrow("container_environment");
+  },
+);
+
+test.each(pinnedImageDefaults)(
+  "pinned image default $entry rejects other images and values",
+  async ({ imageRole, entry, wrong }) => {
+    for (const [role, value] of [
+      ["worker", entry],
+      ...wrong.map((value): [(typeof IMAGES)[number], string] => [
+        imageRole,
+        value,
+      ]),
+      [imageRole, "AWS_SECRET_ACCESS_KEY=forbidden"],
+      [imageRole, "HTTPS_PROXY=http://proxy.invalid"],
+    ] satisfies [(typeof IMAGES)[number], string][]) {
+      const { engine, state, imageState, image, options } =
+        inspectedContainer(role);
+      imageState.Config.Env.push(value);
+      state.Config.Env.push(value);
+      if (imageRole === "dns") {
+        state.HostConfig.CapAdd = ["NET_BIND_SERVICE"];
+        options.push("--cap-add", "NET_BIND_SERVICE");
+      }
+      await expect(
+        engine.create(imageRole, image, options, ["infinity"], "/bin/sleep"),
+      ).rejects.toThrow("image_environment");
+    }
+  },
+);
+
+test.each([
+  "tool-check",
+  "pack-claude",
+  "pack-codex",
+  "probe",
+  "host-tls-probe",
+])("pinned image default HOME is available to guard reuse %s", async (role) => {
+  const { engine, state, imageState, image, options } =
+    inspectedContainer("guard");
+  imageState.Config.Env.push("HOME=/tmp");
+  state.Config.Env.push("HOME=/tmp");
+  await engine.create(role, image, options, ["infinity"], "/bin/sleep");
+});
+
+test.each(["dns", "denied-dns"])(
+  "pinned image default certificate is available to DNS reuse %s",
+  async (role) => {
+    const { engine, state, imageState, image, options } =
+      inspectedContainer("dns");
+    imageState.Config.Env.push(
+      "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+    );
+    state.Config.Env.push("SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt");
+    state.HostConfig.CapAdd = ["NET_BIND_SERVICE"];
+    await engine.create(
+      role,
+      image,
+      [...options, "--cap-add", "NET_BIND_SERVICE"],
+      ["infinity"],
+      "/bin/sleep",
+    );
+  },
+);
+
+test("pinned image defaults allow both Bun entries together but preserve image identity", async () => {
+  const { engine, state, imageState, image, options, id } =
+    inspectedContainer("orchestrator");
+  const defaults = pinnedImageDefaults
+    .filter(({ imageRole }) => imageRole === "orchestrator")
+    .map(({ entry }) => entry);
+  imageState.Config.Env.push(...defaults);
+  state.Config.Env.push(...defaults);
+  await engine.create("probe", image, options, ["infinity"], "/bin/sleep");
+  imageState.Id = "sha256:" + "f".repeat(64);
+  await expect(engine.audit(id)).rejects.toThrow("container_image");
+});
+
+test("resolver-stage compares equivalent capability names exactly", async () => {
+  const { engine, state, id, image, options } = inspectedContainer();
+  const requested = ["CHOWN", "DAC_OVERRIDE", "FOWNER"];
+  state.HostConfig.CapAdd = requested.map((capability) => "CAP_" + capability);
+  await engine.create(
+    "resolver-stage",
+    image,
+    [
+      ...options,
+      ...requested.flatMap((capability) => ["--cap-add", capability]),
+    ],
+    ["infinity"],
+    "/bin/sleep",
+  );
+  state.HostConfig.CapAdd = requested;
+  await expect(engine.audit(id)).resolves.toBeDefined();
+  for (const capabilities of [
+    ["CAP_CHOWN", "CAP_DAC_OVERRIDE"],
+    ["CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_NET_ADMIN"],
+    [...requested, "CAP_NET_ADMIN"],
+    [...requested, "CAP_FOWNER"],
+    ["CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER", "CAP_FOWNER"],
+    ["CAP_CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER"],
+  ]) {
+    state.HostConfig.CapAdd = capabilities;
+    await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+  }
+  state.HostConfig.CapAdd = requested.map((capability) => "CAP_" + capability);
+  for (const dropped of [
+    [],
+    ["CAP_ALL"],
+    ["ALL", "NET_ADMIN"],
+    ["ALL", "ALL"],
+  ]) {
+    state.HostConfig.CapDrop = dropped;
+    await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+  }
+  state.HostConfig.CapDrop = ["ALL"];
+  for (const security of [
+    [],
+    ["no-new-privileges:true"],
+    ["no-new-privileges", "seccomp=unconfined"],
+  ]) {
+    state.HostConfig.SecurityOpt = security;
+    await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+  }
+  state.HostConfig.SecurityOpt = ["no-new-privileges"];
+  await expect(engine.audit(id)).resolves.toBeDefined();
+});
+
+test.each(["dns", "denied-dns"])(
+  "%s requires exactly NET_BIND_SERVICE in its effective audit",
+  async (role) => {
+    const { engine, state, id, image, options } = inspectedContainer();
+    state.HostConfig.CapAdd = ["CAP_NET_BIND_SERVICE"];
+    await engine.create(
+      role,
+      image,
+      [...options, "--cap-add", "NET_BIND_SERVICE"],
+      ["infinity"],
+      "/bin/sleep",
+    );
+    state.HostConfig.CapAdd = ["NET_BIND_SERVICE"];
+    await expect(engine.audit(id)).resolves.toBeDefined();
+    for (const capabilities of [
+      [],
+      ["NET_ADMIN"],
+      ["NET_BIND_SERVICE", "NET_ADMIN"],
+      ["NET_BIND_SERVICE", "NET_BIND_SERVICE"],
+      ["CAP_NET_BIND_SERVICE", "CAP_NET_BIND_SERVICE"],
+      ["NET_BIND_SERVICE", "CAP_NET_BIND_SERVICE"],
+      ["CAP_CAP_NET_BIND_SERVICE"],
+    ]) {
+      state.HostConfig.CapAdd = capabilities;
+      await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+    }
+    const missing = inspectedContainer();
+    await expect(
+      missing.engine.create(
+        role,
+        missing.image,
+        missing.options,
+        ["infinity"],
+        "/bin/sleep",
+      ),
+    ).rejects.toThrow("container_capabilities");
+    const extra = inspectedContainer();
+    extra.state.HostConfig.CapAdd = ["NET_BIND_SERVICE", "NET_ADMIN"];
+    await expect(
+      extra.engine.create(
+        role,
+        extra.image,
+        [
+          ...extra.options,
+          "--cap-add",
+          "NET_BIND_SERVICE",
+          "--cap-add",
+          "NET_ADMIN",
+        ],
+        ["infinity"],
+        "/bin/sleep",
+      ),
+    ).rejects.toThrow("container_capabilities");
+  },
+);
+
+test.each([
+  "worker",
+  "orchestrator",
+  "coordinator",
+  "probe",
+  "dns-other",
+  "denied-dns-other",
+])("%s cannot request the fixture DNS capability", async (role) => {
+  const { engine, state, image, options } = inspectedContainer();
+  state.HostConfig.CapAdd = ["NET_BIND_SERVICE"];
+  await expect(
+    engine.create(
+      role,
+      image,
+      [...options, "--cap-add", "NET_BIND_SERVICE"],
+      ["infinity"],
+      "/bin/sleep",
+    ),
+  ).rejects.toThrow("container_capabilities");
+});
+
+test("effective container audit rejects added authority and environment", async () => {
+  const { engine, state, id, image } = inspectedContainer();
+  await engine.create(
+    "probe",
+    image,
+    [
+      "--network",
+      "none",
+      "--user",
+      "1000:1000",
+      "--read-only",
+      "--tmpfs",
+      "/tmp:rw,nosuid,nodev,size=4m",
+    ],
+    ["infinity"],
+    "/bin/sleep",
+  );
+  state.Config.Env.push("DATABASE_URL=forbidden");
+  await expect(engine.audit(id)).rejects.toThrow("container_environment");
+  state.Config.Env.pop();
+  state.HostConfig.Privileged = true;
+  await expect(engine.audit(id)).rejects.toThrow("container_resources");
+  state.HostConfig.Privileged = false;
+  state.Config.User = "0:0";
+  await expect(engine.audit(id)).rejects.toThrow("container_namespace");
+  state.Config.User = "1000:1000";
+  Reflect.set(state.HostConfig, "PortBindings", {
+    "8443/tcp": [{ HostIp: "0.0.0.0", HostPort: "8443" }],
+  });
+  await expect(engine.audit(id)).rejects.toThrow("container_exposure");
+  Reflect.deleteProperty(state.HostConfig, "PortBindings");
+  state.HostConfig.PidMode = "container:foreign";
+  await expect(engine.audit(id)).rejects.toThrow("container_namespace");
+  state.HostConfig.PidMode = "host";
+  await expect(engine.audit(id)).rejects.toThrow("container_namespace");
+  state.HostConfig.PidMode = "";
+  Reflect.set(state.HostConfig, "Sysctls", { "net.ipv4.ip_forward": "1" });
+  await expect(engine.audit(id)).rejects.toThrow("container_exposure");
+  Reflect.deleteProperty(state.HostConfig, "Sysctls");
+  Reflect.set(state.HostConfig, "CgroupnsMode", "host");
+  await expect(engine.audit(id)).rejects.toThrow("container_namespace");
+  Reflect.deleteProperty(state.HostConfig, "CgroupnsMode");
+  await expect(engine.audit(id)).resolves.toBeDefined();
+});
+
+test("platform output keeps only approved runner failure classifications", async () => {
+  const { platformFailureLabel } = await import("./main.ts");
+  const { RunnerFailure } =
+    await import("../../../../orchestrator/scripts/mcp-stack/failure.ts");
+  for (const [code, seam, label] of [
+    [
+      "INVALID_CONTEXT",
+      "owned_path",
+      "FAILED:runner_invalid_context_owned_path",
+    ],
+    [
+      "INVALID_CONTEXT",
+      "private_file",
+      "FAILED:runner_invalid_context_private_file",
+    ],
+    [
+      "INVALID_CONTEXT",
+      "request_route",
+      "FAILED:runner_invalid_context_request_route",
+    ],
+    [
+      "INVALID_CONTEXT",
+      "request_size",
+      "FAILED:runner_invalid_context_request_size",
+    ],
+    [
+      "ASSERTION_FAILED",
+      "observer_token",
+      "FAILED:runner_assertion_failed_observer_token",
+    ],
+    [
+      "ASSERTION_FAILED",
+      "fixture_observer_status",
+      "FAILED:runner_assertion_failed_fixture_observer_status",
+    ],
+    [
+      "ASSERTION_FAILED",
+      "fixture_identity",
+      "FAILED:runner_assertion_failed_fixture_identity",
+    ],
+    [
+      "TRANSPORT_FAILED",
+      "https_request",
+      "FAILED:runner_transport_failed_https_request",
+    ],
+  ] as const) {
+    const error = new RunnerFailure(code, seam);
+    error.message = "private response body";
+    error.stack = "private stack";
+    expect(platformFailureLabel(error)).toBe(label);
+  }
+  const changedCode = new RunnerFailure("TRANSPORT_FAILED", "https_request");
+  Reflect.set(changedCode, "code", "PRIVATE_CODE");
+  for (const error of [
+    changedCode,
+    new RunnerFailure("ASSERTION_FAILED", "https_request"),
+    new RunnerFailure("TRANSPORT_FAILED", "private_value"),
+    new RunnerFailure("TRANSPORT_FAILED", "https_request\nprivate_value"),
+    new Error("TRANSPORT_FAILED:https_request private_value"),
+    { code: "TRANSPORT_FAILED", seam: "https_request" },
+    "private_value",
+    null,
+  ])
+    expect(platformFailureLabel(error)).toBe("FAILED:platform_composition");
+  expect(
+    platformFailureLabel(
+      new PlatformFailure("NEEDS_CONTEXT", "native_dns_lookup"),
+    ),
+  ).toBe("NEEDS_CONTEXT:native_dns_lookup");
+});
+
+for (const kind of ["modern", "legacy"] as const) {
+  test(`fixture ${kind} readiness gives unknown errors a fixed phase label`, async () => {
+    const { Stack } = await import("./launch.ts");
+    const { FixtureObserver } =
+      await import("../../../../orchestrator/scripts/mcp-stack/observer.ts");
+    const { RunnerFailure } =
+      await import("../../../../orchestrator/scripts/mcp-stack/failure.ts");
+    const inputs = {
+      images: { fixture: { id: "fixture-image" } },
+    } as Inputs;
+    const ctx = {
+      protocolFixtures: {
+        modern: {
+          runRoot: "/owned/modern",
+          configuration: { path: "/owned/modern/config" },
+        },
+        legacy: {
+          runRoot: "/owned/legacy",
+          configuration: { path: "/owned/legacy/config" },
+        },
+      },
+    } as import("../../../../orchestrator/scripts/mcp-stack/context.ts").Context;
+    const engine = new Engine(inputs, "/owned", "mcp-123456789012345678901234");
+    engine.networkOptions = () => [];
+    engine.create = async (role) => role;
+    engine.nativeDns = async () => {};
+    const stack = new Stack(
+      inputs,
+      "/owned",
+      {} as ConstructorParameters<typeof Stack>[2],
+      {} as ConstructorParameters<typeof Stack>[3],
+      {} as ConstructorParameters<typeof Stack>[4],
+      engine,
+    );
+    for (const failure of [
+      new Error("private path and response"),
+      new RunnerFailure("TRANSPORT_FAILED", "https_request"),
+      new PlatformFailure("INVALID_CONTEXT", "private_file"),
+    ]) {
+      let index = 0;
+      const ready = spyOn(
+        FixtureObserver.prototype,
+        "ready",
+      ).mockImplementation(async () => {
+        if (["modern", "legacy"][index++] === kind) throw failure;
+      });
+      try {
+        const preparing = stack.fixtures(ctx);
+        if (
+          failure instanceof RunnerFailure ||
+          failure instanceof PlatformFailure
+        )
+          await expect(preparing).rejects.toBe(failure);
+        else
+          await expect(preparing).rejects.toMatchObject({
+            code: "FAILED",
+            seam:
+              kind === "modern"
+                ? "fixture_modern_readiness"
+                : "fixture_legacy_readiness",
+          });
+      } finally {
+        ready.mockRestore();
+      }
+    }
+  });
+}
+
+test("entrypoint rejects a foreign backend before creating output or invoking a matrix", async () => {
+  const { main, matrixArguments } = await import("./main.ts");
+  const { BINARIES, IMAGES } = await import("./preflight.ts");
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/entry-"),
+  );
+  try {
+    const output = join(root, "new-run"),
+      manifest = join(root, "manifest.json"),
+      pin = { path: "/owned/binary", sha256: "a".repeat(64) };
+    await writeFile(
+      manifest,
+      JSON.stringify({
+        version: 1,
+        backend: "vz",
+        architecture: "arm64",
+        proxy: pin,
+        nativeProbe: pin,
+        sourceCommit: "b".repeat(40),
+        engineSocket: "/owned/engine.sock",
+        engineConfig: "/owned/config",
+        engineId: "engine-identity-123",
+        registryPort: 32000,
+        subnet: "10.42.3.0/24",
+        nativeHostIp: "10.42.4.1",
+        binaries: Object.fromEntries(BINARIES.map((k) => [k, pin])),
+        images: Object.fromEntries(
+          IMAGES.map((k) => [
+            k,
+            {
+              archive: pin,
+              id: "sha256:" + "c".repeat(64),
+              manifestDigest: "sha256:" + "d".repeat(64),
+            },
+          ]),
+        ),
+      }),
+      { mode: 0o600 },
+    );
+    await expect(
+      main([
+        "--backend",
+        "firecracker",
+        "--run-root",
+        output,
+        "--artifacts",
+        manifest,
+      ]),
+    ).rejects.toThrow("platform_identity");
+    await expect(readFile(join(output, "context.json"))).rejects.toThrow();
+    expect(matrixArguments("/owned/context.json").slice(1)).toEqual([
+      "--context",
+      "/owned/context.json",
+      "--matrix",
+      "all",
+    ]);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+for (const failedLookup of [false, true]) {
+  test(`real startup prefix checks DNS after dependencies and stops on failure (${failedLookup})`, async () => {
+    const { bootPlatform } = await import("./main.ts");
+    const { Stack } = await import("./launch.ts");
+    const { FixtureObserver } =
+      await import("../../../../orchestrator/scripts/mcp-stack/observer.ts");
+    const inputs = {
+      backend: "vz",
+      images: { fixture: { id: "fixture-image" } },
+    } as Inputs;
+    const ctx = {
+      protocolFixtures: {
+        modern: {
+          runRoot: "/owned/modern",
+          configuration: { path: "/owned/modern/config" },
+        },
+        legacy: {
+          runRoot: "/owned/legacy",
+          configuration: { path: "/owned/legacy/config" },
+        },
+      },
+    } as import("../../../../orchestrator/scripts/mcp-stack/context.ts").Context;
+    const steps: string[] = [];
+    const step = async (name: string) => {
+      steps.push(name);
+    };
+    const engine = new Engine(inputs, "/owned", "mcp-123456789012345678901234");
+    engine.reserveRegistryPort = () => step("registry-port");
+    engine.reserveHostPort = () => step("host-port");
+    engine.qualifyTools = () => step("tools");
+    engine.network = () => step("network");
+    engine.networkOptions = () => [];
+    engine.create = async (role) => {
+      steps.push(role);
+      return role;
+    };
+    engine.nativeDns = async () => {
+      steps.push("native-dns");
+      if (!steps.includes("dependencies"))
+        throw new PlatformFailure("NEEDS_CONTEXT", "dns_before_dependencies");
+      if (failedLookup)
+        throw new PlatformFailure("NEEDS_CONTEXT", "native_dns_lookup");
+    };
+    engine.guards = () => step("guards");
+    engine.verifyNetwork = async (probes) => {
+      steps.push(`verify-network:${probes}`);
+      return {
+        generation: "test-generation",
+        enforcementSha256: "a".repeat(64),
+        fixtureOnlyEgress: true,
+        externalDnsBlocked: true,
+        roles: ["orchestrator", "coordinator", "worker"],
+      };
+    };
+    const stack = new Stack(
+      inputs,
+      "/owned",
+      {} as ConstructorParameters<typeof Stack>[2],
+      {} as ConstructorParameters<typeof Stack>[3],
+      {} as ConstructorParameters<typeof Stack>[4],
+      engine,
+    );
+    stack.dependencies = () => step("dependencies");
+    stack.edges = () => step("edges");
+    stack.startRole = (_ctx, role) => step(`start:${role}`);
+    stack.readyRole = (_ctx, role) => step(`ready:${role}`);
+    stack.migrateOrchestrator = () => step("migrate");
+    // Replace only the native I/O boundary; retain the real fixture launch and DNS gate.
+    const ready = spyOn(FixtureObserver.prototype, "ready").mockImplementation(
+      () => step("observer"),
+    );
+    try {
+      const boot = bootPlatform(
+        engine,
+        { path: "/owned/ca", sha256: "a".repeat(64) },
+        async () => {
+          steps.push("prepare");
+          return { stack, ctx };
+        },
+      );
+      const prefix = [
+        "registry-port",
+        "host-port",
+        "tools",
+        "prepare",
+        "network",
+        "dependencies",
+        "fixture-modern",
+        "fixture-legacy",
+        "native-dns",
+      ];
+      if (failedLookup) {
+        await expect(boot).rejects.toMatchObject({
+          code: "NEEDS_CONTEXT",
+          seam: "native_dns_lookup",
+        });
+        expect(steps).toEqual(prefix);
+      } else {
+        await expect(boot).resolves.toBe(ctx);
+        expect(steps).toEqual([
+          ...prefix,
+          "observer",
+          "observer",
+          "guards",
+          "verify-network:true",
+          "edges",
+          "start:worker",
+          "ready:worker",
+          "start:coordinator",
+          "ready:coordinator",
+          "migrate",
+          "start:orchestrator",
+          "ready:orchestrator",
+          "start:host-agent",
+          "ready:host-agent",
+        ]);
+      }
+    } finally {
+      ready.mockRestore();
+    }
+  });
+}
+
+for (const backend of ["firecracker", "vz"] as const)
+  test(`native DNS accepts only the expected addresses for every fixture name (${backend})`, async () => {
+    const engine = new Engine(
+      { backend, subnet: "10.42.3.0/24", nativeHostIp: "10.42.4.1" } as Inputs,
+      "/owned",
+      "mcp-123456789012345678901234",
+    );
+    const records: Record<string, string> = {
+      "postgres.fixture.example": "10.42.3.10",
+      "app.fixture.example": "10.42.3.20",
+      "coordinator.fixture.example": "10.42.3.21",
+      "operator.fixture.example": "10.42.3.21",
+      "control.fixture.example": "10.42.3.21",
+      "worker.fixture.example": "10.42.3.22",
+      "host.fixture.example":
+        backend === "firecracker" ? "10.42.3.21" : "10.42.4.1",
+      "resource.modern.fixture.example": "10.42.3.30",
+      "issuer.modern.fixture.example": "10.42.3.30",
+      "authorization.modern.fixture.example": "10.42.3.30",
+      "token.modern.fixture.example": "10.42.3.30",
+      "observer.modern.fixture.example": "10.42.3.30",
+      "resource.legacy.fixture.example": "10.42.3.31",
+      "issuer.legacy.fixture.example": "10.42.3.31",
+      "authorization.legacy.fixture.example": "10.42.3.31",
+      "token.legacy.fixture.example": "10.42.3.31",
+      "observer.legacy.fixture.example": "10.42.3.31",
+    };
+    const names: string[] = [];
+    await engine.nativeDns(async (name, options) => {
+      expect(options).toEqual({ all: true });
+      expect(records[name]).toBeDefined();
+      names.push(name);
+      return [{ address: records[name]!, family: 4 }];
+    });
+    expect(names).toEqual(Object.keys(records));
+    if (backend === "firecracker")
+      await expect(
+        engine.nativeDns(async (name) => [
+          {
+            address:
+              name === "host.fixture.example" ? "10.42.4.1" : records[name]!,
+            family: 4,
+          },
+        ]),
+      ).rejects.toMatchObject({
+        code: "NEEDS_CONTEXT",
+        seam: "native_dns_route",
+      });
+  });
+
+for (const actual of [
+  [],
+  [{ address: "10.42.3.11", family: 4 }],
+  [
+    { address: "10.42.3.10", family: 4 },
+    { address: "10.42.3.11", family: 4 },
+  ],
+]) {
+  test(`native DNS rejects empty or wrong successful answers (${actual.length})`, async () => {
+    const engine = new Engine(
+      {
+        backend: "vz",
+        subnet: "10.42.3.0/24",
+        nativeHostIp: "10.42.4.1",
+      } as Inputs,
+      "/owned",
+      "mcp-123456789012345678901234",
+    );
+    await expect(engine.nativeDns(async () => actual)).rejects.toMatchObject({
+      code: "NEEDS_CONTEXT",
+      seam: "native_dns_route",
+    });
+  });
+}
+
+test("native DNS lookup rejection exposes only the static safe seam", async () => {
+  const engine = new Engine(
+    {
+      backend: "vz",
+      subnet: "10.42.3.0/24",
+      nativeHostIp: "10.42.4.1",
+    } as Inputs,
+    "/owned",
+    "mcp-123456789012345678901234",
+  );
+  let failure: unknown;
+  try {
+    await engine.nativeDns(async () => {
+      throw new Error(
+        "secret-marker lookup postgres.fixture.example at 10.42.3.10",
+      );
+    });
+  } catch (error) {
+    failure = error;
+  }
+  expect(failure).toBeInstanceOf(PlatformFailure);
+  expect(failure).toMatchObject({
+    code: "NEEDS_CONTEXT",
+    seam: "native_dns_lookup",
+  });
+  expect(String(failure)).toBe("Error: NEEDS_CONTEXT:native_dns_lookup");
+  expect(JSON.stringify(failure)).not.toMatch(
+    /secret-marker|fixture\.example|10\.42\.3\.10/,
+  );
+  expect(failure).not.toHaveProperty("cause");
+});
+
+test("fixed boot graph waits for worker, coordinator and real migration before app and host", async () => {
+  const { bootApplications } = await import("./main.ts");
+  const ctx =
+    {} as import("../../../../orchestrator/scripts/mcp-stack/context.ts").Context;
+  const steps: string[] = [];
+  const lifecycle = {
+    startRole: async (_ctx: typeof ctx, role: string, variant: string) => {
+      steps.push(`start:${role}:${variant}`);
+    },
+    readyRole: async (_ctx: typeof ctx, role: string) => {
+      steps.push(`ready:${role}`);
+    },
+    migrateOrchestrator: async () => {
+      steps.push("migrate");
+    },
+  };
+  await bootApplications(lifecycle, ctx);
+  expect(steps).toEqual([
+    "start:worker:normal",
+    "ready:worker",
+    "start:coordinator:normal",
+    "ready:coordinator",
+    "migrate",
+    "start:orchestrator:normal",
+    "ready:orchestrator",
+    "start:host-agent:normal",
+    "ready:host-agent",
+  ]);
+  steps.length = 0;
+  await expect(
+    bootApplications(
+      {
+        ...lifecycle,
+        migrateOrchestrator: async () => {
+          throw new Error("real migration failed");
+        },
+      },
+      ctx,
+    ),
+  ).rejects.toThrow("real migration failed");
+  expect(steps).toEqual([
+    "start:worker:normal",
+    "ready:worker",
+    "start:coordinator:normal",
+    "ready:coordinator",
+  ]);
+});
+
+test("FC bind stays in its private namespace while VZ binds the verified native address", async () => {
+  const { hostListenAddress } = await import("./launch.ts");
+  const { dnsRecords, dnsHosts, address, rules } = await import("./network.ts");
+  const inputs = {
+    backend: "firecracker" as const,
+    nativeHostIp: "10.42.4.1",
+    subnet: "10.42.3.0/24",
+  };
+  expect(hostListenAddress(inputs)).toBe("0.0.0.0:9101");
+  expect(hostListenAddress({ ...inputs, backend: "vz" })).toBe(
+    "10.42.4.1:9101",
+  );
+  expect(dnsRecords(inputs)["postgres.fixture.example"]).toBe("10.42.3.10");
+  expect(dnsHosts(inputs)).toContain("10.42.3.10 postgres.fixture.example\n");
+  const hostRule = (ip: string) => ({
+    rule: {
+      family: "inet",
+      table: "mcp",
+      chain: "output",
+      expr: [
+        {
+          match: {
+            op: "==",
+            left: { payload: { protocol: "ip", field: "daddr" } },
+            right: ip,
+          },
+        },
+        {
+          match: {
+            op: "==",
+            left: { payload: { protocol: "tcp", field: "dport" } },
+            right: 9101,
+          },
+        },
+        { accept: null },
+      ],
+    },
+  });
+  for (const backend of ["firecracker", "vz"] as const) {
+    const selected = backend === "firecracker" ? "10.42.3.21" : "10.42.4.1";
+    const other = backend === "firecracker" ? "10.42.4.1" : "10.42.3.21";
+    const current = { ...inputs, backend };
+    expect(dnsRecords(current)["host.fixture.example"]).toBe(selected);
+    expect(dnsHosts(current)).toContain(`${selected} host.fixture.example\n`);
+    expect(dnsHosts(current)).not.toContain(`${other} host.fixture.example\n`);
+    for (const role of ["coordinator", "orchestrator"] as const) {
+      expect(rules(current, role)).toContainEqual(hostRule(selected));
+      expect(rules(current, role)).not.toContainEqual(hostRule(other));
+    }
+    expect(rules(current, "worker")).not.toContainEqual(hostRule(selected));
+    expect(rules(current, "worker")).not.toContainEqual(hostRule(other));
+  }
+  expect(JSON.stringify(rules(inputs, "worker"))).not.toContain(
+    address(inputs, "postgres"),
+  );
+});
+
+test("abort terminates an in-flight pinned CLI and releases the control lease", async () => {
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/cancel-"),
+  );
+  const config = join(root, "config");
+  await mkdir(config, { mode: 0o700 });
+  const socket = join(root, "engine.sock");
+  const server = createServer();
+  await new Promise<void>((resolve) => server.listen(socket, resolve));
+  const script = join(root, "docker"),
+    started = join(root, "started");
+  await writeFile(
+    script,
+    `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} -e 'require("fs").writeFileSync(${JSON.stringify(started)},String(process.pid));setInterval(()=>{},100)'\n`,
+    { mode: 0o700 },
+  );
+  const inputs = {
+    engineSocket: socket,
+    engineConfig: config,
+    binaries: {
+      docker: { path: script, sha256: hash(await readFile(script)) },
+    },
+  } as Inputs;
+  const controller = new AbortController();
+  try {
+    const engine = new Engine(inputs, root, "mcp-123456789012345678901234");
+    const running = engine.controlled(controller.signal, () =>
+      engine.call(["info"], undefined, 30000),
+    );
+    const outcome = running.then(
+      () => false,
+      () => true,
+    );
+    const deadline = performance.now() + 2000;
+    while (!(await readFile(started).catch(() => undefined))) {
+      if (performance.now() >= deadline)
+        throw new Error("controlled child did not start");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const pid = Number(await readFile(started, "utf8"));
+    controller.abort();
+    expect(await outcome).toBe(true);
+    expect(() => process.kill(pid, 0)).toThrow();
+    await expect(
+      engine.controlled(new AbortController().signal, async () => "drained"),
+    ).resolves.toBe("drained");
+  } finally {
+    controller.abort();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(root, { recursive: true });
+  }
+});
+
+test("cleanup retains a failure receipt and refuses to delete a substituted network", async () => {
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/cleanup-"),
+  );
+  const runId = "mcp-123456789012345678901234",
+    id = "c".repeat(64);
+  const operations: string[][] = [];
+  let foreign = false;
+  class CleanupEngine extends Engine {
+    override async project(): Promise<string> {
+      return `${runId}-resolver`;
+    }
+    override async call(args: string[]): Promise<Buffer> {
+      operations.push(args);
+      if (args[0] === "network" && args[1] === "ls") return Buffer.from("");
+      if (args[0] === "network" && args[1] === "create") return Buffer.from(id);
+      if (args[0] === "network" && args[1] === "inspect")
+        return Buffer.from(
+          JSON.stringify([
+            {
+              Id: id,
+              Internal: true,
+              Driver: "bridge",
+              Labels: { "engrams.mcp.run": foreign ? "foreign" : runId },
+              IPAM: {
+                Config: [{ Subnet: "10.42.3.0/24", Gateway: "10.42.3.1" }],
+              },
+              Containers: {},
+            },
+          ]),
+        );
+      if (args[0] === "ps") return Buffer.from("");
+      throw new Error("unexpected cleanup command");
+    }
+  }
+  try {
+    const engine = new CleanupEngine(
+      { subnet: "10.42.3.0/24" } as Inputs,
+      root,
+      runId,
+    );
+    await engine.network();
+    foreign = true;
+    await expect(engine.cleanup()).rejects.toThrow("engine_cleanup");
+    expect(
+      operations.some((args) => args[0] === "network" && args[1] === "rm"),
+    ).toBe(false);
+    const receipt = JSON.parse(
+      await readFile(join(root, "cleanup.json"), "utf8"),
+    );
+    expect(receipt.success).toBe(false);
+    expect(receipt.networkRemaining).toBe(true);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("FC launch uses the declared configuration, private namespace and original image entrypoint", async () => {
+  const { generateIdentity } = await import("./identity.ts");
+  const { generateConfiguration } = await import("./configuration.ts");
+  const { parseInputs, BINARIES, IMAGES } = await import("./preflight.ts");
+  const { Stack } = await import("./launch.ts");
+  const { put } = await import("./owned.ts");
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/fc-plan-"),
+  );
+  try {
+    const pin = await put(join(root, "binary"), "controlled test artifact");
+    const openssl = await realpath(
+      process.env.MCP_PLATFORM_TEST_OPENSSL ??
+        Bun.which("openssl") ??
+        "openssl",
+    );
+    const image = {
+      archive: pin,
+      id: `sha256:${"c".repeat(64)}`,
+      manifestDigest: `sha256:${"d".repeat(64)}`,
+    };
+    const inputs = parseInputs(
+      {
+        version: 1,
+        backend: "firecracker",
+        architecture: "arm64",
+        sourceCommit: "b".repeat(40),
+        engineSocket: "/owned/engine.sock",
+        engineConfig: "/owned/config",
+        engineId: "engine-identity-123",
+        registryPort: 32000,
+        subnet: "10.42.3.0/24",
+        nativeHostIp: "10.42.4.1",
+        proxy: pin,
+        firecracker: pin,
+        thinPool: { name: "suite", directory: root },
+        binaries: {
+          ...Object.fromEntries(BINARIES.map((key) => [key, pin])),
+          openssl: { path: openssl, sha256: hash(await readFile(openssl)) },
+        },
+        images: {
+          ...Object.fromEntries(IMAGES.map((key) => [key, image])),
+          hostAgent: image,
+        },
+      },
+      "firecracker",
+    );
+    const identity = await generateIdentity(inputs, root),
+      configuration = await generateConfiguration(inputs, root, identity);
+    const artifacts = {
+      coordinator: pin,
+      orchestrator: pin,
+      worker: pin,
+      fixture: pin,
+      guestImage: pin,
+      hostAgent: pin,
+      kernel: pin,
+      helper: pin,
+      claudeHarness: pin,
+      codexHarness: pin,
+      modelCli: pin,
+      claudeBundle: pin,
+      codexBundle: pin,
+    };
+    const assets = {
+      binaries: inputs.binaries,
+      proxy: pin,
+      nativeProbe: undefined,
+      firecracker: pin,
+      artifacts,
+      bundles: join(root, "bundles"),
+      stamp: {},
+    };
+    const launches: {
+      role: string;
+      image: string;
+      options: string[];
+      args: string[] | undefined;
+      entrypoint: string | undefined;
+    }[] = [];
+    const projections = new Map<string, Record<string, Pin>>();
+    class LaunchEngine extends Engine {
+      override networkName() {
+        return "owned-network";
+      }
+      override networkOptions() {
+        return ["--network", this.networkName()];
+      }
+      override async project(
+        role: string,
+        files: Record<string, Pin>,
+      ): Promise<string> {
+        projections.set(role, files);
+        return `${this.runId}-${role}`;
+      }
+      override async call(args: string[]): Promise<Buffer> {
+        if (args[0] === "exec" && args[2] === "/usr/bin/dig")
+          return Buffer.from("10.42.3.40\n");
+        if (args[0] === "exec") return Buffer.from("");
+        throw new Error("unexpected dependency command");
+      }
+      override async remove() {}
+      override async create(
+        role: string,
+        image: string,
+        options: string[],
+        args?: string[],
+        entrypoint?: string,
+      ): Promise<string> {
+        launches.push({ role, image, options, args, entrypoint });
+        return "a".repeat(64);
+      }
+    }
+    const engine = new LaunchEngine(inputs, root, identity.runId, {
+      bootId: "11111111-1111-4111-8111-111111111111",
+      release: "test-kernel",
+      pidNamespace: "pid:[1]",
+      pool: poolFixture(),
+    });
+    engine.guardIds.set("coordinator", "e".repeat(64));
+    const stack = new Stack(
+      inputs,
+      root,
+      identity,
+      assets,
+      configuration,
+      engine,
+    );
+    const ctx = await stack.prepare();
+    expect(ctx.observer.hostLogFile).toBe(
+      join(root, "host", "egress-proxyd.log"),
+    );
+    expect((await stat(ctx.observer.hostLogFile)).mode & 0o777).toBe(0o600);
+    await stack.startRole(ctx, "host-agent", "normal");
+    const launch = launches[0]!;
+    expect(launch.role).toBe("host-agent");
+    expect(
+      launch.options
+        .flatMap((value, index) =>
+          value === "--cap-add" ? [launch.options[index + 1]!] : [],
+        )
+        .sort(),
+    ).toEqual(["MKNOD", "NET_ADMIN", "NET_BIND_SERVICE", "SYS_ADMIN"]);
+    expect(launch.entrypoint).toBeUndefined();
+    expect(launch.args).toBeUndefined();
+    expect(launch.options).toContain(`container:${"e".repeat(64)}`);
+    expect(launch.options[launch.options.indexOf("--pid") + 1]).toBe("host");
+    expect(launch.options[launch.options.indexOf("--cgroupns") + 1]).toBe(
+      "private",
+    );
+    expect(launch.options).toContain(
+      "/dev/mapper/control:/dev/mapper/control:rw",
+    );
+    expect(launch.options).toContain("b 253:* rwm");
+    expect(launch.options).toContain("/dev/kvm:/dev/kvm:rw");
+    expect(launch.options).toContain("/dev/net/tun:/dev/net/tun:rw");
+    const envPath = launch.options[launch.options.indexOf("--env-file") + 1]!;
+    const actualEnv = Object.fromEntries(
+      (await readFile(envPath, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => {
+          const i = line.indexOf("=");
+          return [line.slice(0, i), line.slice(i + 1)];
+        }),
+    );
+    const declared = JSON.parse(
+      await readFile(
+        ctx.supervisor.configurations["host-agent"].normal.path,
+        "utf8",
+      ),
+    );
+    expect(actualEnv).toEqual(declared.env);
+    expect(actualEnv.ENGRAM_GRPC_LISTEN_ADDR).toBe("0.0.0.0:9101");
+    expect(actualEnv.ENGRAM_GRPC_ADVERTISE_ADDR).toBe(
+      "https://host.fixture.example:9101",
+    );
+    expect(actualEnv.MCP_FIXTURE_HOST_LOG).toBe(
+      join(root, "host", "host.jsonl"),
+    );
+    expect(actualEnv.ENGRAM_FIRECRACKER_BIN).toBe("/usr/local/bin/firecracker");
+    const coordinatorConfiguration = JSON.parse(
+      await readFile(
+        ctx.supervisor.configurations.coordinator.normal.path,
+        "utf8",
+      ),
+    );
+    const orchestratorConfiguration = JSON.parse(
+      await readFile(
+        ctx.supervisor.configurations.orchestrator.normal.path,
+        "utf8",
+      ),
+    );
+    expect(
+      coordinatorConfiguration.env.ENGRAM_AUTH_TOKENS.split(","),
+    ).toContain(orchestratorConfiguration.env.CONTROL_PLANE_BEARER);
+    expect(
+      coordinatorConfiguration.env.ENGRAM_AUTH_TOKENS.split(","),
+    ).toContain(declared.env.ENGRAM_COORDINATOR_TOKEN);
+    const workerConfiguration = JSON.parse(
+      await readFile(ctx.supervisor.configurations.worker.normal.path, "utf8"),
+    );
+    expect(Object.keys(workerConfiguration.env).sort()).toEqual([
+      "MCP_WORKER_ENABLED",
+      "NODE_ENV",
+    ]);
+    expect(Object.keys(workerConfiguration.files).sort()).toEqual([
+      "config.json",
+      "tls/ca.crt",
+      "tls/tls.crt",
+      "tls/tls.key",
+    ]);
+    const coordinatorDsn = await readFile(
+        ctx.observer.coordinatorDsnFile,
+        "utf8",
+      ),
+      orchestratorDsn = await readFile(
+        ctx.observer.orchestratorDsnFile,
+        "utf8",
+      );
+    expect(ctx.observer.coordinatorDsnFile).not.toBe(
+      ctx.observer.orchestratorDsnFile,
+    );
+    expect(new URL(coordinatorDsn).hostname).toBe("postgres.fixture.example");
+    expect(new URL(orchestratorDsn).pathname).toBe(
+      `/mcp_${identity.runId.replaceAll("-", "_")}`,
+    );
+    expect(coordinatorDsn).toBe(orchestratorDsn);
+    engine.guardIds.set("worker", "f".repeat(64));
+    await stack.startRole(ctx, "worker", "normal");
+    const workerLaunch = launches.find((v) => v.role === "worker")!;
+    expect(workerLaunch.options).not.toContain("--cap-add");
+    await stack.dependencies();
+    engine.guardIds.set("orchestrator", "d".repeat(64));
+    await stack.edges();
+    for (const role of ["orchestrator", "coordinator"] as const) {
+      const files = projections.get(`${role}-edge`)!;
+      const config = await readFile(files["edge.conf"]!.path, "utf8");
+      expect(hash(config)).toBe(files["edge.conf"]!.sha256);
+      expect(
+        [...config.matchAll(/(\w+)_temp_path\s+([^;]+);/g)].map(
+          ([, module, path]) => [module, path],
+        ),
+      ).toEqual([
+        ["client_body", "/tmp/client"],
+        ["proxy", "/tmp/proxy"],
+        ["fastcgi", "/tmp/fastcgi"],
+        ["uwsgi", "/tmp/uwsgi"],
+        ["scgi", "/tmp/scgi"],
+      ]);
+      expect(config).toContain("pid /tmp/nginx.pid;");
+      expect(config).toContain("ssl_protocols TLSv1.3;");
+      expect(config).toContain(
+        `proxy_pass http://127.0.0.1:${role === "orchestrator" ? 8787 : 8080};`,
+      );
+      const edge = launches.find((v) => v.role === `${role}-edge`)!;
+      expect(edge.image).toBe(inputs.images.edge.id);
+      expect(edge.entrypoint).toBe("/usr/sbin/nginx");
+      expect(edge.args).toEqual([
+        "-c",
+        "/projection/edge.conf",
+        "-g",
+        "daemon off;",
+      ]);
+      expect(edge.options).toEqual([
+        "--network",
+        `container:${engine.guardIds.get(role)}`,
+        "--user",
+        "1000:1000",
+        "--read-only",
+        "--mount",
+        `type=volume,src=${identity.runId}-${role}-edge,dst=/projection,readonly`,
+        "--tmpfs",
+        "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777",
+      ]);
+      expect(files["tls.crt"]).toEqual(
+        identity.leaves[role === "orchestrator" ? "app" : "coordinator"]
+          .certificate,
+      );
+      expect(files["tls.key"]).toEqual(
+        identity.leaves[role === "orchestrator" ? "app" : "coordinator"].key,
+      );
+    }
+    for (const role of ["dns", "denied-dns"]) {
+      const dnsLaunch = launches.find((v) => v.role === role)!;
+      expect(dnsLaunch.entrypoint).toBe("/coredns");
+      expect(dnsLaunch.options).toContain("--read-only");
+      expect(dnsLaunch.options[dnsLaunch.options.indexOf("--user") + 1]).toBe(
+        "1000:1000",
+      );
+      expect(
+        dnsLaunch.options.flatMap((v, i) =>
+          v === "--cap-add" ? [dnsLaunch.options[i + 1]] : [],
+        ),
+      ).toEqual(["NET_BIND_SERVICE"]);
+    }
+    for (const launch of launches.filter(
+      (v) => !["dns", "denied-dns", "host-agent"].includes(v.role),
+    ))
+      expect(launch.options).not.toContain("NET_BIND_SERVICE");
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+for (const failInspect of [false, true]) {
+  test(`guest publication uses writable scratch and cleans up after ${failInspect ? "inspect failure" : "success"}`, async () => {
+    const { publishGuest } = await import("./assets.ts");
+    const root = await mkdtemp(
+      join(process.cwd(), "var/mcp-platform-composition/publish-"),
+    );
+    try {
+      const archive = await put(join(root, "guest.tar"), "owned archive");
+      const config = Buffer.from('{"architecture":"arm64","os":"linux"}');
+      const image = {
+        archive,
+        id: `sha256:${hash(config)}`,
+        manifestDigest: "",
+      };
+      const manifest = Buffer.from(
+        JSON.stringify({
+          schemaVersion: 2,
+          config: { digest: image.id },
+          layers: [],
+        }),
+      );
+      image.manifestDigest = `sha256:${hash(manifest)}`;
+      const inputs = parseInputs(
+        {
+          version: 1,
+          backend: "vz",
+          architecture: "arm64",
+          sourceCommit: "b".repeat(40),
+          engineSocket: "/owned/socket",
+          engineConfig: "/owned/config",
+          engineId: "engine-identity-123",
+          registryPort: 32000,
+          subnet: "10.42.3.0/24",
+          nativeHostIp: "10.42.4.1",
+          proxy: archive,
+          nativeProbe: archive,
+          binaries: Object.fromEntries(BINARIES.map((key) => [key, archive])),
+          images: Object.fromEntries(IMAGES.map((key) => [key, image])),
+        },
+        "vz",
+      );
+      const calls: {
+        args: string[];
+        stdin: string | undefined;
+        timeout: number | undefined;
+      }[] = [];
+      const removed: string[] = [];
+      const launches: unknown[] = [];
+      const id = "a".repeat(64),
+        guard = "e".repeat(64);
+      const runId = "mcp-123456789012345678901234";
+      class PublicationEngine extends Engine {
+        override async create(
+          role: string,
+          image: string,
+          options: string[],
+          args?: string[],
+          entrypoint?: string,
+        ): Promise<string> {
+          launches.push({ role, image, options, args, entrypoint });
+          return id;
+        }
+        override async call(
+          args: string[],
+          stdin?: string,
+          timeout?: number,
+        ): Promise<Buffer> {
+          calls.push({ args, stdin, timeout });
+          if (failInspect) throw new Error("inspect failed");
+          return args.includes("--config") ? config : manifest;
+        }
+        override async remove(role: string) {
+          removed.push(role);
+        }
+      }
+      const engine = new PublicationEngine(inputs, root, runId);
+      engine.guardIds.set("coordinator", guard);
+      const uri = `127.0.0.1:32000/${runId}/guest`;
+      const provenance = join(root, "image-provenance.json");
+      if (failInspect) {
+        await expect(publishGuest(inputs, root, engine)).rejects.toThrow(
+          "inspect failed",
+        );
+        await expect(stat(provenance)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      } else {
+        expect(await publishGuest(inputs, root, engine)).toBe(
+          `${uri}@${image.manifestDigest}`,
+        );
+        expect(JSON.parse(await readFile(provenance, "utf8"))).toEqual({
+          version: 1,
+          archiveSha256: archive.sha256,
+          manifestDigest: image.manifestDigest,
+          configDigest: image.id,
+          imageUri: `${uri}@${image.manifestDigest}`,
+        });
+      }
+      expect(removed).toEqual(["image-copy"]);
+      expect(launches).toEqual([
+        {
+          role: "image-copy",
+          image: inputs.images.guard.id,
+          options: [
+            "--network",
+            `container:${guard}`,
+            "--user",
+            `${process.getuid?.()}:${process.getgid?.()}`,
+            "--read-only",
+            "--mount",
+            `type=bind,src=${archive.path},dst=/input/guest.tar,readonly`,
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev,size=256m,mode=1777",
+          ],
+          args: ["infinity"],
+          entrypoint: "/bin/sleep",
+        },
+      ]);
+      const prefix = ["exec", id, "/usr/bin/skopeo", "--tmpdir", "/tmp"];
+      const expected = [
+        {
+          args: [...prefix, "inspect", "--raw", "oci-archive:/input/guest.tar"],
+          stdin: undefined,
+          timeout: undefined,
+        },
+        {
+          args: [
+            ...prefix,
+            "inspect",
+            "--raw",
+            "--config",
+            "oci-archive:/input/guest.tar",
+          ],
+          stdin: undefined,
+          timeout: undefined,
+        },
+        {
+          args: [
+            ...prefix,
+            "copy",
+            "--preserve-digests",
+            "--dest-tls-verify=false",
+            "oci-archive:/input/guest.tar",
+            `docker://${uri}:fixture`,
+          ],
+          stdin: undefined,
+          timeout: 120000,
+        },
+        {
+          args: [
+            ...prefix,
+            "inspect",
+            "--tls-verify=false",
+            "--raw",
+            `docker://${uri}@${image.manifestDigest}`,
+          ],
+          stdin: undefined,
+          timeout: undefined,
+        },
+      ];
+      expect(calls).toEqual(failInspect ? expected.slice(0, 1) : expected);
+    } finally {
+      await rm(root, { recursive: true });
+    }
+  });
+}
+
+test("archive provenance rejects a swapped config, manifest, or multi-platform index", async () => {
+  const { verifyArchiveIdentity } = await import("./assets.ts");
+  const config = Buffer.from('{"architecture":"arm64","os":"linux"}');
+  const id = `sha256:${hash(config)}`;
+  const manifest = Buffer.from(
+    JSON.stringify({ schemaVersion: 2, config: { digest: id }, layers: [] }),
+  );
+  const image = {
+    archive: { path: "/owned/image.tar", sha256: "a".repeat(64) },
+    id,
+    manifestDigest: `sha256:${hash(manifest)}`,
+  };
+  expect(() => verifyArchiveIdentity(image, manifest, config)).not.toThrow();
+  expect(() =>
+    verifyArchiveIdentity(image, manifest, Buffer.from("different")),
+  ).toThrow("archive_config_identity");
+  expect(() =>
+    verifyArchiveIdentity(
+      { ...image, manifestDigest: image.id },
+      manifest,
+      config,
+    ),
+  ).toThrow("archive_image_identity");
+  const index = Buffer.from(
+    JSON.stringify({ schemaVersion: 2, manifests: [], config: { digest: id } }),
+  );
+  expect(() =>
+    verifyArchiveIdentity(
+      { ...image, manifestDigest: `sha256:${hash(index)}` },
+      index,
+      config,
+    ),
+  ).toThrow("archive_image_identity");
+});
+
+test("resolver uses only a readonly named file projection and rejects source, subpath and byte substitution", async () => {
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/resolver-"),
+  );
+  const runId = "mcp-123456789012345678901234",
+    image = `sha256:${"b".repeat(64)}`,
+    id = "a".repeat(64),
+    network = "e".repeat(64),
+    volume = `${runId}-resolver`;
+  const mount = {
+    Type: "volume",
+    Source: volume,
+    Target: "/etc/resolv.conf",
+    ReadOnly: true,
+    VolumeOptions: { Subpath: "resolv.conf", NoCopy: true },
+  };
+  const observed = {
+    Type: "volume",
+    Name: volume,
+    Source: `/engine/volumes/${volume}/_data`,
+    Destination: "/etc/resolv.conf",
+    RW: false,
+  };
+  const state = {
+    Id: id,
+    Image: image,
+    Config: {
+      Labels: { "engrams.mcp.run": runId },
+      User: "1000:1000",
+      Env: ["PATH=/usr/bin:/bin"],
+      Entrypoint: ["/bin/sleep"],
+      Cmd: ["infinity"],
+    },
+    HostConfig: {
+      RestartPolicy: { Name: "no" },
+      Privileged: false,
+      ReadonlyRootfs: true,
+      PidsLimit: 128,
+      Memory: 805306368,
+      NanoCpus: 2000000000,
+      NetworkMode: "none",
+      PidMode: "",
+      IpcMode: "private",
+      CapDrop: ["ALL"],
+      CapAdd: [],
+      SecurityOpt: ["no-new-privileges"],
+      MaskedPaths: ["/proc/kcore"],
+      ReadonlyPaths: ["/proc/sys"],
+      Binds: [],
+      VolumesFrom: [],
+      Devices: [],
+      DeviceRequests: [],
+      Mounts: [mount],
+    },
+    Mounts: [observed],
+  };
+  const calls: string[][] = [];
+  let foreignVolume = false,
+    wrongBytes = false;
+  class ResolverEngine extends Engine {
+    override async project(role: string): Promise<string> {
+      return this.volume(role);
+    }
+    override async call(args: string[]): Promise<Buffer> {
+      calls.push(args);
+      if (
+        (args[0] === "network" && args[1] === "ls") ||
+        (args[0] === "volume" && args[1] === "ls")
+      )
+        return Buffer.from("");
+      if (args[0] === "network" && args[1] === "create")
+        return Buffer.from(network);
+      if (args[0] === "network" && args[1] === "inspect")
+        return Buffer.from(
+          JSON.stringify([
+            {
+              Id: network,
+              Internal: true,
+              Driver: "bridge",
+              Labels: { "engrams.mcp.run": runId },
+              IPAM: {
+                Config: [{ Subnet: "10.42.3.0/24", Gateway: "10.42.3.1" }],
+              },
+            },
+          ]),
+        );
+      if (args[0] === "volume" && args[1] === "create")
+        return Buffer.from(volume);
+      if (args[0] === "volume" && args[1] === "inspect")
+        return Buffer.from(
+          JSON.stringify([
+            {
+              Name: volume,
+              Mountpoint: `/engine/volumes/${volume}/_data`,
+              Driver: "local",
+              Scope: "local",
+              Labels: { "engrams.mcp.run": foreignVolume ? "foreign" : runId },
+            },
+          ]),
+        );
+      if (args[0] === "create" || args[0] === "start") return Buffer.from(id);
+      if (args[0] === "container" && args[1] === "inspect")
+        return Buffer.from(JSON.stringify([state]));
+      if (args[0] === "image")
+        return Buffer.from(
+          JSON.stringify([
+            {
+              Id: image,
+              Config: {
+                Env: ["PATH=/usr/bin:/bin"],
+                Entrypoint: ["/bin/sleep"],
+                Cmd: ["infinity"],
+              },
+            },
+          ]),
+        );
+      if (args[0] === "cp") {
+        expect(args[1]).toBe(`${id}:/etc/resolv.conf`);
+        await writeFile(
+          args[2]!,
+          wrongBytes
+            ? "nameserver 127.0.0.11\n"
+            : await readFile(join(root, "resolv.conf")),
+        );
+        return Buffer.from("");
+      }
+      throw new Error("unexpected resolver operation");
+    }
+  }
+  try {
+    const engine = new ResolverEngine(
+      { subnet: "10.42.3.0/24", images: { guard: { id: image } } } as Inputs,
+      root,
+      runId,
+    );
+    await engine.network();
+    await engine.create(
+      "probe",
+      image,
+      ["--network", "none", "--user", "1000:1000", "--read-only"],
+      ["infinity"],
+      "/bin/sleep",
+    );
+    expect(calls.find((args) => args[0] === "create")).toContain(
+      `type=volume,src=${volume},dst=/etc/resolv.conf,volume-subpath=resolv.conf,volume-nocopy,readonly`,
+    );
+    mount.VolumeOptions.Subpath = "foreign";
+    await expect(engine.audit(id)).rejects.toThrow(
+      "container_mount_specification",
+    );
+    mount.VolumeOptions.Subpath = "resolv.conf";
+    mount.ReadOnly = false;
+    await expect(engine.audit(id)).rejects.toThrow(
+      "container_mount_specification",
+    );
+    mount.ReadOnly = true;
+    const originalSource = observed.Source;
+    observed.Source = "/foreign/volume";
+    await expect(engine.audit(id)).rejects.toThrow("container_mount");
+    observed.Source = originalSource;
+    observed.Name = "foreign";
+    await expect(engine.audit(id)).rejects.toThrow("container_mount");
+    observed.Name = volume;
+    foreignVolume = true;
+    await expect(engine.audit(id)).rejects.toThrow("volume_identity");
+    foreignVolume = false;
+    wrongBytes = true;
+    await expect(engine.verifyResolver(id)).rejects.toThrow("resolver_changed");
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("cleanup recovers only a planned owned container after a lost create response", async () => {
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/lost-create-"),
+  );
+  const runId = "mcp-123456789012345678901234",
+    id = "a".repeat(64);
+  let removed = false;
+  const calls: string[][] = [];
+  class LostResponseEngine extends Engine {
+    override async call(args: string[]): Promise<Buffer> {
+      calls.push(args);
+      if (args[0] === "create") throw new Error("lost create response");
+      if (args[0] === "ps") return Buffer.from(removed ? "" : id);
+      if (args[0] === "container" && args[1] === "inspect")
+        return Buffer.from(
+          JSON.stringify([
+            {
+              Id: id,
+              Name: `/${runId}-probe`,
+              Config: { Labels: { "engrams.mcp.run": runId } },
+              State: { Running: false, Pid: 0 },
+            },
+          ]),
+        );
+      if (args[0] === "logs") return Buffer.from("controlled retained log");
+      if (args[0] === "rm") {
+        removed = true;
+        return Buffer.from(id);
+      }
+      throw new Error("unexpected cleanup operation");
+    }
+  }
+  try {
+    const engine = new LostResponseEngine({} as Inputs, root, runId);
+    await expect(
+      engine.create("probe", "sha256:" + "b".repeat(64), ["--network", "none"]),
+    ).rejects.toThrow("lost create response");
+    await engine.cleanup();
+    expect(calls.find((args) => args[0] === "rm")).toEqual(["rm", id]);
+    expect(
+      JSON.parse(await readFile(join(root, "cleanup.json"), "utf8")).success,
+    ).toBe(true);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+async function handoffFixture(root: string) {
+  const { ContextSchema } =
+    await import("../../../../orchestrator/scripts/mcp-stack/context.ts");
+  const { put } = await import("./owned.ts");
+  const pin = await put(join(root, "artifact"), "a".repeat(40));
+  const endpoint = (name: string) => ({
+    origin: `https://${name}.fixture.example`,
+    ca: pin,
+    serverFingerprint: Array(32).fill("AA").join(":"),
+  });
+  const fixture = async (name: "modern" | "legacy") => {
+    const runRoot = join(root, name);
+    await mkdir(runRoot, { mode: 0o700 });
+    const configuration = await put(join(runRoot, "configuration"), "fixture");
+    return {
+      ...endpoint(`observer.${name}`),
+      configuration,
+      runRoot,
+      tokenFile: configuration.path,
+      resourceKeyFile: configuration.path,
+      resourceOrigin: `https://resource.${name}.fixture.example`,
+      issuerOrigin: `https://issuer.${name}.fixture.example`,
+      authorizationOrigin: `https://authorization.${name}.fixture.example`,
+      tokenOrigin: `https://token.${name}.fixture.example`,
+      redirectUri: "https://app.fixture.example/integrations/mcp/callback",
+      protocol: name === "modern" ? "2026-07-28" : "2025-06-18",
+    };
+  };
+  const human = (name: string) => ({
+    email: `${name}@fixture.example`,
+    passwordFile: pin.path,
+    cookieFile: join(root, `${name}.cookie`),
+  });
+  return ContextSchema.parse({
+    version: 1,
+    runId: "mcp-controlled-handoff",
+    runRoot: root,
+    backend: "vz",
+    sourceCommit: "b".repeat(40),
+    hostId: "00000000-0000-4000-8000-000000000001",
+    imageId: "controlled-image",
+    imageDigest: "sha256:" + "c".repeat(64),
+    artifacts: Object.fromEntries(
+      [
+        "coordinator",
+        "orchestrator",
+        "worker",
+        "hostAgent",
+        "fixture",
+        "kernel",
+        "guestImage",
+        "claudeHarness",
+        "codexHarness",
+        "modelCli",
+        "claudeBundle",
+        "codexBundle",
+        "helper",
+      ].map((name) => [name, pin]),
+    ),
+    endpoints: {
+      app: endpoint("app"),
+      coordinator: endpoint("coordinator"),
+      workerControl: endpoint("worker"),
+      operator: {
+        ...endpoint("operator"),
+        certificate: pin,
+        privateKeyFile: pin.path,
+      },
+    },
+    protocolFixtures: {
+      modern: await fixture("modern"),
+      legacy: await fixture("legacy"),
+    },
+    publication: {
+      candidateIdentity: "sha256:" + "d".repeat(64),
+      expectedGeneration: null,
+      deploymentIdentity: "sha256:" + "d".repeat(64),
+      networkIdentity: "sha256:" + "d".repeat(64),
+      trustIdentity: "sha256:" + "d".repeat(64),
+      zone: "fixture-zone",
+    },
+    identities: {
+      admin: human("admin"),
+      owner: human("owner"),
+      other: human("other"),
+      unattendedKeyFile: join(root, "unattended"),
+      automationKeyFile: join(root, "automation"),
+      routerSentinelFile: pin.path,
+    },
+    supervisor: {
+      socket: join(root, "s"),
+      tokenFile: pin.path,
+      configurations: {
+        orchestrator: { normal: pin },
+        coordinator: { normal: pin },
+        worker: { normal: pin },
+        "host-agent": { normal: pin },
+      },
+      operatorCandidates: {
+        normal: { file: pin, identity: "sha256:" + "d".repeat(64) },
+      },
+    },
+    observer: {
+      coordinatorDsnFile: pin.path,
+      orchestratorDsnFile: pin.path,
+      hostManagedRoot: join(root, "managed"),
+      hostLogFile: pin.path,
+    },
+    guest: {
+      stateDirectory: "/tmp/mcp-stack-fixture",
+      cliPath: "/opt/engram/dyn/0/engram-mcp-model-fixture",
+    },
+    deadlines: { requestMs: 1000, stepMs: 3000, totalMs: 10000 },
+    evidenceFile: join(root, "evidence"),
+  });
+}
+
+test("runner handoff validates the complete context with a real private supervisor socket", async () => {
+  const { startContextSupervisor } = await import("./main.ts");
+  const { loadContext } =
+    await import("../../../../orchestrator/scripts/mcp-stack/context.ts");
+  const { lstat } = await import("node:fs/promises");
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/h-"),
+  );
+  let supervisor:
+    Awaited<ReturnType<typeof startContextSupervisor>> | undefined;
+  try {
+    const ctx = await handoffFixture(root);
+    await mkdir(ctx.observer.hostManagedRoot, { mode: 0o700 });
+    const unexpected = async (): Promise<never> => {
+      throw new Error("handoff does not need lifecycle access");
+    };
+    supervisor = await startContextSupervisor(ctx, {
+      status: unexpected,
+      restart: unexpected,
+      stop: unexpected,
+    });
+    expect((await lstat(ctx.supervisor.socket)).isSocket()).toBe(true);
+    expect((await lstat(ctx.supervisor.socket)).mode & 0o077).toBe(0);
+    expect(await loadContext(join(root, "context.json"))).toEqual(ctx);
+    await supervisor.close();
+    supervisor = undefined;
+    await expect(lstat(ctx.supervisor.socket)).rejects.toThrow();
+  } finally {
+    if (supervisor) await supervisor.close();
+    await rm(root, { recursive: true });
+  }
+});
+
+test("failed complete context validation drains and removes the real handoff supervisor", async () => {
+  const { startContextSupervisor } = await import("./main.ts");
+  const { lstat } = await import("node:fs/promises");
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/h-failed-"),
+  );
+  try {
+    const ctx = await handoffFixture(root);
+    const unexpected = async (): Promise<never> => {
+      throw new Error("handoff does not need lifecycle access");
+    };
+    await expect(
+      startContextSupervisor(ctx, {
+        status: unexpected,
+        restart: unexpected,
+        stop: unexpected,
+      }),
+    ).rejects.toThrow("owned_path");
+    await expect(lstat(ctx.supervisor.socket)).rejects.toThrow();
+    expect((await lstat(join(root, "context.json"))).isFile()).toBe(true);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("only the coordinator guard installs the exact native-host route on the internal bridge", async () => {
+  const calls: string[][] = [];
+  const inputs = {
+    backend: "firecracker",
+    subnet: "10.42.3.0/24",
+    nativeHostIp: "10.42.4.1",
+    registryPort: 32000,
+    images: { guard: { id: "sha256:" + "a".repeat(64) } },
+  } as Inputs;
+  const ids = {
+    orchestrator: "a".repeat(64),
+    coordinator: "b".repeat(64),
+    worker: "c".repeat(64),
+  };
+  class GuardPlan extends Engine {
+    override async project(): Promise<string> {
+      return "controlled-probe-trust";
+    }
+    override networkOptions(): string[] {
+      return ["--network", "controlled-internal"];
+    }
+    override async create(role: string): Promise<string> {
+      return ids[role.slice(0, -6) as keyof typeof ids];
+    }
+    override async inspect() {
+      return {
+        HostConfig: {
+          PortBindings: {
+            "32000/tcp": [{ HostIp: "127.0.0.1", HostPort: "32000" }],
+            "9101/tcp": [{ HostIp: "10.42.4.1", HostPort: "9101" }],
+          },
+        },
+      };
+    }
+    override async call(args: string[]): Promise<Buffer> {
+      calls.push(args);
+      return Buffer.from("");
+    }
+    override async verifyNetwork() {
+      return {
+        generation: "controlled",
+        enforcementSha256: "e".repeat(64),
+        fixtureOnlyEgress: true as const,
+        externalDnsBlocked: true as const,
+        roles: ["orchestrator", "coordinator", "worker"] as (
+          "orchestrator" | "coordinator" | "worker"
+        )[],
+      };
+    }
+  }
+  const engine = new GuardPlan(inputs, "/owned/run", "mcp-controlled-route");
+  await engine.guards({ path: "/owned/ca", sha256: "f".repeat(64) });
+  expect(calls.filter((args) => args.includes("/usr/sbin/ip"))).toEqual([
+    [
+      "exec",
+      ids.coordinator,
+      "/usr/sbin/ip",
+      "-4",
+      "route",
+      "replace",
+      "10.42.4.1/32",
+      "via",
+      "10.42.3.1",
+      "dev",
+      "eth0",
+    ],
+  ]);
+});
+
+test("native-host route qualification rejects default, missing, duplicate and substituted routes", async () => {
+  const { verifyNativeRouteState } = await import("./engine.ts");
+  const inputs = { subnet: "10.42.3.0/24", nativeHostIp: "10.42.4.1" };
+  const route = { dst: "10.42.4.1", gateway: "10.42.3.1", dev: "eth0" };
+  const selected = { ...route, prefsrc: "10.42.3.21" };
+  expect(() =>
+    verifyNativeRouteState([route], [selected], inputs),
+  ).not.toThrow();
+  for (const routes of [
+    [],
+    [route, route],
+    [route, { dst: "default", gateway: "10.42.3.1" }],
+    [{ ...route, gateway: "10.42.3.40" }],
+    [{ ...route, dev: "foreign0" }],
+  ])
+    expect(() => verifyNativeRouteState(routes, [selected], inputs)).toThrow();
+  for (const current of [
+    { ...selected, gateway: "10.42.3.40" },
+    { ...selected, prefsrc: "10.42.3.22" },
+    { ...selected, dev: "foreign0" },
+  ])
+    expect(() => verifyNativeRouteState([route], [current], inputs)).toThrow(
+      "native_route_selected",
+    );
+});
+
+test("native-host TLS qualification pins the actual first leaf and removes its private probe on failure", async () => {
+  const { generateIdentity } = await import("./identity.ts");
+  const { verifyNativeHostTls } = await import("./engine.ts");
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/host-tls-"),
+  );
+  const openssl = await realpath(
+    process.env.MCP_PLATFORM_TEST_OPENSSL ?? Bun.which("openssl") ?? "openssl",
+  );
+  const inputs = {
+    subnet: "10.42.3.0/24",
+    nativeHostIp: "10.42.4.1",
+    binaries: {
+      openssl: { path: openssl, sha256: hash(await readFile(openssl)) },
+    },
+    images: { guard: { id: "sha256:" + "a".repeat(64) } },
+  } as Inputs;
+  try {
+    const identity = await generateIdentity(inputs, root),
+      id = "a".repeat(64),
+      calls: string[][] = [];
+    const host = identity.leaves.host,
+      wrong = identity.leaves.worker;
+    const output = async (certificate: string) =>
+      Buffer.from(
+        `New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384\n${await readFile(certificate, "utf8")}\nVerify return code: 0 (ok)\n`,
+      );
+    let bytes = await output(host.certificate.path),
+      running = false,
+      removed = true;
+    class TlsProbe extends Engine {
+      override async project(
+        _role: string,
+        files: Record<string, import("./owned.ts").Pin>,
+      ): Promise<string> {
+        expect(Object.keys(files).sort()).toEqual([
+          "ca.pem",
+          "client.crt",
+          "client.key",
+        ]);
+        return "controlled-client-tls";
+      }
+      override async verifyNetwork() {
+        return {
+          generation: "controlled",
+          enforcementSha256: "e".repeat(64),
+          fixtureOnlyEgress: true as const,
+          externalDnsBlocked: true as const,
+          roles: ["orchestrator", "coordinator", "worker"] as (
+            "orchestrator" | "coordinator" | "worker"
+          )[],
+        };
+      }
+      override async audit(id: string) {
+        return { Id: id };
+      }
+      override async call(args: string[]): Promise<Buffer> {
+        calls.push(args);
+        if (args[0] === "create") {
+          removed = false;
+          return Buffer.from(id);
+        }
+        if (args[0] === "start") {
+          running = true;
+          return Buffer.from(id);
+        }
+        if (args[0] === "exec" && args[2] === "/usr/bin/openssl") return bytes;
+        if (args[0] === "container" && args[1] === "inspect")
+          return Buffer.from(
+            JSON.stringify([
+              {
+                Id: id,
+                Config: { Labels: { "engrams.mcp.run": identity.runId } },
+                State: { Running: running, Pid: running ? 123 : 0 },
+              },
+            ]),
+          );
+        if (args[0] === "stop") {
+          running = false;
+          return Buffer.from(id);
+        }
+        if (args[0] === "rm") {
+          removed = true;
+          return Buffer.from(id);
+        }
+        if (args[0] === "ps") return Buffer.from(removed ? "" : id);
+        throw new Error("unexpected fixed TLS probe command");
+      }
+    }
+    const engine = new TlsProbe(inputs, root, identity.runId);
+    engine.guardIds.set("coordinator", "b".repeat(64));
+    const tls = {
+      ca: identity.ca,
+      clientCertificate: identity.leaves.coordinator.certificate,
+      clientKey: identity.leaves.coordinator.key,
+      serverCertificate: host.certificate,
+    };
+    await engine.qualifyNativeHost(tls);
+    await engine.qualifyNativeHost(tls);
+    expect(removed).toBe(true);
+    const created = calls.find((args) => args[0] === "create")!;
+    expect(created).toContain(`container:${"b".repeat(64)}`);
+    expect(created).toContain(
+      "type=volume,src=controlled-client-tls,dst=/etc/mcp-host-probe,readonly",
+    );
+    expect(created).not.toContain("--env-file");
+    expect(created).not.toContain("--cap-add");
+    expect(created).not.toContain("--device");
+    const invoked = calls.find(
+      (args) => args[0] === "exec" && args[2] === "/usr/bin/openssl",
+    )!;
+    for (const flag of [
+      "-tls1_3",
+      "-verify_return_error",
+      "-verify_hostname",
+      "-servername",
+      "-cert",
+      "-key",
+    ])
+      expect(invoked).toContain(flag);
+    bytes = await output(wrong.certificate.path);
+    await expect(engine.qualifyNativeHost(tls)).rejects.toThrow(
+      "native_host_tls_leaf",
+    );
+    expect(removed).toBe(true);
+    expect(running).toBe(false);
+    const correct = await output(host.certificate.path);
+    expect(() =>
+      verifyNativeHostTls(Buffer.concat([bytes, correct]), host.fingerprint),
+    ).toThrow("native_host_tls_leaf");
+    expect(() =>
+      verifyNativeHostTls(
+        Buffer.from(correct.toString().replace("TLSv1.3", "TLSv1.2")),
+        host.fingerprint,
+      ),
+    ).toThrow("native_host_tls_verification");
+    expect(() =>
+      verifyNativeHostTls(
+        Buffer.from(correct.toString().replace("0 (ok)", "20 (bad)")),
+        host.fingerprint,
+      ),
+    ).toThrow("native_host_tls_verification");
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("FC sysctls belong only to its C guard and actual firewall order stays production exact", async () => {
+  const { fcGuardSysctls, fcHostFirewall, verifyFcHostFirewall } =
+    await import("./engine.ts");
+  expect(fcGuardSysctls("firecracker", "coordinator-guard")).toEqual({
+    "net.ipv4.ip_forward": "1",
+    "net.ipv4.conf.all.route_localnet": "1",
+  });
+  for (const backend of ["firecracker", "vz"] as const)
+    for (const role of [
+      "orchestrator-guard",
+      "worker-guard",
+      "host-agent",
+      "worker",
+      ...(backend === "vz" ? ["coordinator-guard"] : []),
+    ])
+      expect(fcGuardSysctls(backend, role)).toEqual({});
+  const expected = fcHostFirewall(26000);
+  expect(expected.INPUT[0]).toContain("--dport 26003");
+  expect(expected.FORWARD.at(-1)).toContain("engram-default-deny");
+  expect(expected.PREROUTING[0]).toContain("-i vh-engr-+");
+  expect(expected.PREROUTING[2]).toContain("--dport 443");
+  const actual = Object.fromEntries(
+    Object.entries(expected).map(([chain, lines]) => [
+      chain,
+      [
+        `-P ${chain} ACCEPT`,
+        ...lines.map((line) =>
+          line
+            .replace("-p tcp", "-p tcp -m tcp")
+            .replace("-p udp", "-p udp -m udp")
+            .replace("--to-port ", "--to-ports ")
+            .replace(/--comment (\S+)/, '--comment "$1"'),
+        ),
+      ].join("\n") + "\n",
+    ]),
+  );
+  verifyFcHostFirewall(actual, 26000);
+  for (const current of [
+    {
+      ...actual,
+      INPUT: actual.INPUT!.replace("--dport 26003", "--dport 26004"),
+    },
+    { ...actual, INPUT: actual.INPUT!.replace(/-A INPUT[^\n]+\n/, "") },
+    {
+      ...actual,
+      FORWARD: actual.FORWARD!.replace(
+        "-P FORWARD ACCEPT\n",
+        "-P FORWARD ACCEPT\n-A FORWARD -j ACCEPT\n",
+      ),
+    },
+    {
+      ...actual,
+      PREROUTING: actual.PREROUTING!.replace("-i vh-engr-+", "-i tap-engr-+"),
+    },
+    { ...actual, POSTROUTING: "-P POSTROUTING ACCEPT\n" },
+    {
+      ...actual,
+      INPUT: actual
+        .INPUT!.split("\n")
+        .map((line, i, all) => (i === 1 ? all[5] : i === 5 ? all[1] : line))
+        .join("\n"),
+    },
+  ])
+    expect(() => verifyFcHostFirewall(current, 26000)).toThrow();
+});
+
+function dockerDnsFirewall(production: Record<string, string[]>): Record<
+  string,
+  string
+> & {
+  POSTROUTING: string;
+  OUTPUT: string;
+  DOCKER_OUTPUT: string;
+  DOCKER_POSTROUTING: string;
+} {
+  return {
+    ...Object.fromEntries(
+      Object.entries(production).map(([chain, rules]) => [
+        chain,
+        [`-P ${chain} ACCEPT`, ...rules].join("\n") + "\n",
+      ]),
+    ),
+    POSTROUTING:
+      [
+        "-P POSTROUTING ACCEPT",
+        "-A POSTROUTING -d 127.0.0.11/32 -j DOCKER_POSTROUTING",
+        ...production.POSTROUTING!,
+      ].join("\n") + "\n",
+    OUTPUT: "-P OUTPUT ACCEPT\n-A OUTPUT -d 127.0.0.11/32 -j DOCKER_OUTPUT\n",
+    DOCKER_OUTPUT:
+      [
+        "-N DOCKER_OUTPUT",
+        "-A DOCKER_OUTPUT -d 127.0.0.11/32 -p tcp -m tcp --dport 53 -j DNAT --to-destination 127.0.0.11:35285",
+        "-A DOCKER_OUTPUT -d 127.0.0.11/32 -p udp -m udp --dport 53 -j DNAT --to-destination 127.0.0.11:52990",
+      ].join("\n") + "\n",
+    DOCKER_POSTROUTING:
+      [
+        "-N DOCKER_POSTROUTING",
+        "-A DOCKER_POSTROUTING -s 127.0.0.11/32 -p tcp -m tcp --sport 35285 -j SNAT --to-source :53",
+        "-A DOCKER_POSTROUTING -s 127.0.0.11/32 -p udp -m udp --sport 52990 -j SNAT --to-source :53",
+      ].join("\n") + "\n",
+  };
+}
+
+test("FC firewall accepts the exact Docker loopback DNS graph", async () => {
+  const { fcHostFirewall, verifyFcHostFirewall } = await import("./engine.ts");
+  const actual = dockerDnsFirewall(fcHostFirewall(30000));
+  expect(() => verifyFcHostFirewall(actual, 30000)).not.toThrow();
+  const otherPorts = Object.fromEntries(
+    Object.entries(actual).map(([chain, rules]) => [
+      chain,
+      rules.replaceAll("35285", "1").replaceAll("52990", "65535"),
+    ]),
+  );
+  expect(() => verifyFcHostFirewall(otherPorts, 30000)).not.toThrow();
+});
+
+test("FC firewall rejects any changed Docker DNS graph or production rule", async () => {
+  const { fcHostFirewall, verifyFcHostFirewall } = await import("./engine.ts");
+  const actual = dockerDnsFirewall(fcHostFirewall(30000));
+  const mutations: Record<string, string>[] = [];
+  for (const chain of [
+    "OUTPUT",
+    "DOCKER_OUTPUT",
+    "DOCKER_POSTROUTING",
+  ] as const) {
+    const missing: Record<string, string> = { ...actual };
+    delete missing[chain];
+    mutations.push(missing);
+    mutations.push({
+      ...actual,
+      [chain]: actual[chain].replaceAll("127.0.0.11", "127.0.0.12"),
+    });
+    mutations.push({
+      ...actual,
+      [chain]: actual[chain] + "-A " + chain + " -d 203.0.113.1/32 -j ACCEPT\n",
+    });
+    const lines = actual[chain].trim().split("\n");
+    mutations.push({
+      ...actual,
+      [chain]: [...lines, lines[1]].join("\n") + "\n",
+    });
+  }
+  for (const port of ["0", "65536", "035285", "-1", "1:2"])
+    mutations.push({
+      ...actual,
+      DOCKER_OUTPUT: actual.DOCKER_OUTPUT.replace(
+        "127.0.0.11:35285",
+        "127.0.0.11:" + port,
+      ),
+    });
+  mutations.push(
+    {
+      ...actual,
+      DOCKER_OUTPUT: actual.DOCKER_OUTPUT.replace("--dport 53", "--dport 54"),
+    },
+    {
+      ...actual,
+      DOCKER_OUTPUT: actual.DOCKER_OUTPUT.replace("-p tcp", "-p udp"),
+    },
+    {
+      ...actual,
+      DOCKER_OUTPUT: actual.DOCKER_OUTPUT.replace("-j DNAT", "-j REDIRECT"),
+    },
+    {
+      ...actual,
+      DOCKER_POSTROUTING: actual.DOCKER_POSTROUTING.replace(
+        "--sport 35285",
+        "--sport 35286",
+      ),
+    },
+    {
+      ...actual,
+      DOCKER_POSTROUTING: actual.DOCKER_POSTROUTING.replace(
+        "--to-source :53",
+        "--to-source :54",
+      ),
+    },
+    {
+      ...actual,
+      OUTPUT: actual.OUTPUT.replace("DOCKER_OUTPUT", "OTHER_OUTPUT"),
+    },
+    {
+      ...actual,
+      POSTROUTING: actual.POSTROUTING.replace("127.0.0.11/32", "127.0.0.0/8"),
+    },
+    {
+      ...actual,
+      POSTROUTING: actual.POSTROUTING.replace(
+        "DOCKER_POSTROUTING",
+        "OTHER_POSTROUTING",
+      ),
+    },
+    {
+      ...actual,
+      POSTROUTING: actual.POSTROUTING + "-A POSTROUTING -j MASQUERADE\n",
+    },
+    {
+      ...actual,
+      INPUT: actual.INPUT!.replace("--dport 30003", "--dport 30004"),
+    },
+    { ...actual, FORWARD: actual.FORWARD!.split("\n").reverse().join("\n") },
+    { ...actual, EXTRA: "-N EXTRA\n" },
+    {
+      ...actual,
+      DOCKER_OUTPUT: actual.DOCKER_OUTPUT.replace(
+        /-A DOCKER_OUTPUT[^\n]+\n/,
+        "",
+      ),
+    },
+    {
+      ...actual,
+      DOCKER_POSTROUTING: actual.DOCKER_POSTROUTING.replace(
+        /-A DOCKER_POSTROUTING[^\n]+\n/,
+        "",
+      ),
+    },
+  );
+  const forward = actual.FORWARD!.trim().split("\n");
+  mutations.push({
+    ...actual,
+    FORWARD:
+      [forward[0], forward[2], forward[1], ...forward.slice(3)].join("\n") +
+      "\n",
+  });
+  mutations.push({
+    ...actual,
+    DOCKER_OUTPUT: actual.DOCKER_OUTPUT.replace(
+      "--dport 53",
+      "--dport 53 --dport 53",
+    ),
+  });
+  mutations.push({
+    ...actual,
+    DOCKER_OUTPUT: actual.DOCKER_OUTPUT.replace(
+      "127.0.0.11/32",
+      "127.0.0.11/8",
+    ),
+  });
+  const swapped = actual.POSTROUTING.trim().split("\n");
+  mutations.push({
+    ...actual,
+    POSTROUTING: [swapped[0], swapped[2], swapped[1]].join("\n") + "\n",
+  });
+  mutations.push({
+    ...actual,
+    POSTROUTING: actual.POSTROUTING.replace(
+      "-P POSTROUTING ACCEPT\n",
+      "-P POSTROUTING ACCEPT\n-A POSTROUTING -d 127.0.0.11/32 -j DOCKER_POSTROUTING\n",
+    ),
+  });
+  for (const current of mutations)
+    expect(() => verifyFcHostFirewall(current, 30000)).toThrow();
+});
+
+test("FC qualification reads both actual namespace sysctls and production chains", async () => {
+  const { fcHostFirewall } = await import("./engine.ts");
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/fc-net-"),
+  );
+  const calls: string[][] = [];
+  let badNamespace = false,
+    badSysctl = false,
+    dockerDns = false;
+  class FcProbe extends Engine {
+    override async call(args: string[]) {
+      calls.push(args);
+      if (args[2] === "/usr/bin/readlink")
+        return Buffer.from(
+          badNamespace && args[1] === "host" ? "net:[456]\n" : "net:[123]\n",
+        );
+      if (args[2] === "/bin/cat") return Buffer.from(badSysctl ? "0\n" : "1\n");
+      if (args[2] === "/usr/sbin/iptables") {
+        const chain = args[6]!;
+        if (dockerDns) {
+          const actual: Record<string, string> = dockerDnsFirewall(
+            fcHostFirewall(26000),
+          );
+          const output = actual[chain];
+          if (output === undefined) throw Error("unexpected DNS chain");
+          return Buffer.from(output);
+        }
+        return Buffer.from(
+          [`-P ${chain} ACCEPT`, ...fcHostFirewall(26000)[chain]!].join("\n") +
+            "\n",
+        );
+      }
+      throw new Error("unexpected FC qualification command");
+    }
+  }
+  try {
+    const engine = new FcProbe(
+      { backend: "firecracker", registryPort: 26000 } as Inputs,
+      root,
+      "controlled",
+    );
+    engine.guardIds.set("coordinator", "guard");
+    await engine.qualifyFcHost("host");
+    expect(calls.filter((args) => args[2] === "/bin/cat")).toHaveLength(4);
+    expect(
+      calls.filter((args) => args[2] === "/usr/sbin/iptables"),
+    ).toHaveLength(4);
+    calls.length = 0;
+    dockerDns = true;
+    await engine.qualifyFcHost("host");
+    expect(
+      calls
+        .filter((args) => args[2] === "/usr/sbin/iptables")
+        .map((args) => args.slice(4)),
+    ).toEqual([
+      ["filter", "-S", "INPUT"],
+      ["filter", "-S", "FORWARD"],
+      ["nat", "-S", "PREROUTING"],
+      ["nat", "-S", "POSTROUTING"],
+      ["nat", "-S", "OUTPUT"],
+      ["nat", "-S", "DOCKER_OUTPUT"],
+      ["nat", "-S", "DOCKER_POSTROUTING"],
+    ]);
+    dockerDns = false;
+    badNamespace = true;
+    await expect(engine.qualifyFcHost("host")).rejects.toThrow(
+      "fc_host_namespace",
+    );
+    badNamespace = false;
+    badSysctl = true;
+    await expect(engine.qualifyFcHost("host")).rejects.toThrow(
+      "fc_host_sysctl",
+    );
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("VZ link uses private nonoverlapping IPAM and derives its interface from the exact endpoint", async () => {
+  const { verifyNativeSubnet, nativeInterface, verifyNativeRouteState } =
+    await import("./engine.ts");
+  expect(() =>
+    verifyNativeSubnet("172.25.0.0/16", "172.25.0.1", [
+      "10.42.3.0/24",
+      "192.168.1.5",
+    ]),
+  ).not.toThrow();
+  for (const [subnet, gateway, forbidden] of [
+    ["8.8.8.0/24", "8.8.8.1", []],
+    ["172.25.0.0/16", "172.26.0.1", []],
+    ["172.25.0.0/16", "172.25.0.1", ["172.25.3.0/24"]],
+    ["172.25.0.0/16", "172.25.0.1", ["172.25.3.5"]],
+    ["172.25.3.0/16", "172.25.3.1", []],
+  ] as [string, string, string[]][])
+    expect(() => verifyNativeSubnet(subnet, gateway, forbidden)).toThrow();
+  const value = [
+    {
+      ifname: "owned7",
+      address: "02:42:ac:19:00:02",
+      addr_info: [{ family: "inet", local: "172.25.0.2" }],
+    },
+  ];
+  expect(nativeInterface(value, "172.25.0.2", "02:42:ac:19:00:02")).toBe(
+    "owned7",
+  );
+  expect(() =>
+    nativeInterface(
+      [{ ...value[0], addr_info: [{ family: "inet6", local: "172.25.0.2" }] }],
+      "172.25.0.2",
+      "02:42:ac:19:00:02",
+    ),
+  ).toThrow("native_link_interface");
+  expect(() =>
+    nativeInterface(value, "172.25.0.3", "02:42:ac:19:00:02"),
+  ).toThrow();
+  expect(() =>
+    nativeInterface([...value, ...value], "172.25.0.2", "02:42:ac:19:00:02"),
+  ).toThrow();
+  expect(() =>
+    nativeInterface(value, "172.25.0.2", "02:42:ac:19:00:03"),
+  ).toThrow();
+  const inputs = { subnet: "10.42.3.0/24", nativeHostIp: "192.168.1.5" };
+  const link = { gateway: "172.25.0.1", dev: "owned7", source: "172.25.0.2" };
+  const route = {
+    dst: inputs.nativeHostIp,
+    gateway: link.gateway,
+    dev: link.dev,
+  };
+  expect(() =>
+    verifyNativeRouteState(
+      [route],
+      [{ ...route, prefsrc: link.source }],
+      inputs,
+      link,
+    ),
+  ).not.toThrow();
+  expect(() =>
+    verifyNativeRouteState(
+      [route, { dst: "default" }],
+      [{ ...route, prefsrc: link.source }],
+      inputs,
+      link,
+    ),
+  ).toThrow();
+});
+
+test("cleanup selects only authenticated fixture or managed-principal sessions on the exact host", async () => {
+  const { ownedCleanupSessions } = await import("./main.ts");
+  const id = "11111111-1111-4111-8111-111111111111";
+  const session = { id, status: "active", hostId: "owned-host" };
+  expect(
+    ownedCleanupSessions(
+      [{ session, ownerEmail: "owner@fixture.example" }],
+      "owned-host",
+      new Map(),
+      new Set(),
+    ),
+  ).toEqual([id]);
+  expect(
+    ownedCleanupSessions(
+      [{ session }],
+      "owned-host",
+      new Map([[id, "owned-actor"]]),
+      new Set(["owned-actor"]),
+    ),
+  ).toEqual([id]);
+  expect(() =>
+    ownedCleanupSessions(
+      [{ session, ownerEmail: "foreign@example.test" }],
+      "owned-host",
+      new Map(),
+      new Set(),
+    ),
+  ).toThrow("cleanup_foreign_session");
+  expect(() =>
+    ownedCleanupSessions(
+      [
+        {
+          session: { ...session, hostId: "foreign-host" },
+          ownerEmail: "owner@fixture.example",
+        },
+      ],
+      "owned-host",
+      new Map(),
+      new Set(),
+    ),
+  ).toThrow();
+  expect(() =>
+    ownedCleanupSessions(
+      [{ session }, { session }],
+      "owned-host",
+      new Map([[id, "owned-actor"]]),
+      new Set(["owned-actor"]),
+    ),
+  ).toThrow("cleanup_session_identity");
+  expect(
+    ownedCleanupSessions(
+      [{ session: { ...session, status: "completed" } }],
+      "owned-host",
+      new Map(),
+      new Set(),
+    ),
+  ).toEqual([]);
+});
+
+test("session teardown ignores a deleted old automation task and cleans the exact pending session", async () => {
+  const { create } =
+    await import("../../../../orchestrator/node_modules/@bufbuild/protobuf/dist/esm/index.js");
+  const { WhoAmIResponseSchema } =
+    await import("../../../../orchestrator/src/gen/engram/app/v1/api_key_pb.ts");
+  const { GetAutomationResponseSchema, GetRunResponseSchema } =
+    await import("../../../../orchestrator/src/gen/engram/app/v1/automation_pb.ts");
+  const { GetTaskResponseSchema } =
+    await import("../../../../orchestrator/src/gen/engram/app/v1/task_pb.ts");
+  const { ListSessionsResponseSchema, DeleteSessionResponseSchema } =
+    await import("../../../../orchestrator/src/gen/engram/app/v1/session_pb.ts");
+  const { recordOwnedAutomation } =
+    await import("../../../../orchestrator/scripts/mcp-stack/automation-ownership.ts");
+  const { canonicalJson } =
+    await import("../../../../orchestrator/scripts/mcp-stack/guest.ts");
+  const { publicClient } =
+    await import("../../../../orchestrator/scripts/mcp-stack/transport.ts");
+  const { destroyRunSessions } = await import("./main.ts");
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/automation-cleanup-"),
+  );
+  try {
+    const ctx = await handoffFixture(root);
+    await mkdir(ctx.observer.hostManagedRoot, { mode: 0o700 });
+    const sessionId = "11111111-1111-4111-8111-111111111111";
+    const automationId = "fixture-automation";
+    const runId = "autorun:fixture-automation:manual:fixture-event";
+    const taskId = "fixture-root-task";
+    const definition = {
+      blocks: [
+        {
+          id: "launch",
+          type: "create_session",
+          config: { profileId: "fixture-profile" },
+        },
+      ],
+    };
+    const reference = {
+      automationId,
+      definitionActorId: "fixture-admin",
+      definitionSha256: hash(canonicalJson(definition)),
+      profileId: "fixture-profile",
+    };
+    await recordOwnedAutomation(ctx, reference);
+    await recordOwnedAutomation(ctx, { ...reference, runId });
+    const oldAutomationId = "fixture-old-automation";
+    const oldRunId = "autorun:fixture-old-automation:manual:old-event";
+    const oldSessionId = "22222222-2222-4222-8222-222222222222";
+    const oldTaskId = "deleted-old-task";
+    const oldReference = { ...reference, automationId: oldAutomationId };
+    await recordOwnedAutomation(ctx, oldReference);
+    await recordOwnedAutomation(ctx, { ...oldReference, runId: oldRunId });
+    await recordOwnedAutomation(ctx, {
+      ...oldReference,
+      runId: oldRunId,
+      sessionId: oldSessionId,
+      taskId: oldTaskId,
+    });
+    const admin = await publicClient(ctx, {
+      kind: "cookie",
+      value: "fixture=bootstrap",
+    });
+    const destroyed: string[] = [];
+    const spies = [
+      spyOn(admin.identity, "whoAmI").mockResolvedValue(
+        create(WhoAmIResponseSchema, {
+          email: "bootstrap@fixture.example",
+          role: "admin",
+          userId: "fixture-admin",
+        }),
+      ),
+      spyOn(admin.automations, "getAutomation").mockImplementation(
+        async (request) => {
+          const id = request.lookup?.case === "id" ? request.lookup.value : "";
+          return create(GetAutomationResponseSchema, {
+            automation: {
+              id,
+              kind: "user",
+              createdByUserId: "fixture-admin",
+              currentVersion: 1,
+              version: {
+                automationId: id,
+                number: 1,
+                definitionJson: JSON.stringify(definition),
+                createdByUserId: "fixture-admin",
+              },
+            },
+          });
+        },
+      ),
+      spyOn(admin.automationRuns, "getRun").mockImplementation(
+        async (request) => {
+          const old = request.runId === oldRunId;
+          const sid = old ? oldSessionId : sessionId,
+            tid = old ? oldTaskId : taskId;
+          return create(GetRunResponseSchema, {
+            run: {
+              brief: {
+                id: request.runId,
+                automationId: old ? oldAutomationId : automationId,
+                version: 1,
+                triggerSource: "manual",
+                status: old ? "completed" : "waiting",
+              },
+              steps: [
+                {
+                  blockId: "launch",
+                  status: "succeeded",
+                  sessionId: sid,
+                  outputsJson: JSON.stringify({
+                    session_id: sid,
+                    task_id: tid,
+                    initial_prompt: false,
+                    prompt: "",
+                  }),
+                },
+              ],
+              sessionIds: [sid],
+            },
+          });
+        },
+      ),
+      spyOn(admin.tasks, "getTask").mockImplementation(async (request) => {
+        if (request.taskId === oldTaskId)
+          throw new Error("old_task_was_deleted");
+        return create(GetTaskResponseSchema, {
+          task: {
+            id: taskId,
+            type: "automation",
+            sourceJson: JSON.stringify({
+              provider: "automation",
+              automationId,
+              runId,
+            }),
+            sessions: [{ sessionId, role: "primary" }],
+          },
+        });
+      }),
+      spyOn(admin.sessions, "listSessions").mockImplementation(async () =>
+        create(ListSessionsResponseSchema, {
+          sessions: destroyed.length
+            ? []
+            : [{ session: { id: sessionId, status: "creating" } }],
+        }),
+      ),
+      spyOn(admin.sessions, "deleteSession").mockImplementation(
+        async (request) => {
+          if (request.sessionId !== sessionId)
+            throw new Error("foreign_cleanup_request");
+          destroyed.push(request.sessionId);
+          return create(DeleteSessionResponseSchema);
+        },
+      ),
+    ];
+    try {
+      await destroyRunSessions(ctx, admin);
+      expect(
+        JSON.parse(
+          await readFile(join(ctx.runRoot, "session-cleanup.json"), "utf8"),
+        ),
+      ).toEqual({ destroyed: [sessionId], remaining: [] });
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("cleanup admits only the exact proven automation session before host assignment", async () => {
+  const { ownedCleanupSessions } = await import("./main.ts");
+  const id = "11111111-1111-4111-8111-111111111111";
+  const session = { id, status: "active" };
+  expect(
+    ownedCleanupSessions(
+      [{ session }],
+      "owned-host",
+      new Map(),
+      new Set(),
+      new Set([id]),
+    ),
+  ).toEqual([id]);
+  for (const row of [
+    { session: { ...session, id: "22222222-2222-4222-8222-222222222222" } },
+    { session: { ...session, hostId: "foreign-host" } },
+  ])
+    expect(() =>
+      ownedCleanupSessions(
+        [row],
+        "owned-host",
+        new Map(),
+        new Set(),
+        new Set([id]),
+      ),
+    ).toThrow("cleanup_foreign_session");
+  expect(() =>
+    ownedCleanupSessions(
+      [{ session }],
+      "owned-host",
+      new Map([[id, "automation:foreign"]]),
+      new Set(),
+    ),
+  ).toThrow("cleanup_foreign_session");
+});
+
+test("VZ guard acquires and revalidates its exact link with complete address metadata", async () => {
+  const calls: string[][] = [];
+  const id = "b".repeat(64),
+    network = "d".repeat(64),
+    runId = "mcp-controlled-vz";
+  let connected = false,
+    removed = false;
+  const endpoint = {
+    IPv4Address: "172.25.0.2/16",
+    MacAddress: "02:42:ac:19:00:02",
+  };
+  const interfaces = [
+    {
+      ifname: "owned7",
+      address: endpoint.MacAddress,
+      addr_info: [
+        { family: "inet6", local: "fe80::42:acff:fe19:2" },
+        { family: "inet", local: "172.25.0.2" },
+      ],
+    },
+  ];
+  class VzPlan extends Engine {
+    override async project() {
+      return "controlled-trust";
+    }
+    override networkOptions() {
+      return ["--network", "controlled-internal"];
+    }
+    override async create(role: string) {
+      return role === "coordinator-guard"
+        ? id
+        : role === "worker-guard"
+          ? "c".repeat(64)
+          : "a".repeat(64);
+    }
+    override async inspect() {
+      return {
+        HostConfig: {
+          PortBindings: {
+            "32000/tcp": [{ HostIp: "127.0.0.1", HostPort: "32000" }],
+          },
+        },
+      };
+    }
+    override async verifyNetwork() {
+      return {
+        generation: "controlled",
+        enforcementSha256: "e".repeat(64),
+        fixtureOnlyEgress: true as const,
+        externalDnsBlocked: true as const,
+        roles: ["orchestrator", "coordinator", "worker"] as (
+          "orchestrator" | "coordinator" | "worker"
+        )[],
+      };
+    }
+    override async call(args: string[]) {
+      calls.push(args);
+      if (args[0] === "network" && args[1] === "create")
+        return Buffer.from(network);
+      if (args[0] === "network" && args[1] === "connect") {
+        connected = true;
+        return Buffer.from("");
+      }
+      if (args[0] === "network" && args[1] === "inspect")
+        return Buffer.from(
+          JSON.stringify([
+            {
+              Id: network,
+              Name: `${runId}-native-network`,
+              Internal: false,
+              Driver: "bridge",
+              EnableIPv6: false,
+              Labels: { "engrams.mcp.run": runId },
+              IPAM: {
+                Config: [{ Subnet: "172.25.0.0/16", Gateway: "172.25.0.1" }],
+              },
+              Containers: connected ? { [id]: endpoint } : {},
+            },
+          ]),
+        );
+      if (args.includes("address"))
+        return Buffer.from(
+          JSON.stringify(
+            args.includes("-4")
+              ? interfaces.map(({ ifname, addr_info }) => ({
+                  ifname,
+                  addr_info: addr_info.filter((info) => info.family === "inet"),
+                }))
+              : interfaces,
+          ),
+        );
+      if (
+        args.includes("route") &&
+        (args.includes("table") || args.includes("get"))
+      )
+        return Buffer.from(
+          JSON.stringify([
+            {
+              dst: "192.168.254.1",
+              gateway: "172.25.0.1",
+              dev: "owned7",
+              ...(args.includes("get") ? { prefsrc: "172.25.0.2" } : {}),
+            },
+          ]),
+        );
+      if (args.at(-1) === "default")
+        return Buffer.from(
+          JSON.stringify([
+            { dst: "default", gateway: "172.25.0.1", dev: "owned7" },
+          ]),
+        );
+      if (args[0] === "network" && args[1] === "rm") {
+        removed = true;
+        return Buffer.from(network);
+      }
+      return Buffer.from("");
+    }
+  }
+  const engine = new VzPlan(
+    {
+      backend: "vz",
+      subnet: "10.42.3.0/24",
+      nativeHostIp: "192.168.254.1",
+      registryPort: 32000,
+      images: { guard: { id: "sha256:" + "a".repeat(64) } },
+    } as Inputs,
+    "/owned/run",
+    runId,
+  );
+  await engine.guards({ path: "/owned/ca", sha256: "f".repeat(64) });
+  await engine.verifyNativeRoute();
+  const attach = calls.findIndex(
+    (args) => args[0] === "network" && args[1] === "connect",
+  );
+  expect(
+    calls.slice(0, attach).filter((args) => args.includes("/usr/sbin/nft")),
+  ).toHaveLength(3);
+  expect(calls[attach]).toEqual(["network", "connect", network, id]);
+  expect(calls).toContainEqual([
+    "exec",
+    id,
+    "/usr/sbin/ip",
+    "-4",
+    "route",
+    "del",
+    "default",
+    "via",
+    "172.25.0.1",
+    "dev",
+    "owned7",
+  ]);
+  expect(calls).toContainEqual([
+    "exec",
+    id,
+    "/usr/sbin/ip",
+    "-4",
+    "route",
+    "replace",
+    "192.168.254.1/32",
+    "via",
+    "172.25.0.1",
+    "dev",
+    "owned7",
+  ]);
+  expect(removed).toBe(false);
+});
+
+test("FC process proof rejects a recycled PID, foreign cgroup, UID or executable", async () => {
+  const { verifyFcProcessIdentity } = await import("./fc-runtime.ts");
+  const process = {
+    pid: 42,
+    bootId: "fixed-boot",
+    birth: "100",
+    uid: 0,
+    executable: "/usr/local/bin/firecracker",
+    cgroup: "/owned/container",
+    sha256: "a".repeat(64),
+  };
+  expect(() => verifyFcProcessIdentity(process, { ...process })).not.toThrow();
+  for (const actual of [
+    undefined,
+    { ...process, birth: "101" },
+    { ...process, bootId: "foreign-boot" },
+    { ...process, uid: 1000 },
+    { ...process, executable: "/foreign/firecracker" },
+    { ...process, cgroup: "/foreign/container" },
+    { ...process, sha256: "b".repeat(64) },
+  ])
+    expect(() => verifyFcProcessIdentity(process, actual)).toThrow(
+      "fc_process_identity_changed",
+    );
+});
+
+test("secret projection reads back private file and directory modes and refuses a public key", async () => {
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/private-projection-"),
+  );
+  const { put } = await import("./owned.ts");
+  const file = await put(join(root, "client.key"), "controlled-private-key");
+  let publicKey = false,
+    removed = false;
+  class Projection extends Engine {
+    override async volume() {
+      return "controlled-volume";
+    }
+    override async create() {
+      return "a".repeat(64);
+    }
+    override async remove() {
+      removed = true;
+    }
+    override async call(args: string[]) {
+      if (args.includes("/usr/bin/stat"))
+        return Buffer.from(
+          args.includes("%u:%g:%a:%F:%h")
+            ? `1000:1000:${publicKey ? "644" : "600"}:regular file:1\n`
+            : "1000:1000:700:directory\n",
+        );
+      if (args.includes("/usr/bin/sha256sum"))
+        return Buffer.from(file.sha256 + "  /projection/client.key\n");
+      return Buffer.from("");
+    }
+  }
+  try {
+    const engine = new Projection(
+      { images: { guard: { id: "sha256:" + "a".repeat(64) } } } as Inputs,
+      root,
+      "controlled",
+    );
+    await expect(
+      engine.project("host-tls", { "client.key": file }),
+    ).resolves.toBe("controlled-volume");
+    expect(removed).toBe(true);
+    publicKey = true;
+    await expect(
+      engine.project("host-tls", { "client.key": file }),
+    ).rejects.toThrow("projection_file_mode");
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+for (const partial of [false, true])
+  test(`FC evidence write failure stays fatal after a later sample (${partial ? "partial append" : "missing append"})`, async () => {
+    const { FcRuntime } = await import("./fc-runtime.ts");
+    const { appendFile } = await import("node:fs/promises");
+    const root = await mkdtemp(
+      join(process.cwd(), "var/mcp-platform-composition/evidence-fault-"),
+    );
+    const path = join(root, "fc-physical.jsonl");
+    const record =
+      JSON.stringify({
+        sandboxId: "controlled-sandbox",
+        bootAttempt: "controlled-boot",
+        readSectors: "1",
+      }) + "\n";
+    let writes = 0;
+    const runtime = new FcRuntime(
+      {
+        bootId: "controlled",
+        release: "controlled",
+        pidNamespace: "pid:[1]",
+        pool: poolFixture(),
+      },
+      {} as Inputs,
+      root,
+      async (file, bytes) => {
+        writes++;
+        if (writes === 1) {
+          if (partial)
+            await appendFile(file, bytes.slice(0, 15), { mode: 0o600 });
+          throw new Error("controlled evidence write failure");
+        }
+        await appendFile(file, bytes, { mode: 0o600 });
+      },
+    );
+    try {
+      await expect(
+        runtime.retainObservation("controlled-sandbox:controlled-boot", record),
+      ).rejects.toThrow("controlled evidence write failure");
+      // This would be a successful unrelated sample if the failure were lost.
+      await expect(runtime.observe()).rejects.toThrow(
+        "fc_physical_evidence_write",
+      );
+      await expect(runtime.requireCoverage()).rejects.toThrow(
+        "fc_physical_evidence_write",
+      );
+      await expect(
+        runtime.retainObservation("another-sandbox:another-boot", record),
+      ).rejects.toThrow("fc_physical_evidence_write");
+      expect(writes).toBe(1);
+      if (partial) {
+        const retained = await readFile(path, "utf8");
+        expect(retained).toBe(record.slice(0, 15));
+        expect(() => JSON.parse(retained)).toThrow();
+      } else
+        await expect(readFile(path)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true });
+    }
+  });
+
+test("matrix arguments forward the selected stage without replacing focused selectors", async () => {
+  const { matrixArguments } = await import("./main.ts");
+  const key = "codex/catalog-fidelity";
+  expect(matrixArguments("/owned/context.json").slice(1)).toEqual([
+    "--context",
+    "/owned/context.json",
+    "--matrix",
+    "all",
+  ]);
+  expect(
+    matrixArguments("/owned/context.json", {
+      stage: "matrix",
+      matrix: key,
+    }).slice(1),
+  ).toEqual(["--context", "/owned/context.json", "--matrix", key]);
+  expect(
+    matrixArguments("/owned/context.json", { stage: "infrastructure" }).slice(
+      1,
+    ),
+  ).toEqual(["--context", "/owned/context.json", "--stage", "infrastructure"]);
+});
+
+async function receiptFixture(
+  root: string,
+  selection: import("../../../../orchestrator/scripts/mcp-stack/manifest.ts").RunSelection,
+) {
+  const { Evidence } =
+    await import("../../../../orchestrator/scripts/mcp-stack/evidence.ts");
+  const { selectedCases } =
+    await import("../../../../orchestrator/scripts/mcp-stack/manifest.ts");
+  const ctx = await handoffFixture(root);
+  const evidence = await Evidence.create(ctx, selection);
+  const hash = "a".repeat(64);
+  try {
+    await evidence.prerequisites({
+      supervisorSha256: hash,
+      publicationSha256: hash,
+      publicStateSha256: hash,
+    });
+    await evidence.infrastructure(
+      ["ordinary", "managed"].map((mode) => ({
+        mode,
+        execSha256: hash,
+        uploadSha256: hash,
+        downloadSha256: hash,
+        sizeBytes: 4096,
+        unauthenticatedStatus: 401,
+        nonOwnerStatus: 404,
+      })),
+    );
+    for (const selected of selectedCases(selection)) {
+      const digest = await evidence.observe({
+        source: "guest-proof",
+        caseKey: selected.key,
+        identitySha256: hash,
+        state: "succeeded",
+        contentSha256: hash,
+      });
+      await evidence.result({
+        key: selected.key,
+        status: "PASS",
+        assertions: selected.assertions.map((assertion) => ({
+          assertion,
+          observationHashes: [digest],
+        })),
+      });
+    }
+    await evidence.finish();
+  } finally {
+    await evidence.close();
+  }
+  const source = await readFile(ctx.evidenceFile, "utf8");
+  return {
+    ctx,
+    source,
+    records: source
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line)),
+  };
+}
+for (const mode of [
+  "full",
+  "filtered",
+  "infrastructure",
+  "explicit-all-keys",
+] as const) {
+  test(`adapter completion validates real ${mode} Evidence writer output`, async () => {
+    const { verifyRunnerCompletion } = await import("./main.ts");
+    const { REQUIRED_CASES } =
+      await import("../../../../orchestrator/scripts/mcp-stack/manifest.ts");
+    const root = await mkdtemp(
+      join(process.cwd(), "var/mcp-platform-composition/receipt-"),
+    );
+    try {
+      const selection =
+        mode === "infrastructure"
+          ? { stage: "infrastructure" as const }
+          : {
+              stage: "matrix" as const,
+              matrix:
+                mode === "full"
+                  ? "all"
+                  : mode === "explicit-all-keys"
+                    ? REQUIRED_CASES.map((c) => c.key).join(",")
+                    : "codex/catalog-fidelity,claude/catalog-fidelity",
+            };
+      const { ctx, source, records } = await receiptFixture(root, selection);
+      await expect(
+        verifyRunnerCompletion(ctx, selection),
+      ).resolves.toBeUndefined();
+      expect(records.at(-1).physicalAcceptance).toBe(mode === "full");
+      if (mode === "full") {
+        expect(records.filter((r) => r.kind === "case")).toHaveLength(24);
+        expect(
+          records
+            .filter((r) => r.kind === "case")
+            .reduce((n, r) => n + r.assertions.length, 0),
+        ).toBe(138);
+        expect(Buffer.byteLength(source)).toBeLessThan(16 * 1024 * 1024);
+      } else
+        await expect(
+          verifyRunnerCompletion(ctx, { stage: "matrix", matrix: "all" }),
+        ).rejects.toThrow("runner_completion");
+    } finally {
+      await rm(root, { recursive: true });
+    }
+  });
+}
+for (const malformed of [
+  "terminal-only",
+  "contradictory-stage-flag",
+  "wrong-stage",
+  "duplicate-completion",
+  "copied-after-failed-case",
+  "missing-infrastructure",
+  "wrong-infrastructure-order",
+  "bad-infrastructure-hash",
+  "missing-case",
+  "failed-case",
+  "unrecorded-provenance",
+  "tampered-observation",
+  "wrong-run-header",
+  "wrong-selector",
+  "trailing-observation",
+  "unknown-record",
+  "empty-stream",
+  "torn-final-line",
+] as const) {
+  test(`adapter completion rejects ${malformed} evidence`, async () => {
+    const { verifyRunnerCompletion } = await import("./main.ts");
+    const root = await mkdtemp(
+      join(process.cwd(), "var/mcp-platform-composition/receipt-"),
+    );
+    try {
+      const selection = { stage: "matrix" as const, matrix: "all" };
+      const { ctx, records } = await receiptFixture(root, selection);
+      const terminal = records.at(-1),
+        observation = records.find((r) => r.kind === "observation"),
+        result = records.find((r) => r.kind === "case"),
+        infra = records.find((r) => r.kind === "infrastructure");
+      let altered = [...records];
+      switch (malformed) {
+        case "terminal-only":
+          altered = [terminal];
+          break;
+        case "contradictory-stage-flag":
+          altered[altered.length - 1] = { ...terminal, stageCompleted: true };
+          break;
+        case "wrong-stage":
+          altered[altered.length - 1] = {
+            ...terminal,
+            stage: "infrastructure",
+          };
+          break;
+        case "duplicate-completion":
+          altered.push(terminal);
+          break;
+        case "copied-after-failed-case":
+          altered.push({ ...result, status: "FAIL", assertions: [] }, terminal);
+          break;
+        case "missing-infrastructure":
+          altered = altered.filter((r) => r.kind !== "infrastructure");
+          break;
+        case "wrong-infrastructure-order":
+          infra.rows.reverse();
+          break;
+        case "bad-infrastructure-hash":
+          infra.rows[0].downloadSha256 = "b".repeat(64);
+          break;
+        case "missing-case":
+          altered = altered.filter((r) => r !== result);
+          break;
+        case "failed-case":
+          result.status = "FAIL";
+          result.assertions = [];
+          break;
+        case "unrecorded-provenance":
+          result.assertions[0].observationHashes = ["b".repeat(64)];
+          break;
+        case "tampered-observation":
+          observation.contentSha256 = "b".repeat(64);
+          break;
+        case "wrong-run-header":
+          altered[0].sourceCommit = "f".repeat(40);
+          break;
+        case "wrong-selector":
+          altered[0].matrix = "claude/catalog-fidelity";
+          break;
+        case "trailing-observation":
+          altered.push(observation);
+          break;
+        case "unknown-record":
+          altered.splice(1, 0, { version: 1, kind: "unknown" });
+          break;
+        case "empty-stream":
+          altered = [];
+          break;
+        case "torn-final-line":
+          break;
+      }
+      let source = altered.map((r) => JSON.stringify(r)).join("\n") + "\n";
+      if (malformed === "torn-final-line") source = source.slice(0, -4);
+      await writeFile(ctx.evidenceFile, source);
+      await expect(verifyRunnerCompletion(ctx, selection)).rejects.toThrow(
+        "runner_completion",
+      );
+    } finally {
+      await rm(root, { recursive: true });
+    }
+  });
+}
+
+for (const graceMs of [0, 100]) {
+  test(`owned process teardown waits for transient group EPERM with ${graceMs}ms grace`, async () => {
+    const { OwnedProcess, childEnvironment } = await import("./owned.ts");
+    const owned = new OwnedProcess(
+      process.execPath,
+      ["-e", "setInterval(()=>{},1000)"],
+      process.cwd(),
+      childEnvironment(process.cwd()),
+    );
+    const actualKill = process.kill.bind(process);
+    let retiring = false;
+    let release = false;
+    let denied = 0;
+    const kill = spyOn(process, "kill").mockImplementation((pid, signal) => {
+      if (pid !== -owned.child.pid!) return actualKill(pid, signal);
+      if (retiring && !release) {
+        denied++;
+        throw Object.assign(new Error("group not yet reaped"), {
+          code: "EPERM",
+        });
+      }
+      const result = actualKill(pid, signal);
+      if (signal === "SIGTERM") retiring = true;
+      return result;
+    });
+    let settled = false;
+    const stopping = owned.stop(graceMs).finally(() => {
+      settled = true;
+    });
+    // Observe rejection before advancing the event loop.
+    const outcome = stopping.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(denied).toBeGreaterThan(0);
+      expect(settled).toBe(false);
+      release = true;
+      expect(await outcome).toBeUndefined();
+      await owned.done;
+      let absence: unknown;
+      try {
+        actualKill(-owned.child.pid!, 0);
+      } catch (error) {
+        absence = error;
+      }
+      expect(absence).toMatchObject({ code: "ESRCH" });
+    } finally {
+      release = true;
+      await outcome;
+      kill.mockRestore();
+      await owned.stop(100);
+    }
+  });
+}
+
+test("owned process teardown rejects persistent group EPERM after leader exit", async () => {
+  const { OwnedProcess, childEnvironment } = await import("./owned.ts");
+  const owned = new OwnedProcess(
+    process.execPath,
+    ["-e", ""],
+    process.cwd(),
+    childEnvironment(process.cwd()),
+  );
+  await owned.done;
+  const actualKill = process.kill.bind(process);
+  const kill = spyOn(process, "kill").mockImplementation((pid, signal) => {
+    if (pid !== -owned.child.pid!) return actualKill(pid, signal);
+    throw Object.assign(new Error("group permission denied"), {
+      code: "EPERM",
+    });
+  });
+  try {
+    await expect(owned.stop(0)).rejects.toThrow("FAILED:process_cleanup");
+  } finally {
+    kill.mockRestore();
+    await owned.stop(100);
+  }
+});
+
+for (const stage of ["infrastructure", "selected-case"] as const) {
+  for (const started of [false, true]) {
+    for (const canceled of [false, true]) {
+      test(`${stage} ${canceled ? "cancellation" : "failure"} ${started ? "after" : "before"} native startup uses shared teardown`, async () => {
+        const { cleanupPlatform } = await import("./main.ts");
+        const { OwnedProcess, childEnvironment } = await import("./owned.ts");
+        const fixture = await nativeCleanupFixture();
+        const unrelated = new OwnedProcess(
+          process.execPath,
+          ["-e", "setInterval(()=>{},1000)"],
+          process.cwd(),
+          childEnvironment(process.cwd()),
+        );
+        const runner = new OwnedProcess(
+          process.execPath,
+          ["-e", "setInterval(()=>{},1000)"],
+          process.cwd(),
+          childEnvironment(process.cwd()),
+        );
+        if (!started) {
+          Reflect.set(fixture.stack, "host", undefined);
+          fixture.setIdentities([]);
+        }
+        const events: string[] = [];
+        const abort = new AbortController();
+        const failure = new PlatformFailure(
+          "FAILED",
+          canceled ? "run_aborted" : `${stage}_failure`,
+        );
+        let failed: string[] = [];
+        try {
+          await expect(
+            (async () => {
+              try {
+                if (canceled) abort.abort();
+                throw failure;
+              } finally {
+                failed = await cleanupPlatform({
+                  stack: fixture.stack,
+                  runner,
+                });
+                events.push("cleanup");
+              }
+            })(),
+          ).rejects.toBe(failure);
+          expect(failed).toEqual([]);
+          expect(events).toEqual(["cleanup"]);
+          expect(fixture.events).toEqual(
+            started ? ["41001:SIGTERM", "host-complete", "41002:SIGTERM"] : [],
+          );
+          expect(fixture.identities()).toEqual([]);
+          expect(unrelated.running()).toBe(true);
+          expect(runner.running()).toBe(false);
+          expect(abort.signal.aborted).toBe(canceled);
+        } finally {
+          // Restore the process signal boundary before retiring the separate real child.
+          await fixture.close();
+          await unrelated.stop(100);
+          await runner.stop(100);
+        }
+      });
+    }
+  }
+}
+
+test("shared teardown reports changed native identity without signaling it or an unrelated child", async () => {
+  const { cleanupPlatform } = await import("./main.ts");
+  const fixture = await nativeCleanupFixture();
+  fixture.setIdentities([
+    { ...fixture.leader, seconds: "1730000001" },
+    fixture.identities()[1]!,
+  ]);
+  try {
+    expect(await cleanupPlatform({ stack: fixture.stack })).toEqual(["host"]);
+    expect(fixture.events).toEqual([]);
+    expect(fixture.identities()).toHaveLength(2);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("network guard checks run together and drain siblings before releasing control on failure", async () => {
+  const { GUARDS, address, rules } = await import("./network.ts");
+  const inputs = {
+    backend: "firecracker",
+    subnet: "10.42.3.0/24",
+    nativeHostIp: "10.42.4.1",
+  } as Inputs;
+  const entered: string[] = [],
+    finished: string[] = [];
+  const allEntered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const failure = new Error("controlled guard failure");
+  const runId = "mcp-guard-fence";
+  class GuardFence extends Engine {
+    override async verifyNativeRoute() {}
+    override async audit(id: string) {
+      entered.push(id);
+      if (entered.length === 3) allEntered.resolve();
+      if (id === "orchestrator") throw failure;
+      await release.promise;
+      return {
+        State: { Running: true },
+        NetworkSettings: {
+          Networks: {
+            [runId + "-network"]: {
+              IPAddress: address(
+                inputs,
+                id === "worker" ? "worker" : "coordinator",
+              ),
+            },
+          },
+        },
+      };
+    }
+    override async verifyResolver() {}
+    override async call(args: string[]): Promise<Buffer> {
+      if (args[0] === "network")
+        return Buffer.from(
+          JSON.stringify([
+            {
+              Id: "network",
+              Internal: true,
+              Labels: { "engrams.mcp.run": runId },
+            },
+          ]),
+        );
+      const role = args[1] === "worker" ? "worker" : "coordinator";
+      if (args.includes("/usr/sbin/nft"))
+        return Buffer.from(JSON.stringify({ nftables: rules(inputs, role) }));
+      if (args.includes("+short"))
+        return Buffer.from(address(inputs, "modern") + "\n");
+      if (args.includes("+comments"))
+        return Buffer.from("status: NXDOMAIN, ANSWER: 0,");
+      if (args.includes("/bin/sh")) {
+        finished.push(role);
+        return Buffer.from("blocked");
+      }
+      return Buffer.alloc(0);
+    }
+  }
+  const engine = new GuardFence(inputs, "/owned/run", runId);
+  Reflect.set(engine, "networkId", "network");
+  for (const role of GUARDS) engine.guardIds.set(role, role);
+  const signal = new AbortController().signal;
+  let settled = false;
+  const result = engine
+    .controlled(signal, () => engine.verifyNetwork(true))
+    .then(
+      () => {
+        settled = true;
+        return undefined;
+      },
+      (error) => {
+        settled = true;
+        return error;
+      },
+    );
+  try {
+    await Promise.race([allEntered.promise, result]);
+    expect(entered).toEqual(GUARDS);
+    expect(settled).toBe(false);
+    await expect(engine.controlled(signal, async () => {})).rejects.toThrow(
+      "engine_control_busy",
+    );
+    release.resolve();
+    expect(await result).toBe(failure);
+    expect(finished.sort()).toEqual(["coordinator", "worker"]);
+    await expect(
+      engine.controlled(signal, async () => {}),
+    ).resolves.toBeUndefined();
+  } finally {
+    release.resolve();
+    await result;
+  }
+});
+
+test("role status checks run together and drain siblings before releasing control on failure", async () => {
+  const { Stack } = await import("./launch.ts");
+  const { ROLES } =
+    await import("../../../../orchestrator/scripts/mcp-stack/supervisor.ts");
+  const { GUARDS } = await import("./network.ts");
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/status-fence-"),
+  );
+  const ctx = await handoffFixture(root);
+  ctx.backend = "firecracker";
+  const pin = ctx.artifacts.coordinator;
+  const inputs = {
+    backend: "firecracker",
+    images: Object.fromEntries(
+      ["coordinator", "orchestrator", "worker", "fixture", "hostAgent"].map(
+        (role) => [role, { id: role }],
+      ),
+    ),
+  } as Inputs;
+  const entered: string[] = [],
+    finished: string[] = [];
+  const allEntered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const failure = new Error("controlled role failure");
+  let fail = true;
+  class RoleFence extends Engine {
+    override async audit(id: string) {
+      entered.push(id);
+      if (entered.length === ROLES.length) allEntered.resolve();
+      if (id === "orchestrator" && fail) throw failure;
+      await release.promise;
+      finished.push(id);
+      return {
+        State: { Running: true },
+        Image: id.startsWith("fixture-") ? "fixture" : id,
+      };
+    }
+    override async verifyResolver() {}
+    override async qualifyFcHost() {}
+    override async qualifyNativeHost() {}
+    override async inspect() {
+      return { State: { Running: true, Pid: 123 } };
+    }
+    override async verifyNetwork() {
+      return {
+        generation: "controlled",
+        enforcementSha256: "e".repeat(64),
+        fixtureOnlyEgress: true as const,
+        externalDnsBlocked: true as const,
+        roles: GUARDS,
+      };
+    }
+  }
+  const engine = new RoleFence(inputs, root, ctx.runId, {
+    bootId: "controlled",
+    release: "controlled",
+    pidNamespace: "pid:[1]",
+    pool: poolFixture(),
+  });
+  const kernel = spyOn(engine.fc!, "qualifyKernel").mockResolvedValue(
+    undefined,
+  );
+  const observe = spyOn(engine.fc!, "observe").mockResolvedValue(undefined);
+  const identity = {
+    ca: pin,
+    leaves: {
+      coordinator: { certificate: pin, key: pin },
+      host: { certificate: pin },
+    },
+  } as ConstructorParameters<typeof Stack>[2];
+  const stack = new Stack(
+    inputs,
+    root,
+    identity,
+    {} as ConstructorParameters<typeof Stack>[3],
+    {} as ConstructorParameters<typeof Stack>[4],
+    engine,
+  );
+  Reflect.set(
+    stack,
+    "active",
+    new Map(ROLES.map((role) => [role, { id: role, configuration: "normal" }])),
+  );
+  Reflect.set(
+    stack,
+    "configs",
+    new Map(
+      ["orchestrator", "coordinator", "worker", "host-agent"].map((role) => [
+        role,
+        { normal: { env: {}, files: {} } },
+      ]),
+    ),
+  );
+  const signal = new AbortController().signal;
+  let settled = false;
+  const result = engine
+    .controlled(signal, () => stack.status(ctx))
+    .then(
+      () => {
+        settled = true;
+        return undefined;
+      },
+      (error) => {
+        settled = true;
+        return error;
+      },
+    );
+  try {
+    await Promise.race([allEntered.promise, result]);
+    expect([...entered].sort()).toEqual([...ROLES].sort());
+    expect(settled).toBe(false);
+    await expect(engine.controlled(signal, async () => {})).rejects.toThrow(
+      "engine_control_busy",
+    );
+    release.resolve();
+    expect(await result).toBe(failure);
+    expect(finished).toHaveLength(ROLES.length - 1);
+    fail = false;
+    const status = await engine.controlled(signal, () => stack.status(ctx));
+    expect(status.roles.map((role) => role.role)).toEqual([...ROLES]);
+    expect(status.roles.every((role) => role.state === "running")).toBe(true);
+  } finally {
+    release.resolve();
+    await result;
+    kernel.mockRestore();
+    observe.mockRestore();
+    await rm(root, { recursive: true });
+  }
+});
+
+test("drained check results keep input order when completion order differs", async () => {
+  const { drainChecks } = await import("./engine.ts");
+  const first = Promise.withResolvers<string>();
+  const second = Promise.withResolvers<string>();
+  const result = drainChecks([first.promise, second.promise]);
+  second.resolve("second");
+  first.resolve("first");
+  expect(await result).toEqual(["first", "second"]);
+});

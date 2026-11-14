@@ -148,6 +148,11 @@ pub struct VzBackend {
 }
 
 impl VzBackend {
+    /// The same configured kernel that managed preparation copies and verifies.
+    pub fn managed_kernel_path(&self) -> &Path {
+        &self.cfg.kernel_path
+    }
+
     pub fn new(work_dir: impl Into<PathBuf>, cfg: VzConfig) -> Result<Self, SandboxError> {
         let work_dir = work_dir.into();
         // Validate the kernel exists up-front so misconfiguration
@@ -169,6 +174,29 @@ impl VzBackend {
             forge_sink: Mutex::new(None),
             upload_sink: Mutex::new(None),
         })
+    }
+
+    /// Prepare exact disk-only managed inputs with closed host networking.
+    /// The returned owner is outside ordinary lifecycles. The blocking pin
+    /// operation owns disposable staging until the input copy is complete.
+    pub async fn prepare_managed_cold(
+        &self,
+        request: engram_core::types::managed_cold::ManagedColdPrepare,
+        spec: SandboxSpec,
+        network: engram_egress_proto::private::RegisteredPrivateNetwork,
+        helper: crate::managed::ManagedHelperArtifact,
+        staging: tempfile::TempDir,
+    ) -> Result<crate::managed::PreparedManagedVz, SandboxError> {
+        crate::managed::prepare(
+            &self.work_dir,
+            &self.cfg,
+            request,
+            spec,
+            network,
+            helper,
+            staging,
+        )
+        .await
     }
 
     fn vsock_uds_path_for(&self, id: SandboxId) -> Result<PathBuf, SandboxError> {
@@ -397,6 +425,13 @@ impl VzBackend {
         let Some(w) = manifest.warm.clone() else {
             return Err("manifest has no warm block (the save failed)".into());
         };
+        if w.configuration_revision != crate::snapshot::CONFIGURATION_REVISION {
+            return Err(format!(
+                "configuration revision differs (saved {}, current {})",
+                w.configuration_revision,
+                crate::snapshot::CONFIGURATION_REVISION
+            ));
+        }
         if !src.join(crate::snapshot::MACHINE_STATE_FILENAME).exists() {
             return Err("machine.vzs missing from the snapshot dir".into());
         }
@@ -575,7 +610,7 @@ impl VzBackend {
 /// Run the agentd exec protocol over a connected byte stream. The
 /// Firecracker backend carries the same function; only the connection
 /// setup differs.
-async fn drive_exec_protocol<R, W>(
+pub(crate) async fn drive_exec_protocol<R, W>(
     sandbox_id: SandboxId,
     mut reader: R,
     mut writer: W,
@@ -695,7 +730,9 @@ where
     })
 }
 
-async fn probe_durable_exec(mut stream: UnixStream) -> Result<bool, SandboxError> {
+pub(crate) async fn probe_durable_exec<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+) -> Result<bool, SandboxError> {
     write_msg(
         &mut stream,
         &WireRequest::CancelExec {
@@ -1085,6 +1122,7 @@ impl SandboxBackend for VzBackend {
             let state_path = dest.join(crate::snapshot::MACHINE_STATE_FILENAME);
             match vm.save(&state_path).await {
                 Ok(()) => Some(crate::snapshot::WarmMachineState {
+                    configuration_revision: crate::snapshot::CONFIGURATION_REVISION,
                     machine_identifier: machine_identifier.clone(),
                     mac_address: mac_address.clone(),
                     kernel_cmdline: self.current_kernel_cmdline(),
@@ -1572,6 +1610,66 @@ mod tests {
 
         assert!(matches!(stream.next().await, Some(ExecEvent::Exit(None))));
         assert!(stream.next().await.is_none());
+    }
+
+    #[test]
+    fn warm_gate_requires_current_configuration_revision() {
+        let work = tempfile::tempdir().unwrap();
+        let kernel = tempfile::NamedTempFile::new().unwrap();
+        let backend =
+            VzBackend::new(work.path().join("sb"), VzConfig::with_kernel(kernel.path())).unwrap();
+        std::fs::write(
+            work.path().join(crate::snapshot::MACHINE_STATE_FILENAME),
+            [],
+        )
+        .unwrap();
+        let mut value = serde_json::json!({
+            "configuration_revision": 1,
+            "machine_identifier": [1, 2, 3],
+            "mac_address": "02:00:00:00:00:02",
+            "kernel_cmdline": backend.current_kernel_cmdline(),
+            "aux_ro_drives": [],
+            "memory_mib": 1024,
+            "vcpus": 2,
+            "swap_mib": null
+        });
+        let manifest_for = |value| {
+            crate::snapshot::VzSnapshotManifest::new(
+                SandboxId::new(),
+                SandboxSpec {
+                    image: "warm-test".into(),
+                    rootfs_source: None,
+                    image_uri: None,
+                    rootfs_manifest: None,
+                    cpu: engram_core::types::sandbox::CpuLimit { vcpus: 2 },
+                    memory: engram_core::types::sandbox::MemoryLimit { max_mib: 1024 },
+                    disk: engram_core::types::sandbox::DiskLimit { max_gib: 1 },
+                    ttl: None,
+                    env: HashMap::new(),
+                    workdir: None,
+                    network: Default::default(),
+                    aux_ro_drives: vec![],
+                    swap_mib: None,
+                    swap_source: None,
+                    swap_manifest: None,
+                },
+                Some(serde_json::from_value(value).unwrap()),
+            )
+        };
+        let current = manifest_for(value.clone());
+        assert!(backend.warm_gate(&current, work.path()).is_ok());
+        for revision in [0, u32::MAX] {
+            value["configuration_revision"] = revision.into();
+            let manifest = manifest_for(value.clone());
+            let error = backend.warm_gate(&manifest, work.path()).unwrap_err();
+            assert!(error.contains("configuration revision"), "{error}");
+        }
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("configuration_revision");
+        let legacy = manifest_for(value);
+        assert!(backend.warm_gate(&legacy, work.path()).is_err());
     }
 
     #[test]

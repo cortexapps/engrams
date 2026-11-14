@@ -81,6 +81,7 @@ impl EventOutbox {
                 state.open_runs.push(run_id.clone());
             }
             HarnessEvent::RunCompleted { run_id, .. }
+            | HarnessEvent::RunDeferred { run_id, .. }
             | HarnessEvent::RunInterrupted { run_id, .. } => {
                 state.open_runs.retain(|r| r != run_id);
             }
@@ -880,5 +881,27 @@ mod tests {
             channels.event_tx.try_send(HarnessEvent::Idle).unwrap();
         }
         assert!(channels.event_tx.try_send(HarnessEvent::Idle).is_err());
+    }
+
+    #[test]
+    fn deferred_completion_closes_the_reconnect_run_inventory() {
+        let outbox = EventOutbox::new();
+        outbox.sequence(
+            4,
+            HarnessEvent::RunStarted {
+                run_id: "r1".into(),
+                prompt_id: None,
+                prompt_summary: None,
+            },
+        );
+        assert_eq!(outbox.continued_runs(5), vec!["r1"]);
+        outbox.sequence(
+            4,
+            HarnessEvent::RunDeferred {
+                run_id: "r1".into(),
+                deferred_tool_call_ids: vec!["t1".into()],
+            },
+        );
+        assert!(outbox.continued_runs(5).is_empty());
     }
 }

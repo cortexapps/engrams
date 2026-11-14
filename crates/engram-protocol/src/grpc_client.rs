@@ -117,28 +117,29 @@ fn fenced_request(id: SandboxId, fence: SessionFence) -> FencedSandboxRequest {
     }
 }
 
-/// Deadline applied (via the gRPC `grpc-timeout` header) to the
-/// snapshot-restore RPCs — `restore` (resume),
-/// `restore_base_for_session` (cold-create-via-restore), and
-/// `start_agent` (the harness (re)attach leg of the same resume
-/// pipeline, which shares the wedge modes). Without it a
-/// host that wedges mid-restore leaves the coord caller hung
-/// indefinitely (observed as a ~6-minute dead-host stall); the
-/// keepalive pings only catch a *silent* connection, not a peer that
-/// ACKs but never completes the call. Set generously above the
-/// slowest legitimate restore (cold boot ~15-30s, rechunk-heavy
-/// resumes up to a couple of minutes) so it never aborts a real
-/// restore, while still bounding the pathological hang. Because it
-/// rides the gRPC deadline header, the *host* side observes it too and
-/// can abort its own work. Override via
-/// `ENGRAM_RESTORE_RPC_TIMEOUT_SECS`.
-fn restore_rpc_timeout() -> Duration {
+/// Deadline for restore, harness start and managed lifecycle calls.
+/// The host receives the same deadline through the gRPC timeout header.
+/// `ENGRAM_RESTORE_RPC_TIMEOUT_SECS` overrides the 240-second default.
+pub fn restore_rpc_timeout() -> Duration {
     let secs = std::env::var("ENGRAM_RESTORE_RPC_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|s| *s > 0)
         .unwrap_or(240);
     Duration::from_secs(secs)
+}
+
+fn managed_request<T>(message: T) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    request.set_timeout(restore_rpc_timeout());
+    request.metadata_mut().insert(
+        crate::wire::MANAGED_PROTOCOL_METADATA_KEY,
+        crate::wire::MANAGED_PROTOCOL_VERSION
+            .to_string()
+            .parse()
+            .expect("protocol number is ASCII"),
+    );
+    request
 }
 
 /// The largest `HostService` message either side decodes or encodes.
@@ -154,13 +155,14 @@ pub const HOST_RPC_MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 #[derive(Clone)]
 pub struct GrpcHostClient {
     inner: HostServiceClient<InterceptedService<Channel, TraceparentInjector>>,
+    managed_transport: bool,
 }
 
 impl GrpcHostClient {
     /// Build a client over an existing tonic `Channel`. The channel
     /// is HTTP/2-multiplexing — many concurrent RPCs share one
     /// TCP+H2 connection — so we want exactly one instance per
-    /// host. Callers go through `GrpcHostPool::dispatch` which
+    /// host. Callers go through `GrpcHostPool::get_or_warm` which
     /// hands out a clone of the pool's entry.
     ///
     /// Every RPC carries the caller's `traceparent` via
@@ -171,7 +173,32 @@ impl GrpcHostClient {
         Self {
             inner: HostServiceClient::with_interceptor(channel, TraceparentInjector)
                 .max_decoding_message_size(HOST_RPC_MAX_MESSAGE_BYTES),
+            managed_transport: false,
         }
+    }
+
+    /// Only the pool can construct a client with pinned mutual TLS authority.
+    pub(crate) fn with_pinned_tls(
+        host: engram_core::HostId,
+        address: &str,
+        endpoint: tonic::transport::Endpoint,
+        tls: &crate::host_tls::HostClientTls,
+    ) -> Result<Self, SandboxError> {
+        let endpoint = tls
+            .endpoint(host, address, endpoint)
+            .map_err(SandboxError::InvalidSpec)?;
+        let mut client = Self::new(endpoint.connect_lazy());
+        client.managed_transport = true;
+        Ok(client)
+    }
+
+    fn require_managed_transport(&self) -> Result<(), SandboxError> {
+        if !self.managed_transport {
+            return Err(SandboxError::Unsupported(
+                "managed RPC requires pinned mutual TLS".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Fire a no-op `Ping` to force TCP+H2 handshake on a freshly
@@ -911,7 +938,7 @@ impl GrpcHostClient {
         let mut req = tonic::Request::new(StartAgentRequest {
             sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
             agent_bincode: encode_bincode(&agent, "AgentSpec")?,
-            policy_bincode: encode_bincode(&policy, "SessionEgressPolicy")?,
+            policy_bincode: crate::ordinary_policy::encode(&policy)?,
             session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
             fencing_epoch: fence.epoch,
         });
@@ -1420,13 +1447,7 @@ fn proxy_body_to_shell_frame(
     })
 }
 
-// ---- helpers ----
-//
-// Use `bincode::serialize` / `bincode::deserialize` with default
-// config to match the existing WS codec (`src/codec.rs:49,71`) so
-// a SandboxSpec encoded on the gRPC wire decodes identically to one
-// on the WS wire. Both transports use the same Rust types during
-// the ADR 0013 transition.
+// General payloads use bincode defaults. Ordinary policy has its own strict codec.
 
 fn encode_bincode<T: serde::Serialize>(
     value: &T,
@@ -1659,6 +1680,150 @@ impl HostClient for GrpcHostClient {
         Self::restore_base_for_session(self, metadata, session_env, selected_mounts, fence).await
     }
 
+    async fn read_managed_cold_assets(
+        &self,
+        request: engram_core::types::managed_assets::ManagedColdAssetsRequest,
+    ) -> Result<engram_core::types::managed_assets::ManagedColdAssetsReceipt, SandboxError> {
+        self.require_managed_transport()?;
+        request
+            .validate()
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?;
+        let payload_json = crate::managed_boot::encode(&request)?;
+        let response = self
+            .inner
+            .clone()
+            .read_managed_cold_assets(managed_request(crate::grpc::ReadManagedColdAssetsRequest {
+                payload_json,
+            }))
+            .await
+            .map_err(managed_grpc_error)?
+            .into_inner();
+        let receipt: engram_core::types::managed_assets::ManagedColdAssetsReceipt =
+            crate::managed_boot::decode(&response.payload_json)?;
+        receipt
+            .validate_for(&request)
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?;
+        Ok(receipt)
+    }
+    async fn capture_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedCaptureRequest,
+    ) -> Result<engram_core::types::managed_boot::ManagedCaptureAuthority, SandboxError> {
+        self.require_managed_transport()?;
+        let payload_json = crate::managed_boot::encode(&request)?;
+        let response = self
+            .inner
+            .clone()
+            .capture_managed_boot(managed_request(crate::grpc::ManagedBootRequest {
+                payload_json,
+            }))
+            .await
+            .map_err(managed_grpc_error)?
+            .into_inner();
+        crate::managed_boot::decode(&response.payload_json)
+    }
+    async fn prepare_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedBootPrepare,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootPreparedReceipt, SandboxError> {
+        self.require_managed_transport()?;
+        let payload_json = crate::managed_boot::encode(&request)?;
+        let response = self
+            .inner
+            .clone()
+            .prepare_managed_boot(managed_request(crate::grpc::ManagedBootRequest {
+                payload_json,
+            }))
+            .await
+            .map_err(managed_grpc_error)?
+            .into_inner();
+        crate::managed_boot::decode(&response.payload_json)
+    }
+    async fn read_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedBootKey,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootHostState, SandboxError> {
+        self.require_managed_transport()?;
+        let payload_json = crate::managed_boot::encode(&request)?;
+        let response = self
+            .inner
+            .clone()
+            .read_managed_boot(managed_request(crate::grpc::ManagedBootRequest {
+                payload_json,
+            }))
+            .await
+            .map_err(managed_grpc_error)?
+            .into_inner();
+        crate::managed_boot::decode(&response.payload_json)
+    }
+    async fn finalize_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedBootFinalize,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootFinalReceipt, SandboxError> {
+        self.require_managed_transport()?;
+        let payload_json = crate::managed_boot::encode(&request)?;
+        let response = self
+            .inner
+            .clone()
+            .finalize_managed_boot(managed_request(crate::grpc::ManagedBootRequest {
+                payload_json,
+            }))
+            .await
+            .map_err(managed_grpc_error)?
+            .into_inner();
+        crate::managed_boot::decode(&response.payload_json)
+    }
+    async fn start_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedBootStart,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootHostState, SandboxError> {
+        self.require_managed_transport()?;
+        let payload_json = crate::managed_boot::encode(&request)?;
+        let response = self
+            .inner
+            .clone()
+            .start_managed_boot(managed_request(crate::grpc::ManagedBootRequest {
+                payload_json,
+            }))
+            .await
+            .map_err(managed_grpc_error)?
+            .into_inner();
+        crate::managed_boot::decode(&response.payload_json)
+    }
+    async fn read_managed_policy(
+        &self,
+        target: engram_core::types::managed_deny::ManagedPolicyTarget,
+    ) -> Result<Option<engram_core::types::managed_deny::ManagedAppliedState>, SandboxError> {
+        self.require_managed_transport()?;
+        let response = self
+            .inner
+            .clone()
+            .read_managed_policy(managed_request(crate::grpc::ReadManagedPolicyRequest {
+                target_bincode: encode_bincode(&target, "managed target")?,
+            }))
+            .await
+            .map_err(managed_grpc_error)?
+            .into_inner();
+        crate::managed_policy::decode(&response.state_bincode)
+            .map_err(|_| SandboxError::InvalidSpec("invalid managed state".into()))
+    }
+    async fn apply_managed_policy(
+        &self,
+        request: engram_core::types::managed_deny::ManagedPolicyApply,
+    ) -> Result<engram_core::types::managed_deny::ManagedAppliedState, SandboxError> {
+        self.require_managed_transport()?;
+        let response = self
+            .inner
+            .clone()
+            .apply_managed_policy(managed_request(crate::grpc::ApplyManagedPolicyRequest {
+                request_bincode: encode_bincode(&request, "managed apply")?,
+            }))
+            .await
+            .map_err(managed_grpc_error)?
+            .into_inner();
+        crate::managed_policy::decode(&response.state_bincode)
+            .map_err(|_| SandboxError::InvalidSpec("invalid managed state".into()))
+    }
     async fn start_agent(
         &self,
         id: SandboxId,
@@ -1779,10 +1944,7 @@ impl HostClient for GrpcHostClient {
     // doesn't carry static capability or in-proc sink wiring.
 }
 
-/// Map a tonic Status into the same `SandboxError` shape today's WS
-/// path produces. The bincode wire used `RemoteError::into_sandbox`;
-/// tonic gives us a status code + message, so we do the equivalent
-/// mapping per code.
+/// Map gRPC status codes and exact refusal markers to typed sandbox errors.
 fn grpc_to_sandbox_err(status: tonic::Status) -> SandboxError {
     use tonic::Code;
     match status.code() {
@@ -1813,7 +1975,11 @@ fn grpc_to_sandbox_err(status: tonic::Status) -> SandboxError {
         // io::ErrorKind for the resume re-plan. A `failed_precondition`
         // with NEITHER marker falls through to the generic mapping.
         Code::FailedPrecondition => {
-            if let Some((host, coord)) = crate::wire::parse_wire_skew_message(status.message()) {
+            if status.message() == crate::wire::MANAGED_RECOVERY_REQUIRED_STATUS {
+                SandboxError::ManagedRecoveryRequired
+            } else if let Some((host, coord)) =
+                crate::wire::parse_wire_skew_message(status.message())
+            {
                 SandboxError::WireSkew { host, coord }
             } else if let Some((kind, message)) =
                 crate::wire::parse_harness_spawn_message(status.message())
@@ -1831,9 +1997,146 @@ fn grpc_to_sandbox_err(status: tonic::Status) -> SandboxError {
     }
 }
 
+fn managed_grpc_error(status: tonic::Status) -> SandboxError {
+    if status.code() == tonic::Code::Unimplemented {
+        SandboxError::Unsupported(status.message().to_string())
+    } else {
+        grpc_to_sandbox_err(status)
+    }
+}
+
 #[cfg(test)]
 mod grpc_err_tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct CountingHost(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl tonic::server::NamedService for CountingHost {
+        const NAME: &'static str = "engram.host.v1.HostService";
+    }
+
+    impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>> for CountingHost {
+        type Response = tonic::codegen::http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(
+            &mut self,
+            request: tonic::codegen::http::Request<tonic::body::Body>,
+        ) -> Self::Future {
+            let _ = request;
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let status = tonic::Status::unimplemented("unexpected ordinary transport call");
+            std::future::ready(Ok(status.into_http()))
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_client_refuses_managed_calls_before_network() {
+        use engram_core::types::{managed_assets::ManagedColdAssetsRequest, manifest::ManifestRef};
+        use futures::FutureExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let incoming = futures::stream::unfold(listener, |listener| async move {
+            let next = listener.accept().await.map(|(stream, _)| stream);
+            Some((next, listener))
+        });
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let mut server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(CountingHost(calls.clone()))
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = stopped.await;
+                }),
+        );
+        let exercise = async {
+            let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let client = GrpcHostClient::new(channel);
+            let request = ManagedColdAssetsRequest {
+                version: 1,
+                host_id: engram_core::HostId::new(),
+                session_id: SessionId::new(),
+                intent_id: "intent-a".into(),
+                image: "test.invalid/image:v1".into(),
+                image_digest: format!("sha256:{}", "a".repeat(64)),
+                disk_manifest: ManifestRef::new(),
+                aux_ro_drives: (0..3)
+                    .map(|i| AuxRoDrive {
+                        drive_id: AuxRoDrive::slot_drive_id(i),
+                        guest_mount: AuxRoDrive::slot_guest_mount(i),
+                        fs_type: "squashfs".into(),
+                        sha256: Some("b".repeat(64)),
+                    })
+                    .collect(),
+            };
+            let error = client.read_managed_cold_assets(request).await.unwrap_err();
+            assert!(matches!(error, SandboxError::Unsupported(_)), "{error:?}");
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            // The legacy snapshot fallback must retain its existing mapping.
+            assert!(
+                matches!(grpc_to_sandbox_err(tonic::Status::unimplemented("legacy")), SandboxError::InvalidSpec(message) if message == "legacy")
+            );
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            std::panic::AssertUnwindSafe(exercise).catch_unwind(),
+        )
+        .await;
+        let _ = stop.send(());
+        let joined = tokio::time::timeout(Duration::from_secs(2), &mut server).await;
+        if joined.is_err() {
+            server.abort();
+            let _ = server.await;
+        }
+        joined.unwrap().unwrap().unwrap();
+        outcome.unwrap().unwrap();
+    }
+
+    #[test]
+    fn managed_request_retains_both_contract_markers_and_deadline() {
+        let request = TraceparentInjector.call(managed_request(())).unwrap();
+        assert_eq!(
+            request
+                .metadata()
+                .get(crate::wire::WIRE_VERSION_METADATA_KEY)
+                .unwrap(),
+            "38"
+        );
+        assert_eq!(
+            request
+                .metadata()
+                .get(crate::wire::MANAGED_PROTOCOL_METADATA_KEY)
+                .unwrap(),
+            "43"
+        );
+        assert!(request.metadata().contains_key("grpc-timeout"));
+    }
+
+    #[test]
+    fn managed_errors_preserve_unsupported_and_current_transport_failures() {
+        assert!(
+            matches!(managed_grpc_error(tonic::Status::unimplemented("absent")), SandboxError::Unsupported(message) if message == "absent")
+        );
+        assert!(
+            matches!(managed_grpc_error(tonic::Status::invalid_argument("invalid")), SandboxError::InvalidSpec(message) if message == "invalid")
+        );
+        assert!(
+            matches!(managed_grpc_error(tonic::Status::unavailable("down")), SandboxError::Unavailable(message) if message == "down")
+        );
+    }
 
     #[test]
     fn migration_client_interceptor_stamps_wire_version() {
@@ -1905,6 +2208,26 @@ mod grpc_err_tests {
             "some other precondition",
         ));
         assert!(matches!(err, SandboxError::Vm(_)));
+    }
+
+    #[test]
+    fn managed_recovery_requires_exact_status_marker() {
+        let marker = crate::wire::MANAGED_RECOVERY_REQUIRED_STATUS;
+        assert!(matches!(
+            grpc_to_sandbox_err(tonic::Status::failed_precondition(marker)),
+            SandboxError::ManagedRecoveryRequired
+        ));
+        for status in [
+            tonic::Status::failed_precondition(format!("{marker}: extra")),
+            tonic::Status::failed_precondition("managed sandbox requires cold recovery"),
+            tonic::Status::invalid_argument(marker),
+            tonic::Status::unavailable(marker),
+        ] {
+            assert!(!matches!(
+                grpc_to_sandbox_err(status),
+                SandboxError::ManagedRecoveryRequired
+            ));
+        }
     }
 
     #[test]

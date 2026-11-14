@@ -1,0 +1,17 @@
+[package]
+name = "engram-mcp-model-fixture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+serde_json = { version = "=1.0.154", features = ["unbounded_depth"] }
+serde = "=1.0.229"
+sha2 = "=0.10.9"
+libc = "=0.2.191"
+
+[[bin]]
+name = "fixture-mock-bridge"
+path = "tests/support/mock_bridge.rs"

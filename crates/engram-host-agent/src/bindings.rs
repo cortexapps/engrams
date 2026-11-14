@@ -106,6 +106,72 @@ impl BindingStore {
         })
     }
 
+    pub(crate) fn managed_required(&self, session: SessionId) -> bool {
+        if self
+            .dir
+            .join(format!("{session}.managed-boot"))
+            .try_exists()
+            .unwrap_or(true)
+        {
+            return true;
+        }
+        self.dir
+            .join(format!("{session}.managed-required"))
+            .try_exists()
+            .unwrap_or(true)
+            || self
+                .dir
+                .join(format!("{session}.managed"))
+                .try_exists()
+                .unwrap_or(true)
+    }
+    /// Check every durable managed association, including a record whose binding
+    /// has been removed or moved. An unreadable association cannot prove ordinary.
+    pub(crate) fn managed_sandbox_required(&self, sandbox: SandboxId) -> std::io::Result<bool> {
+        if self
+            .dir
+            .join(format!("{sandbox}.managed-sandbox"))
+            .try_exists()?
+        {
+            return Ok(true);
+        }
+        let mut sessions = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(&self.dir)? {
+            let path = entry?.path();
+            if matches!(
+                path.extension().and_then(|v| v.to_str()),
+                Some("managed" | "managed-required")
+            ) {
+                let sid: SessionId = path
+                    .file_stem()
+                    .and_then(|v| v.to_str())
+                    .ok_or_else(|| std::io::Error::other("invalid managed filename"))?
+                    .parse()
+                    .map_err(std::io::Error::other)?;
+                sessions.insert(sid);
+            }
+        }
+        for sid in sessions {
+            if self
+                .read(sid)?
+                .is_some_and(|binding| binding.sandbox_id == sandbox)
+            {
+                return Ok(true);
+            }
+            // The desired record can retain the old physical target after unbind.
+            let record = crate::managed_policy::read_record(self, sid)?
+                .ok_or_else(|| std::io::Error::other("managed record missing"))?;
+            if record.egress.sandbox_id == sandbox {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn directory(&self) -> &std::path::Path {
+        &self.dir
+    }
+
     fn path_for(&self, session_id: SessionId) -> PathBuf {
         self.dir.join(format!("{session_id}.json"))
     }
@@ -177,7 +243,7 @@ impl BindingStore {
                 format!("binding record {}: {e}", path.display()),
             )
         })?;
-        if record.schema_version != BINDING_SCHEMA_VERSION {
+        if record.schema_version != BINDING_SCHEMA_VERSION || record.session_id != session_id {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
@@ -302,6 +368,23 @@ impl BindingStore {
                 }
             }
         }
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            if entry.path().extension().and_then(|e| e.to_str()) != Some("managed-required") {
+                continue;
+            }
+            let sid: SessionId = entry
+                .path()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| std::io::Error::other("invalid managed filename"))?
+                .parse()
+                .map_err(std::io::Error::other)?;
+            let record = crate::managed_policy::read_record(self, sid)?
+                .ok_or_else(|| std::io::Error::other("managed record missing"))?;
+            out.retain(|p| p.session_id != sid);
+            out.push(record.egress);
+        }
         Ok(out)
     }
 
@@ -402,6 +485,7 @@ mod tests {
         sandbox_id: SandboxId,
     ) -> engram_core::types::egress::SessionEgressPolicy {
         engram_core::types::egress::SessionEgressPolicy {
+            managed_deny: None,
             session_id,
             sandbox_id,
             guest_ip: std::net::Ipv4Addr::new(10, 200, 0, 2),

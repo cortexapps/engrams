@@ -688,3 +688,15 @@ orchestrator:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+
+# Isolated external MCP workers. Only operators can edit these zone policies.
+# Provision a separate namespace with enforced NetworkPolicy before enabling.
+# Namespace policies are additive: no other policy may grant broader egress.
+mcpWorker:
+  enabled: false
+  image:
+    repository: ghcr.io/cortexapps/engrams/mcp-worker
+    tag: ""
+    pullPolicy: IfNotPresent
+  zones: []
+  # See values-mcp-worker.yaml.example for a complete, disabled zone.

@@ -178,7 +178,7 @@ HOST_BASE_PATHS = ["deploy/packer/", "deploy/otel/"]
 # exactly mirroring `web/`'s treatment. A source-only orchestrator change
 # rebakes the orchestrator (and the other images in the matrix; that's the same
 # coarse behavior `web/` has always had).
-IMAGES_PATHS = ["docker/", "web/", "orchestrator/", "deploy/migrations/"] + BINARY_COMMON
+IMAGES_PATHS = ["docker/", "web/", "orchestrator/", "mcp-worker/", "deploy/migrations/"] + BINARY_COMMON
 # The build INSTRUCTIONS, as opposed to the sources they copy in. Only a change
 # here can break an image in a way a native build does not already catch, so
 # only a change here needs the PR-time `build-images` lane: `tests (linux)`
@@ -249,7 +249,7 @@ E2E_PATHS = [
 ]
 
 
-# ── PR test-lane gating (ci.yml + ci-macos-vz.yml) ─────────────────────
+# ── PR test-lane gating (ci.yml) ─────────────────────
 # These gate the CI *test* lanes (not the bake lanes above) so a change only
 # runs the lanes it can affect. Protos live in the engram-protocol crate, so a
 # proto change is already in every Rust binary's closure (→ cc, host_binaries,
@@ -263,7 +263,10 @@ CI_SELF_PATHS = [".github/workflows/ci.yml",
                  # touching ci.yml (ci-macos-vz.yml was folded into
                  # ci.yml; its old entry here was a dead path).
                  ".github/actions/",
-                 ".github/scripts/detect-rebake-lanes.py"]
+                 ".github/scripts/detect-rebake-lanes.py",
+                 ".github/scripts/tests/",
+                 ".github/scripts/mcp-acceptance-",
+                 ".github/scripts/mcp-stack-"]
 PROTO_PATHS = ["crates/engram-protocol/proto/", "buf.gen.yaml"]
 WEB_PATHS = ["web/", "orchestrator/packages/spec-document/"]
 # The public docs + landing site (site/, Astro + Starlight). Its content is
@@ -279,10 +282,11 @@ SITE_PATHS = ["site/", "crates/engram-protocol/proto/engram/app/"]
 # version it ships on. They were absent here, so a change to either skipped
 # this lane entirely — which is half of how prod came to run a Bun the tests
 # never saw (the other half was the Dockerfile floating on `oven/bun:1`).
-ORCH_PATHS = ["orchestrator/",
+MCP_STACK_FIXTURE_PATHS = ["tests/fixtures/mcp-stack/"]
+ORCH_PATHS = ["orchestrator/", "mcp-worker/",
               "docker/orchestrator.Dockerfile",
               ".bun-version",
-              "crates/engram-egress-proxy/policy/google-credential-denylist.json"]
+              "crates/engram-egress-proxy/policy/google-credential-denylist.json"] + MCP_STACK_FIXTURE_PATHS
 # A lockfile/manifest/toolchain bump recompiles the whole workspace.
 RUST_COMMON = ["Cargo.lock", "Cargo.toml", "rust-toolchain.toml"]
 
@@ -499,6 +503,7 @@ def main():
     e2e_core = (
         bool(cc & e2e_closure)
         or any_path(changed, E2E_PATHS)
+        or any_path(changed, ["sandbox-netstack/"])
         or any_path(changed, HARNESS_PATHS)
     )
     e2e_orchestrator = e2e_core or any_path(changed, ORCH_PATHS)
@@ -550,14 +555,27 @@ def main():
     # lint + tests(linux) + the two macOS lanes build/test the whole workspace:
     # any workspace crate (cc — protos included via engram-protocol), a
     # lockfile/toolchain bump, or a CI-definition change.
+    fixture_changed = any_path(changed, ["tests/fixtures/mcp-model-cli/"])
     test_rust = (
-        ci_self
+        fixture_changed
+        or ci_self
         or bool(cc)
         or any_path(changed, RUST_COMMON)
         or any_path(changed, HARNESS_PATHS)
+        or any_path(changed, ["mcp-worker/", "sandbox-netstack/"])
     )
+    test_mcp_worker = ci_self or proto or any_path(changed, ["mcp-worker/", "docker/mcp-worker.Dockerfile"] + MCP_STACK_FIXTURE_PATHS)
+    # Self-contained producers use one selector: no skipped artifact dependency.
+    test_mcp_physical = (
+        ci_self or proto or test_rust or any_path(changed, ORCH_PATHS + [
+            "crates/", ".sqlx/", "deploy/migrations/", "docker/", "deploy/bundles/",
+            "deploy/demo/", "deploy/kernel/", "third_party/firecracker",
+            "sandbox-netstack/", ".bun-version", ".dockerignore", ".cargo/config.toml",
+        ])
+    )
+    test_netstack = test_rust
     # musl cross-compile of the FC host binaries — same closure as host_binaries.
-    test_cross = ci_self or host_binaries
+    test_cross = ci_self or host_binaries or fixture_changed or harness_changed
     # Firecracker integration lane. Gated on the e2e binary CLOSURE (the FC
     # backend + host-agent + their deps — the Rust the FC integration tests
     # exercise; engram-sandbox-firecracker is in host-agent's closure, and the
@@ -567,7 +585,8 @@ def main():
     # fixtures and mount bundles via the sandbox crates already in the closure;
     # tripping FC on a bundle-payload edit was a needless ~KVM lane. The
     # e2e-STACK lane still gates on `e2e`, so bundle staging is validated there.
-    test_fc = ci_self or bool(cc & e2e_closure) or fc_fork or any_path(changed, FC_POOL_PATHS)
+    test_fc = ci_self or bool(cc & e2e_closure) or fc_fork or any_path(
+        changed, FC_POOL_PATHS + ["sandbox-netstack/"])
     # web / orchestrator: their own sources or the protos they codegen from.
     # (The `engrams` CLI is a workspace crate: test_rust covers it.)
     test_web = ci_self or proto or any_path(changed, WEB_PATHS)
@@ -576,9 +595,9 @@ def main():
     test_buf = ci_self or proto
     test_integrations_cli = ci_self or any_path(changed, INTEGRATIONS_CLI_PATHS)
     # ADR 0122: the deploy-config lane (helm lint/template + terraform
-    # fmt/validate). Same path set as the bake-side tf_or_helm flag,
-    # plus ci_self like every test lane.
-    test_deploy = ci_self or tf_or_helm
+    # fmt/validate + actual nginx callback canary). The web runtime image
+    # also changes the effective nginx behavior, without changing the chart.
+    test_deploy = ci_self or tf_or_helm or any_path(changed, ["docker/web.Dockerfile"])
     # The site lane: leak lint + astro build, build-only (no deploy on PRs).
     test_site = ci_self or any_path(changed, SITE_PATHS)
     # ADR 0098 R-CoSim: the coordinator↔host boundary sim — its own (spanning)
@@ -634,14 +653,17 @@ def main():
             ])
         if name == "orchestrator":
             return bake_all_l or proto_l or any_path(
-                cs, ["orchestrator/", "docker/orchestrator.Dockerfile"])
+                cs, ["orchestrator/", "mcp-worker/src/", "mcp-worker/package.json",
+                     "mcp-worker/package-lock.json", "docker/orchestrator.Dockerfile"])
+        if name == "mcp-worker":
+            return bake_all_l or any_path(cs, ["mcp-worker/", "docker/mcp-worker.Dockerfile"])
         raise ValueError(name)
 
     image_flags = {name: image_flag(name) for name in
-                   ["coordinator", "host-agent", "host-operator", "web", "orchestrator"]}
+                   ["coordinator", "host-agent", "host-operator", "web", "orchestrator", "mcp-worker"]}
     # Stable matrix order; the bake job consumes this as `fromJSON`.
     images_matrix = [name for name in
-                     ["coordinator", "host-agent", "host-operator", "web", "orchestrator"]
+                     ["coordinator", "host-agent", "host-operator", "web", "orchestrator", "mcp-worker"]
                      if image_flags[name]]
     # The deploy-dispatch gate must fire whenever ANY container lane trips —
     # level-triggered lanes can trip when the push range alone would not
@@ -687,8 +709,11 @@ def main():
             f.write(f"e2e={b(e2e)}\n")
             f.write(f"e2e_matrix={json.dumps({'include': e2e_matrix})}\n")
             f.write(f"e2e_full_matrix={json.dumps({'include': e2e_full_matrix})}\n")
-            # PR test lanes (ci.yml + ci-macos-vz.yml gate on these).
+            # PR test lanes (ci.yml gates on these).
             f.write(f"test_rust={b(test_rust)}\n")
+            f.write(f"test_mcp_worker={b(test_mcp_worker)}\n")
+            f.write(f"test_mcp_physical={b(test_mcp_physical)}\n")
+            f.write(f"test_netstack={b(test_netstack)}\n")
             f.write(f"test_cross={b(test_cross)}\n")
             f.write(f"test_fc={b(test_fc)}\n")
             f.write(f"test_web={b(test_web)}\n")

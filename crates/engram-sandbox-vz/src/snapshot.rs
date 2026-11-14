@@ -44,10 +44,17 @@ pub(crate) struct VzSnapshotManifest {
     pub(crate) warm: Option<WarmMachineState>,
 }
 
+/// Default VZ device layout. Increase for incompatible device changes.
+/// Revision 1 adds the virtio entropy device.
+pub(crate) const CONFIGURATION_REVISION: u32 = 1;
+
 /// The identity and effective config of the saved VM. One all-or-nothing
 /// block: a partial identity is not warm-eligible.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct WarmMachineState {
+    /// Missing metadata is revision 0 and cannot use current warm state.
+    #[serde(default)]
+    pub(crate) configuration_revision: u32,
     /// The restoring VM's identifier and MAC must match the saved ones.
     pub(crate) machine_identifier: Vec<u8>,
     pub(crate) mac_address: String,
@@ -121,9 +128,6 @@ pub(crate) async fn build_metadata(
         base_memory_manifest: None,
         base_disk_manifest: None,
         migration_source: None,
-        // ADR 0014: VZ stays portable-snapshot-agnostic. The wrap
-        // layer (PooledBackend) is FC-only on Linux; macOS dev paths
-        // don't go through BlobStorage upload yet.
         source_sandbox_id: None,
         state_blob_key: None,
         sidecar_blob_key: None,
@@ -201,8 +205,24 @@ mod tests {
     }
 
     #[test]
+    fn legacy_warm_configuration_revision_defaults_to_zero() {
+        let value = serde_json::json!({
+            "machine_identifier": [1, 2, 3],
+            "mac_address": "02:00:00:00:00:02",
+            "kernel_cmdline": "console=hvc0",
+            "aux_ro_drives": [],
+            "memory_mib": 1024,
+            "vcpus": 2
+        });
+        let warm: WarmMachineState = serde_json::from_value(value).unwrap();
+        let encoded = serde_json::to_value(warm).unwrap();
+        assert_eq!(encoded["configuration_revision"], 0);
+    }
+
+    #[test]
     fn warm_block_round_trips() {
         let warm = WarmMachineState {
+            configuration_revision: CONFIGURATION_REVISION,
             machine_identifier: vec![1, 2, 3],
             mac_address: "0a:00:00:00:00:01".into(),
             kernel_cmdline: "console=hvc0 ENGRAM_EGRESS=1:2:3".into(),
@@ -215,6 +235,7 @@ mod tests {
         let bytes = serde_json::to_vec(&m).unwrap();
         let parsed: VzSnapshotManifest = serde_json::from_slice(&bytes).unwrap();
         let w = parsed.warm.expect("warm survives");
+        assert_eq!(w.configuration_revision, CONFIGURATION_REVISION);
         assert_eq!(w.machine_identifier, vec![1, 2, 3]);
         assert_eq!(w.mac_address, "0a:00:00:00:00:01");
         assert_eq!(w.memory_mib, 1024);

@@ -14,6 +14,15 @@ use crate::session_ops::{OpCtx, OpOutcome};
 use crate::state::{SessionEvent, SharedState};
 
 pub async fn dispatch(ctx: &OpCtx<'_>) -> OpOutcome {
+    if ctx.op.kind != OpKind::Destroy {
+        if let Err(error) =
+            crate::managed_boot::gate(ctx.state, ctx.op.session_id, ctx.op.kind == OpKind::Deliver)
+                .await
+        {
+            return outcome_from_api_error(error);
+        }
+    }
+
     match ctx.op.kind {
         OpKind::Resume => resume(ctx).await,
         OpKind::Evict => evict(ctx).await,
@@ -1190,9 +1199,34 @@ async fn forward_outbox_row(
     let state = ctx.state;
     if retire_legacy_answer_row(state, row)
         .await
-        .map_err(ForwardDeferral::backoff)?
+        .map_err(|e| ForwardDeferral::backoff(e.to_string()))?
     {
         return Ok(());
+    }
+    crate::managed_boot::gate(state, row.session_id, true)
+        .await
+        .map_err(|e| ForwardDeferral::backoff(e.to_string()))?;
+    if row.kind == OutboxKind::ToolResult {
+        let call = row
+            .payload
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if state
+            .services
+            .meta
+            .managed_tool_target_gone(row.session_id, call)
+            .await
+            .map_err(|e| ForwardDeferral::backoff(e.to_string()))?
+        {
+            state
+                .services
+                .meta
+                .outbox_ack(&row.prompt_id)
+                .await
+                .map_err(|e| ForwardDeferral::backoff(e.to_string()))?;
+            return Ok(());
+        }
     }
     let Some(sandbox_id) = state
         .resolve_sandbox(row.session_id)

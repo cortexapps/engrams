@@ -32,7 +32,8 @@
 //!   same signal, one hop later. **These env knobs move to the
 //!   COORDINATOR deployment with this change.**
 //!
-//! Mid-move sessions can't be nominated by construction: a session
+//! Managed sessions never enter ordinary eviction. Mid-move sessions
+//! can't be nominated by construction: a session
 //! mid-teleport/evac is not `Active`, and `transition_session`'s
 //! legality CAS resolves any nomination race (the loser's Conflict is
 //! a no-op). Epic #545 note: rung interlocks ("skip sessions already
@@ -119,8 +120,8 @@ impl IdleDetectorConfig {
     }
 }
 
-/// Why a candidate crossed the line. Mirrors the retired hub
-/// `IdleKind` — hard candidates survive every gate.
+/// Why a candidate crossed the idle threshold. Hard candidates bypass
+/// the soft memory-pressure gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IdleKind {
     Soft,
@@ -245,6 +246,10 @@ async fn nominate(
     c: &engram_core::traits::metadata::IdleScanCandidate,
     kind: IdleKind,
 ) {
+    if let Err(error) = crate::managed_boot::gate(state, c.session_id, false).await {
+        tracing::debug!(session_id=%c.session_id, error=%error, "idle nomination authority is closed");
+        return;
+    }
     match state
         .services
         .meta
@@ -352,6 +357,14 @@ mod tests {
             suggested_title: None,
         };
         let (state, mini, _local) = build_state_for_session(session);
+        *mini.managed_boot_read_fails.lock() = true;
+        run_once(&IdleDetectorConfig::default(), &state)
+            .await
+            .expect("a failed authority read holds the candidate");
+        assert_eq!(mini.session.lock().status, SessionState::Active);
+        assert!(mini.events.lock().is_empty());
+        assert!(mini.ops.all().is_empty());
+        *mini.managed_boot_read_fails.lock() = false;
         // No events at all → last_event_at falls back to created_at
         // (8h20m ago) → hard TTL (8h) crossed.
         run_once(&IdleDetectorConfig::default(), &state)

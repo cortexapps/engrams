@@ -46,9 +46,8 @@ name: CI
 #                       ls; cold session with harness=claude + exec
 #                       ls; cold session with harness=claude + bogus
 #                       API key + prompt → assert auth failure event.
-#                       Closes the gap that let prod session
-#                       8725648d's empty-Binary-frame bug ship (all
-#                       existing FC tests bypass the coord HTTP path).
+#                       Exercises the coordinator path that the lower
+#                       host-agent FC tests do not cover.
 #
 # All jobs run on Blacksmith Linux runners
 # (https://docs.blacksmith.sh/blacksmith-runners/overview) — faster
@@ -82,9 +81,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Default to read-only repo access. No job here writes to the repo
-# (no GH releases, no commit-back, no PR comments), so least
-# privilege. `packages: read` is load-bearing: the test-fc-* jobs
+# Default to read-only repo access. Jobs that publish artifacts or
+# report protobuf changes request their own write permissions.
+# `packages: read` is load-bearing: the test-fc-* jobs
 # oras-pull the forked firecracker artifact from GHCR — without
 # it the pull is DENIED and every fork-gated FC test (the ADR 0045 R2
 # stock<->fork compat gate, the substrate suites, vmstate_only)
@@ -126,6 +125,9 @@ jobs:
       # detector change sets all of these (see detect-rebake-lanes.py), so a
       # change to how CI runs re-runs everything.
       test_rust: ${{ steps.lanes.outputs.test_rust }}
+      test_mcp_worker: ${{ steps.lanes.outputs.test_mcp_worker }}
+      test_mcp_physical: ${{ steps.lanes.outputs.test_mcp_physical }}
+      test_netstack: ${{ steps.lanes.outputs.test_netstack }}
       test_cross: ${{ steps.lanes.outputs.test_cross }}
       test_fc: ${{ steps.lanes.outputs.test_fc }}
       test_web: ${{ steps.lanes.outputs.test_web }}
@@ -147,6 +149,8 @@ jobs:
           # Full history so the PR base SHA is present for the diff.
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
+      - name: Test MCP path selection
+        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_mcp*.py'
       - name: Detect changed lanes
         id: lanes
         run: |
@@ -262,6 +266,26 @@ jobs:
           fi
       - name: terraform fmt -check
         run: terraform fmt -check -recursive -diff deploy/terraform
+      - name: Callback ingress profiles and effective nginx canary
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ruby
+          python3 -m unittest discover \
+            -s deploy/helm/engram/ci/tests -p 'test_callback_profiles.py'
+          image="$(sed -n 's/^FROM \(nginx:[^ ]*\)$/\1/p' docker/web.Dockerfile)"
+          test -n "$image"
+          docker pull "$image"
+          python3 deploy/helm/engram/ci/callback-ingress-canary.py \
+            --stage var/mcp-callback-canary
+      - name: Keep callback canary evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: callback-ingress-canary
+          path: var/mcp-callback-canary
+          if-no-files-found: error
       - name: terraform validate (every root)
         run: |
           set -euo pipefail
@@ -438,6 +462,19 @@ jobs:
       AWS_REGION: us-east-1
     steps:
       - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Install worker test dependencies
+        working-directory: mcp-worker
+        run: npm ci --ignore-scripts
+      - name: Check TLS fixture prerequisites
+        run: |
+          node --version
+          openssl version
       - uses: dtolnay/rust-toolchain@stable
       # Install protoc via apt: arduino/setup-protoc@v3 with a pinned
       # version *still* called the GH releases API to validate and
@@ -527,6 +564,16 @@ jobs:
       # `--no-fail-fast` reports every failing test instead of stopping
       # at the first; `if: always()` keeps the ha_listener steps below
       # running even if this one fails.
+      - name: Run native MCP fixture and adapter gates
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: bash .github/scripts/mcp-acceptance-native.sh
+
+      - name: Run production Linux MCP wrapper entrypoints
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: bash .github/scripts/mcp-acceptance-linux.sh
+
       - name: cargo nextest run --workspace
         if: always()
         run: cargo nextest run --workspace --no-fail-fast
@@ -686,6 +733,22 @@ jobs:
             --release \
             -p engram-agentd
 
+      - name: Build x86_64 static MCP model fixture
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo build --locked --release --target x86_64-unknown-linux-musl --manifest-path tests/fixtures/mcp-model-cli/Cargo.toml --bin engram-mcp-model-fixture
+          mkdir -p var/mcp-fixture-x86_64
+          cp "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/engram-mcp-model-fixture" var/mcp-fixture-x86_64/
+          file var/mcp-fixture-x86_64/engram-mcp-model-fixture | grep -E 'ELF 64-bit.*x86-64.*static(ally|-pie)? linked'
+          cd var/mcp-fixture-x86_64
+          shasum -a 256 engram-mcp-model-fixture > SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mcp-fixture-x86_64-linux-musl
+          path: var/mcp-fixture-x86_64/
+          if-no-files-found: error
+
       - name: build harness wrappers (musl)
         run: |
           cargo build \
@@ -826,6 +889,72 @@ jobs:
   # and (b) the ADR 0060 DBOS engine — DBOS keeps its system tables in a `dbos`
   # schema of this same database. The .live smoke test still self-skips without a
   # live coordinator.
+  mcp-worker:
+    name: MCP worker (Node 24)
+    needs: detect
+    if: needs.detect.outputs.test_mcp_worker == 'true'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    defaults:
+      run:
+        working-directory: mcp-worker
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - run: npm ci --ignore-scripts
+      - run: npm run format:check
+      - run: npm run typecheck
+      - run: npm test
+      - name: Standalone MCP stack fixture tests
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir -p var/mcp-stack-fixture
+          node --test --test-concurrency=1 --test-timeout=30000 \
+            tests/fixtures/mcp-stack/durable.test.mts \
+            tests/fixtures/mcp-stack/process.test.mts
+      - run: npm run build
+
+  netstack:
+    name: sandbox netstack (${{ matrix.platform }})
+    needs: detect
+    if: needs.detect.outputs.test_netstack == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            runner: blacksmith-2vcpu-ubuntu-2404
+          - platform: macos
+            runner: blacksmith-6vcpu-macos-15
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.2"
+          cache: false
+      - name: Test, vet, verify modules, and race
+        run: |
+          mkdir -p var
+          sandbox-netstack/build.sh test
+          sandbox-netstack/build.sh race
+      - name: Build and stamp current helper
+        run: |
+          sandbox-netstack/build.sh build
+          cd var/mcp-netstack-build
+          test -s engram-sandbox-netstack
+          shasum -a 256 engram-sandbox-netstack > SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sandbox-netstack-${{ matrix.platform }}
+          path: |
+            var/mcp-netstack-build/engram-sandbox-netstack
+            var/mcp-netstack-build/SHA256SUMS
+          if-no-files-found: error
+
+  # Postgres backs live tests and the isolated DBOS restart fixtures.
   orchestrator:
     name: orchestrator (bun)
     needs: detect
@@ -836,8 +965,8 @@ jobs:
         image: postgres:16
         env:
           POSTGRES_PASSWORD: engram
-          POSTGRES_DB: engram_orchestrator_test
-        ports: ["5432:5432"]
+          POSTGRES_DB: engram_mcp_1_1_1
+        ports: ["5435:5432"]
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
@@ -853,10 +982,23 @@ jobs:
       CONTROL_PLANE_BEARER: ci-test-token
       # Reachable Postgres → the DB-gated tests + the DBOS smoke test run here
       # (instead of self-skipping). `bun run migrate` below applies the Drizzle
-      # schema before the suite; DBOS creates its own `dbos` schema on launch.
-      ORCHESTRATOR_DATABASE_URL: postgres://postgres:engram@localhost:5432/engram_orchestrator_test
+      # schema before the suite; DBOS restart fixtures use a second database.
+      ORCHESTRATOR_DATABASE_URL: postgres://postgres:engram@127.0.0.1:5435/engram_mcp_1_1_1
+      MCP_TEST_DATABASE_NAME: engram_mcp_1_1_1
+      MCP_TEST_DBOS_DATABASE_URL: postgres://postgres:engram@127.0.0.1:5435/engram_mcp_dbos_test_ci
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Install worker test dependencies
+        working-directory: mcp-worker
+        run: npm ci --ignore-scripts
+      - name: Check TLS fixture prerequisites
+        working-directory: ${{ github.workspace }}
+        run: |
+          node --version
+          openssl version
       - uses: oven-sh/setup-bun@v2
         with:
           # `.bun-version` is the ONE place the runtime version lives; the
@@ -898,6 +1040,8 @@ jobs:
             exit 1
           fi
           echo "Bun pinned to $want in both."
+      - name: Create isolated DBOS test database
+        run: docker exec ${{ job.services.postgres.id }} createdb -U postgres engram_mcp_dbos_test_ci
       - name: bun install
         run: bun install --frozen-lockfile
       - name: DBOS workflow hash warning (non-blocking, ADR 0104)
@@ -910,6 +1054,44 @@ jobs:
           NODE_ENV=test bun scripts/dbos-workflow-hashes.ts
       - name: bun typecheck
         run: bun run typecheck
+      - name: MCP acceptance scripts typecheck
+        run: bun run tsc -p scripts/mcp-stack/tsconfig.json --noEmit
+      - name: MCP acceptance scripts unit tests
+        run: |
+          set -euo pipefail
+          mkdir -p ../var/mcp-stack-runner
+          result=$(mktemp)
+          trap 'rm -f "$result"' EXIT
+          bun test scripts/mcp-stack 2>&1 | tee "$result"
+          grep -Eq '^[[:space:]]*[1-9][0-9]* pass$' "$result"
+          grep -Eq '^[[:space:]]*0 fail$' "$result"
+          grep -Eq '^Ran [1-9][0-9]* tests across [1-9][0-9]* files\.' "$result"
+      - name: MCP platform source typecheck
+        run: bun run tsc -p ../tests/fixtures/mcp-stack/platform/tsconfig.json --noEmit
+      - name: MCP platform source unit tests
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p var/mcp-platform-composition
+          MCP_PLATFORM_TEST_OPENSSL=$(command -v openssl)
+          export MCP_PLATFORM_TEST_OPENSSL
+          "$MCP_PLATFORM_TEST_OPENSSL" version | grep -Eq '^OpenSSL 3\.'
+          result=$(mktemp)
+          trap 'rm -f "$result"' EXIT
+          bun test tests/fixtures/mcp-stack/platform 2>&1 | tee "$result"
+          grep -Eq '^[[:space:]]*[1-9][0-9]* pass$' "$result"
+          grep -Eq '^[[:space:]]*0 fail$' "$result"
+          grep -Eq '^Ran [1-9][0-9]* tests across [1-9][0-9]* files?\.' "$result"
+      - name: MCP Inputs writer source tests
+        run: |
+          set -euo pipefail
+          result=$(mktemp)
+          trap 'rm -f "$result"' EXIT
+          node --experimental-transform-types --test --test-isolation=none --test-reporter=tap ../.github/scripts/tests/mcp-stack-inputs.test.mts 2>&1 | tee "$result"
+          grep -Eq '^# pass [1-9][0-9]*$' "$result"
+          grep -Eq '^# fail 0$' "$result"
+          grep -Eq '^# cancelled 0$' "$result"
       - name: apply orchestrator migrations
         run: bun run migrate
       - name: bun test
@@ -921,9 +1103,8 @@ jobs:
   # fails this job. Breaking-change detection is ADVISORY: it runs against
   # the PR base, but a detected break does NOT fail the job — it surfaces
   # as a `::warning::` plus a detailed PR comment so a reviewer can confirm
-  # the wire-compat impact is intended. Codegen-drift activates only once
-  # the generated TS bindings are committed (ADR 0051 Tasks 4-5) — until
-  # then this PR ships only the contract + Rust stubs.
+  # the wire-compat impact is intended. Codegen drift checks the committed
+  # TypeScript bindings.
   buf:
     name: buf (proto lint + breaking + codegen drift)
     needs: detect
@@ -987,9 +1168,7 @@ jobs:
         if: github.event_name == 'pull_request' && steps.breaking.outcome == 'failure'
         run: |
           echo "::warning title=Proto breaking change detected::buf found a wire-incompatible change to crates/engram-protocol/proto against the PR base. This is non-blocking — see the buf comment on the PR for details. Confirm the break is intended before merging."
-      # TS codegen drift check. Guarded on the committed output dir so it
-      # stays inert in this PR (protos + Rust stubs only) and activates
-      # once web/src/gen lands with the connect-es deps (ADR 0051 Task 4).
+      # Check all committed TypeScript outputs for schema drift.
       - name: Codegen drift check (buf generate)
         run: |
           if [ -d web/src/gen/engram/app ]; then
@@ -1144,6 +1323,14 @@ jobs:
         with:
           gh-token: ${{ secrets.GITHUB_TOKEN }}
           rust-cache-shared-key: fc-root
+
+      - name: Install CLOSED namespace test tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends iproute2 nftables procps
+
+      - name: CLOSED namespace installed-state test (root)
+        run: bash .github/scripts/mcp-acceptance-fc-closed.sh
 
       # Root-only lanes: the pagemap and idle-page scans, the post-copy
       # moves that use them, the dm-thin pool, and the TAP/netns tests.
@@ -1486,7 +1673,7 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
-          rustflags: ''
+          rustflags: ""
           target: x86_64-unknown-linux-musl
 
       - name: Install protoc
@@ -1764,7 +1951,7 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
-          rustflags: ''
+          rustflags: ""
           target: x86_64-unknown-linux-musl
 
       # Install protoc via apt: arduino/setup-protoc@v3 with a pinned
@@ -1941,7 +2128,7 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
-          rustflags: ''
+          rustflags: ""
 
       # nextest is what every other test step in this workflow uses.
       - uses: taiki-e/install-action@nextest
@@ -2115,7 +2302,7 @@ jobs:
           # upload/download-artifact's ZIP drops Unix mode bits; the guest execs
           # /opt/engram/dyn/0/harness, so it must stay executable in the squashfs.
           chmod +x var/harness-claude-stage/harness var/harness-claude-stage/claude
-          chmod +x var/harness-codex-stage/harness var/harness-codex-stage/codex
+          chmod +x var/harness-codex-stage/harness var/harness-codex-stage/codex var/harness-codex-stage/codex-code-mode-host
           ls -la var/harness-claude-stage/
           # Point `just bundles-squashfs` (tilt runs it next) at this downloaded
           # tree so it packs `harness-claude` into var/shared's stamp.
@@ -2284,11 +2471,21 @@ jobs:
   # surface; Linux/FC remains the canonical production gate.
   vz:
     name: engram-sandbox-vz unit tests
-    needs: detect
+    needs: [detect, netstack]
     if: needs.detect.outputs.test_rust == 'true'
-    runs-on: blacksmith-6vcpu-macos-15  # arm64, has Xcode CLT pre-installed
+    runs-on: blacksmith-6vcpu-macos-15 # arm64, has Xcode CLT pre-installed
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: sandbox-netstack-macos
+          path: var/mcp-netstack-artifact
+      - name: Verify current helper artifact
+        run: |
+          cd var/mcp-netstack-artifact
+          test -s engram-sandbox-netstack
+          shasum -a 256 -c SHA256SUMS
+          chmod +x engram-sandbox-netstack
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -2349,7 +2546,27 @@ jobs:
         run: touch /tmp/engram-vz-rootfs.ext4
       - name: Run ignored VZ tests (config validation; e2e_vz runs live below)
         if: always()
-        run: cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only --no-fail-fast -E 'not test(e2e_vz)'
+        run: cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only --no-fail-fast -E 'not test(e2e_vz) and not test(=managed::helper::tests::actual_helper_closed_lifetime_and_descriptor_isolation) and not test(=managed::helper::tests::actual_helper_release_ack_and_active_dns_cleanup) and not test(=managed::helper::tests::actual_helper_rejects_wrong_epoch_and_canceled_release)'
+      - name: Run verified packaged helper tests
+        if: always()
+        run: bash .github/scripts/mcp-acceptance-helper.sh
+      - name: Build arm64 static MCP model fixture
+        run: |
+          brew install messense/macos-cross-toolchains/aarch64-unknown-linux-musl
+          rustup target add aarch64-unknown-linux-musl
+          export CARGO_TARGET_DIR="$PWD/target"
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-unknown-linux-musl-gcc
+          cargo build --locked --release --target aarch64-unknown-linux-musl --manifest-path tests/fixtures/mcp-model-cli/Cargo.toml --bin engram-mcp-model-fixture
+          mkdir -p var/mcp-fixture-aarch64
+          cp "$CARGO_TARGET_DIR/aarch64-unknown-linux-musl/release/engram-mcp-model-fixture" var/mcp-fixture-aarch64/
+          file var/mcp-fixture-aarch64/engram-mcp-model-fixture | grep -E 'ELF 64-bit.*ARM aarch64.*static(ally|-pie)? linked'
+          cd var/mcp-fixture-aarch64
+          shasum -a 256 engram-mcp-model-fixture > SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mcp-fixture-aarch64-linux-musl
+          path: var/mcp-fixture-aarch64/
+          if-no-files-found: error
       - name: Probe nested virtualization
         id: hv
         if: always()
@@ -2384,6 +2601,19 @@ jobs:
     runs-on: blacksmith-6vcpu-macos-15
     steps:
       - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Install worker test dependencies
+        working-directory: mcp-worker
+        run: npm ci --ignore-scripts
+      - name: Check TLS fixture prerequisites
+        run: |
+          node --version
+          openssl version
       - uses: dtolnay/rust-toolchain@stable
       - uses: arduino/setup-protoc@v3
         with:
@@ -2392,6 +2622,10 @@ jobs:
       - uses: taiki-e/install-action@nextest
       # Same default set as Linux minus engram-sandbox-vz (the `vz` job runs that
       # codesigned) — catches macOS-only regressions in cross-platform crates.
+      - name: Run native MCP fixture and adapter gates
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: bash .github/scripts/mcp-acceptance-native.sh
       - name: cargo nextest run --workspace --exclude engram-sandbox-vz
         if: always()
         run: cargo nextest run --workspace --exclude engram-sandbox-vz --no-fail-fast
@@ -2530,6 +2764,82 @@ jobs:
           # never exports to gha anyway; it stays warm through Blacksmith's
           # colocated BuildKit cache.
 
+  # Each dedicated runner has a qualified existing Linux engine and native
+  # DNS/routes. See platform/ci/README.md. Missing prerequisites fail hard.
+  mcp-physical-fc:
+    name: MCP physical Firecracker (24 cases)
+    concurrency:
+      group: mcp-physical-fc-${{ github.repository }}
+      cancel-in-progress: false
+    needs: detect
+    if: needs.detect.outputs.test_mcp_physical == 'true'
+    runs-on: [self-hosted, Linux, X64, engram-mcp-firecracker]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Produce and run physical Firecracker assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MCP_FC_BOOT_ARTIFACTS: ${{ vars.MCP_FC_BOOT_ARTIFACTS }}
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP}/mcp-physical-fc-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          safe="var/mcp-physical-safe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$safe"
+          finish() {
+            if sudo test -f "$root/summary.json"; then
+              sudo install -m 0644 "$root/summary.json" "$safe/firecracker.json"
+            fi
+          }
+          trap finish EXIT
+          args=(--backend firecracker --operator /etc/engrams/mcp-physical-firecracker.json --work-root "$root")
+          if [[ -n "${MCP_FC_BOOT_ARTIFACTS:-}" ]]; then
+            args+=(--boot-artifacts "$MCP_FC_BOOT_ARTIFACTS")
+          fi
+          sudo --preserve-env=GITHUB_TOKEN python3 -I .github/scripts/mcp-stack-assets.py "${args[@]}"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mcp-physical-fc-safe-summary
+          path: var/mcp-physical-safe-${{ github.run_id }}-${{ github.run_attempt }}/firecracker.json
+          if-no-files-found: error
+
+  mcp-physical-vz:
+    name: MCP physical VZ (24 cases)
+    concurrency:
+      group: mcp-physical-vz-${{ github.repository }}
+      cancel-in-progress: false
+    needs: detect
+    if: needs.detect.outputs.test_mcp_physical == 'true'
+    runs-on: [self-hosted, macOS, ARM64, engram-mcp-vz]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Produce and run physical VZ assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP}/mcp-physical-vz-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p var/mcp-physical-safe-${{ github.run_id }}-${{ github.run_attempt }}
+          finish() {
+            if test -f "$root/summary.json"; then
+              install -m 0644 "$root/summary.json" var/mcp-physical-safe-${{ github.run_id }}-${{ github.run_attempt }}/vz.json
+            fi
+          }
+          trap finish EXIT
+          python3 -I .github/scripts/mcp-stack-assets.py --backend vz --operator '/Library/Application Support/engrams/mcp-physical-vz.json' --work-root "$root"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mcp-physical-vz-safe-summary
+          path: var/mcp-physical-safe-${{ github.run_id }}-${{ github.run_attempt }}/vz.json
+          if-no-files-found: error
+
   ci-gate:
     name: CI Gate
     if: always()
@@ -2542,6 +2852,10 @@ jobs:
       - web
       - site
       - orchestrator
+      - mcp-worker
+      - mcp-physical-fc
+      - mcp-physical-vz
+      - netstack
       - buf
       - test-fc-unprivileged
       - test-fc-pooled

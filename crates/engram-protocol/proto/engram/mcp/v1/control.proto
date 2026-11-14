@@ -1,0 +1,180 @@
+syntax = "proto3";
+package engram.mcp.v1;
+
+// Internal protocol 1. Served only on the separate mTLS listener.
+service CredentialControlService {
+  rpc PutSecret(PutSecretRequest) returns (PutSecretResponse);
+  rpc BeginAuthorization(BeginAuthorizationRequest) returns (BeginAuthorizationResponse);
+  rpc CancelAuthorization(CancelAuthorizationRequest) returns (CancelAuthorizationResponse);
+  rpc CompleteAuthorization(CompleteAuthorizationRequest) returns (CompleteAuthorizationResponse);
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  rpc Revoke(RevokeRequest) returns (RevokeResponse);
+  rpc Lease(LeaseRequest) returns (LeaseResponse);
+}
+message Destination {
+  string zone_id = 1;
+  string endpoint = 2;
+}
+message ChangeContext {
+  string connection_id = 1;
+  int64 config_revision = 2;
+  int64 previous_authorization_generation = 3;
+  Destination resource = 4;
+}
+message AuthorityContext {
+  string connection_id = 1;
+  int64 config_revision = 2;
+  int64 authorization_generation = 3;
+  string credential_identity = 4;
+  Destination resource = 5;
+  string policy_digest = 6;
+  string policy_revision = 7;
+}
+enum CredentialKind {
+  CREDENTIAL_KIND_UNSPECIFIED = 0;
+  CREDENTIAL_KIND_API_KEY = 1;
+  CREDENTIAL_KIND_CLIENT_SECRET = 2;
+  CREDENTIAL_KIND_OAUTH = 3;
+}
+message CredentialReference {
+  CredentialKind kind = 1;
+  string name = 2;
+  string connection_id = 3;
+  int64 generation = 4;
+  string registration_id = 5;
+}
+message CredentialStatus {
+  uint32 protocol = 1;
+  AuthorityContext context = 2;
+  CredentialReference reference = 3;
+  int64 version = 4;
+  string status = 5;
+}
+message PutSecretRequest {
+  uint32 protocol = 1;
+  ChangeContext context = 2;
+  CredentialKind kind = 3;
+  CredentialReference expected = 4;
+  string header = 5;
+  string value = 6;
+  string actor_id = 7;
+}
+message BeginAuthorizationRequest {
+  uint32 protocol = 1;
+  ChangeContext context = 2;
+  string registration_id = 3;
+  CredentialReference client_secret = 4;
+  optional int64 expected_version = 5;
+  string actor_id = 6;
+  bool sharing_consent = 7;
+}
+message BeginAuthorizationResponse {
+  uint32 protocol = 1;
+  string flow_id = 2;
+  AuthorityContext context = 3;
+  string authorization_url = 4;
+  int64 expires_at = 5;
+}
+message CompleteAuthorizationRequest {
+  uint32 protocol = 1;
+  AuthorityContext context = 2;
+  string registration_id = 3;
+  string flow_id = 4;
+  string state = 5;
+  string redirect_uri = 6;
+  optional string issuer = 7;
+  string code = 8;
+  string actor_id = 9;
+}
+message GetStatusRequest {
+  uint32 protocol = 1;
+  string connection_id = 2;
+  CredentialReference reference = 3;
+}
+message RevokeRequest {
+  uint32 protocol = 1;
+  CredentialStatus expected = 2;
+  string actor_id = 3;
+}
+message WorkerIdentity {
+  uint32 protocol = 1;
+  string boot_id = 2;
+  string zone_id = 3;
+  string policy_digest = 4;
+  string policy_revision = 5;
+}
+message Admission {
+  string id = 1;
+  string deployment_id = 2;
+  int64 expires_at = 3;
+}
+message AdministrationScope {
+  string request_id = 1;
+  string actor_id = 2;
+}
+message ExecutionScope {
+  string session_id = 1;
+  string run_id = 2;
+  string tool_call_id = 3;
+  string binding_hash = 4;
+}
+message LeaseRequest {
+  uint32 protocol = 1;
+  AuthorityContext context = 2;
+  CredentialReference reference = 3;
+  WorkerIdentity worker = 4;
+  string intent_id = 5;
+  string request_digest = 6;
+  string operation = 7;
+  // Short credential delivery deadline, at most ten seconds.
+  int64 expires_at = 8;
+  // Frozen worker operation deadline, at most five minutes.
+  int64 operation_expires_at = 12;
+  Admission admission = 9;
+  oneof scope {
+    AdministrationScope administration = 10;
+    ExecutionScope execution = 11;
+  }
+}
+
+// Transient operation memory only. Never queue, cache, persist, log, or return
+// this message to a browser or guest. Worker dispatch consumes the bound intent.
+message LeaseResponse {
+  uint32 protocol = 1;
+  string header = 2;
+  string value = 3;
+  int64 expires_at = 4;
+  string intent_id = 5;
+  int64 operation_expires_at = 6;
+}
+
+// Exact attempt only. Cancellation persists in the existing flow row.
+message CancelAuthorizationRequest {
+  uint32 protocol = 1;
+  string flow_id = 2;
+  string connection_id = 3;
+  string registration_id = 4;
+  string actor_id = 5;
+}
+message CancelAuthorizationResponse {
+  uint32 protocol = 1;
+  string flow_id = 2;
+  string connection_id = 3;
+  string registration_id = 4;
+}
+
+message PutSecretResponse {
+  CredentialStatus status = 1;
+}
+
+message CompleteAuthorizationResponse {
+  CredentialStatus status = 1;
+}
+
+message GetStatusResponse {
+  CredentialStatus status = 1;
+}
+
+message RevokeResponse {
+  CredentialStatus status = 1;
+}

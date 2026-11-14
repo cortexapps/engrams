@@ -1,0 +1,1 @@
+CREATE INDEX "mcp_execution_lifecycle_active_idx" ON "mcp_execution" USING btree ("id") WHERE "mcp_execution"."state" IN ('waiting_approval','authorized','dispatching');

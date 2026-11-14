@@ -69,6 +69,7 @@ export interface TaskLaunchPolicy {
   integrationPolicyJson: string;
   integrationGrants: ProfileIntegrationGrant[];
   integrationConnections: IntegrationConnectionSnapshot[];
+  mcpBindingEnvelope?: import("../mcp/binding-store.ts").McpBindingEnvelope;
   network: ProfileNetwork;
   secrets: ProfileSecret[];
   repos: ProfileRepo[];
@@ -173,6 +174,13 @@ export const taskSession = pgTable(
     // snapshot. This makes broker audit records attributable without consulting
     // mutable workflow state.
     integrationPrincipalId: text("integration_principal_id"),
+    // Candidate metadata only. The host must separately acknowledge deny enforcement.
+    mcpBindingEnvelope:
+      jsonb("mcp_binding_envelope").$type<import("../mcp/binding-store.ts").McpBindingEnvelope>(),
+    mcpManagedLifecycle:
+      jsonb("mcp_managed_lifecycle").$type<
+        import("../mcp/managed-lifecycle.ts").ManagedLifecycle
+      >(),
     // ADR 0109: content-hash of the compiled authorization snapshot
     // (profileId + grants + connections). The broker emits it as the
     // `engrams_profile_snapshot` OIDC claim, so Google-side audit logs join
@@ -1064,7 +1072,6 @@ export const consumerCursor = pgTable(
   (t) => [primaryKey({ columns: [t.sessionId, t.consumer] })],
 );
 
-
 // ---------------------------------------------------------------------------
 // DBOS orphan sweep (ADR 0104)
 // ---------------------------------------------------------------------------
@@ -1155,6 +1162,7 @@ export interface ProfileIntegrationGrant {
    * while programmatic sessions always compile the org credential. Rides the
    * grant array through launch_policy and the task_session snapshot. */
   credentialScope?: "org" | "user";
+  mcp?: import("../mcp/types.ts").McpToolGrant;
 }
 
 /** A parsed forge remote — enough to join against the GitHub integration. */
@@ -1175,6 +1183,7 @@ export interface ProfileRepo {
 
 /** Immutable non-secret connection configuration stamped onto a session. */
 export interface IntegrationConnectionSnapshot {
+  mcp?: import("../mcp/session-bindings.ts").McpSessionBinding;
   id: string;
   alias: string;
   provider: string;
@@ -1188,60 +1197,62 @@ export const DEFAULT_PROFILE_NETWORK: ProfileNetwork = {
   allowHostPatterns: [],
 };
 
-export const profile = pgTable(
-  "profile",
-  {
-    id: text("id").primaryKey(), // uuid string (crypto.randomUUID())
-    name: text("name").notNull(),
-    description: text("description").notNull().default(""),
-    icon: text("icon").notNull().default("Bot"), // lucide icon name
-    imageId: text("image_id").notNull(), // logical ref → enabled_images.id (§3)
-    // ADR 0062/0063: the default harness (a HarnessCatalogService catalog name)
-    // this profile's sessions run, with default model + effort (catalog option
-    // ids). `harness` is REQUIRED — a profile always names a concrete harness (the
-    // "inherit deployment default" semantics were superseded; existing rows were
-    // backfilled to `claude`). model/effort stay nullable → the harness
-    // descriptor's defaults. All overridable per session.
-    harness: text("harness").notNull(),
-    modelRouter: text("model_router"),
-    model: text("model"),
-    effort: text("effort"),
-    programmaticOnly: boolean("programmatic_only").notNull().default(false),
-    includeUserTokens: boolean("include_user_tokens").notNull().default(false),
-    envVars: jsonb("env_vars").notNull().default({}), // { KEY: VALUE }
-    // ADR 0055: dynamic skill bundle names this profile's sessions mount (e.g.
-    // ["skills", "browser"]). Resolved by the coordinator to reserved-slot
-    // mounts at session create. Empty = base session (no skills).
-    skills: jsonb("skills").$type<string[]>().notNull().default([]),
-    // ADR 0109: structured integration authority. Unlike the retired flat
-    // capability array, this preserves which configured identity an operation
-    // uses and keeps its resource constraints attached.
-    integrationGrants: jsonb("integration_grants")
-      .$type<ProfileIntegrationGrant[]>()
-      .notNull()
-      .default([]),
-    // ADR 0057: egress network allow-list (deny by default) + secrets this
-    // profile's sessions get, lifted off the image manifest. Additive in B1;
-    // compiled into the per-session SessionPolicy + consumed at boot in B2.
-    network: jsonb("network").$type<ProfileNetwork>().notNull().default(DEFAULT_PROFILE_NETWORK),
-    secrets: jsonb("secrets").$type<ProfileSecret[]>().notNull().default([]),
-    // Git repositories this profile's image contains — explicit, user-managed
-    // (by hand or via DiscoverProfileRepos). Fed to the routing picker's cards.
-    repos: jsonb("repos").$type<ProfileRepo[]>().notNull().default([]),
-    // ADR 0118: the services every session from this profile hosts. The
-    // orchestrator reserves one hostname per app BEFORE it creates the session
-    // (inside the transaction below this one) and injects each app's address
-    // into the guest's env, so a sibling app is configured with an address the
-    // user's browser can reach too. Empty = no apps.
-    apps: jsonb("apps").$type<ProfileApp[]>().notNull().default([]),
-    createdAt: timestamp("created_at").notNull().defaultNow(),
-    updatedAt: timestamp("updated_at")
-      .notNull()
-      .defaultNow()
-      .$onUpdate(() => new Date()),
-    deletedAt: timestamp("deleted_at"), // null = active; soft delete only (§4)
-  },
-);
+export const profile = pgTable("profile", {
+  id: text("id").primaryKey(), // uuid string (crypto.randomUUID())
+  name: text("name").notNull(),
+  description: text("description").notNull().default(""),
+  icon: text("icon").notNull().default("Bot"), // lucide icon name
+  imageId: text("image_id").notNull(), // logical ref → enabled_images.id (§3)
+  // ADR 0062/0063: the default harness (a HarnessCatalogService catalog name)
+  // this profile's sessions run, with default model + effort (catalog option
+  // ids). `harness` is REQUIRED — a profile always names a concrete harness (the
+  // "inherit deployment default" semantics were superseded; existing rows were
+  // backfilled to `claude`). model/effort stay nullable → the harness
+  // descriptor's defaults. All overridable per session.
+  harness: text("harness").notNull(),
+  modelRouter: text("model_router"),
+  model: text("model"),
+  effort: text("effort"),
+  programmaticOnly: boolean("programmatic_only").notNull().default(false),
+  includeUserTokens: boolean("include_user_tokens").notNull().default(false),
+  envVars: jsonb("env_vars").notNull().default({}), // { KEY: VALUE }
+  // ADR 0055: dynamic skill bundle names this profile's sessions mount (e.g.
+  // ["skills", "browser"]). Resolved by the coordinator to reserved-slot
+  // mounts at session create. Empty = base session (no skills).
+  skills: jsonb("skills").$type<string[]>().notNull().default([]),
+  // ADR 0109: structured integration authority. Unlike the retired flat
+  // capability array, this preserves which configured identity an operation
+  // uses and keeps its resource constraints attached.
+  mcpGrantPublication: jsonb("mcp_grant_publication").$type<{
+    revision: number;
+    actorId: string;
+    grantsHash: string;
+  }>(),
+  integrationGrants: jsonb("integration_grants")
+    .$type<ProfileIntegrationGrant[]>()
+    .notNull()
+    .default([]),
+  // ADR 0057: egress network allow-list (deny by default) + secrets this
+  // profile's sessions get, lifted off the image manifest. Additive in B1;
+  // compiled into the per-session SessionPolicy + consumed at boot in B2.
+  network: jsonb("network").$type<ProfileNetwork>().notNull().default(DEFAULT_PROFILE_NETWORK),
+  secrets: jsonb("secrets").$type<ProfileSecret[]>().notNull().default([]),
+  // Git repositories this profile's image contains — explicit, user-managed
+  // (by hand or via DiscoverProfileRepos). Fed to the routing picker's cards.
+  repos: jsonb("repos").$type<ProfileRepo[]>().notNull().default([]),
+  // ADR 0118: the services every session from this profile hosts. The
+  // orchestrator reserves one hostname per app BEFORE it creates the session
+  // (inside the transaction below this one) and injects each app's address
+  // into the guest's env, so a sibling app is configured with an address the
+  // user's browser can reach too. Empty = no apps.
+  apps: jsonb("apps").$type<ProfileApp[]>().notNull().default([]),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at")
+    .notNull()
+    .defaultNow()
+    .$onUpdate(() => new Date()),
+  deletedAt: timestamp("deleted_at"), // null = active; soft delete only (§4)
+});
 
 // ---------------------------------------------------------------------------
 // Automations (ADR 0102 → ADR 0119): versioned block-graph definitions whose
@@ -1301,7 +1312,10 @@ export const routerModel = pgTable(
     available: boolean("available").notNull().default(true),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [primaryKey({ columns: [t.routerId, t.modelId] }), index("router_model_available_idx").on(t.routerId, t.available)],
+  (t) => [
+    primaryKey({ columns: [t.routerId, t.modelId] }),
+    index("router_model_available_idx").on(t.routerId, t.available),
+  ],
 );
 
 export const routerModelPolicy = pgTable(
@@ -1315,7 +1329,10 @@ export const routerModelPolicy = pgTable(
   },
   (t) => [
     primaryKey({ columns: [t.routerId, t.modelId] }),
-    foreignKey({ columns: [t.routerId, t.modelId], foreignColumns: [routerModel.routerId, routerModel.modelId] }).onDelete("cascade"),
+    foreignKey({
+      columns: [t.routerId, t.modelId],
+      foreignColumns: [routerModel.routerId, routerModel.modelId],
+    }).onDelete("cascade"),
     check("router_model_policy_user_implies_enabled", sql`NOT ${t.userEnabled} OR ${t.enabled}`),
   ],
 );
@@ -1743,6 +1760,15 @@ export const integrationConnection = pgTable(
   {
     id: text("id").primaryKey(),
     alias: text("alias").notNull().unique(),
+    mcpCredential: jsonb("mcp_credential")
+      .$type<import("../mcp/credential-store.ts").CredentialMetadata>()
+      .notNull()
+      .default({}),
+    configRevision: integer("config_revision").notNull().default(1),
+    authGeneration: integer("auth_generation").notNull().default(1),
+    credentialIdentity: text("credential_identity").notNull().default(""),
+    catalogRevision: integer("catalog_revision").notNull().default(0),
+    revoked: boolean("revoked").notNull().default(false),
     provider: text("provider").notNull(),
     displayName: text("display_name").notNull(),
     isDefault: boolean("is_default").notNull().default(false),
@@ -2155,3 +2181,280 @@ export const accountRelations = relations(account, ({ one }) => ({
     references: [user.id],
   }),
 }));
+
+/** Immutable discovery and review records. Published revisions never change. */
+export const mcpCatalog = pgTable(
+  "mcp_catalog",
+  {
+    id: text("id").primaryKey(),
+    connectionId: text("connection_id")
+      .notNull()
+      .references(() => integrationConnection.id),
+    kind: text("kind").$type<"draft" | "published">().notNull(),
+    revision: integer("revision").notNull(),
+    configRevision: integer("config_revision").notNull(),
+    authGeneration: integer("auth_generation").notNull(),
+    credentialIdentity: text("credential_identity").notNull(),
+    tools: jsonb("tools")
+      .$type<
+        import("../mcp/types.ts").McpDiscoveredTool[] | import("../mcp/types.ts").McpReviewedTool[]
+      >()
+      .notNull(),
+    fingerprint: text("fingerprint").notNull(),
+    actorId: text("actor_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [
+    index("mcp_catalog_connection_idx").on(t.connectionId, t.createdAt),
+    uniqueIndex("mcp_catalog_published_revision_idx")
+      .on(t.connectionId, t.revision)
+      .where(sql`kind = 'published'`),
+    check(
+      "mcp_catalog_kind_check",
+      sql`${t.kind} IN ('draft','published') AND ((${t.kind} = 'draft' AND ${t.revision} = 0) OR (${t.kind} = 'published' AND ${t.revision} > 0))`,
+    ),
+  ],
+);
+
+/** Authoritative upstream outcome. Guest completion is a separate projection. */
+export const mcpExecution = pgTable(
+  "mcp_execution",
+  {
+    id: text("id").primaryKey(),
+    taskId: text("task_id").notNull(),
+    sessionId: text("session_id").notNull(),
+    runId: text("run_id").notNull(),
+    toolCallId: text("tool_call_id").notNull(),
+    connectionId: text("connection_id")
+      .notNull()
+      .references(() => integrationConnection.id),
+    catalogId: text("catalog_id")
+      .notNull()
+      .references(() => mcpCatalog.id),
+    principalId: text("principal_id").notNull(),
+    bindingHash: text("binding_hash").notNull(),
+    requestDigest: text("request_digest").notNull(),
+    argumentHash: text("argument_hash").notNull(),
+    originalArguments: text("original_arguments"),
+    requestContext:
+      jsonb("request_context").$type<import("../mcp/journal-review.ts").FrozenRequestContext>(),
+    upstreamName: text("upstream_name").notNull(),
+    configRevision: integer("config_revision").notNull(),
+    authGeneration: integer("auth_generation").notNull(),
+    classification: text("classification").$type<"read" | "write">().notNull(),
+    authorizationKind: text("authorization_kind")
+      .$type<"read" | "approval" | "automation">()
+      .notNull(),
+    automationGrantHash: text("automation_grant_hash"),
+    state: text("state").$type<import("../mcp/types.ts").McpExecutionState>().notNull(),
+    version: integer("version").notNull().default(1),
+    bootId: text("boot_id"),
+    intentId: text("intent_id"),
+    intentExpiresAt: timestamp("intent_expires_at", { withTimezone: true }),
+    deadline: timestamp("deadline", { withTimezone: true }).notNull(),
+    result: jsonb("result").$type<Record<string, unknown>>(),
+    resultUnavailable: boolean("result_unavailable").notNull().default(false),
+    // Delivery settlement: enqueue ACK or authoritative target-gone rejection, never guest/effect proof.
+    completionEnqueuedVersion: integer("completion_enqueued_version").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [
+    foreignKey({
+      columns: [t.taskId, t.sessionId],
+      foreignColumns: [taskSession.taskId, taskSession.sessionId],
+    }).onDelete("cascade"),
+    index("mcp_execution_task_session_idx").on(t.taskId, t.sessionId),
+    uniqueIndex("mcp_execution_call_idx").on(t.sessionId, t.toolCallId),
+    index("mcp_execution_connection_state_idx").on(t.connectionId, t.sessionId, t.state),
+    index("mcp_execution_catalog_idx").on(t.catalogId),
+    index("mcp_execution_pending_idx").on(t.state, t.deadline),
+    index("mcp_execution_lifecycle_active_idx")
+      .on(t.id)
+      .where(sql`${t.state} IN ('waiting_approval','authorized','dispatching')`),
+    index("mcp_execution_recovery_idx")
+      .on(t.id)
+      .where(sql`${t.completionEnqueuedVersion} < ${t.version}`),
+    check(
+      "mcp_execution_completion_version_check",
+      sql`${t.completionEnqueuedVersion} >= 0 AND ${t.completionEnqueuedVersion} <= ${t.version}`,
+    ),
+    uniqueIndex("mcp_execution_intent_idx").on(t.intentId),
+    check(
+      "mcp_execution_state_check",
+      sql`${t.state} IN ('waiting_approval','authorized','dispatching','succeeded','failed','canceled','outcome_unknown')`,
+    ),
+    check("mcp_execution_classification_check", sql`${t.classification} IN ('read','write')`),
+    check(
+      "mcp_execution_authorization_check",
+      sql`(${t.authorizationKind} = 'read' AND ${t.classification} = 'read' AND ${t.automationGrantHash} IS NULL) OR (${t.authorizationKind} = 'approval' AND ${t.automationGrantHash} IS NULL) OR (${t.authorizationKind} = 'automation' AND ${t.classification} = 'write' AND ${t.automationGrantHash} IS NOT NULL)`,
+    ),
+    check(
+      "mcp_execution_dispatch_check",
+      sql`${t.state} NOT IN ('dispatching','outcome_unknown','succeeded') OR (${t.bootId} IS NOT NULL AND ${t.intentId} IS NOT NULL AND ${t.intentExpiresAt} IS NOT NULL)`,
+    ),
+  ],
+);
+
+export const mcpApproval = pgTable(
+  "mcp_approval",
+  {
+    executionId: text("execution_id")
+      .primaryKey()
+      .references(() => mcpExecution.id, { onDelete: "cascade" }),
+    deploymentId: text("deployment_id").notNull(),
+    sessionId: text("session_id").notNull(),
+    requestDigest: text("request_digest").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    decision: text("decision").$type<"pending" | "approved" | "denied" | "expired">().notNull(),
+    actorId: text("actor_id"),
+    decidedAt: timestamp("decided_at", { withTimezone: true }),
+    consumedAt: timestamp("consumed_at", { withTimezone: true }),
+  },
+  (t) => [
+    index("mcp_approval_pending_idx").on(t.deploymentId, t.decision, t.expiresAt),
+    index("mcp_approval_session_idx").on(t.sessionId, t.decision),
+    check(
+      "mcp_approval_decision_check",
+      sql`${t.decision} IN ('pending','approved','denied','expired')`,
+    ),
+    check(
+      "mcp_approval_consumed_check",
+      sql`${t.consumedAt} IS NULL OR (${t.decision} = 'approved' AND ${t.actorId} IS NOT NULL)`,
+    ),
+  ],
+);
+
+/** A cancellation is a durable decision, not proof that an upstream effect was undone. */
+export const mcpCancellation = pgTable(
+  "mcp_cancellation",
+  {
+    executionId: text("execution_id")
+      .primaryKey()
+      .references(() => mcpExecution.id, { onDelete: "cascade" }),
+    actorId: text("actor_id"),
+    cause: text("cause").notNull(),
+    expectedJournalRevision: integer("expected_journal_revision").notNull(),
+    journalRevision: integer("journal_revision").notNull(),
+    state: text("state").$type<"canceled" | "outcome_unknown">().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [
+    check(
+      "mcp_cancellation_revision_check",
+      sql`${t.expectedJournalRevision} > 0 AND ${t.journalRevision} = ${t.expectedJournalRevision} + 1`,
+    ),
+    check("mcp_cancellation_state_check", sql`${t.state} IN ('canceled','outcome_unknown')`),
+  ],
+);
+
+export const mcpResolution = pgTable(
+  "mcp_resolution",
+  {
+    executionId: text("execution_id")
+      .primaryKey()
+      .references(() => mcpExecution.id, { onDelete: "cascade" }),
+    expectedContext:
+      jsonb("expected_context").$type<import("../mcp/journal.ts").McpUnknownContext>(),
+    actorId: text("actor_id").notNull(),
+    outcome: text("outcome").$type<"succeeded" | "failed" | "acknowledged">().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [
+    check(
+      "mcp_resolution_outcome_check",
+      sql`${t.outcome} IN ('succeeded','failed','acknowledged')`,
+    ),
+  ],
+);
+
+/** Durable row locks serialize short admission decisions across replicas. */
+export const mcpAdmissionScope = pgTable("mcp_admission_scope", { id: text("id").primaryKey() });
+export const mcpAdmission = pgTable(
+  "mcp_admission",
+  {
+    executionId: text("execution_id")
+      .primaryKey()
+      .references(() => mcpExecution.id, { onDelete: "cascade" }),
+    reservationId: text("reservation_id")
+      .notNull()
+      .default(sql`gen_random_uuid()::text`),
+    deploymentId: text("deployment_id")
+      .notNull()
+      .references(() => mcpAdmissionScope.id),
+    connectionId: text("connection_id")
+      .notNull()
+      .references(() => integrationConnection.id),
+    sessionId: text("session_id").notNull(),
+    phase: text("phase").$type<"schema" | "execute">().notNull().default("execute"),
+    schemaQueueExpiresAt: timestamp("schema_queue_expires_at", { withTimezone: true }),
+    executeQueueExpiresAt: timestamp("execute_queue_expires_at", { withTimezone: true }),
+    executeExpiresAt: timestamp("execute_expires_at", { withTimezone: true }),
+    schemaDigest: text("schema_digest"),
+    state: text("state").$type<"queued" | "admitted" | "released">().notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [
+    uniqueIndex("mcp_admission_reservation_idx").on(t.reservationId),
+    index("mcp_admission_deployment_idx").on(t.deploymentId, t.state, t.expiresAt),
+    index("mcp_admission_connection_idx").on(t.connectionId, t.state),
+    index("mcp_admission_session_idx").on(t.sessionId, t.state),
+    check("mcp_admission_phase_check", sql`${t.phase} IN ('schema','execute')`),
+    check("mcp_admission_state_check", sql`${t.state} IN ('queued','admitted','released')`),
+  ],
+);
+
+/** Single-use administrative discovery. Contains authority metadata only. */
+export const mcpDiscoveryAdmission = pgTable(
+  "mcp_discovery_admission",
+  {
+    requestId: text("request_id").primaryKey(),
+    intentId: text("intent_id").notNull(),
+    deploymentId: text("deployment_id")
+      .notNull()
+      .references(() => mcpAdmissionScope.id),
+    connectionId: text("connection_id")
+      .notNull()
+      .references(() => integrationConnection.id),
+    actorId: text("actor_id").notNull(),
+    configRevision: integer("config_revision").notNull(),
+    authGeneration: integer("auth_generation").notNull(),
+    credentialIdentity: text("credential_identity").notNull(),
+    identity: jsonb("identity")
+      .$type<import("../../../mcp-worker/src/contracts.ts").WorkerIdentity>()
+      .notNull(),
+    destination: text("destination").notNull(),
+    operation: jsonb("operation")
+      .$type<import("../mcp/discovery-admission.ts").McpAdministrativeOperation>()
+      .notNull()
+      .default({ kind: "discover" }),
+    requestDigest: text("request_digest").notNull(),
+    statusDigest: text("status_digest").notNull(),
+    state: text("state").$type<"reserved" | "dispatched" | "finished">().notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [
+    uniqueIndex("mcp_discovery_admission_intent_idx").on(t.intentId),
+    index("mcp_discovery_admission_deployment_idx").on(t.deploymentId, t.state, t.expiresAt),
+    index("mcp_discovery_admission_connection_idx").on(t.connectionId, t.state, t.expiresAt),
+    check(
+      "mcp_administrative_operation_check",
+      sql`coalesce(
+      ${t.operation} = '{"kind":"discover"}'::jsonb OR (
+        ${t.operation}->>'kind' = 'validateSchemas' AND
+        ${t.operation}->>'documentsDigest' ~ '^sha256:[0-9a-f]{64}$' AND
+        ${t.operation} - 'kind' - 'documentsDigest' = '{}'::jsonb AND ${t.destination} = ''
+      ), false)`,
+    ),
+    check(
+      "mcp_discovery_admission_state_check",
+      sql`${t.state} IN ('reserved','dispatched','finished')`,
+    ),
+    check(
+      "mcp_discovery_admission_expiry_check",
+      sql`${t.expiresAt} = ${t.createdAt} + interval '30 seconds'`,
+    ),
+  ],
+);

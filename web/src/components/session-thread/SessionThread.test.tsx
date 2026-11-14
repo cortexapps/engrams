@@ -570,3 +570,104 @@ describe("SessionThread", () => {
     await waitFor(() => expect(screen.getByText("bleed-probe-A")).toBeTruthy());
   });
 });
+
+test("plan approval sends the exact trusted plan review shown to the user", async () => {
+  let completed: unknown;
+  const transport = createRouterTransport((router) => {
+    router.service(SessionService, {
+      getMcpWritePolicy: () => ({
+        planReview: {
+          toolCallId: "t-plan",
+          runId: "r1",
+          requestDigest: "digest",
+          argsJson: '{"plan":"# Trusted plan"}',
+          policyRef: { sessionId: "s1", policyRevision: 3n, bindingEpoch: 2n },
+        },
+        allowedActions: ["approve_current_plan"],
+      }),
+      completeToolCall: (req) => {
+        completed = req;
+        return {};
+      },
+    });
+  });
+  renderWithProviders(
+    <SessionThread
+      sessionId="s1"
+      status="idle"
+      events={indexed([
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "t-plan",
+          name: "exit_plan_mode",
+          args_json: '{"plan":"# Changed guest plan"}',
+          at: AT,
+        },
+      ])}
+    />,
+    { transport },
+  );
+  expect(await screen.findByText("Trusted plan")).toBeTruthy();
+  await userEvent.click(screen.getByRole("button", { name: "Approve & build" }));
+  await waitFor(() =>
+    expect(completed).toMatchObject({
+      expectedMcpPlanReview: {
+        toolCallId: "t-plan",
+        requestDigest: "digest",
+        argsJson: '{"plan":"# Trusted plan"}',
+      },
+    }),
+  );
+});
+
+test("a rejected plan review reloads the trusted context without retrying approval", async () => {
+  let reads = 0;
+  let completions = 0;
+  const transport = createRouterTransport((router) => {
+    router.service(SessionService, {
+      getMcpWritePolicy: () => {
+        reads++;
+        return {
+          planReview: {
+            toolCallId: "t-plan",
+            runId: "r1",
+            requestDigest: "digest",
+            argsJson: '{"plan":"# Trusted plan"}',
+            policyRef: { sessionId: "s1", policyRevision: 3n, bindingEpoch: 2n },
+          },
+          allowedActions: ["approve_current_plan"],
+        };
+      },
+      completeToolCall: () => {
+        completions++;
+        throw new Error("stale review");
+      },
+    });
+  });
+  renderWithProviders(
+    <SessionThread
+      sessionId="s1"
+      status="idle"
+      events={indexed([
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "t-plan",
+          name: "exit_plan_mode",
+          args_json: '{"plan":"# Plan"}',
+          at: AT,
+        },
+      ])}
+    />,
+    { transport },
+  );
+  await screen.findByText("Trusted plan");
+  await userEvent.click(screen.getByRole("button", { name: "Approve & build" }));
+  expect((await screen.findByRole("alert")).textContent).toContain("permission may have changed");
+  expect(screen.getByRole("button", { name: "Approve & build" }).hasAttribute("disabled")).toBe(
+    true,
+  );
+  await waitFor(() => expect(reads).toBeGreaterThan(1));
+  expect(completions).toBe(1);
+});

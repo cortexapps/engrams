@@ -1,5 +1,13 @@
 /** Recursive session coordination tools (ADR 0113). */
 
+import {
+  createReservedTaskSession,
+  McpSessionCreationMismatchError,
+} from "../mcp/session-create.ts";
+import { McpManagedCreationPending } from "../mcp/managed-runtime.ts";
+import { assertMcpDirectPolicyJson } from "../mcp/session-conflicts.ts";
+import { assertChildMcpCreationBlocked } from "../mcp/session-child.ts";
+
 import { createHash } from "node:crypto";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { and, eq, ne, sql } from "drizzle-orm";
@@ -214,6 +222,7 @@ function snapshotConnectionStore(policy: TaskLaunchPolicy): IntegrationConnectio
 
 async function compileChildInput(
   parent: TaskRow,
+  spawningSessionId: string,
   args: z.output<typeof SpawnInput>,
   sessionId: string,
 ): Promise<SessionCreateInput> {
@@ -225,6 +234,11 @@ async function compileChildInput(
   // unattended sessions never carry human credentials extends to spawns.
   // The frozen policy already stamped org authority for such a parent (no
   // oauth_user mint sources), so no user seam below would fire anyway.
+  const inheritMcp = await assertChildMcpCreationBlocked(
+    parent.id,
+    spawningSessionId,
+    policy.integrationGrants,
+  );
   const ownerId = parent.createdByUserId;
   const db = getDb();
   const secrets = makeUserSecretStore(db);
@@ -286,7 +300,8 @@ async function compileChildInput(
       connectors: { list: () => makeConnectorStore(db).list() },
       harnessCatalog: harnessCatalog as unknown as HarnessCatalogClient,
       toolRegistry: productionTools,
-      resolveUserToken: (envVar) => (ownerId ? secrets.get(ownerId, envVar) : Promise.resolve(null)),
+      resolveUserToken: (envVar) =>
+        ownerId ? secrets.get(ownerId, envVar) : Promise.resolve(null),
       resolveAllUserTokens: () => (ownerId ? secrets.getAll(ownerId) : Promise.resolve({})),
       ...(ownerId
         ? {
@@ -320,8 +335,15 @@ async function compileChildInput(
       ...(identity ? { owner: identity } : {}),
       ...(ownerId ? {} : { programmatic: true }),
       excludeHumanInteractionTools: true,
+      spawningSessionId,
+      inheritMcp,
     },
   );
+  if (input.mcpBindingEnvelope)
+    assertMcpDirectPolicyJson(
+      policy.integrationPolicyJson,
+      input.mcpBindingEnvelope.managedDenyPolicy.hosts,
+    );
   return {
     ...input,
     requestedSessionId: sessionId,
@@ -329,8 +351,12 @@ async function compileChildInput(
     selectedSkills: [...policy.skills],
     capabilities: [...policy.capabilities],
     integrationPolicyJson: policy.integrationPolicyJson,
-    integrationGrants: structuredClone(policy.integrationGrants),
-    integrationConnections: structuredClone(policy.integrationConnections),
+    integrationGrants: input.mcpBindingEnvelope
+      ? input.integrationGrants
+      : structuredClone(policy.integrationGrants),
+    integrationConnections: input.mcpBindingEnvelope
+      ? input.integrationConnections
+      : structuredClone(policy.integrationConnections),
     prompt: undefined,
     harnessMode: undefined,
   };
@@ -536,10 +562,23 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
           throw new Error(`sub-session depth exceeds ${config.subSessionMaxDepth}`);
         }
         const rootTaskId = parent.rootTaskId ?? parent.id;
-        const input = await compileChildInput(parent, args, sessionId);
+        const input = await compileChildInput(parent, ctx.sessionId, args, sessionId);
+        const [spawning] = await getDb()
+          .select({ principal: taskSession.integrationPrincipalId })
+          .from(taskSession)
+          .where(and(eq(taskSession.taskId, parent.id), eq(taskSession.sessionId, ctx.sessionId)));
+        const childPrincipal = input.mcpBindingEnvelope
+          ? spawning?.principal
+          : parent.createdByUserId;
+        if (input.mcpBindingEnvelope && !childPrincipal)
+          throw Error("MCP parent principal unavailable");
         const policy = parent.launchPolicy!;
+        const { mcpBindingEnvelope: _parentEnvelope, ...basePolicy } = structuredClone(policy);
         const childPolicy: TaskLaunchPolicy = {
-          ...structuredClone(policy),
+          ...basePolicy,
+          integrationGrants: input.integrationGrants ?? [],
+          integrationConnections: input.integrationConnections ?? [],
+          ...(input.mcpBindingEnvelope ? { mcpBindingEnvelope: input.mcpBindingEnvelope } : {}),
           harness: input.harness ?? policy.harness,
           ...(input.modelRouter ? { modelRouter: input.modelRouter } : {}),
           ...(input.model ? { model: input.model } : {}),
@@ -613,13 +652,17 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
               role: "primary",
               profileId: policy.profileId,
               capabilities: [...policy.capabilities],
-              integrationGrants: structuredClone(policy.integrationGrants),
-              integrationConnections: structuredClone(policy.integrationConnections),
-              integrationPrincipalId: parent.createdByUserId,
+              integrationGrants: structuredClone(input.integrationGrants ?? []),
+              integrationConnections: structuredClone(input.integrationConnections ?? []),
+              ...(input.mcpBindingEnvelope ? { mcpBindingEnvelope: input.mcpBindingEnvelope } : {}),
+              integrationPrincipalId: childPrincipal,
               integrationSnapshotHash: integrationSnapshotHash({
                 profileId: policy.profileId,
-                integrationGrants: policy.integrationGrants,
-                integrationConnections: policy.integrationConnections,
+                integrationGrants: input.integrationGrants ?? [],
+                integrationConnections: input.integrationConnections ?? [],
+                ...(input.mcpBindingEnvelope
+                  ? { mcpBindingEnvelope: input.mcpBindingEnvelope }
+                  : {}),
               }),
             })
             .onConflictDoNothing();
@@ -651,8 +694,17 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
           }
         });
         try {
-          await sessions.createSession(input);
+          await createReservedTaskSession({ sessions }, input, {
+            actorId: childPrincipal ?? "",
+            inputId: sessionId,
+          });
         } catch (error) {
+          if (error instanceof McpManagedCreationPending) throw error;
+          if (error instanceof McpSessionCreationMismatchError) {
+            // Compensate the actual created identity, never the requested reservation.
+            await sessions.deleteSession({ sessionId: error.createdSessionId }).catch(() => {});
+            throw error;
+          }
           try {
             await sessions.getSession({ sessionId });
           } catch {
@@ -669,10 +721,7 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
         // listener permanently terminal (review finding on this PR). A
         // crash inside this window leaves the session unenrolled — the same
         // narrow exposure the sibling paths accept.
-        await getDb()
-          .insert(sessionListenerTable)
-          .values({ sessionId })
-          .onConflictDoNothing();
+        await getDb().insert(sessionListenerTable).values({ sessionId }).onConflictDoNothing();
         if ((args.file_paths?.length ?? 0) > 0) {
           await sessions.copyFiles({
             sourceSessionId: ctx.sessionId,

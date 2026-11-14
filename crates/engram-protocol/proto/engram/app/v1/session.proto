@@ -25,6 +25,7 @@ service SessionService {
   // `tool_result_submitted` event at RPC time, enqueues a durable ToolResult
   // outbox row, and resumes an idle session exactly as SendPrompt does.
   rpc CompleteToolCall(CompleteToolCallRequest) returns (CompleteToolCallResponse);
+  rpc GetMcpWritePolicy(GetMcpWritePolicyRequest) returns (GetMcpWritePolicyResponse);
   // Streams the event envelope itself, not a wrapped Response message.
   // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
   rpc StreamEvents(StreamEventsRequest) returns (stream SessionEvent);
@@ -316,6 +317,42 @@ message DequeueQueuedPromptResponse {
   string note = 2;
 }
 
+message McpWritePolicyRef {
+  string session_id = 1;
+  int64 policy_revision = 2;
+  int64 binding_epoch = 3;
+}
+message McpTrustedWritePolicy {
+  McpWritePolicyRef ref = 1;
+  string write_eligibility = 2;
+  string cause = 3;
+  string accepted_input_id = 4;
+  optional string authenticated_actor_id = 5;
+  optional string prompt_id = 6;
+  optional string plan_tool_call_id = 7;
+  optional string plan_request_digest = 8;
+  repeated McpWritePolicyRef ancestor_policy_refs = 9;
+  bool current = 10;
+  bool initialized = 11;
+}
+message McpPlanReview {
+  McpWritePolicyRef policy_ref = 1;
+  string tool_call_id = 2;
+  string run_id = 3;
+  int64 event_idx = 4;
+  string request_digest = 5;
+  string args_json = 6;
+}
+message GetMcpWritePolicyRequest {
+  string session_id = 1;
+  optional string plan_tool_call_id = 2;
+}
+message GetMcpWritePolicyResponse {
+  McpTrustedWritePolicy policy = 1;
+  McpPlanReview plan_review = 2;
+  string reason = 3;
+  repeated string allowed_actions = 4;
+}
 message CompleteToolCallRequest {
   string session_id = 1;
   // The call_id carried on the `tool_call_requested` event — the
@@ -324,6 +361,8 @@ message CompleteToolCallRequest {
   // Opaque JSON result. Validated upstream (orchestrator) against the
   // tool's output schema; the coordinator never inspects it.
   string result_json = 3;
+  // Optional exact server review. Only the authenticated human handler consumes it.
+  McpPlanReview expected_mcp_plan_review = 4;
 }
 
 message CompleteToolCallResponse {

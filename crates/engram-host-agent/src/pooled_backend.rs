@@ -60,13 +60,13 @@ impl ItemAssembler {
                 return Err(SandboxError::Snapshot(format!(
                     "migration fetch: item {} arrived twice",
                     frame.item_idx
-                )))
+                )));
             }
             None => {
                 return Err(SandboxError::Snapshot(format!(
                     "migration fetch: item {} was not requested",
                     frame.item_idx
-                )))
+                )));
             }
         }
         if self.item.is_some_and(|i| i != frame.item_idx) || frame.offset != self.bytes.len() as u64
@@ -980,9 +980,6 @@ fn progress_line_detail(line: &crate::warm_progress::WarmProgressLine) -> Option
     }
 }
 
-/// Record `engram_warm_hook_stage_seconds` for every CLOSED stage in a
-/// `[warm]`-hook stage history (the still-open stage, if any — `outcome:
-/// Running` — has no duration to record).
 /// ADR 0088 addendum (adversarial-review fix): the pre-seed balloon
 /// inflate with rollback-safe cleanup. Returns:
 ///
@@ -1040,6 +1037,7 @@ async fn balloon_inflate_for_seed(
     }
 }
 
+/// Record the duration of each completed warm-hook stage.
 fn record_warm_stage_metrics(stages: &[engram_core::types::WarmStageRecord]) {
     use engram_core::types::WarmStageOutcome;
     for stage in stages {
@@ -2610,14 +2608,36 @@ impl PooledBackend {
     /// volumes of every sandbox that is neither alive nor awaiting an
     /// eviction finalize. Runs once at startup, after the reattach pass
     /// fixes the live set and before anything can provision a sandbox.
-    pub async fn reconcile_volumes(&self) {
+    pub async fn reconcile_volumes(&self, bindings: &crate::bindings::BindingStore) {
         let Some(volumes) = &self.volumes else {
             return;
         };
-        let live = match self.inner.list().await {
+        let mut live = match self.inner.list().await {
             Ok(ids) => ids,
             Err(error) => {
                 tracing::warn!(%error, "volume reconcile skipped: cannot list sandboxes");
+                return;
+            }
+        };
+        // Managed owners are absent from the ordinary backend map. Durable
+        // markers reserve their live and transient volumes after a restart.
+        // This does not adopt them or prove that their former VM was reaped.
+        let protected = async {
+            let mut managed = Vec::new();
+            for name in volumes.disk().list().await? {
+                if let Some(parsed) = engram_host_core::session_volumes::parse(&name) {
+                    if bindings.managed_sandbox_required(parsed.sandbox)? {
+                        managed.push(parsed.sandbox);
+                    }
+                }
+            }
+            Ok::<_, std::io::Error>(managed)
+        }
+        .await;
+        let protected = match protected {
+            Ok(ids) => ids,
+            Err(error) => {
+                tracing::warn!(%error, "volume reconcile skipped: managed ownership unavailable");
                 return;
             }
         };
@@ -2632,6 +2652,7 @@ impl PooledBackend {
         for id in live.iter().copied() {
             self.settle_disks(id);
         }
+        live.extend(protected);
         let finalizer = self.eviction_finalizer();
         match crate::eviction_finalize::reconcile_volumes(volumes, finalizer.as_ref(), live).await {
             Ok(report) => {
@@ -5579,7 +5600,7 @@ impl SandboxBackend for PooledBackend {
                                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                             ) =>
                         {
-                            continue
+                            continue;
                         }
                         Err(e) => return Err(format!("control frame: {e}")),
                     };
@@ -6162,16 +6183,8 @@ impl SandboxBackend for PooledBackend {
             .capture_gate(id)
             .quiesce(id, CaptureUser::StartAgent)
             .await;
-        // ADR 0021 P1.2: only the host-agent knows the per-host egress-
-        // proxy CA, so it stamps the PEM onto the AgentSpec right
-        // before the backend sees it. Each backend rides it into the
-        // guest on the same `SpawnHarness` frame that spawns the
-        // harness (2026-07 core-ops fold — one first-contact RPC
-        // installs the CA and spawns, instead of a separate round
-        // trip). Coord-supplied specs always arrive with
-        // `host_ca_pem = None`; the host-agent fills it in here.
-        if agent.host_ca_pem.is_none() {
-            agent.host_ca_pem = self.egress.as_ref().map(|e| e.ca_cert_pem.clone());
+        if let Some(egress) = &self.egress {
+            egress.install_ca(&mut agent);
         }
         self.inner.start_agent(id, agent).await
     }
@@ -6636,11 +6649,7 @@ impl SandboxBackend for PooledBackend {
                 warm_stages: Vec::new(),
             };
             let _ = progress.try_send(snapshot_event.clone());
-            // Finding 1: pause/flush/chunk memory + upload a multi-GB
-            // state blob to BlobStorage has historically run many minutes
-            // on dev-brain with zero progress traffic once the warm hook
-            // (if any) is done — same lease-staleness risk as the boot
-            // leg above.
+            // Keep the capture lease current while the snapshot uploads.
             let snapshot_keepalive = spawn_leg_keepalive(progress.clone(), snapshot_event);
             // Capture: pause → flush disk → chunk memory + upload
             // state.bin/sidecar to BlobStorage. This is the portable
@@ -6858,6 +6867,12 @@ impl SandboxBackend for PooledBackend {
         self.inner.set_upload_sink(sink);
     }
 
+    async fn managed_network_proof(
+        &self,
+        target: &engram_core::types::managed_deny::ManagedPolicyTarget,
+    ) -> Option<engram_core::types::managed_deny::ManagedNetworkProof> {
+        self.inner.managed_network_proof(target).await
+    }
     async fn notify_session_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError> {
         let sandbox_id = policy.sandbox_id;
         let session_id = policy.session_id;
@@ -6867,7 +6882,10 @@ impl SandboxBackend for PooledBackend {
         self.session_bindings.insert(sandbox_id, session_id);
 
         let Some(egress) = self.egress.as_ref() else {
-            if !policy.guest_services.is_empty() || !policy.tunnels.is_empty() {
+            if policy.managed_deny.is_some()
+                || !policy.guest_services.is_empty()
+                || !policy.tunnels.is_empty()
+            {
                 return Err(SandboxError::InvalidSpec(
                     "guest services and tunnels require a host egress proxy".into(),
                 ));
@@ -7107,6 +7125,7 @@ mod tests {
         for (guest_services, tunnels) in cases {
             let error = pooled
                 .notify_session_policy(SessionEgressPolicy {
+                    managed_deny: None,
                     session_id: SessionId::new(),
                     sandbox_id: SandboxId::new(),
                     guest_ip: std::net::Ipv4Addr::LOCALHOST,
@@ -10900,6 +10919,7 @@ mod tests {
             allow: &[&str],
         ) -> SessionEgressPolicy {
             SessionEgressPolicy {
+                managed_deny: None,
                 session_id,
                 sandbox_id,
                 guest_ip,
@@ -13233,5 +13253,69 @@ mod tests {
         assert!(!pooled.held_snapshots.contains_key(&id));
         assert_eq!(inner.rearms.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(inner.inner.destroy_calls.lock().as_slice(), &[id]);
+    }
+}
+
+#[cfg(test)]
+mod managed_volume_reconcile_tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
+    use super::*;
+    use engram_host_core::{
+        disk::SessionDisk,
+        session_volumes::{live_name, transient_name},
+        FileDisk,
+    };
+
+    #[tokio::test]
+    async fn startup_keeps_managed_volumes_and_sweeps_unowned_volumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let bindings = crate::bindings::BindingStore::open(dir.path().join("bindings")).unwrap();
+        let managed = SandboxId::new();
+        let ordinary = SandboxId::new();
+        std::fs::write(
+            bindings
+                .directory()
+                .join(format!("{managed}.managed-sandbox")),
+            b"1",
+        )
+        .unwrap();
+        let disk = Arc::new(FileDisk::new(dir.path().join("volumes"), 4096).unwrap());
+        let managed_root = live_name(managed, DiskRole::Root);
+        let managed_cut = transient_name(managed, DiskRole::Root);
+        let dead_root = live_name(ordinary, DiskRole::Root);
+        for name in [&managed_root, &managed_cut, &dead_root] {
+            disk.create(name, 4096).await.unwrap();
+        }
+        let volumes = Arc::new(SessionVolumes::new(
+            disk.clone(),
+            engram_fill::FillEngine::new(
+                engram_chunk_store::ChunkStore::new(Arc::new(
+                    engram_storage_local::LocalBlobStorage::new(dir.path().join("blob")),
+                )),
+                engram_fill::Config::default(),
+            ),
+        ));
+        let backend = PooledBackend::new(Arc::new(engram_sandbox_process::ProcessBackend::new(
+            dir.path().join("ordinary"),
+        )))
+        .with_session_volumes(volumes);
+        backend.reconcile_volumes(&bindings).await;
+        assert!(!backend.disk_settles.contains_key(&managed));
+        assert!(disk.open(&managed_root).await.is_ok());
+        assert!(disk.open(&managed_cut).await.is_ok());
+        assert!(disk.open(&dead_root).await.is_err());
+
+        // A corrupt association cannot authorize deleting any unowned disk.
+        disk.create(&dead_root, 4096).await.unwrap();
+        std::fs::write(
+            bindings.directory().join("invalid.managed-required"),
+            b"invalid",
+        )
+        .unwrap();
+        backend.reconcile_volumes(&bindings).await;
+        assert!(disk.open(&dead_root).await.is_ok());
+        assert!(disk.open(&managed_root).await.is_ok());
+        assert!(disk.open(&managed_cut).await.is_ok());
     }
 }

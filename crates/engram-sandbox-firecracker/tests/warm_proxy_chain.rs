@@ -241,6 +241,7 @@ async fn warm_path_redirects_through_proxy_with_correct_source_lookup() {
         allow: engram_egress_proxy::HostList::from_manifest(&[TEST_HOST.into()], &[]).unwrap(),
     };
     registry.register(engram_egress_proxy::SessionState {
+        managed_deny: None,
         session_id,
         sandbox_id,
         guest_ip: snat_ip,

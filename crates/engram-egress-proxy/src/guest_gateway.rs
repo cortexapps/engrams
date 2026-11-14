@@ -149,10 +149,10 @@ async fn serve_connection(
     gateway: &GuestGatewayRegistry,
 ) -> std::io::Result<()> {
     let session = match peer.ip() {
-        std::net::IpAddr::V4(ip) => registry.lookup(ip),
+        std::net::IpAddr::V4(ip) => registry.enroll(ip),
         std::net::IpAddr::V6(_) => None,
     };
-    let Some(session) = session else {
+    let Some((session, lease)) = session else {
         // No registered session owns this guest address.
         write_response(
             &mut stream,
@@ -165,6 +165,17 @@ async fn serve_connection(
         return stream.shutdown().await;
     };
 
+    lease
+        .run(serve_enrolled(stream, peer, session, gateway))
+        .await
+        .unwrap_or(Ok(()))
+}
+async fn serve_enrolled(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    session: Arc<SessionState>,
+    gateway: &GuestGatewayRegistry,
+) -> std::io::Result<()> {
     let (request, initial_data) = read_request_header(&mut stream, REQUEST_HEADER_TIMEOUT).await?;
     let request = String::from_utf8_lossy(&request);
     let mut lines = request.lines();
@@ -665,6 +676,7 @@ mod tests {
         let registry = Registry::new();
         let guest_ip = "10.200.0.2".parse().unwrap();
         let state = |guest_services| SessionState {
+            managed_deny: None,
             session_id: SessionId::new(),
             sandbox_id: engram_core::SandboxId::new(),
             guest_ip,
@@ -692,6 +704,7 @@ mod tests {
     async fn socket_endpoint_returns_only_the_placeholder_to_an_enabled_session() {
         let registry = Arc::new(Registry::new());
         registry.register(SessionState {
+            managed_deny: None,
             session_id: SessionId::new(),
             sandbox_id: engram_core::SandboxId::new(),
             guest_ip: std::net::Ipv4Addr::LOCALHOST,
@@ -736,6 +749,7 @@ mod tests {
 
         let registry = Arc::new(Registry::new());
         registry.register(SessionState {
+            managed_deny: None,
             session_id: SessionId::new(),
             sandbox_id: engram_core::SandboxId::new(),
             guest_ip: std::net::Ipv4Addr::LOCALHOST,
@@ -799,6 +813,7 @@ mod tests {
     async fn connect_preserves_bytes_coalesced_after_the_request_header() {
         let registry = Arc::new(Registry::new());
         registry.register(SessionState {
+            managed_deny: None,
             session_id: SessionId::new(),
             sandbox_id: engram_core::SandboxId::new(),
             guest_ip: std::net::Ipv4Addr::LOCALHOST,
@@ -854,6 +869,7 @@ mod tests {
     async fn tunnel_connect_failure_returns_an_actionable_bad_gateway() {
         let registry = Arc::new(Registry::new());
         registry.register(SessionState {
+            managed_deny: None,
             session_id: SessionId::new(),
             sandbox_id: engram_core::SandboxId::new(),
             guest_ip: std::net::Ipv4Addr::LOCALHOST,
@@ -941,6 +957,7 @@ mod tests {
         use engram_core::types::integration::CredentialMintSource;
 
         let session = SessionState {
+            managed_deny: None,
             session_id: SessionId::new(),
             sandbox_id: engram_core::SandboxId::new(),
             guest_ip: std::net::Ipv4Addr::LOCALHOST,
@@ -984,6 +1001,7 @@ mod tests {
 
         let registry = Arc::new(Registry::new());
         registry.register(SessionState {
+            managed_deny: None,
             session_id: SessionId::new(),
             sandbox_id: engram_core::SandboxId::new(),
             guest_ip: std::net::Ipv4Addr::LOCALHOST,
@@ -1049,5 +1067,98 @@ mod tests {
         assert!(!config_path
             .join("application_default_credentials.json")
             .exists());
+    }
+}
+
+#[cfg(test)]
+mod managed_tests {
+    use super::*;
+    struct LoopbackTunnel(SocketAddr);
+    #[async_trait]
+    impl TunnelUpstream for LoopbackTunnel {
+        fn kind(&self) -> &'static str {
+            "test.loopback"
+        }
+        async fn connect(
+            &self,
+            _: SessionId,
+            _: &SessionTunnel,
+        ) -> std::io::Result<Box<dyn TunnelStream>> {
+            Ok(Box::new(TcpStream::connect(self.0).await?))
+        }
+    }
+    #[tokio::test]
+    async fn managed_transition_drains_gateway_and_refuses_opaque_tunnels() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let registry = Arc::new(Registry::new());
+            let old = SessionState {
+                managed_deny: None,
+                session_id: SessionId::new(),
+                sandbox_id: engram_core::SandboxId::new(),
+                guest_ip: std::net::Ipv4Addr::LOCALHOST,
+                network_allow: crate::HostList::empty(),
+                allow_all: false,
+                secrets: vec![],
+                injects: vec![],
+                observes: vec![],
+                guest_services: vec![],
+                apps: vec![],
+                tunnels: vec![SessionTunnel {
+                    id: "echo".into(),
+                    connector: "test.loopback".into(),
+                    config_json: "{}".into(),
+                    mint_source: None,
+                }],
+            };
+            registry.register(old.clone());
+            let retained = registry.lookup(old.guest_ip).unwrap();
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let gateway = GuestGatewayRegistry::new(
+                std::iter::empty::<Arc<dyn GuestServiceAdapter>>(),
+                [Arc::new(LoopbackTunnel(upstream.local_addr().unwrap()))
+                    as Arc<dyn TunnelUpstream>],
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut guest = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (stream, peer) = listener.accept().await.unwrap();
+            let run_registry = registry.clone();
+            let task = tokio::spawn(async move {
+                serve_connection(stream, peer, &run_registry, &gateway).await
+            });
+            guest
+                .write_all(
+                    b"CONNECT /_engrams/v1/tunnels/echo HTTP/1.1\r\nEngram-Gateway: 1\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut response = [0; 256];
+            let n = guest.read(&mut response).await.unwrap();
+            assert!(response[..n].starts_with(b"HTTP/1.1 200"));
+            let (mut remote, _) = upstream.accept().await.unwrap();
+            let mut next = old.clone();
+            next.managed_deny = Some(
+                engram_core::types::managed_deny::ManagedDenyPolicy::new(1, ["mcp.example".into()])
+                    .unwrap(),
+            );
+            assert_eq!(
+                registry.apply(next.clone()).await.unwrap_err(),
+                "managed policy does not support tunnels"
+            );
+            next.tunnels.clear();
+            registry.apply(next).await.unwrap();
+            task.await.unwrap().unwrap();
+            assert_eq!(guest.read(&mut [0]).await.unwrap(), 0);
+            assert_eq!(remote.read(&mut [0]).await.unwrap(), 0);
+            assert_eq!(retained.tunnels.len(), 1);
+            registry.unregister(old.session_id);
+            assert!(
+                registry.apply(old).await.is_err(),
+                "remove cannot erase the managed floor"
+            );
+        })
+        .await
+        .expect("bounded gateway drain test");
     }
 }

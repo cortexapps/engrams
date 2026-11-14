@@ -16,7 +16,7 @@
  * combo clips the corners in Chromium).
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, Link } from "@tanstack/react-router";
 import { Controller, useController, useForm, type Control } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -57,6 +57,11 @@ import {
   type ConnectorView,
 } from "../../components/integrations/useConnectorViews";
 import { IconPicker } from "../../components/profiles/IconPicker";
+import { McpGrantEditor } from "../../components/profiles/McpGrantEditor";
+import {
+  integrationGrantSchema,
+  type McpProfileGrant,
+} from "../../components/profiles/profileForm";
 import { PowerSelector } from "../../components/profiles/PowerSelector";
 import { PolicyRail } from "../../components/profiles/PolicyRail";
 import { ProviderTile } from "../../components/integrations/ProviderTile";
@@ -139,16 +144,7 @@ const schema = z.object({
   programmaticOnly: z.boolean(),
   includeUserTokens: z.boolean(),
   skills: z.array(z.string()),
-  integrationGrants: z.array(
-    z.object({
-      connectionId: z.string(),
-      operation: z.string(),
-      resourceConstraints: z.array(z.string()),
-      // ADR 0115: "" | "org" = the shared org credential; "user" = each
-      // member's personal credential (human launches then require it).
-      credentialScope: z.string().optional(),
-    }),
-  ),
+  integrationGrants: z.array(integrationGrantSchema),
   repos: z.array(z.custom<RepoRow>()),
   envRows: z.array(z.custom<EnvRow>()),
   networkDefault: z.enum(["deny", "allow"]),
@@ -246,6 +242,13 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const create = useCreateProfile();
   const update = useUpdateProfile();
 
+  const [publishMcp, setPublishMcp] = useState(false);
+  const [mcpAvailability, setMcpAvailability] = useState<Record<string, boolean>>({});
+  const setMcpReviewAvailability = useCallback((id: string, available: boolean) => {
+    setMcpAvailability((current) =>
+      current[id] === available ? current : { ...current, [id]: available },
+    );
+  }, []);
   const [netOpen, setNetOpen] = useState(false);
   const [advanced, setAdvanced] = useState(false);
   const [hydratedProfileId, setHydratedProfileId] = useState<string | null>(null);
@@ -260,6 +263,21 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   // The collections below have no registered input, so they ride useController
   // (see useFieldValue): a bare watch/setValue pair drops in-place row edits.
   const [integrationGrants, setGrants] = useFieldValue(control, "integrationGrants");
+  const mcpReviewReady = !integrationGrants.some((grant) => {
+    if (!grant.mcp) return false;
+    const connection = connectionData?.connections.find(
+      (item) => item.id === grant.connectionId && item.provider === "mcp",
+    );
+    return (
+      !connection ||
+      !mcpAvailability[
+        `${connection.id}:${connection.configRevision}:${connection.authGeneration}:${connection.catalogRevision}`
+      ]
+    );
+  });
+  useEffect(() => {
+    if (!mcpReviewReady) setPublishMcp(false);
+  }, [mcpReviewReady]);
   const [skills, setSkills] = useFieldValue(control, "skills");
   const [envRows, setEnvRows] = useFieldValue(control, "envRows");
   const [secretRows, setSecretRows] = useFieldValue(control, "secretRows");
@@ -308,7 +326,17 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
         connectionId: grant.connectionId,
         operation: grant.operation,
         resourceConstraints: [...grant.resourceConstraints],
-        ...(grant.credentialScope === "user" ? { credentialScope: "user" } : {}),
+        ...(grant.credentialScope !== undefined ? { credentialScope: grant.credentialScope } : {}),
+        ...(grant.mcp
+          ? {
+              mcp: {
+                upstreamName: grant.mcp.upstreamName,
+                automationWrite: grant.mcp.automationWrite,
+                unrestricted: grant.mcp.unrestricted,
+                argumentConstraintDocumentsJson: [...grant.mcp.argumentConstraintDocumentsJson],
+              },
+            }
+          : {}),
       })),
       repos: (p.repos ?? []).map((r) => ({ path: r.path, remoteUrl: r.remoteUrl })),
       envRows: mapToEnvRows(p.envVars),
@@ -387,7 +415,8 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
     [capabilities, network, secretRows, views, harnessDescriptor, routerDescriptor],
   );
   const connected = views.filter(
-    (view) => view.status === "connected" && view.connectionModel !== "named",
+    (view) =>
+      view.provider !== "mcp" && view.status === "connected" && view.connectionModel !== "named",
   );
   // Disabled connections stay visible: editing a connection's endpoints
   // auto-disables it, and a hidden grant on a disabled connection blocked
@@ -397,8 +426,8 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   // change here.
   const namedProviders = views.filter((view) => view.connectionModel === "named");
   const namedProviderKeys = new Set(namedProviders.map((view) => view.provider));
-  const googleConnections = (connectionData?.connections ?? []).filter((connection) =>
-    namedProviderKeys.has(connection.provider),
+  const googleConnections = (connectionData?.connections ?? []).filter(
+    (connection) => connection.provider !== "mcp" && namedProviderKeys.has(connection.provider),
   );
   const capabilitiesByProvider = new Map(
     namedProviders.map((view) => [view.provider, view.capabilities]),
@@ -463,7 +492,70 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
     setGrants(integrationGrants.filter((grant) => grant.connectionId !== v.defaultConnectionId));
 
   const onSubmit = async (vals: ProfileFormValues) => {
+    if (publishMcp && !mcpReviewReady) {
+      form.setError("root", {
+        message:
+          "The reviewed MCP catalog is unavailable. Reload and review the grants before publishing.",
+      });
+      return;
+    }
+    const signature = (grants: McpProfileGrant[]) =>
+      JSON.stringify(
+        grants
+          .filter((g) => g.mcp)
+          .map((g) => ({
+            connectionId: g.connectionId,
+            operation: g.operation,
+            resourceConstraints: g.resourceConstraints,
+            credentialScope: g.credentialScope || "",
+            mcp: g.mcp && {
+              upstreamName: g.mcp.upstreamName,
+              automationWrite: g.mcp.automationWrite,
+              unrestricted: g.mcp.unrestricted,
+              argumentConstraintDocumentsJson: g.mcp.argumentConstraintDocumentsJson,
+            },
+          })),
+      );
+    const previous = existing?.profile?.integrationGrants ?? [];
+    if (signature(vals.integrationGrants) !== signature(previous) && !publishMcp) {
+      form.setError("root", {
+        message: "Review and select publication before saving MCP grant changes.",
+      });
+      return;
+    }
+    for (const grant of vals.integrationGrants) {
+      if (!grant.mcp) continue;
+      const docs = grant.mcp.argumentConstraintDocumentsJson;
+      if (
+        grant.mcp.unrestricted !== (docs.length === 0) ||
+        (docs.length > 0 &&
+          docs.every((json) => {
+            try {
+              return Object.keys(JSON.parse(json)).length === 0;
+            } catch {
+              return false;
+            }
+          })) ||
+        docs.some((json) => {
+          try {
+            const value: unknown = JSON.parse(json);
+            return !value || typeof value !== "object" || Array.isArray(value);
+          } catch {
+            return true;
+          }
+        })
+      ) {
+        form.setError("root", {
+          message:
+            "Each MCP constraint must be a JSON object, or unrestricted arguments must be selected.",
+        });
+        return;
+      }
+    }
     const payload = {
+      ...(publishMcp
+        ? { expectedMcpGrantRevision: existing?.profile?.mcpGrantRevision ?? 0n }
+        : {}),
       name: vals.name.trim(),
       description: vals.description,
       icon: vals.icon,
@@ -498,7 +590,14 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       }
       navigate({ to: "/settings/profiles" });
     } catch (e) {
-      form.setError("root", { message: e instanceof Error ? e.message : String(e) });
+      form.setError("root", {
+        message: publishMcp
+          ? "Could not publish MCP grants. Reload the profile and review them again."
+          : e instanceof Error
+            ? e.message
+            : String(e),
+      });
+      if (publishMcp) setPublishMcp(false);
     }
   };
 
@@ -808,8 +907,55 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
             title="Integrations"
             sub="Enable an integration to bind its credential and open its egress — then choose exactly which powers sessions get."
           >
+            {(connectionData?.connections ?? [])
+              .filter((connection) => connection.provider === "mcp")
+              .map((connection) => (
+                <McpGrantEditor
+                  key={connection.id}
+                  connection={connection}
+                  grants={integrationGrants}
+                  onAvailability={setMcpReviewAvailability}
+                  onChange={(next) => {
+                    setGrants(next);
+                    setPublishMcp(false);
+                  }}
+                />
+              ))}
+            {integrationGrants
+              .filter(
+                (grant) =>
+                  grant.mcp &&
+                  !(connectionData?.connections ?? []).some(
+                    (connection) =>
+                      connection.id === grant.connectionId && connection.provider === "mcp",
+                  ),
+              )
+              .map((grant) => (
+                <p key={`${grant.connectionId}:${grant.mcp?.upstreamName}`} className="text-sm">
+                  MCP connection unavailable: <code>{grant.mcp?.upstreamName}</code>. Its grant is
+                  preserved.
+                </p>
+              ))}
+            {(integrationGrants.some((grant) => grant.mcp) ||
+              (existing?.profile?.integrationGrants ?? []).some((grant) => grant.mcp)) && (
+              <label className="text-sm">
+                <input
+                  type="checkbox"
+                  disabled={!mcpReviewReady}
+                  checked={publishMcp && mcpReviewReady}
+                  onChange={(event) => setPublishMcp(event.target.checked)}
+                />{" "}
+                Review and publish MCP grants with this save
+              </label>
+            )}
+            {existing?.profile?.mcpGrantRevision === 0n &&
+              integrationGrants.some((grant) => grant.mcp) && (
+                <p className="text-xs text-muted-foreground">
+                  An administrator must publish these grants before use.
+                </p>
+              )}
             {connected.length === 0 && googleConnections.length === 0 ? (
-              <EmptyIntegrations />
+              !integrationGrants.some((grant) => grant.mcp) && <EmptyIntegrations />
             ) : (
               <div className="flex flex-col gap-3">
                 {connected.map((v) => {

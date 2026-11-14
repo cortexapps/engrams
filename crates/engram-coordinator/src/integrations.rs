@@ -112,6 +112,18 @@ impl IntegrationBroker {
             return Some(e.clone());
         }
         let desc = self.by_provider.get(provider)?;
+        // Cache notifications are not an authorization fence. Check each ref
+        // before returning an engine that already holds a plaintext value.
+        for field in &desc.fields {
+            let name = format!("{}.{}", desc.kind, field.name);
+            if secrets
+                .check_access(&name, &SecretSchema::default())
+                .await
+                .is_err()
+            {
+                return None;
+            }
+        }
         let version = self.version.load(Ordering::Acquire);
         if let Some((v, eng)) = self.lazy.lock().get(provider) {
             if *v == version {
@@ -170,6 +182,34 @@ impl IntegrationBroker {
 mod tests {
     // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
     #![allow(clippy::disallowed_methods)]
+    #[tokio::test]
+    async fn mcp_reservation_blocks_cached_mint_before_notification() {
+        use engram_core::traits::{LayeredSecretStore, MetadataStore, StaticSecretStore};
+        use engram_core::types::org_secret::McpSecretRole;
+        let meta = engram_sim::SimMetadataStore::new(
+            engram_sim::ManualClock::new(),
+            Arc::new(engram_sim::SimEntropy::seeded(4)),
+        );
+        let secrets: Arc<dyn SecretStore> = Arc::new(LayeredSecretStore::new(vec![
+            Arc::new(crate::org_secrets::OrgSecretBackend::new(
+                meta.clone(),
+                Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                    [7; 32], "test",
+                )),
+            )),
+            Arc::new(StaticSecretStore::new(HashMap::from([(
+                "fake_kind.token".into(),
+                "cached-value".into(),
+            )]))),
+        ]));
+        let broker = broker();
+        assert!(broker.resolve("fake", &secrets).await.is_some());
+        meta.reserve_mcp_org_secret("fake_kind.token", "connection-a", McpSecretRole::ApiKey)
+            .await
+            .unwrap();
+        assert!(broker.resolve("fake", &secrets).await.is_none());
+    }
+
     use super::*;
     use async_trait::async_trait;
     use engram_core::error::{IntegrationError, SecretError};

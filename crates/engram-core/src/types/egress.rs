@@ -1,5 +1,5 @@
 //! Egress-policy types used by `SandboxBackend::notify_session_policy`
-//! and the wire-protocol `NotifyKind::SessionEgressPolicy` frame.
+//! and the policy bundled with `HostClient::start_agent`.
 //!
 //! These intentionally use flat `Vec<String>` for host allow-lists
 //! rather than the `engram-egress-proxy::HostList` type — the proxy
@@ -20,8 +20,8 @@ use crate::{SandboxId, SessionId};
 
 /// Per-session egress policy the host-agent's proxy registers
 /// against a session's `guest_ip`. Built by the coordinator from
-/// the image manifest + resolved secret bundle, shipped to the
-/// owning host over the WS, applied locally by the host-agent.
+/// the image manifest + resolved secret bundle and sent with the agent
+/// in the host start RPC. The host-agent applies it before spawn.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEgressPolicy {
     pub session_id: SessionId,
@@ -71,18 +71,19 @@ pub struct SessionEgressPolicy {
     /// straight back into the sibling's guest port instead of sending it out to
     /// the internet.
     ///
-    /// LAST on purpose. This type crosses the coord↔host wire as positional
+    /// This type crosses the coord↔host wire as positional
     /// bincode (ADR 0013), so field ORDER is the format: an inserted
     /// non-trailing field shifts every byte after it and desyncs a peer built
-    /// from an older tree across a roll. A trailing field is the only wire-safe
-    /// evolution — see `engram-protocol/tests/wire_golden.rs`, which pins these
+    /// from an older tree across a roll. Append fields and bump the wire version
+    /// on evolution — see `engram-protocol/tests/wire_golden.rs`, which pins these
     /// bytes and is what catches the mistake.
     ///
-    /// `#[serde(default)]` so policies serialized before this field decode with
-    /// none, and the short circuit simply never fires — the pre-ADR-0118
-    /// behaviour.
+    /// The default applies to JSON only; positional bincode requires matching versions.
     #[serde(default)]
     pub apps: Vec<AppEndpoint>,
+    /// Mandatory exact-host deny. Appended: bincode field order is the wire format.
+    #[serde(default)]
+    pub managed_deny: Option<crate::types::managed_deny::ManagedDenyPolicy>,
 }
 
 /// ADR 0118: one app's resolved public address, as the egress proxy needs it.

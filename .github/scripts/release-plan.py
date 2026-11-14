@@ -36,9 +36,9 @@ from pathlib import Path
 
 DETECTOR = Path(__file__).with_name("detect-rebake-lanes.py")
 
-# The five container images whose lanes the detector evaluates against a
+# The container images whose lanes the detector evaluates against a
 # registry baseline (`--image-baseline`), in the detector's own order.
-BASELINE_IMAGES = ["coordinator", "host-agent", "host-operator", "web", "orchestrator"]
+BASELINE_IMAGES = ["coordinator", "host-agent", "host-operator", "web", "orchestrator", "mcp-worker"]
 # Artifacts with a push-range lane: the detector output that says "the inputs
 # changed in this range".
 RANGE_LANES = {"node-assets": "node_assets", "cli-tools": "cli_tools"}

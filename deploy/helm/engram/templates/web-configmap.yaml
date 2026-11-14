@@ -16,6 +16,22 @@ metadata:
     {{- include "engram.web.labels" . | nindent 4 }}
 data:
   default.conf.template: |
+    # The initial OAuth callback GET contains transient credentials. Keep
+    # only the original path, including after the SPA's internal redirect.
+    # Never include request, args, headers, referrer, or body in this format.
+    map $request_uri $engram_log_path {
+      ~^(?<engram_request_path>[^?]*) $engram_request_path;
+      default "";
+    }
+    log_format engram_safe escape=json
+      '{"method":"$request_method","path":"$engram_log_path",'
+      '"status":$status,"duration":$request_time,"bytes":$body_bytes_sent}';
+
+    # nginx request error messages can contain the full request and referrer.
+    # They have no field-level redaction. Suppress HTTP error diagnostics;
+    # status/timing remain in access logs and main-process diagnostics remain.
+    error_log /dev/null;
+
     # Sets `Connection: upgrade` only when the client requested an
     # Upgrade; otherwise leaves it alone so keep-alive works for
     # plain HTTP. Standard nginx WS-proxy idiom. Must live at http{}
@@ -44,6 +60,7 @@ data:
       server_name _;
       root /usr/share/nginx/html;
       index index.html;
+      access_log /dev/stdout engram_safe;
 
       # Health probe target. Cheap and auth-free; the readiness
       # probe hits this before the pod joins the Service.

@@ -71,17 +71,6 @@ pub type ForgeSink = Arc<dyn Fn(HarnessByteStream) + Send + Sync>;
 /// coord's loopback HTTP artifact endpoint).
 pub type UploadSink = Arc<dyn Fn(HarnessByteStream) + Send + Sync>;
 
-/// VM lifecycle seam. Production implementation: `engram-sandbox-firecracker`
-/// (Firecracker over its HTTP-over-Unix-socket API). Dev implementation:
-/// `engram-sandbox-process` (host subprocesses, no isolation).
-///
-/// `exec_stream` is the primary exec method — it returns immediately
-/// with a stream of [`ExecEvent`]s so callers can show output in real
-/// time (and so multiple subscribers can observe one command running).
-/// `exec` is provided with a default impl that drains the stream into
-/// an in-memory [`ExecHandle`]; it's a convenience for short commands
-/// and unit tests. Backend implementations only need to provide
-/// `exec_stream`.
 /// ADR 0022 Option A: a point-in-time sample of guest memory across a
 /// backend's live sandboxes on one host, summed. `pss_bytes` (proportional
 /// set size) charges each shared clean page to a fraction of the sandboxes
@@ -161,8 +150,19 @@ pub enum AgentRefresh {
     Restarted,
 }
 
+/// Sandbox lifecycle and guest I/O. Firecracker provides production isolation;
+/// VZ provides macOS development parity and Process runs without isolation.
+/// `exec_stream` returns live events; `exec` buffers a short command's output.
 #[async_trait]
 pub trait SandboxBackend: Send + Sync {
+    /// Strict host-owned network enforcement for this exact placement. Unavailable
+    /// until the backend can prove all egress paths are controlled before execution.
+    async fn managed_network_proof(
+        &self,
+        _target: &crate::types::managed_deny::ManagedPolicyTarget,
+    ) -> Option<crate::types::managed_deny::ManagedNetworkProof> {
+        None
+    }
     /// Boot a sandbox under `id`, which the caller mints. Every host
     /// resource the sandbox owns (volumes, jail, sockets) is named by
     /// `id` before the backend sees it.
@@ -223,22 +223,19 @@ pub trait SandboxBackend: Send + Sync {
     /// endpoint instead).
     fn set_upload_sink(&self, _sink: UploadSink) {}
 
-    /// Push per-session egress policy to the backend. The
-    /// coordinator calls this after `create_for_session` returns,
-    /// once the sandbox's `guest_endpoints` is known and before
-    /// `start_agent` dispatches — so the harness can't make
-    /// network calls before the local proxy knows the policy.
-    /// WS-frame ordering between this notify and the subsequent
-    /// `start_agent` request is what guarantees the sequencing on
-    /// remote-host backends.
+    /// Install per-session egress policy in the local backend before
+    /// starting the agent. `HostClient::start_agent` carries the policy
+    /// and agent in one host RPC and applies the policy before spawn.
     ///
-    /// `RemoteSandboxBackend` forwards via the existing WS as a
-    /// `NotifyKind::SessionEgressPolicy`. Local backends apply the
-    /// policy in-process (used by `--mode=all`). The default rejects a
-    /// policy that needs the guest gateway because such a backend cannot
-    /// authenticate or intercept the guest caller. Other policies remain a
-    /// no-op for Process and in-test fixtures. ADR 0006 and ADR 0109.
+    /// The default rejects managed deny policies, guest services and tunnels
+    /// because they require a host proxy. Other policies are a no-op for
+    /// Process and test backends.
     async fn notify_session_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError> {
+        if policy.managed_deny.is_some() {
+            return Err(SandboxError::InvalidSpec(
+                "managed policy requires a host proxy".into(),
+            ));
+        }
         if !policy.guest_services.is_empty() || !policy.tunnels.is_empty() {
             return Err(SandboxError::InvalidSpec(
                 "guest services and tunnels require a session-scoped guest gateway".to_string(),
@@ -251,10 +248,8 @@ pub trait SandboxBackend: Send + Sync {
     /// chunks. A terminal backend result ends with one [`ExecEvent::Exit`] or
     /// [`ExecEvent::Refused`]; ending without either terminal means transport
     /// loss and must not be interpreted as a terminal status. Terminating the
-    /// stream early (dropping it) does NOT necessarily kill the
-    /// underlying process — backends are free to detach and let it run
-    /// to completion. Callers that need cancellation should hold the
-    /// stream until exit or use a separate kill API (future work).
+    /// stream early does not necessarily kill the underlying process.
+    /// Use `cancel_exec` to cancel its durable exec ticket.
     async fn exec_stream(
         &self,
         id: SandboxId,

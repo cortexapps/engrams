@@ -39,6 +39,12 @@ impl HostEgress {
         }
     }
 
+    pub(crate) fn install_ca(&self, agent: &mut engram_core::types::sandbox::AgentSpec) {
+        agent
+            .host_ca_pem
+            .get_or_insert_with(|| self.ca_cert_pem.clone());
+    }
+
     /// The raw control client — the test harnesses' assertion surface
     /// (`lookup_guest` / `decide` / `health`).
     pub fn handle(&self) -> Arc<ProxydHandle> {

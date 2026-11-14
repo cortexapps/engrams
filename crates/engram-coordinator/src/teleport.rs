@@ -137,6 +137,7 @@ async fn plan_host_teleports_with_limit(
                 Some(&format!("teleport:{host}:{id}")),
             )
             .await
+            .map_err(ApiError::from)
             .map(|_| {
                 report.planned.push(id);
             }),
@@ -150,7 +151,7 @@ async fn plan_host_teleports_with_limit(
                             report.skipped += 1
                         }
                     }),
-                Err(e) => Err(e),
+                Err(e) => Err(e.into()),
             },
             _ => {
                 report.skipped += 1;
@@ -194,6 +195,8 @@ pub(crate) async fn admit_for_rpc(
     id: SessionId,
     target: Option<HostId>,
 ) -> Result<TeleportRow, ApiError> {
+    crate::managed_boot::gate(state, id, false).await?;
+
     let claim=crate::session_ops::OpClaim::try_acquire(state,id,OpKind::Teleport,serde_json::json!({"source_host":state.services.meta.get_session(id).await?.host_id,"reason":TeleportReason::Ui})).await?
         .ok_or_else(||ApiError::Conflict("busy_lane".into()))?;
     let admitted = steps::admit(&claim.as_ctx(), target, TeleportReason::Ui).await;
@@ -746,6 +749,7 @@ mod steps {
         reason: TeleportReason,
     ) -> Result<TeleportAdmitOutcome, ApiError> {
         let state = ctx.state;
+        crate::managed_boot::gate(state, ctx.op.session_id, false).await?;
         let session = state.services.meta.get_session(ctx.op.session_id).await?;
         if session.status != SessionState::Active {
             return Ok(TeleportAdmitOutcome::SessionNotActive(session.status));

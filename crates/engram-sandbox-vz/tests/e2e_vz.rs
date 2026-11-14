@@ -38,8 +38,7 @@ use engram_core::types::sandbox::{
     AuxRoDrive, CpuLimit, DiskLimit, ExecEvent, ExecRequest, MemoryLimit, SandboxSpec, SessionDisks,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
-use engram_core::SandboxError;
-use engram_core::SandboxId;
+use engram_core::{SandboxError, SandboxId};
 use engram_harness_proto::{
     read_msg, write_msg, ForgeOp, ForgeRequest, ForgeResponse, RelayAck, RelayConnect,
     PROXY_PORT_VSOCK_PORT,
@@ -242,16 +241,16 @@ fn spec_with_skill(rootfs: &Path, sha: &str) -> SandboxSpec {
 
 /// Run one command to completion, returning (stdout, exit_code).
 async fn exec(backend: &VzBackend, id: SandboxId, sh: &str) -> (String, Option<i32>) {
-    try_exec(backend, id, sh).await.expect("exec_stream")
+    let (out, exit) = try_exec(backend, id, sh).await.expect("exec_stream");
+    (out, exit.flatten())
 }
 
-/// `exec` for a guest that may refuse the dial: a paused VM fails fast
-/// or hangs, and both are the outcome under test.
+/// Preserve submission errors and distinguish stream loss from any Exit event.
 async fn try_exec(
     backend: &VzBackend,
     id: SandboxId,
     sh: &str,
-) -> Result<(String, Option<i32>), SandboxError> {
+) -> Result<(String, Option<Option<i32>>), SandboxError> {
     let req = ExecRequest {
         command: vec!["/bin/sh".into(), "-c".into(), sh.into()],
         stdin: None,
@@ -271,13 +270,28 @@ async fn try_exec(
             ExecEvent::Stdout(b) => out.push_str(&String::from_utf8_lossy(&b)),
             ExecEvent::Stderr(b) => out.push_str(&String::from_utf8_lossy(&b)),
             ExecEvent::Exit(c) => {
-                code = c;
+                code = Some(c);
                 break;
             }
             ExecEvent::Refused(reason) => panic!("exec refused: {reason}"),
         }
     }
     Ok((out, code))
+}
+
+fn exec_has_terminal_exit(result: &Result<(String, Option<Option<i32>>), SandboxError>) -> bool {
+    matches!(result, Ok((_, Some(_))))
+}
+
+#[test]
+fn parked_exec_rejects_every_terminal_exit() {
+    assert!(!exec_has_terminal_exit(&Err(SandboxError::Unavailable(
+        "transport closed before submission".into(),
+    ))));
+    assert!(!exec_has_terminal_exit(&Ok((String::new(), None))));
+    for code in [None, Some(0), Some(1)] {
+        assert!(exec_has_terminal_exit(&Ok((String::new(), Some(code)))));
+    }
 }
 
 /// Poll `guest_endpoints` until the in-VM agentd answers (proves boot + agentd up).
@@ -787,10 +801,9 @@ async fn e2e_vz_pause_freezes_and_resume_revives() {
     let (out, code) = exec(&backend, id, "echo pre-pause").await;
     assert_eq!(code, Some(0), "pre-pause exec; out={out}");
 
-    // Park. A frozen guest can't serve a fresh exec: the vsock dial
-    // hangs (timeout), fails fast (`Err`), or the stream ends with no
-    // Exit event (`code=None`). Only a completed `Some(0)` exec proves
-    // the guest is still running.
+    // Park. A frozen guest can't serve a fresh exec: either the vsock
+    // dial hangs (timeout), submission fails, or the stream ends with NO
+    // Exit event. Any Exit event proves the guest made progress.
     backend.pause(id).await.expect("pause");
     backend.pause(id).await.expect("pause is idempotent");
     let frozen = tokio::time::timeout(
@@ -799,7 +812,7 @@ async fn e2e_vz_pause_freezes_and_resume_revives() {
     )
     .await;
     assert!(
-        !matches!(&frozen, Ok(Ok((_, Some(0))))),
+        !frozen.as_ref().is_ok_and(exec_has_terminal_exit),
         "exec completed against a paused VM — pause didn't freeze the guest: {frozen:?}",
     );
 
@@ -812,7 +825,7 @@ async fn e2e_vz_pause_freezes_and_resume_revives() {
     )
     .await;
     assert!(
-        !matches!(&still_frozen, Ok(Ok((_, Some(0))))),
+        !still_frozen.as_ref().is_ok_and(exec_has_terminal_exit),
         "snapshot un-parked the VM as a side effect: {still_frozen:?}",
     );
 

@@ -5,14 +5,10 @@
  * QuickJS context has no fetch, no timers, no require, no process, and this
  * module installs no host functions — only a console shim that collects logs.
  *
- * Isolation strategy (spike-verified under Bun, 2026-08-21): a FRESH WASM
- * module with its own capped WebAssembly.Memory per evaluation, ~5 ms each.
- * A shared module was rejected: QuickJS's own setMemoryLimit does not stop a
- * `new Array(1e6)` allocation loop from growing the shared emscripten linear
- * memory past 2 GiB, and linear memory never shrinks — one hostile eval
- * would bloat the orchestrator for its lifetime. A per-eval module bounds
- * the worst case at WASM_MEMORY_MAX_BYTES and the allocator reclaims the
- * instance after disposal.
+ * Each evaluation owns a fresh WASM module and capped WebAssembly.Memory.
+ * QuickJS's memory accounting does not bound all linear-memory growth, and
+ * linear memory does not shrink. Independent instances bound each evaluation
+ * and let the host collect a failed instance without re-entering native code.
  */
 
 import type {
@@ -24,6 +20,7 @@ import type {
 
 export const CODE_MEMORY_LIMIT_BYTES = 32 * 1024 * 1024;
 export const CODE_CPU_BUDGET_MS = 250;
+/** QuickJS's WASM shadow-stack limit; the host has a separate stack limit. */
 export const CODE_MAX_STACK_BYTES = 512 * 1024;
 export const CODE_OUTPUT_MAX_BYTES = 256 * 1024;
 /** Hard ceiling on the per-eval WASM linear memory (backstops QuickJS's own
@@ -178,18 +175,15 @@ function normalizeError(dumped: unknown): CodeErrorShape {
   return shape;
 }
 
-function readLogs(ctx: QuickJSContext): string[] {
+function readLogs(ctx: QuickJSContext, track: (handle: QuickJSHandle) => QuickJSHandle): string[] {
   const result = ctx.evalCode(`JSON.stringify(globalThis.__logs ?? [])`);
   if (result.error) {
-    result.error.dispose();
+    track(result.error);
     return [];
   }
-  try {
-    const parsed: unknown = JSON.parse(ctx.getString(result.value));
-    return Array.isArray(parsed) ? parsed.filter((l): l is string => typeof l === "string") : [];
-  } finally {
-    result.value.dispose();
-  }
+  const value = track(result.value);
+  const parsed: unknown = JSON.parse(ctx.getString(value));
+  return Array.isArray(parsed) ? parsed.filter((l): l is string => typeof l === "string") : [];
 }
 
 /** Evaluate user code against a frozen JSON input. Never throws for guest
@@ -226,7 +220,12 @@ export async function evaluateCode(
     const prelude = ctx.evalCode(GUEST_PRELUDE);
     if (prelude.error) {
       track(prelude.error);
-      return { ok: false, error: normalizeError(ctx.dump(prelude.error)), durationMs: duration(), logs: [] };
+      return {
+        ok: false,
+        error: normalizeError(ctx.dump(prelude.error)),
+        durationMs: duration(),
+        logs: [],
+      };
     }
     track(prelude.value);
 
@@ -237,7 +236,7 @@ export async function evaluateCode(
         ok: false,
         error: normalizeError(ctx.dump(moduleResult.error)),
         durationMs: duration(),
-        logs: readLogs(ctx),
+        logs: readLogs(ctx, track),
       };
     }
     const ns = track(moduleResult.value);
@@ -251,11 +250,11 @@ export async function evaluateCode(
         ok: false,
         error: normalizeError(ctx.dump(driven.error)),
         durationMs: duration(),
-        logs: readLogs(ctx),
+        logs: readLogs(ctx, track),
       };
     }
     const serialized = ctx.getString(track(driven.value));
-    const logs = readLogs(ctx);
+    const logs = readLogs(ctx, track);
 
     let value: unknown;
     try {
@@ -278,34 +277,34 @@ export async function evaluateCode(
     }
     return { ok: true, value, durationMs: duration(), logs };
   } catch (error) {
-    // Host-side failure (instantiation, wasm trap). Typed, never thrown.
+    // A host exception can bypass QuickJS unwinding. Abandon the fresh instance;
+    // its native cleanup is unsafe, including handles acquired while reading logs.
+    handles.length = 0;
+    ctx = undefined;
+    runtime = undefined;
     return {
       ok: false,
       error: {
-        name: "SandboxError",
+        name:
+          error instanceof RangeError &&
+          /maximum call stack size exceeded|stack overflow/i.test(error.message)
+            ? error.name
+            : "SandboxError",
         message: error instanceof Error ? error.message : String(error),
       },
       durationMs: duration(),
       logs: [],
     };
   } finally {
-    for (const handle of handles.reverse()) {
-      try {
-        handle.dispose();
-      } catch {
-        // Already consumed by the context; disposal order is best-effort.
+    try {
+      // Dumping a Promise exception can consume its handle.
+      for (const handle of handles.reverse()) {
+        if (handle.alive) handle.dispose();
       }
-    }
-    try {
       ctx?.dispose();
-    } catch {
-      // A leaked handle throws here; the runtime disposal below still frees
-      // the instance, and the fresh-module strategy bounds any residue.
-    }
-    try {
       runtime?.dispose();
     } catch {
-      // Same rationale as above.
+      // A failed cleanup also ends native access. The host collects the instance.
     }
   }
 }
