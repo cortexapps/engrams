@@ -1,6 +1,7 @@
 /** GitHub as a git forge. Every call goes through the coordinator's
  * IntegrationOp, which holds the credential: an installation-wide mint. */
 
+import { REVIEW_DISPATCH_EVENT_KEY } from "../../automations/builtins/review-variant.ts";
 import {
   escapeGitPath,
   ForgeRequestError,
@@ -10,7 +11,19 @@ import {
   type GitForgeSpec,
   type InlineComment,
   type PrReviewComment,
+  type ReviewEvent,
+  type ReviewEventPullRequest,
 } from "../../forges/forge.ts";
+import {
+  decodeBody,
+  isObject,
+  parseJson,
+  responseError,
+  succeeded,
+  unusable,
+  type Json,
+} from "../../forges/http.ts";
+import { EMPTY_PR_CONTEXT } from "../../forges/pr-context.ts";
 import {
   runIntegrationOp as defaultRunIntegrationOp,
   type IntegrationOpResult,
@@ -20,6 +33,7 @@ import { readPrContext } from "./pr.ts";
 import { GITHUB_REVIEW } from "./review-variant.ts";
 
 const PROVIDER = "github";
+const FORGE = "GitHub";
 const log = rootLog.child({ component: "github-forge" });
 const PER_PAGE = 100;
 // The marker scan guards the window between a posted review and its
@@ -28,40 +42,23 @@ const MAX_REVIEW_PAGES = 10;
 // Comments are advisory context for a re-review, so a very long thread is cut
 // short and does not fail the read.
 const MAX_COMMENT_PAGES = 10;
+/** The `author_association` values of a person with a role in the
+ * repository or its organization. */
+const MAY_REQUEST_REVIEW: ReadonlySet<string> = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+/** The pull-request actions that change the pull request and start no review. */
+const UPDATE_ACTIONS: ReadonlySet<string> = new Set([
+  "closed",
+  "reopened",
+  "edited",
+  "converted_to_draft",
+]);
 
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+function str(value: unknown): string | null {
+  return typeof value === "string" && value !== "" ? value : null;
 }
 
-function decodeBody(body: Uint8Array): string {
-  return new TextDecoder().decode(body);
-}
-
-/** A 2xx response whose body is not what the operation returns. It carries
- * the status, so no caller treats it as permanent. */
-function unusable(operation: string, result: IntegrationOpResult, what: string): ForgeRequestError {
-  return new ForgeRequestError(result.status, `${operation} returned ${what}`, "");
-}
-
-function parseJson(result: IntegrationOpResult, operation: string): unknown {
-  try {
-    return JSON.parse(decodeBody(result.body));
-  } catch {
-    throw unusable(operation, result, "invalid JSON");
-  }
-}
-
-function succeeded(result: IntegrationOpResult): boolean {
-  return result.status >= 200 && result.status < 300;
-}
-
-function responseError(operation: string, result: IntegrationOpResult): ForgeRequestError {
-  const detail = decodeBody(result.body).trim();
-  return new ForgeRequestError(
-    result.status,
-    `${operation} failed with GitHub status ${result.status}${detail ? `: ${detail}` : ""}`,
-    detail,
-  );
+function positiveInt(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
 }
 
 function isRateLimitResponseBody(body: string): boolean {
@@ -105,7 +102,7 @@ function reviewIdFrom(result: IntegrationOpResult, repo: string, prNumber: numbe
   return undefined;
 }
 
-function commentPayload(comment: InlineComment): Record<string, unknown> {
+function commentPayload(comment: InlineComment): Json {
   return {
     path: comment.path,
     side: comment.side,
@@ -120,7 +117,6 @@ function commentPayload(comment: InlineComment): Record<string, unknown> {
 const GITHUB_LINKS: ForgeLinks = {
   pullRequest: (repo, number) => `https://github.com/${repo}/pull/${number}`,
   review: (prUrl, reviewId) => `${prUrl}#pullrequestreview-${reviewId}`,
-  comment: (prUrl, commentId) => `${prUrl}#discussion_r${commentId}`,
   file(_prUrl, at) {
     const base = `https://github.com/${at.repo}/blob/${at.sha}/${escapeGitPath(at.path)}`;
     const lines = linkLines(at);
@@ -142,45 +138,123 @@ function parsePullRequestUrl(url: string): { repo: string; number: number | null
   return { repo: `${segments[0]}/${segments[1]}`, number };
 }
 
+/** The pull request of a `pull_request` event or of the dispatch event. */
+function eventPullRequest(payload: Json): ReviewEventPullRequest | null {
+  const repository = isObject(payload["repository"]) ? payload["repository"] : null;
+  const pr = isObject(payload["pull_request"]) ? payload["pull_request"] : null;
+  const repo = repository && str(repository["full_name"]);
+  const number = pr && (positiveInt(pr["number"]) ?? positiveInt(payload["number"]));
+  if (!repo || pr === null || !number) return null;
+  const head = isObject(pr["head"]) ? pr["head"] : {};
+  const base = isObject(pr["base"]) ? pr["base"] : {};
+  return {
+    repo,
+    number,
+    url: str(pr["html_url"]) ?? "",
+    headSha: str(head["sha"]) ?? "",
+    baseSha: str(base["sha"]) ?? "",
+    context: readPrContext(pr),
+  };
+}
+
+function reviewEvent(eventKey: string, payload: Json): ReviewEvent | null {
+  if (eventKey === REVIEW_DISPATCH_EVENT_KEY) {
+    const pr = eventPullRequest(payload);
+    return pr && { kind: "dispatch", pr };
+  }
+
+  if (eventKey.startsWith("pull_request.")) {
+    const pr = eventPullRequest(payload);
+    if (pr === null) return null;
+    const action = eventKey.slice("pull_request.".length);
+    if (action === "opened" || action === "synchronize" || action === "ready_for_review") {
+      const draft = isObject(payload["pull_request"]) && payload["pull_request"]["draft"] === true;
+      return { kind: "change", trigger: action, draft, pr };
+    }
+    return UPDATE_ACTIONS.has(action) ? { kind: "update", pr } : null;
+  }
+
+  const inline = eventKey === "pull_request_review_comment.created";
+  if (eventKey === "issue_comment.created" || inline) {
+    const repository = isObject(payload["repository"]) ? payload["repository"] : null;
+    // An inline review comment names its pull request; any other comment
+    // names an issue, which is a pull request when it has `pull_request`.
+    const subject = payload[inline ? "pull_request" : "issue"];
+    const issue = isObject(subject) ? subject : null;
+    const comment = isObject(payload["comment"]) ? payload["comment"] : null;
+    const sender = isObject(payload["sender"]) ? payload["sender"] : {};
+    const repo = repository && str(repository["full_name"]);
+    const number = issue && positiveInt(issue["number"]);
+    const body = comment && str(comment["body"]);
+    const author = comment && isObject(comment["user"]) ? str(comment["user"]["login"]) : null;
+    // A comment on an issue that is not a pull request is not for a review.
+    if (!repo || !issue || !number || !body || !author) return null;
+    if (!inline && !isObject(issue["pull_request"])) return null;
+    const url = str(issue["html_url"]);
+    return {
+      kind: "comment",
+      body,
+      authorId: author,
+      fromBot: sender["type"] === "Bot",
+      authorAccess: comment ? str(comment["author_association"]) : null,
+      pr: {
+        repo,
+        number,
+        url: url ?? "",
+        headSha: "",
+        baseSha: "",
+        context: { ...EMPTY_PR_CONTEXT, url },
+      },
+    };
+  }
+  return null;
+}
+
 export function makeGithubForge(
   deps: { runIntegrationOp?: typeof defaultRunIntegrationOp } = {},
 ): GitForge {
   const runOp = deps.runIntegrationOp ?? defaultRunIntegrationOp;
-  const get = (path: string): Promise<IntegrationOpResult> =>
-    runOp(PROVIDER, { method: "GET", path, contentType: "application/json" });
-  const post = (path: string, body: unknown): Promise<IntegrationOpResult> =>
+  const send = (method: string, path: string, body?: unknown): Promise<IntegrationOpResult> =>
     runOp(PROVIDER, {
-      method: "POST",
+      method,
       path,
-      body: JSON.stringify(body),
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
       contentType: "application/json",
     });
-  const listPage = async (path: string, page: number, operation: string): Promise<unknown[]> => {
-    const response = await get(`${path}?per_page=${PER_PAGE}&page=${page}`);
-    if (!succeeded(response)) throw responseError(operation, response);
+  const list = async (operation: string, path: string): Promise<unknown[]> => {
+    const response = await send("GET", path);
+    if (!succeeded(response)) throw responseError(FORGE, operation, response);
     const value = parseJson(response, operation);
-    if (!Array.isArray(value)) throw unusable(operation, response, "a non-array response");
+    if (!Array.isArray(value)) throw unusable(operation, "a non-array response");
     return value;
   };
+  const listPage = (path: string, page: number, operation: string): Promise<unknown[]> =>
+    list(operation, `${path}?per_page=${PER_PAGE}&page=${page}`);
 
   return {
     provider: PROVIDER,
-    caseInsensitiveRepos: true,
+    // GitHub finds a repository by its name in any case.
+    repoKey: (repo) => repo.toLowerCase(),
     parsePullRequestUrl,
     links: GITHUB_LINKS,
     isPermanentError,
+    reviewEvent,
+
+    async mayRequestReview(comment) {
+      return comment.authorAccess !== null && MAY_REQUEST_REVIEW.has(comment.authorAccess);
+    },
 
     async fetchPullRequest(repo, prNumber) {
-      const response = await get(`/repos/${repo}/pulls/${prNumber}`);
-      if (!succeeded(response)) throw responseError("get pull request", response);
+      const response = await send("GET", `/repos/${repo}/pulls/${prNumber}`);
+      if (!succeeded(response)) throw responseError(FORGE, "get pull request", response);
       const value = parseJson(response, "get pull request");
       if (!isObject(value) || !isObject(value["head"]) || !isObject(value["base"])) {
-        throw unusable("get pull request", response, "no head/base");
+        throw unusable("get pull request", "no head/base");
       }
       const headSha = value["head"]["sha"];
       const baseSha = value["base"]["sha"];
       if (typeof headSha !== "string" || typeof baseSha !== "string") {
-        throw unusable("get pull request", response, "no head/base SHAs");
+        throw unusable("get pull request", "no head/base SHAs");
       }
       return { headSha, baseSha, pr: readPrContext(value) };
     },
@@ -204,24 +278,36 @@ export function makeGithubForge(
       return false;
     },
 
+    async createComment(repo, prNumber, body) {
+      const response = await send("POST", `/repos/${repo}/issues/${prNumber}/comments`, { body });
+      if (!succeeded(response)) throw responseError(FORGE, "create comment", response);
+      const value = parseJson(response, "create comment");
+      const id = isObject(value) ? positiveInt(value["id"]) : null;
+      if (id === null) throw unusable("create comment", "no id");
+      return String(id);
+    },
+
+    async updateComment(repo, commentId, body) {
+      if (!/^[1-9]\d*$/.test(commentId)) {
+        throw new ForgeRequestError(400, `"${commentId}" is not a GitHub comment id`, "");
+      }
+      const response = await send("PATCH", `/repos/${repo}/issues/comments/${commentId}`, { body });
+      if (!succeeded(response)) throw responseError(FORGE, "update comment", response);
+    },
+
+    // The newest 100 comments. A marker in a comment proves nothing by
+    // itself: any commenter can post one. The app's comments are a bot's.
     async findCommentWithMarker(repo, prNumber, marker) {
-      const response = await get(
+      const comments = await list(
+        "list comments",
         `/repos/${repo}/issues/${prNumber}/comments?per_page=${PER_PAGE}&sort=created&direction=desc`,
       );
-      if (!succeeded(response)) return null;
-      let value: unknown;
-      try {
-        value = JSON.parse(decodeBody(response.body));
-      } catch {
-        return null;
+      for (const item of comments) {
+        if (!isObject(item) || typeof item["body"] !== "string" || !item["body"].includes(marker)) continue;
+        const id = positiveInt(item["id"]);
+        if (id !== null && isObject(item["user"]) && item["user"]["type"] === "Bot") return String(id);
       }
-      if (!Array.isArray(value)) return null;
-      return (
-        value.find(
-          (item): item is Record<string, unknown> =>
-            isObject(item) && typeof item["body"] === "string" && item["body"].includes(marker),
-        ) ?? null
-      );
+      return null;
     },
 
     async listReviewComments(repo, prNumber) {
@@ -243,7 +329,7 @@ export function makeGithubForge(
             inReplyToId: typeof inReplyTo === "string" || typeof inReplyTo === "number"
               ? String(inReplyTo)
               : null,
-            authorLogin: isObject(user) && typeof user["login"] === "string" ? user["login"] : "",
+            author: isObject(user) && typeof user["login"] === "string" ? user["login"] : "",
             body: typeof item["body"] === "string" ? item["body"] : "",
             path: typeof item["path"] === "string" ? item["path"] : null,
           });
@@ -257,7 +343,7 @@ export function makeGithubForge(
       const path = `/repos/${input.repo}/pulls/${input.prNumber}/reviews`;
       const review = { commit_id: input.commitId, event: "COMMENT" };
       const inlineBody = input.buildSummary(true);
-      let response = await post(path, {
+      let response = await send("POST", path, {
         ...review,
         body: inlineBody,
         comments: input.comments.map(commentPayload),
@@ -270,10 +356,11 @@ export function makeGithubForge(
         // body that quotes every finding.
         inlinePosted = false;
         summaryMd = input.buildSummary(false);
-        response = await post(path, { ...review, body: summaryMd });
+        response = await send("POST", path, { ...review, body: summaryMd });
       }
       if (!succeeded(response)) {
         throw responseError(
+          FORGE,
           inlinePosted ? "create pull request review" : "create summary-only pull request review",
           response,
         );
@@ -281,8 +368,8 @@ export function makeGithubForge(
       const providerReviewId = reviewIdFrom(response, input.repo, input.prNumber);
       return {
         ...(providerReviewId ? { providerReviewId } : {}),
-        posted: true,
         inlinePosted,
+        inlineFindingIds: inlinePosted ? input.comments.map((comment) => comment.findingId) : [],
         summaryMd,
       };
     },
@@ -290,7 +377,6 @@ export function makeGithubForge(
 }
 
 export const GITHUB_FORGE: GitForgeSpec = {
-  provider: PROVIDER,
   legacyDefault: true,
   make: makeGithubForge,
   review: GITHUB_REVIEW,

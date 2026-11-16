@@ -1,15 +1,36 @@
 import { expect, test } from "bun:test";
 
-import { BUILTIN_ACTION_IDS } from "../../../connectors/builtin-actions-allowlist.ts";
-import { forgeProviders } from "../../../forges/registry.ts";
-import { BUILTIN_ACTIONS } from "../builtin.ts";
+import { connectorRegistry } from "../../../connectors/registry.ts";
+import { providerSpecs } from "../../../providers/index.ts";
+import { builtinActions } from "../builtin.ts";
 
-test("the ids a connector may name are the ids that have an implementation", () => {
-  expect(Object.keys(BUILTIN_ACTIONS).sort()).toEqual([...BUILTIN_ACTION_IDS].sort());
+/** Every `builtin` action id that a shipped connector names. */
+function declaredBuiltinIds(): string[] {
+  return [...connectorRegistry().values()].flatMap((connector) =>
+    (connector.actions ?? []).flatMap((action) =>
+      action.execute.kind === "builtin" ? [action.execute.id] : [],
+    ),
+  );
+}
+
+test("every builtin action a connector names has an implementation", () => {
+  const table = builtinActions();
+  const missing = declaredBuiltinIds().filter((id) => !table.has(id));
+  expect(missing).toEqual([]);
 });
 
-test("every git forge has a post_pr_review action", () => {
-  for (const provider of forgeProviders()) {
-    expect(BUILTIN_ACTIONS).toHaveProperty([`${provider}.post_pr_review`]);
+test("every implementation is named by a connector", () => {
+  const declared = new Set(declaredBuiltinIds());
+  const unused = [...builtinActions().keys()].filter((id) => !declared.has(id));
+  expect(unused).toEqual([]);
+});
+
+test("every git forge has the forge actions", () => {
+  const table = builtinActions();
+  for (const { provider, forge } of providerSpecs()) {
+    if (!forge) continue;
+    for (const name of ["post_pr_review", "upsert_pr_comment", "update_pr_comment"]) {
+      expect(table.has(`${provider}.${name}`)).toBe(true);
+    }
   }
 });

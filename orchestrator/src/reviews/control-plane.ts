@@ -91,10 +91,11 @@ export interface ReviewControlPlane {
     opts?: { sessionId?: string },
   ): Promise<ReviewPostPayload>;
   /** The forge refused the inline anchors and the post action fell back to the
-   *  summary-only review. Re-settle the inline findings as `ui_only` (they
-   *  are on the Reviews page, not the diff) and store the fallback summary
-   *  as the pass summary, so the dossier says what the PR shows. */
-  recordSummaryOnlyPost(reviewId: string): Promise<void>;
+   *  summary-only review. Re-settle the findings that are not in
+   *  `inlineFindingIds` as `ui_only` (they are on the Reviews page, not the
+   *  diff) and store the fallback summary as the pass summary, so the
+   *  dossier says what the PR shows. */
+  recordSummaryOnlyPost(reviewId: string, inlineFindingIds: readonly string[]): Promise<void>;
   /** Tear down the given worker (best-effort) and mark the review failed, as one
    *  durable step. `reason` is recorded on the activity log for the UI. */
   failReview(
@@ -177,12 +178,13 @@ function postedSummary(count: number): string {
 async function settleFindingStates(
   store: Pick<ReviewControlPlaneStore, "updateFindingState">,
   settled: PolicyDecision,
-  inlinePosted: boolean,
+  /** Whether the comment of a finding to post is on the diff. */
+  onDiff: (findingId: string) => boolean,
 ): Promise<void> {
   for (const item of settled.toPost) {
     await store.updateFindingState(
       item.finding.id,
-      inlinePosted ? "posted" : "ui_only",
+      onDiff(item.finding.id) ? "posted" : "ui_only",
       item.verdictReason == null ? undefined : { verdictReason: item.verdictReason },
     );
   }
@@ -396,7 +398,7 @@ export function makeReviewControlPlane(
           if (title === undefined) continue;
           authorReplies.push({
             finding_title: title,
-            author: comment.authorLogin,
+            author: comment.author,
             body: clipPriorText(comment.body),
           });
         }
@@ -744,7 +746,7 @@ export function makeReviewControlPlane(
       });
       // Findings settle as if the inline comments land; the action reports
       // a 422 summary-only fallback on its own outputs for the dossier.
-      await settleFindingStates(reviews(), decision, true);
+      await settleFindingStates(reviews(), decision, () => true);
       const summaryMd = buildReviewSummary({
         reviewId,
         reviewUrl: reviewsPageUrl,
@@ -777,11 +779,13 @@ export function makeReviewControlPlane(
       };
     },
 
-    async recordSummaryOnlyPost(reviewId) {
+    async recordSummaryOnlyPost(reviewId, inlineFindingIds) {
       const detail = await reviews().getReview(reviewId);
       if (!detail) throw new Error(`review not found: ${reviewId}`);
       const decision = buildDecision(detail);
-      await settleFindingStates(reviews(), decision, false);
+      const onDiff = new Set(inlineFindingIds);
+      await settleFindingStates(reviews(), decision, (findingId) => onDiff.has(findingId));
+      const quoted = decision.toPost.length - decision.toPost.filter((item) => onDiff.has(item.finding.id)).length;
       const finalized = await reviews().finalizeReview(reviewId, {
         status: "posted",
         summaryMd: buildReviewSummary({
@@ -795,7 +799,7 @@ export function makeReviewControlPlane(
       await recordEvent(
         reviewId,
         "inline_fallback",
-        `The inline anchors were refused; ${decision.toPost.length} finding${decision.toPost.length === 1 ? "" : "s"} posted in the summary instead`,
+        `The diff does not show every finding; ${quoted} finding${quoted === 1 ? "" : "s"} posted in the summary only`,
       );
     },
 

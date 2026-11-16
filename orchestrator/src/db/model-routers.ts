@@ -56,7 +56,8 @@ export interface ModelRouterStore {
   getSyncState(routerId: string): Promise<RouterSyncStateRow | null>;
   recordFailure(routerId: string, error: string, now: Date): Promise<void>;
   getSettings(routerId: string): Promise<RouterSettings | null>;
-  setSettings(routerId: string, settings: RouterSettings, now: Date): Promise<void>;
+  /** Write the roles that `settings` names; the other roles keep their value. */
+  setSettings(routerId: string, settings: Partial<RouterSettings>, now: Date): Promise<void>;
 }
 
 export function makeModelRouterStore(db: ReturnType<typeof getDb> = getDb()): ModelRouterStore {
@@ -173,6 +174,8 @@ export function makeModelRouterStore(db: ReturnType<typeof getDb> = getDb()): Mo
       return rows[0] ?? null;
     },
     async setSettings(routerId, settings, now) {
+      // One statement that writes the named columns only, so two admins who
+      // set different roles at the same time both keep their choice.
       await db.insert(routerSettings).values({ routerId, ...settings, updatedAt: now }).onConflictDoUpdate({
         target: routerSettings.routerId,
         set: { ...settings, updatedAt: now },

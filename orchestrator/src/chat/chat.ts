@@ -7,10 +7,12 @@ import type { Hono } from "hono";
 import type { ThreadsVariant } from "../automations/builtins/threads-variant.ts";
 import type { CommunicationPolicy, SourceMention } from "../workflows/communication-policy.ts";
 
-/** Where the answer to an interactive card goes: the run that asked, or the
- * session whose question it is. The provider carries it on the card. */
+/** Where the answer to an interactive card goes. The provider carries it
+ * on the card, and `answers.ts` delivers the answer. */
 export interface AnswerRoute {
+  /** Present when a run posted the card (a choice block). */
   runId?: string;
+  /** Present when a session relay posted the card (an agent's question). */
   sessionId?: string;
 }
 
@@ -29,12 +31,14 @@ export interface ChatProvider {
   listChannels(): Promise<ChannelOption[]>;
   /** A label for each channel id, in request order. */
   describeChannels(keys: readonly string[]): Promise<ChannelOption[]>;
+  /** A message's text as a person reads it: no user mentions, and a
+   * channel or a link as its visible part. */
+  plainText(text: string): string;
   /** The workstream handle of a thread. */
   threadHandle(place: Pick<SourceMention, "channel" | "threadRoot">): string;
 }
 
 export interface ChatProviderSpec {
-  provider: string;
   /** Stored rows and block configs with no provider mean this one. */
   legacyDefault?: true;
   make(): ChatProvider;

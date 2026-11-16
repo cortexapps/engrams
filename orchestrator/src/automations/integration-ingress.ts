@@ -1,9 +1,8 @@
 /** The ingress spine every provider event delivery passes through: bounded
  * body → verify → parse → extract → redact → ledger → dispatch.
  *
- * The caller supplies the verifier and the provider's extract step. The spine
- * owns the ledger write and the dispatch hand-off, and returns the raw body
- * and parsed payload so the provider can do its own work on the delivery.
+ * The provider's event source verifies the delivery and says what it means.
+ * The spine owns the ledger write and the dispatch hand-off.
  * `setIntegrationEventDispatch` installs the trigger dispatcher at boot.
  */
 
@@ -16,6 +15,7 @@ import {
 import { BodyTooLargeError, readBoundedBody } from "../http/bounded-body.ts";
 import type { DispatchIntegrationResult } from "./dispatch.ts";
 import { log as rootLog } from "../log.ts";
+import type { IngressDelivery, VerificationSecretResolver } from "./verify.ts";
 import { parseWebhookPayload, redactWebhookPayload, WebhookEventError } from "./webhook.ts";
 
 const log = rootLog.child({ component: "integration-ingress" });
@@ -37,25 +37,23 @@ export type IngressOutcome =
    * delivery id) — the route should refuse it. */
   | { kind: "reject"; status: number; error: string };
 
-export interface IntegrationEventRoute {
-  provider: string;
-  /** Display name for the auto-provisioned default connection. */
-  displayName: string;
-  verify(headers: Headers, rawBody: Uint8Array): Promise<boolean>;
-  extract(headers: Headers, payload: Record<string, unknown>): IngressOutcome;
-}
-
-/** A provider's part of the event route: what a verified delivery means.
- * The route verifies it against the connector's declared ingress. */
+/** A provider's part of the event route: whether a delivery is the
+ * provider's, and what a verified one means. */
 export interface IntegrationEventSource {
   provider: string;
+  /** Whether the provider signed the delivery. It rejects when the signing
+   * secret cannot be read. */
+  verify(delivery: IngressDelivery): Promise<boolean>;
   extract(headers: Headers, payload: Record<string, unknown>, now: Date): IngressOutcome;
-  /** Provider work on a verified delivery, after the ledger write and the
-   * dispatch. A returned response replaces the route's 200. */
-  afterDelivery?(
-    delivery: Extract<DeliveryResult, { kind: "skipped" | "recorded" }>,
-    headers: Headers,
-  ): Promise<Response | undefined>;
+}
+
+/** What the connector declares about a provider's deliveries. */
+export interface DeclaredDelivery {
+  /** Display name for the auto-provisioned default connection. */
+  displayName: string;
+  /** The org secret that signs the deliveries. */
+  secretRef: string;
+  secrets: VerificationSecretResolver;
 }
 
 export interface IntegrationEventDispatchInput {
@@ -119,38 +117,55 @@ function jsonResponse(status: number, error: string): Response {
   });
 }
 
-export async function handleIntegrationDelivery(
-  route: IntegrationEventRoute,
+/** The raw body of a request that `source` verifies; else the refusal. The
+ * body is bounded. A signing secret that cannot be read (not sealed yet, or
+ * the resolver is down) is a 401 and not a 5xx: a 5xx makes the provider
+ * retry an endpoint that is not set up to receive it. */
+export async function readVerifiedBody(
+  source: Pick<IntegrationEventSource, "provider" | "verify">,
+  declared: Pick<DeclaredDelivery, "secretRef" | "secrets">,
   request: Request,
-  deps: HandleDeliveryDeps = {},
-): Promise<DeliveryResult> {
+  now: Date,
+): Promise<{ ok: true; rawBody: Uint8Array } | { ok: false; response: Response }> {
   let rawBody: Uint8Array;
   try {
     rawBody = await readBoundedBody(request);
   } catch (error) {
     if (error instanceof BodyTooLargeError) {
-      return { kind: "rejected", response: new Response(null, { status: 413 }) };
+      return { ok: false, response: new Response(null, { status: 413 }) };
     }
     throw error;
   }
-
   let verified: boolean;
   try {
-    verified = await route.verify(request.headers, rawBody);
+    verified = await source.verify({
+      headers: request.headers,
+      rawBody,
+      now,
+      secret: () =>
+        declared.secrets.resolve({ provider: source.provider, secretRef: declared.secretRef }),
+    });
   } catch (error) {
-    // The signing secret could not be read (not sealed yet, or the resolver
-    // is down). The delivery is unverifiable, which is a refusal, not a
-    // fault: a 5xx here would make the provider retry an endpoint that is
-    // not set up to receive it.
     log.warn(
-      { provider: route.provider, error },
+      { provider: source.provider, error },
       "integration delivery could not be verified; rejecting it",
     );
-    return { kind: "rejected", response: jsonResponse(401, "signature not verifiable") };
+    return { ok: false, response: jsonResponse(401, "signature not verifiable") };
   }
-  if (!verified) {
-    return { kind: "rejected", response: jsonResponse(401, "invalid signature") };
-  }
+  if (!verified) return { ok: false, response: jsonResponse(401, "invalid signature") };
+  return { ok: true, rawBody };
+}
+
+export async function handleIntegrationDelivery(
+  source: IntegrationEventSource,
+  declared: DeclaredDelivery,
+  request: Request,
+  deps: HandleDeliveryDeps = {},
+): Promise<DeliveryResult> {
+  const now = deps.now ?? (() => new Date());
+  const body = await readVerifiedBody(source, declared, request, now());
+  if (!body.ok) return { kind: "rejected", response: body.response };
+  const { rawBody } = body;
 
   let payload: Record<string, unknown>;
   try {
@@ -161,7 +176,7 @@ export async function handleIntegrationDelivery(
     return { kind: "skipped", reason: `unparseable payload: ${error.message}`, rawBody };
   }
 
-  const outcome = route.extract(request.headers, payload);
+  const outcome = source.extract(request.headers, payload, now());
   if (outcome.kind === "respond") return { kind: "responded", response: outcome.response };
   if (outcome.kind === "reject") {
     return { kind: "rejected", response: jsonResponse(outcome.status, outcome.error) };
@@ -170,7 +185,6 @@ export async function handleIntegrationDelivery(
     return { kind: "skipped", reason: outcome.reason, rawBody, payload };
   }
 
-  const now = deps.now ?? (() => new Date());
   const store = deps.store ?? makeIntegrationEventStore();
   const connectionIdFor =
     deps.connectionIdFor ??
@@ -182,11 +196,11 @@ export async function handleIntegrationDelivery(
       return connection.id;
     });
 
-  const connectionId = await connectionIdFor(route.provider, route.displayName);
+  const connectionId = await connectionIdFor(source.provider, declared.displayName);
   const redacted = redactWebhookPayload(payload);
   const receivedAt = now();
   const { recorded } = await store.record({
-    provider: route.provider,
+    provider: source.provider,
     connectionId,
     eventKey: outcome.event.eventKey,
     deliveryId: outcome.event.deliveryId,
@@ -199,7 +213,7 @@ export async function handleIntegrationDelivery(
   let dispatched: DispatchIntegrationResult | undefined;
   try {
     dispatched = await dispatch({
-      provider: route.provider,
+      provider: source.provider,
       connectionId,
       eventKey: outcome.event.eventKey,
       deliveryId: outcome.event.deliveryId,
@@ -214,7 +228,7 @@ export async function handleIntegrationDelivery(
     // and every run id is derived from the delivery id, so targets that
     // already admitted dedupe on the replay.
     log.error(
-      { provider: route.provider, eventKey: outcome.event.eventKey, error },
+      { provider: source.provider, eventKey: outcome.event.eventKey, error },
       "integration event dispatch failed; failing the delivery so the provider retries",
     );
     return {

@@ -13,11 +13,11 @@ import type { HandleTemplatePart, WebhookFacet } from "../connectors/registry.ts
 import { forgeFor } from "../forges/registry.ts";
 import { ownPath } from "./paths.ts";
 
-/** The stored form of a provider's external identifier: lower case for a
- * forge whose repository names compare without case. Handles and trigger
- * scope values both pass through here, so a write and a later match agree. */
+/** The stored form of a provider's external identifier: a forge's key for a
+ * repository name. Handles and trigger scope values both pass through here,
+ * so a write and a later match agree. */
 export function canonicalIdentifier(provider: string, value: string): string {
-  return forgeFor(provider)?.caseInsensitiveRepos ? value.toLowerCase() : value;
+  return forgeFor(provider)?.repoKey(value) ?? value;
 }
 
 /** Render one template. `resolve` maps a path part to a payload value; a

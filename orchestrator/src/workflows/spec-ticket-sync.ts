@@ -16,7 +16,7 @@
 import { DBOS } from "@dbos-inc/dbos-sdk";
 
 import { getPool } from "../db/client.ts";
-import { makeLinearIssueClient } from "../integrations/linear-issues.ts";
+import { makeLinearIssueClient } from "../providers/linear/issues.ts";
 import { log } from "../log.ts";
 import {
   linkSpecTicketDependencies,

@@ -14,9 +14,16 @@ import {
   type PrReviewComment,
   type ReviewEvent,
   type ReviewEventPullRequest,
-  type TypedReviewForge,
 } from "../../forges/forge.ts";
-import type { PrContext } from "../../forges/pr-context.ts";
+import {
+  isObject,
+  parseJson,
+  responseError,
+  succeeded,
+  unusable,
+  type Json,
+} from "../../forges/http.ts";
+import { EMPTY_PR_CONTEXT, type PrContext } from "../../forges/pr-context.ts";
 import {
   runIntegrationOp as defaultRunIntegrationOp,
   type IntegrationOpResult,
@@ -25,6 +32,7 @@ import { REVIEW_DISPATCH_EVENT_KEY } from "../../automations/builtins/review-var
 import { GITLAB_REVIEW } from "./review-variant.ts";
 
 const GITLAB_PROVIDER = "gitlab";
+const FORGE = "GitLab";
 const PER_PAGE = 100;
 // IntegrationOp returns no response headers, so a short page is the end.
 const MAX_PAGES = 20;
@@ -32,12 +40,6 @@ const MAX_PAGES = 20;
 const MIN_ACCESS_TO_REQUEST_REVIEW = 30;
 /** A project or group access token acts as a bot user with this name. */
 const TOKEN_BOT_USERNAME = /^(project|group)_\d+_bot(_|$)/;
-
-type Json = Record<string, unknown>;
-
-function isObject(value: unknown): value is Json {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function str(value: unknown): string | null {
   return typeof value === "string" && value !== "" ? value : null;
@@ -52,11 +54,11 @@ function identifier(value: unknown): string | null {
   return typeof value === "string" && value !== "" ? value : positiveInt(value)?.toString() ?? null;
 }
 
-function isoTime(value: unknown): string | null {
+function time(value: unknown): Date | null {
   const text = str(value);
   if (text === null) return null;
   const parsed = new Date(text);
-  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
 /** GitLab's states are opened, closed, merged and locked (a merge in
@@ -76,36 +78,6 @@ function prState(state: unknown, draft: unknown): string | null {
 
 function isDraft(mr: Json): boolean {
   return mr["draft"] === true || mr["work_in_progress"] === true;
-}
-
-function decodeBody(body: Uint8Array): string {
-  return new TextDecoder().decode(body);
-}
-
-function succeeded(result: IntegrationOpResult): boolean {
-  return result.status >= 200 && result.status < 300;
-}
-
-function responseError(operation: string, result: IntegrationOpResult): ForgeRequestError {
-  const detail = decodeBody(result.body).trim();
-  return new ForgeRequestError(
-    result.status,
-    `${operation} failed with GitLab status ${result.status}${detail ? `: ${detail}` : ""}`,
-    detail,
-  );
-}
-
-/** A 2xx response whose body is not what the operation returns. */
-function unusable(operation: string, what: string): ForgeRequestError {
-  return new ForgeRequestError(200, `${operation} returned ${what}`, "");
-}
-
-function parseJson(result: IntegrationOpResult, operation: string): unknown {
-  try {
-    return JSON.parse(decodeBody(result.body));
-  } catch {
-    throw unusable(operation, "invalid JSON");
-  }
 }
 
 /** GitLab answers 404 for a project the token cannot see. A 403 is a missing
@@ -140,7 +112,6 @@ function parsePullRequestUrl(url: string): { repo: string; number: number | null
 const GITLAB_LINKS: ForgeLinks = {
   pullRequest: () => null,
   review: (prUrl, noteId) => `${prUrl}#note_${noteId}`,
-  comment: (prUrl, noteId) => `${prUrl}#note_${noteId}`,
   file(prUrl, at) {
     const base = `${prUrl.split("/-/")[0]}/-/blob/${at.sha}/${escapeGitPath(at.path)}`;
     const lines = linkLines(at);
@@ -164,11 +135,12 @@ function eventPullRequest(project: Json, mr: Json, url: string | null): ReviewEv
     headSha: str(lastCommit["id"]) ?? "",
     baseSha: "",
     context: {
+      ...EMPTY_PR_CONTEXT,
       providerId: identifier(mr["id"]),
       title: str(mr["title"]),
       state: prState(mr["state"], isDraft(mr)),
       url,
-      providerUpdatedAt: isoTime(mr["updated_at"]),
+      providerUpdatedAt: time(mr["updated_at"]),
       headBranch: str(mr["source_branch"]),
       baseBranch: str(mr["target_branch"]),
     },
@@ -208,9 +180,9 @@ function reviewEvent(eventKey: string, payload: Json): ReviewEvent | null {
       case "merge_request.update":
         // `oldrev` is present only when the source branch got commits.
         if (str(attributes["oldrev"]) !== null) return change("synchronize");
-        return leftDraft(payload) ? change("ready_for_review") : null;
+        return leftDraft(payload) ? change("ready_for_review") : { kind: "update", pr };
       default:
-        return null;
+        return { kind: "update", pr };
     }
   }
 
@@ -235,6 +207,8 @@ function reviewEvent(eventKey: string, payload: Json): ReviewEvent | null {
       authorId,
       fromBot:
         attributes["system"] === true || TOKEN_BOT_USERNAME.test(str(user?.["username"]) ?? ""),
+      // The hook states no role; `mayRequestReview` reads the membership.
+      authorAccess: null,
       pr,
     };
   }
@@ -245,7 +219,6 @@ function reviewEvent(eventKey: string, payload: Json): ReviewEvent | null {
  * line counts. `changes_count` is a string, and "1000+" past the cap. */
 function readPrContext(mr: Json): PrContext {
   const author = isObject(mr["author"]) ? mr["author"] : null;
-  const updatedAt = isoTime(mr["updated_at"]);
   const changes = str(mr["changes_count"]);
   return {
     providerId: identifier(mr["id"]),
@@ -253,7 +226,7 @@ function readPrContext(mr: Json): PrContext {
     author: author ? str(author["username"]) : null,
     state: prState(mr["state"], isDraft(mr)),
     url: str(mr["web_url"]),
-    providerUpdatedAt: updatedAt === null ? null : new Date(updatedAt),
+    providerUpdatedAt: time(mr["updated_at"]),
     headBranch: str(mr["source_branch"]),
     baseBranch: str(mr["target_branch"]),
     additions: null,
@@ -344,24 +317,28 @@ function positionKey(where: Json): string {
   return [str(where["new_path"]), positiveInt(where["old_line"]), positiveInt(where["new_line"])].join("\n");
 }
 
-/** GitLab runs a line that starts with "/" as a quick action (`/approve`,
- * `/merge`) with the token's role, outside a code block. The text of a
- * review comes from a model that read the merge request, so such a line is
- * escaped. GitLab also drops "\r". */
-function withoutQuickActions(body: string): string {
-  let fence: string | null = null;
-  return body
-    .replace(/\r/g, "")
-    .split("\n")
-    .map((line) => {
-      const mark = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1]?.[0];
-      if (mark !== undefined) {
-        if (fence === null) fence = mark;
-        else if (fence === mark) fence = null;
-        return line;
-      }
-      return fence === null && /^ {0,3}\//.test(line) ? line.replace("/", "\\/") : line;
-    })
+/** GitLab runs a line that starts with "/" in column 0 as a quick action
+ * (`/approve`, `/merge`) with the token's role, unless the line is code. The
+ * text of a review comes from a model that read the merge request, so each
+ * such line is escaped. Only a code fence that opens in column 0 and closes
+ * keeps its lines: a fence with an indent can end with its list item, and
+ * the lines after it are then not code. GitLab also drops "\r". */
+export function withoutQuickActions(body: string): string {
+  const lines = body.replace(/\r/g, "").split("\n");
+  const code = new Set<number>();
+  for (let index = 0; index < lines.length; index += 1) {
+    // The info string of a backtick fence has no backtick.
+    const open = /^(`{3,})[^`]*$|^(~{3,})/.exec(lines[index]!);
+    const fence = open?.[1] ?? open?.[2];
+    if (fence === undefined) continue;
+    const close = new RegExp(`^ {0,3}${fence[0]}{${fence.length},}[ \\t]*$`);
+    const end = lines.findIndex((line, at) => at > index && close.test(line));
+    if (end === -1) break;
+    for (let at = index + 1; at < end; at += 1) code.add(at);
+    index = end;
+  }
+  return lines
+    .map((line, index) => (line.startsWith("/") && !code.has(index) ? `\\${line}` : line))
     .join("\n");
 }
 
@@ -379,7 +356,7 @@ function parseCommentId(id: string): { prNumber: string; noteId: string } {
 
 export function makeGitlabForge(
   deps: { runIntegrationOp?: typeof defaultRunIntegrationOp } = {},
-): GitForge & { typedReview: TypedReviewForge } {
+): GitForge {
   const runOp = deps.runIntegrationOp ?? defaultRunIntegrationOp;
   const send = (method: string, path: string, body?: unknown): Promise<IntegrationOpResult> =>
     runOp(GITLAB_PROVIDER, {
@@ -399,7 +376,7 @@ export function makeGitlabForge(
     body?: unknown,
   ): Promise<unknown> => {
     const response = await send(method, path, body);
-    if (!succeeded(response)) throw responseError(operation, response);
+    if (!succeeded(response)) throw responseError(FORGE, operation, response);
     return parseJson(response, operation);
   };
   const requestObject = async (
@@ -470,14 +447,20 @@ export function makeGitlabForge(
     return { refs: { base_sha: base, start_sha: start, head_sha: commitId }, files };
   };
 
-  const typedReview: TypedReviewForge = {
+  return {
+    provider: GITLAB_PROVIDER,
+    // GitLab finds a project by its path in any case.
+    repoKey: (repo) => repo.toLowerCase(),
+    parsePullRequestUrl,
+    links: GITLAB_LINKS,
+    isPermanentError,
     reviewEvent,
 
-    async mayRequestReview(repo, authorId) {
+    async mayRequestReview({ pr: { repo }, authorId }) {
       const response = await send("GET", `${project(repo)}/members/all/${encodeURIComponent(authorId)}`);
       // Not a member of the project or of a group above it.
       if (response.status === 404) return false;
-      if (!succeeded(response)) throw responseError("get project member", response);
+      if (!succeeded(response)) throw responseError(FORGE, "get project member", response);
       const member = parseJson(response, "get project member");
       const level = isObject(member) ? member["access_level"] : null;
       if (typeof level !== "number" || level < MIN_ACCESS_TO_REQUEST_REVIEW) return false;
@@ -501,16 +484,6 @@ export function makeGitlabForge(
         body: withoutQuickActions(body),
       });
     },
-  };
-
-  return {
-    provider: GITLAB_PROVIDER,
-    // GitLab finds a project by its path in any case.
-    caseInsensitiveRepos: true,
-    parsePullRequestUrl,
-    links: GITLAB_LINKS,
-    isPermanentError,
-    typedReview,
 
     async fetchPullRequest(repo, prNumber) {
       const mr = await readMergeRequest(repo, prNumber);
@@ -532,7 +505,7 @@ export function makeGitlabForge(
           comments.push({
             id,
             inReplyToId: id === rootId ? null : rootId,
-            authorLogin: (author && str(author["username"])) ?? "",
+            author: (author && str(author["username"])) ?? "",
             body: str(note["body"]) ?? "",
             path: where ? str(where["new_path"]) : null,
           });
@@ -551,21 +524,14 @@ export function makeGitlabForge(
     },
 
     async findCommentWithMarker(repo, prNumber, marker) {
-      let self: string;
-      let notes: Json[];
-      try {
-        self = await selfId();
-        notes = await list(
-          "list merge request notes",
-          `${mergeRequest(repo, prNumber)}/notes`,
-          "&sort=desc&order_by=created_at",
-        );
-      } catch {
-        return null;
-      }
-      const note = notes.find((item) => isOwn(item, self, marker));
-      const id = note && identifier(note["id"]);
-      return note && id ? { ...note, id: commentId(prNumber, id) } : null;
+      const self = await selfId();
+      const notes = await list(
+        "list merge request notes",
+        `${mergeRequest(repo, prNumber)}/notes`,
+        "&sort=desc&order_by=created_at",
+      );
+      const id = identifier(notes.find((item) => isOwn(item, self, marker))?.["id"]);
+      return id === null ? null : commentId(prNumber, id);
     },
 
     /** Every position is checked against the reviewed diff before anything
@@ -574,12 +540,13 @@ export function makeGitlabForge(
      * the marker, so an attempt after a failure posts only the comments that
      * are not on the merge request yet. */
     async postReview(input) {
-      const { repo, prNumber, marker } = input;
+      const { repo, prNumber, marker, comments } = input;
       const base = mergeRequest(repo, prNumber);
-      const diff = await reviewedDiff(repo, prNumber, input.commitId);
-      const positions = diff === null ? [] : input.comments.map((comment) => position(diff, comment));
-      let inlinePosted = diff !== null && positions.every((where) => where !== null);
-      if (inlinePosted && input.comments.length > 0) {
+      const diff = comments.length > 0 ? await reviewedDiff(repo, prNumber, input.commitId) : null;
+      const positions = diff === null ? [] : comments.map((comment) => position(diff, comment));
+      let inlinePosted = comments.length === 0 || (diff !== null && !positions.includes(null));
+      const inlineFindingIds: string[] = [];
+      if (inlinePosted && comments.length > 0) {
         const self = await selfId();
         // How many of this review's comments each position already has.
         const posted = new Map<string, number>();
@@ -588,26 +555,28 @@ export function makeGitlabForge(
           const key = positionKey(note["position"]);
           posted.set(key, (posted.get(key) ?? 0) + 1);
         }
-        for (const [index, comment] of input.comments.entries()) {
+        for (const [index, comment] of comments.entries()) {
           const where = positions[index];
           if (!where) continue;
           const key = positionKey(where);
           const already = posted.get(key) ?? 0;
           if (already > 0) {
             posted.set(key, already - 1);
+            inlineFindingIds.push(comment.findingId);
             continue;
           }
           const response = await send("POST", `${base}/discussions`, {
             body: `${withoutQuickActions(comment.body)}\n\n${marker}`,
             position: where,
           });
-          // GitLab refuses a position it cannot place. The comments before
-          // this one stay; the summary quotes every finding.
+          // GitLab refuses a position it cannot place. The other comments
+          // still post; the summary quotes every finding.
           if (response.status === 400) {
             inlinePosted = false;
-            break;
+            continue;
           }
-          if (!succeeded(response)) throw responseError("create merge request discussion", response);
+          if (!succeeded(response)) throw responseError(FORGE, "create merge request discussion", response);
+          inlineFindingIds.push(comment.findingId);
         }
       }
 
@@ -618,8 +587,8 @@ export function makeGitlabForge(
       const providerReviewId = identifier(note["id"]);
       return {
         ...(providerReviewId ? { providerReviewId } : {}),
-        posted: true,
         inlinePosted,
+        inlineFindingIds,
         summaryMd,
       };
     },
@@ -627,7 +596,6 @@ export function makeGitlabForge(
 }
 
 export const GITLAB_FORGE: GitForgeSpec = {
-  provider: GITLAB_PROVIDER,
   make: makeGitlabForge,
   review: GITLAB_REVIEW,
 };

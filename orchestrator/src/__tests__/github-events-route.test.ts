@@ -12,8 +12,9 @@ import type {
   RecordIntegrationEventInput,
 } from "../db/integration-events.ts";
 import { makeIntegrationEventsRoute } from "../routes/integration-events.ts";
-import { githubEventSource, type GithubEventsDeps } from "../providers/github/events.ts";
+import { githubEventSource } from "../providers/github/events.ts";
 import type { ReviewCoordinate } from "../reviews/automation-review.ts";
+import { makeForgeDeliveryHandler, type ForgeDeliveryDeps } from "../reviews/forge-deliveries.ts";
 
 const SECRET = "github-route-secret";
 
@@ -21,16 +22,28 @@ function makeGithubEventsRoute({
   webhookSecret,
   ingress,
   now,
-  ...source
-}: GithubEventsDeps & {
+  mentionHandle,
+  ...forge
+}: Omit<ForgeDeliveryDeps, "mentionHandle"> & {
   webhookSecret: () => Promise<string>;
   ingress: HandleDeliveryDeps;
+  mentionHandle?: string;
   now?: () => Date;
 }) {
   return makeIntegrationEventsRoute({
-    sources: [githubEventSource(source)],
+    sources: [githubEventSource],
     secrets: { resolve: webhookSecret },
     ingress,
+    forgeDelivery: makeForgeDeliveryHandler({
+      stopAutomationReview: async () => {
+        throw new Error("no stop is expected");
+      },
+      refreshTarget: async () => {
+        throw new Error("no refresh is expected");
+      },
+      ...forge,
+      mentionHandle: async () => mentionHandle ?? "",
+    }),
     ...(now ? { now } : {}),
   });
 }
@@ -99,7 +112,7 @@ function commentBody(
     action: "created",
     repository: { full_name: enrollment.repo },
     issue: { number: 100, pull_request: { url: "https://api.github.test/pr/100" } },
-    comment: { id: 42, body, author_association: authorAssociation },
+    comment: { id: 42, body, author_association: authorAssociation, user: { login: "octo" } },
     sender: { type: senderType },
   });
 }

@@ -105,14 +105,16 @@ describe("validateInputs", () => {
 
 describe("map keys", () => {
   it("validates per noun and normalizes repos to lowercase", () => {
-    expect(isValidMapKey("repository", "Engrams/Engrams")).toBe(true);
-    expect(isValidMapKey("repository", "engrams")).toBe(false);
-    expect(isValidMapKey("channel", "C0123456789")).toBe(true);
-    expect(isValidMapKey("channel", "#eng-reviews")).toBe(true);
-    expect(isValidMapKey("channel", "eng")).toBe(false);
-    expect(isValidMapKey("team", "ENG")).toBe(true);
-    expect(isValidMapKey("team", "eng")).toBe(false);
-    expect(isValidMapKey(undefined, "anything")).toBe(true);
+    expect(isValidMapKey({ keyNoun: "repository" }, "Engrams/Engrams")).toBe(true);
+    expect(isValidMapKey({ keyNoun: "repository" }, "acme/platform/api")).toBe(true);
+    expect(isValidMapKey({ keyNoun: "repository" }, "engrams")).toBe(false);
+    expect(isValidMapKey({ keyNoun: "repository" }, "acme/../api")).toBe(false);
+    expect(isValidMapKey({ keyNoun: "channel" }, "C0123456789")).toBe(true);
+    expect(isValidMapKey({ keyNoun: "channel" }, "#eng-reviews")).toBe(true);
+    expect(isValidMapKey({ keyNoun: "channel" }, "eng reviews")).toBe(false);
+    expect(isValidMapKey({ keyNoun: "team" }, "ENG")).toBe(true);
+    expect(isValidMapKey({ keyNoun: "team" }, "eng")).toBe(false);
+    expect(isValidMapKey({}, "anything")).toBe(true);
     expect(normalizeMapKey("repository", " Engrams/Engrams ")).toBe("engrams/engrams");
     expect(normalizeMapKey("team", " ENG ")).toBe("ENG");
   });

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import { REVIEW_DISPATCH_EVENT_KEY } from "../../../automations/builtins/review-variant.ts";
 import type { ReviewFindingRow } from "../../../db/reviews.ts";
 import { ForgeRequestError, SAFE_REPO_PATH } from "../../../forges/forge.ts";
 import {
@@ -102,14 +103,14 @@ describe("the GitHub forge", () => {
     expect(comments[0]).toEqual({
       id: "1",
       inReplyToId: null,
-      authorLogin: "engrams-agent[bot]",
+      author: "engrams-agent[bot]",
       body: "finding 1",
       path: "src/index.ts",
     });
     expect(comments.at(-1)).toEqual({
       id: "101",
       inReplyToId: "1",
-      authorLogin: "octocat",
+      author: "octocat",
       body: "reply",
       path: null,
     });
@@ -306,8 +307,8 @@ describe("the GitHub forge", () => {
       ],
     })).toEqual({
       providerReviewId: "7654",
-      posted: true,
       inlinePosted: true,
+      inlineFindingIds: ["single", "multi"],
       summaryMd: "inline summary",
     });
 
@@ -357,8 +358,8 @@ describe("the GitHub forge", () => {
       }],
     })).toEqual({
       providerReviewId: "7655",
-      posted: true,
       inlinePosted: false,
+      inlineFindingIds: [],
       summaryMd: "fallback summary",
     });
 
@@ -399,7 +400,7 @@ describe("the GitHub forge", () => {
     expect(isPermanentError(error)).toBe(false);
   });
 
-  test("findCommentWithMarker returns null for a list it cannot read", async () => {
+  test("findCommentWithMarker throws on a list it cannot read", async () => {
     const empty: IntegrationOpResult = {
       status: 200,
       body: new Uint8Array(),
@@ -410,8 +411,41 @@ describe("the GitHub forge", () => {
     const forge = makeGithubForge({ runIntegrationOp: fake.run });
 
     for (let i = 0; i < 3; i++) {
-      expect(await forge.findCommentWithMarker("acme/app", 1, "marker")).toBeNull();
+      await expect(forge.findCommentWithMarker("acme/app", 1, "marker")).rejects.toThrow();
     }
+  });
+
+  test("findCommentWithMarker returns the newest app comment with the marker", async () => {
+    const fake = fakeRunOp([
+      response(200, [
+        { id: 3, user: { type: "User" }, body: "quoting <!-- m -->" },
+        { id: 2, user: { type: "Bot" }, body: "other" },
+        { id: 1, user: { type: "Bot" }, body: "status\n\n<!-- m -->" },
+      ]),
+      response(200, [{ id: 4, user: { type: "User" }, body: "<!-- m -->" }]),
+    ]);
+    const forge = makeGithubForge({ runIntegrationOp: fake.run });
+
+    expect(await forge.findCommentWithMarker("acme/app", 7, "<!-- m -->")).toBe("1");
+    expect(fake.calls[0]?.request).toMatchObject({
+      method: "GET",
+      path: "/repos/acme/app/issues/7/comments?per_page=100&sort=created&direction=desc",
+    });
+    // A person's comment that quotes the marker is not the app's.
+    expect(await forge.findCommentWithMarker("acme/app", 7, "<!-- m -->")).toBeNull();
+  });
+
+  test("createComment returns the id; updateComment refuses an id that is not GitHub's", async () => {
+    const fake = fakeRunOp([response(201, { id: 42 }), response(200, { id: 42 })]);
+    const forge = makeGithubForge({ runIntegrationOp: fake.run });
+
+    expect(await forge.createComment("acme/app", 7, "hello")).toBe("42");
+    expect(fake.calls[0]?.request).toMatchObject({ method: "POST", path: "/repos/acme/app/issues/7/comments" });
+    await forge.updateComment("acme/app", "42", "edited");
+    expect(fake.calls[1]?.request).toMatchObject({ method: "PATCH", path: "/repos/acme/app/issues/comments/42" });
+    expect(JSON.parse(String(fake.calls[1]?.request.body))).toEqual({ body: "edited" });
+    await expect(forge.updateComment("acme/app", "7:8", "x")).rejects.toThrow(ForgeRequestError);
+    expect(fake.calls).toHaveLength(2);
   });
 
   test("a safe repository path has no `.` or `..` name", () => {
@@ -462,5 +496,182 @@ describe("the GitHub forge", () => {
     expect(summary).toContain("`src/index.ts:L12`");
     expect(summary).toContain("[View the full engrams review](https://engrams.example/reviews/review-1)");
     expect(summary.endsWith("<!-- engrams-review:review-1 -->")).toBe(true);
+  });
+});
+
+/** A `pull_request` delivery shaped like the real thing: GitHub sends the
+ * whole pull-request object, which is what lets a review start without an
+ * API call. `pullRequestOverrides` replaces fields inside that object. */
+function pullRequestPayload(action: string, pullRequestOverrides: Record<string, unknown> = {}) {
+  return {
+    action,
+    number: 100,
+    repository: { full_name: "openai/engrams" },
+    pull_request: {
+      id: 2158810101,
+      node_id: "PR_kwDOJ1",
+      number: 100,
+      html_url: "https://github.com/openai/engrams/pull/100",
+      title: "Bump quinn-proto from 0.11.14 to 0.11.16",
+      user: { login: "dependabot[bot]" },
+      state: "open",
+      merged: false,
+      head: { sha: "head-sha", ref: "dependabot/cargo/quinn-proto-0.11.16" },
+      base: { sha: "base-sha", ref: "main" },
+      draft: false,
+      additions: 12,
+      deletions: 4,
+      changed_files: 2,
+      updated_at: "2026-07-21T12:34:56Z",
+      ...pullRequestOverrides,
+    },
+  };
+}
+
+const DELIVERED_PR = {
+  repo: "openai/engrams",
+  number: 100,
+  url: "https://github.com/openai/engrams/pull/100",
+  headSha: "head-sha",
+  baseSha: "base-sha",
+  context: {
+    providerId: "2158810101",
+    url: "https://github.com/openai/engrams/pull/100",
+    providerUpdatedAt: new Date("2026-07-21T12:34:56Z"),
+    title: "Bump quinn-proto from 0.11.14 to 0.11.16",
+    author: "dependabot[bot]",
+    state: "open",
+    headBranch: "dependabot/cargo/quinn-proto-0.11.16",
+    baseBranch: "main",
+    additions: 12,
+    deletions: 4,
+    changedFiles: 2,
+  },
+};
+
+describe("the GitHub forge's review events", () => {
+  const { reviewEvent, mayRequestReview, repoKey } = makeGithubForge();
+
+  test("a pull request that opens, gets commits, or leaves draft is a change", () => {
+    for (const action of ["opened", "synchronize", "ready_for_review"] as const) {
+      expect(reviewEvent(`pull_request.${action}`, pullRequestPayload(action))).toEqual({
+        kind: "change",
+        trigger: action,
+        draft: false,
+        pr: DELIVERED_PR,
+      });
+    }
+  });
+
+  test("a pull request that closes, reopens, is edited, or goes to draft is an update", () => {
+    for (const action of ["closed", "reopened", "edited", "converted_to_draft"]) {
+      expect(reviewEvent(`pull_request.${action}`, pullRequestPayload(action))).toEqual({
+        kind: "update",
+        pr: DELIVERED_PR,
+      });
+    }
+    expect(reviewEvent("pull_request.labeled", pullRequestPayload("labeled"))).toBeNull();
+  });
+
+  test("a delivery with no base.sha still is an event; the pass asks for the SHA", () => {
+    // The base SHA saves the pass an API call. Requiring it would drop a
+    // real review trigger, which is worse than one extra request.
+    const event = reviewEvent("pull_request.opened", pullRequestPayload("opened", { base: { ref: "main" } }));
+    expect(event).toMatchObject({ kind: "change", pr: { baseSha: "" } });
+  });
+
+  test("a draft pull request reports the draft state", () => {
+    const event = reviewEvent("pull_request.opened", pullRequestPayload("opened", { draft: true }));
+    expect(event).toMatchObject({ kind: "change", draft: true, pr: { context: { state: "draft" } } });
+  });
+
+  test("a merged pull request folds GitHub's state and merged flag into one state", () => {
+    const event = reviewEvent(
+      "pull_request.closed",
+      pullRequestPayload("closed", { state: "closed", merged: true }),
+    );
+    expect(event).toMatchObject({ kind: "update", pr: { context: { state: "merged" } } });
+  });
+
+  test("an issue comment is a comment only when the issue is a pull request", () => {
+    const base = {
+      action: "created",
+      repository: { full_name: "openai/engrams" },
+      comment: { id: 42, body: "@engrams review", author_association: "MEMBER", user: { login: "octo" } },
+      sender: { type: "User" },
+    };
+    expect(
+      reviewEvent("issue_comment.created", {
+        ...base,
+        issue: {
+          number: 100,
+          html_url: "https://github.com/openai/engrams/pull/100",
+          pull_request: { url: "https://api.github.test/pr/100" },
+        },
+      }),
+    ).toMatchObject({
+      kind: "comment",
+      body: "@engrams review",
+      authorId: "octo",
+      fromBot: false,
+      authorAccess: "MEMBER",
+      pr: { repo: "openai/engrams", number: 100, url: "https://github.com/openai/engrams/pull/100" },
+    });
+    expect(reviewEvent("issue_comment.created", { ...base, issue: { number: 100 } })).toBeNull();
+    expect(
+      reviewEvent("issue_comment.created", {
+        ...base,
+        sender: { type: "Bot" },
+        issue: { number: 100, pull_request: {} },
+      }),
+    ).toMatchObject({ kind: "comment", fromBot: true });
+  });
+
+  // Todo: reviewEvent returns null for an inline review comment, so `stop`
+  // in one no longer reaches the review run.
+  test("an inline review comment on a pull request is a comment", () => {
+    expect(
+      reviewEvent("pull_request_review_comment.created", {
+        action: "created",
+        repository: { full_name: "openai/engrams" },
+        pull_request: { number: 100, html_url: "https://github.com/openai/engrams/pull/100" },
+        comment: { id: 7, body: "@engrams stop", author_association: "MEMBER", user: { login: "octo" } },
+        sender: { type: "User" },
+      }),
+    ).toMatchObject({ kind: "comment", body: "@engrams stop", pr: { repo: "openai/engrams", number: 100 } });
+  });
+
+  test("the dispatch event names its pull request", () => {
+    expect(reviewEvent(REVIEW_DISPATCH_EVENT_KEY, pullRequestPayload("opened"))).toEqual({
+      kind: "dispatch",
+      pr: DELIVERED_PR,
+    });
+  });
+
+  test("other events and malformed payloads are not review events", () => {
+    expect(reviewEvent("ping", {})).toBeNull();
+    expect(reviewEvent("push", {})).toBeNull();
+    expect(reviewEvent("pull_request.opened", { action: "opened" })).toBeNull();
+  });
+
+  test("an owner, member, or collaborator may give a command; others may not", async () => {
+    const comment = (authorAccess: string | null) => ({
+      kind: "comment" as const,
+      body: "@engrams review",
+      authorId: "octo",
+      fromBot: false,
+      authorAccess,
+      pr: DELIVERED_PR,
+    });
+    for (const access of ["OWNER", "MEMBER", "COLLABORATOR"]) {
+      expect(await mayRequestReview(comment(access))).toBe(true);
+    }
+    for (const access of ["CONTRIBUTOR", "NONE", null]) {
+      expect(await mayRequestReview(comment(access))).toBe(false);
+    }
+  });
+
+  test("a repository name matches in any case", () => {
+    expect(repoKey("OpenAI/Engrams")).toBe(repoKey("openai/engrams"));
   });
 });

@@ -17,9 +17,9 @@ const SLACK_BRAIN_DEFINITION = chatThreadsDefinition(SLACK_THREADS);
 const PR_REVIEW_DEFINITION = reviewDefinition(GITHUB_REVIEW);
 
 test("the PR review definition hash is unchanged", () => {
-  expect(definitionContentHash(PR_REVIEW_DEFINITION)).toBe("c11862e4e9faedf8d6727d752f55ad5816f8aca449f4ba2592ec945725b66313");
+  expect(definitionContentHash(PR_REVIEW_DEFINITION)).toBe("942e1fca24480cf8a998905e917fd088908a868f030be747b07365a067d66baa");
 });
 
 test("the Slack threads definition hash is unchanged", () => {
-  expect(definitionContentHash(SLACK_BRAIN_DEFINITION)).toBe("756c76430aec0afecefddf12051c68a27f71b3afa14e6e5674c13e91f4f3c54f");
+  expect(definitionContentHash(SLACK_BRAIN_DEFINITION)).toBe("149b38fdd5b2065dff989f54201ead291522add58dd209ed446ef753f7cfb719");
 });

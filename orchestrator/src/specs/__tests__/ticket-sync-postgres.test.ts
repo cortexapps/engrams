@@ -24,7 +24,7 @@ import {
   type LinearIssue,
   type LinearIssueClient,
   type LinearWorkspace,
-} from "../../integrations/linear-issues.ts";
+} from "../../providers/linear/issues.ts";
 import {
   PostgresPinnedSpecReader,
   PostgresSpecTicketStore,

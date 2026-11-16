@@ -23,15 +23,15 @@ import { CHOICE_ANSWER_SIGNAL, CHOICE_ID_PREFIX } from "../../session-relay.ts";
 import { chatProviderSchema, mentionFromRelayConfig } from "./relay.ts";
 import { registerBlock } from "./registry.ts";
 
+/** The type name is stored in definitions: it does not change. */
 export const CHOICE_TYPE = "slack_choice";
 
-/** Slack allows 25 buttons in one actions block; a choice past ten is a
- * dropdown's job, not a card's. */
+/** A choice past ten buttons is a dropdown's job, not a card's. */
 export const MAX_CHOICE_BUTTONS = 10;
-/** Every button's value carries the question, its label, the answer id
- * and the thread route, and Slack caps a button value at 2,000
- * characters. These caps keep the worst case near 1,000. A label is also
- * the button's text, which Slack shows up to 75 characters of. */
+/** A provider can carry the question, the label, the answer id and the
+ * thread route in each button's value, and the smallest value limit of a
+ * provider is 2,000 characters. These caps keep the worst case near 1,000.
+ * A label is also the button's text, of which 75 characters show. */
 export const CHOICE_QUESTION_MAX = 500;
 export const CHOICE_LABEL_MAX = 75;
 

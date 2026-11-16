@@ -35,6 +35,7 @@ vi.mock("@/hooks/useModelRouters", () => ({
           defaultModel: "",
           titleModel: "",
           decisionModel: "jev",
+          decisionModelChosen: true,
           availableModelCount: 270,
           enabledModelCount: 3,
           modelCount: 270,

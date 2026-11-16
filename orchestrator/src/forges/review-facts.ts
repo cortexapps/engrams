@@ -3,9 +3,10 @@
  * this module holds the policy, which is the same for every forge. */
 
 import type { GitForge, ReviewEvent } from "./forge.ts";
+import type { PrContext } from "./pr-context.ts";
 import { parseReviewCommand } from "./review-command.ts";
 
-/** The value of a review variant's `facts` step. */
+/** The value of the built-in's `facts` step. */
 export interface ReviewFacts {
   admit: true;
   repo: string;
@@ -17,7 +18,8 @@ export interface ReviewFacts {
   /** Empty when the event carried none; the pass then asks the forge. */
   head_sha: string;
   base_sha: string;
-  pr_context: ReviewEvent["pr"]["context"];
+  /** `providerUpdatedAt` is ISO 8601: a step's value is JSON. */
+  pr_context: Omit<PrContext, "providerUpdatedAt"> & { providerUpdatedAt: string | null };
   categories: unknown[];
   instructions: string;
 }
@@ -30,17 +32,36 @@ export interface ReviewFactsInput {
   inputs: Record<string, unknown>;
 }
 
-function enrolment(
-  forge: GitForge,
-  inputs: Record<string, unknown>,
-  repo: string,
-): { mode?: unknown } | null {
-  const repos = inputs["repos"];
+/** The entry of `repo` in a `repos` input; null when the map does not list
+ * the repository. */
+export function enrolledEntry(forge: GitForge, repos: unknown, repo: string): unknown {
   if (typeof repos !== "object" || repos === null || Array.isArray(repos)) return null;
-  const fold = (name: string): string => (forge.caseInsensitiveRepos ? name.toLowerCase() : name);
-  const wanted = fold(repo);
-  const entry = Object.entries(repos).find(([name]) => fold(name) === wanted)?.[1];
-  return typeof entry === "object" && entry !== null ? (entry as { mode?: unknown }) : null;
+  const wanted = forge.repoKey(repo);
+  return Object.entries(repos).find(([name]) => forge.repoKey(name) === wanted)?.[1] ?? null;
+}
+
+/** The trigger of an event that starts a review; null when it starts none. */
+async function reviewTrigger(
+  forge: GitForge,
+  event: ReviewEvent,
+  mode: unknown,
+  mention: unknown,
+): Promise<ReviewFacts["trigger"] | null> {
+  switch (event.kind) {
+    case "change":
+      return event.draft || mode !== "auto" ? null : event.trigger;
+    case "comment": {
+      if (event.fromBot) return null;
+      const command = parseReviewCommand(event.body, typeof mention === "string" ? mention : "");
+      if (command?.kind !== "review") return null;
+      return (await forge.mayRequestReview(event)) ? "command" : null;
+    }
+    case "dispatch":
+      // An explicit request: it does not need mode "auto".
+      return "dispatch";
+    case "update":
+      return null;
+  }
 }
 
 /** The facts of an admitted event; null when the event starts no review. */
@@ -48,35 +69,20 @@ export async function reviewFacts(
   forge: GitForge,
   input: ReviewFactsInput,
 ): Promise<ReviewFacts | null> {
-  const typed = forge.typedReview;
-  if (!typed) throw new Error(`forge "${forge.provider}" does not classify review events`);
-  const event = typed.reviewEvent(input.eventKey, input.payload);
+  const event = forge.reviewEvent(input.eventKey, input.payload);
   if (event === null) return null;
   const { inputs } = input;
-  const entry = enrolment(forge, inputs, event.pr.repo);
-  if (entry === null) return null;
+  const entry = enrolledEntry(forge, inputs["repos"], event.pr.repo);
+  if (typeof entry !== "object" || entry === null) return null;
   // With no reviewer profile nothing can run, so the event is filtered.
   if (!inputs["profile"]) return null;
-
-  let trigger: ReviewFacts["trigger"];
-  switch (event.kind) {
-    case "change":
-      if (event.draft || entry.mode !== "auto") return null;
-      trigger = event.trigger;
-      break;
-    case "comment": {
-      if (event.fromBot) return null;
-      const mention = typeof inputs["mention"] === "string" ? inputs["mention"] : "";
-      if (parseReviewCommand(event.body, mention)?.kind !== "review") return null;
-      if (!(await typed.mayRequestReview(event.pr.repo, event.authorId))) return null;
-      trigger = "command";
-      break;
-    }
-    case "dispatch":
-      // An explicit request: it does not need mode "auto".
-      trigger = "dispatch";
-      break;
-  }
+  const trigger = await reviewTrigger(
+    forge,
+    event,
+    (entry as { mode?: unknown }).mode,
+    inputs["mention"],
+  );
+  if (trigger === null) return null;
 
   const { pr } = event;
   return {
@@ -88,7 +94,10 @@ export async function reviewFacts(
     trigger,
     head_sha: pr.headSha,
     base_sha: pr.baseSha,
-    pr_context: pr.context,
+    pr_context: {
+      ...pr.context,
+      providerUpdatedAt: pr.context.providerUpdatedAt?.toISOString() ?? null,
+    },
     categories: Array.isArray(inputs["categories"]) ? inputs["categories"] : [],
     instructions: typeof inputs["instructions"] === "string" ? inputs["instructions"] : "",
   };

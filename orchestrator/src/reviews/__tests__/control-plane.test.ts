@@ -26,14 +26,18 @@ function fakeForge(methods: Partial<GitForge>): () => GitForge {
   };
   return () => ({
     provider: "github",
-    caseInsensitiveRepos: true,
     links: requireForge("github").links,
+    repoKey: (repo) => repo.toLowerCase(),
     parsePullRequestUrl: unexpected("parsePullRequestUrl"),
     isPermanentError: unexpected("isPermanentError"),
+    reviewEvent: unexpected("reviewEvent"),
+    mayRequestReview: unexpected("mayRequestReview"),
     fetchPullRequest: unexpected("fetchPullRequest"),
     listReviewComments: unexpected("listReviewComments"),
     postReview: unexpected("postReview"),
     hasReviewWithMarker: unexpected("hasReviewWithMarker"),
+    createComment: unexpected("createComment"),
+    updateComment: unexpected("updateComment"),
     findCommentWithMarker: unexpected("findCommentWithMarker"),
     ...methods,
   });
@@ -499,21 +503,21 @@ describe("ReviewControlPlane", () => {
           {
             id: "900",
             inReplyToId: null,
-            authorLogin: "engrams-agent[bot]",
+            author: "engrams-agent[bot]",
             body: "**🎯 Functional Correctness · HIGH — Retry skips a phase**\n\nWHAT: …",
             path: "orchestrator/src/workflows/pr-review.ts",
           },
           {
             id: "901",
             inReplyToId: "900",
-            authorLogin: "octocat",
+            author: "octocat",
             body: "Declining this one — the retry is fenced upstream.",
             path: "orchestrator/src/workflows/pr-review.ts",
           },
           {
             id: "902",
             inReplyToId: "899",
-            authorLogin: "octocat",
+            author: "octocat",
             body: "Reply to a non-finding thread; must not ride along.",
             path: null,
           },
@@ -879,16 +883,25 @@ describe("ReviewControlPlane", () => {
     expect(payload.summary_md).not.toContain(confirmed.bodyMd);
     expect(payload.fallback_summary_md.endsWith(`<!-- engrams-review:${reviewed.id} -->`)).toBe(true);
 
-    // The action reported inline_posted=false: the findings move to ui_only,
-    // the pass summary becomes the fallback body, and the dossier logs why.
+    // The action reported inline_posted=false with no comment on the diff:
+    // the findings move to ui_only, the pass summary becomes the fallback
+    // body, and the dossier logs why.
     findingUpdates.length = 0;
-    await cp.recordSummaryOnlyPost(reviewed.id);
+    await cp.recordSummaryOnlyPost(reviewed.id, []);
     expect(findingUpdates).toEqual([
       { id: confirmed.id, state: "ui_only" },
       { id: refuted.id, state: "suppressed_refuted" },
     ]);
     expect(finalizations.at(-1)).toMatchObject({ status: "posted", summaryMd: payload.fallback_summary_md });
     expect(events).toContain("inline_fallback");
+
+    // A finding whose comment is on the diff stays posted.
+    findingUpdates.length = 0;
+    await cp.recordSummaryOnlyPost(reviewed.id, [confirmed.id]);
+    expect(findingUpdates).toEqual([
+      { id: confirmed.id, state: "posted" },
+      { id: refuted.id, state: "suppressed_refuted" },
+    ]);
   });
 
 });

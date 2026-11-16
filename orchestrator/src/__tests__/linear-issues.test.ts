@@ -12,7 +12,7 @@ import {
   LinearError,
   makeLinearIssueClient,
   type RunIntegrationOp,
-} from "../integrations/linear-issues.ts";
+} from "../providers/linear/issues.ts";
 
 interface Call {
   provider: string;

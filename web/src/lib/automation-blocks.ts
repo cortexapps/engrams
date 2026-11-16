@@ -1060,7 +1060,7 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
     ],
     label: "Settle review",
     description:
-      "Apply the category and severity policy to the pass's findings, settle them in the ledger, and emit the parameters for github.post_pr_review.",
+      "Apply the category and severity policy to the pass's findings, settle them in the ledger, and emit the parameters for the forge's post_pr_review action.",
     icon: SquareCheck,
     fields: [
       {
@@ -1114,10 +1114,10 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   {
     kind: "review_record_post",
     group: "advanced",
-    outputs: ["review_id", "recorded", "github_review_id"],
+    outputs: ["review_id", "recorded", "provider_review_id", "inline_posted"],
     label: "Record posted review",
     description:
-      "Write the GitHub review id that github.post_pr_review returned onto the pass, so the Reviews page links to the posted review.",
+      "Write the review id that post_pr_review returned onto the pass, so the Reviews page links to the posted review.",
     icon: SquareCheck,
     fields: [
       {
@@ -1128,9 +1128,9 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
       },
       {
         type: "template",
-        key: "githubReviewId",
-        label: "GitHub review id",
-        help: "${{ steps.post.github_review_id | default: '' }}",
+        key: "providerReviewId",
+        label: "Review id on the forge",
+        help: "${{ steps.post.review_id | default: '' }}",
       },
     ],
     summary: () => "Link the pass to its GitHub review",

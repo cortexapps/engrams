@@ -27,10 +27,14 @@ describe("parseReviewCommand", () => {
     expect(parseReviewCommand("@acme-reviewer review", "")).toBeNull();
   });
 
-  test("allows leading prose on its own line and rejects non-commands", () => {
+  test("allows prose before the mention and rejects non-commands", () => {
     expect(parseReviewCommand("Please take another look.\n  @acme-reviewer review auth  ", handle))
       .toEqual({ kind: "review", focus: "auth" });
-    expect(parseReviewCommand("hello @acme-reviewer review", handle)).toBeNull();
+    expect(parseReviewCommand("hello @acme-reviewer review", handle)).toEqual({ kind: "review" });
+    expect(parseReviewCommand("mail me at dev@acme-reviewer review", handle)).toBeNull();
+    // A mention with no verb does not hide a command on a later line.
+    expect(parseReviewCommand("@acme-reviewer thanks\n@acme-reviewer stop", handle))
+      .toEqual({ kind: "stop" });
     expect(parseReviewCommand("@acme-reviewer dance", handle)).toBeNull();
     expect(parseReviewCommand("@acme-reviewer stop now", handle)).toBeNull();
   });

@@ -33,6 +33,8 @@ export interface ThreadsVariant {
   /** Connector action ids. `post` takes `channel`, `threadTs` and `text`;
    * `update` takes `channel`, `ts` and `text` and removes a card's buttons. */
   actions: { post: string; update: string };
+  /** What a channel key looks like, for the prompt of the channel map. */
+  channelKeyHint: string;
   /** The workstream key and label of a thread, as templates over
    * `event.raw`. */
   threadKeyTemplate: string;

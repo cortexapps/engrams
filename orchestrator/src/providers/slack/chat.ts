@@ -10,7 +10,6 @@ import { makeSlackPolicy } from "./policy.ts";
 import { SLACK_THREADS } from "./threads-variant.ts";
 
 export const SLACK_CHAT: ChatProviderSpec = {
-  provider: SLACK_PROVIDER,
   legacyDefault: true,
   make: () => makeSlackChat(),
   interactivity: makeSlackInteractivityRoute,
@@ -28,6 +27,14 @@ export function makeSlackChat(client: () => Promise<WebClient> = getSlackClient)
     },
     listChannels: async () => listSlackChannelOptions(await client()),
     describeChannels: async (keys) => describeSlackChannels(await client(), keys),
+    plainText: (text) =>
+      text
+        .replace(/<@[^>|]+(?:\|[^>]*)?>/g, " ")
+        .replace(/<#[^>|]+\|([^>]*)>/g, "#$1")
+        .replace(/<([^>|]+)\|([^>]*)>/g, "$2")
+        .replace(/<([^>]+)>/g, "$1")
+        .replace(/\s+/g, " ")
+        .trim(),
     threadHandle: (place) => `${SLACK_PROVIDER}:${place.channel}:${place.threadRoot}`,
   };
 }

@@ -4,7 +4,7 @@ import { WebClient } from "@slack/web-api";
 // This module loads before the chat registry here; the registry must not
 // read a provider's spec while it loads.
 import { makeSlackChat, SLACK_CHAT } from "../chat.ts";
-import { chatFor, threadsBuiltinKey } from "../../../chat/registry.ts";
+import { chatFor, chatSpecs, threadsBuiltinKey } from "../../../chat/registry.ts";
 import { declaredIngress } from "../../../connectors/registry.ts";
 
 /** A client whose users.info returns a fixed profile email. */
@@ -16,7 +16,8 @@ const client = (email: string | undefined) => async () => {
 
 describe("Slack as a chat provider", () => {
   test("the registry serves it", () => {
-    expect(chatFor(SLACK_CHAT.provider)?.provider).toBe("slack");
+    expect(chatSpecs().find(({ spec }) => spec === SLACK_CHAT)?.provider).toBe("slack");
+    expect(chatFor("slack")?.provider).toBe("slack");
     expect(threadsBuiltinKey("slack")).toBe("slack_brain");
     expect(threadsBuiltinKey("linear")).toBeNull();
   });

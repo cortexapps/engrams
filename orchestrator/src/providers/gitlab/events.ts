@@ -3,6 +3,7 @@
 
 import type { IntegrationEventSource } from "../../automations/integration-ingress.ts";
 import { ownPath } from "../../automations/paths.ts";
+import { timingSafeHeader, verifySvixHeaders } from "../../automations/verify.ts";
 
 /** `MergeRequest` to `merge_request`. */
 function snakeCase(name: string): string {
@@ -25,13 +26,29 @@ function eventKey(payload: Record<string, unknown>): string | null {
 
 export const gitlabEventSource: IntegrationEventSource = {
   provider: "gitlab",
+  // GitLab has two secrets. A signing token (`whsec_...`, GitLab 19.0 and
+  // later) signs the delivery as Standard Webhooks does. A secret token
+  // arrives as it is in a header. The stored secret says which one the
+  // administrator set, so a delivery cannot choose the weaker check.
+  async verify(delivery) {
+    const secret = await delivery.secret();
+    if (secret.startsWith("whsec_")) return verifySvixHeaders(delivery, secret, "webhook");
+    return secret !== "" && timingSafeHeader(secret, delivery.headers.get("x-gitlab-token"));
+  },
   extract: (headers, payload) => {
     const key = eventKey(payload);
     if (key === null) return { kind: "skip", reason: "no usable object_kind" };
     // The same value on every retry of one delivery. `webhook-id` is its
-    // name from GitLab 19.0; `idempotency-key` from 17.4.
+    // name from GitLab 19.0; `idempotency-key` from 17.4. An earlier GitLab
+    // sends neither, and the refusal shows in its webhook log.
     const deliveryId = headers.get("webhook-id") ?? headers.get("idempotency-key");
-    if (!deliveryId) return { kind: "skip", reason: "missing webhook-id and idempotency-key" };
+    if (!deliveryId) {
+      return {
+        kind: "reject",
+        status: 400,
+        error: "missing webhook-id and idempotency-key; GitLab 17.4 or later is required",
+      };
+    }
     const project = ownPath(payload, "project.path_with_namespace");
     return {
       kind: "event",

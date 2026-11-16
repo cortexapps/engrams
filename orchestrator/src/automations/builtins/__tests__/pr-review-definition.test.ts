@@ -3,9 +3,10 @@ import { describe, expect, test } from "bun:test";
 import { registerEngineBlocks } from "../../engine/blocks/index.ts";
 import { validateDefinition, applyBlockOverrides } from "../../engine/definition.ts";
 import { renderAutomationTemplateInScope } from "../../template.ts";
-import { evaluateCode } from "../../code/sandbox.ts";
+import { requireForge } from "../../../forges/registry.ts";
+import { reviewFacts } from "../../../forges/review-facts.ts";
 import { reviewBuiltin, reviewDefinition } from "../review.ts";
-import { GITHUB_REVIEW, REVIEW_FACTS_SOURCE, defaultMentionHandle } from "../../../providers/github/review-variant.ts";
+import { GITHUB_REVIEW, defaultMentionHandle } from "../../../providers/github/review-variant.ts";
 
 const PR_REVIEW_BUILTIN = reviewBuiltin(GITHUB_REVIEW);
 const PR_REVIEW_DEFINITION = reviewDefinition(GITHUB_REVIEW);
@@ -51,7 +52,7 @@ function commentEvent(body: string, assoc = "MEMBER", senderType = "User", repo 
       action: "created",
       repository: { full_name: repo, name: repo.split("/")[1] },
       issue: { number: 9, pull_request: { url: "x" }, html_url: `https://github.com/${repo}/pull/9` },
-      comment: { body, author_association: assoc },
+      comment: { body, author_association: assoc, user: { login: "dev" } },
       sender: { type: senderType },
     },
   };
@@ -123,15 +124,12 @@ describe("PR_REVIEW_BUILTIN definition", () => {
   });
 });
 
-describe("review facts predicate (QuickJS)", () => {
-  const run = (event: unknown, trigger: Record<string, unknown>) =>
-    evaluateCode(REVIEW_FACTS_SOURCE, { event, inputs, trigger }, "value");
+describe("review facts of a GitHub event", () => {
+  const run = (event: { raw: Record<string, unknown> }, eventKey: string) =>
+    reviewFacts(requireForge("github"), { eventKey, payload: event.raw, inputs });
 
   test("admits an auto-mode PR and derives the facts", async () => {
-    const r = await run(prEvent("opened"), { event: "pull_request.opened" });
-    expect(r.ok).toBe(true);
-    if (!r.ok) return;
-    expect(r.value).toMatchObject({
+    expect(await run(prEvent("opened"), "pull_request.opened")).toMatchObject({
       admit: true,
       repo: "acme/repo",
       repo_name: "repo",
@@ -144,30 +142,22 @@ describe("review facts predicate (QuickJS)", () => {
   });
 
   test("rejects drafts, on_request repos for PR events, and unknown repos", async () => {
-    expect((await run(prEvent("opened", { draft: true }), { event: "pull_request.opened" })).ok && null).toBeNull();
-    const draft = await run(prEvent("opened", { draft: true }), { event: "pull_request.opened" });
-    if (draft.ok) expect(draft.value).toBeNull();
-    const manual = await run(
-      { raw: { ...prEvent("opened").raw, repository: { full_name: "acme/manual", name: "manual" } } },
-      { event: "pull_request.opened" },
-    );
-    if (manual.ok) expect(manual.value).toBeNull();
-    const unknown = await run(
-      { raw: { ...prEvent("opened").raw, repository: { full_name: "other/repo", name: "repo" } } },
-      { event: "pull_request.opened" },
-    );
-    if (unknown.ok) expect(unknown.value).toBeNull();
+    expect(await run(prEvent("opened", { draft: true }), "pull_request.opened")).toBeNull();
+    const manual = { raw: { ...prEvent("opened").raw, repository: { full_name: "acme/manual", name: "manual" } } };
+    expect(await run(manual, "pull_request.opened")).toBeNull();
+    const unknown = { raw: { ...prEvent("opened").raw, repository: { full_name: "other/repo", name: "repo" } } };
+    expect(await run(unknown, "pull_request.opened")).toBeNull();
   });
 
   test("admits a member's review command on a mapped repo; rejects bots, outsiders, other text", async () => {
-    const ok = await run(commentEvent("@engrams review please"), { event: "issue_comment.created" });
-    if (ok.ok) expect(ok.value).toMatchObject({ admit: true, trigger: "command", pr_number: 9 });
-    const bot = await run(commentEvent("@engrams review", "MEMBER", "Bot"), { event: "issue_comment.created" });
-    if (bot.ok) expect(bot.value).toBeNull();
-    const outsider = await run(commentEvent("@engrams review", "NONE"), { event: "issue_comment.created" });
-    if (outsider.ok) expect(outsider.value).toBeNull();
-    const chatter = await run(commentEvent("nice work @engrams"), { event: "issue_comment.created" });
-    if (chatter.ok) expect(chatter.value).toBeNull();
+    expect(await run(commentEvent("@engrams review please"), "issue_comment.created")).toMatchObject({
+      admit: true,
+      trigger: "command",
+      pr_number: 9,
+    });
+    expect(await run(commentEvent("@engrams review", "MEMBER", "Bot"), "issue_comment.created")).toBeNull();
+    expect(await run(commentEvent("@engrams review", "NONE"), "issue_comment.created")).toBeNull();
+    expect(await run(commentEvent("nice work @engrams"), "issue_comment.created")).toBeNull();
   });
 });
 

@@ -17,22 +17,22 @@ export function normalizeMentionHandle(handle: string): string {
   return handle.trim().replace(/^@/, "").replace(/\[bot\]$/i, "").trim();
 }
 
-/** The command on the first line that starts with a mention of `handle`.
- * Lines of prose may come before it. A `[bot]` suffix on the mention is
- * accepted. Null when there is no command, or when the handle is blank
- * (mention commands are then off). */
+/** The command on the first line that has a mention of `handle` and then a
+ * verb. The mention starts the line or follows a space, and prose may come
+ * before it. A `[bot]` suffix on the mention is accepted. Null when there is
+ * no command, or when the handle is blank (mention commands are then off). */
 export function parseReviewCommand(body: string, handle: string): EngramsCommand | null {
   const slug = normalizeMentionHandle(handle);
   if (!slug) return null;
-  const mention = `@${escapeRegExp(slug)}(?:\\[bot\\])?`;
-  const lineMatcher = new RegExp(`^${mention}(?:\\s|$)`, "i");
-  const line = body
-    .split(/\r?\n/)
-    .map((candidate) => candidate.trim())
-    .find((candidate) => lineMatcher.test(candidate));
-  if (!line) return null;
-
-  const match = new RegExp(`^${mention}\\s+(review|fix|stop)(?:\\s+([\\s\\S]*))?$`, "i").exec(line);
+  const command = new RegExp(
+    `(?:^|\\s)@${escapeRegExp(slug)}(?:\\[bot\\])?\\s+(review|fix|stop)(?:\\s+(.*))?$`,
+    "i",
+  );
+  let match: RegExpExecArray | null = null;
+  for (const line of body.split(/\r?\n/)) {
+    match = command.exec(line.trim());
+    if (match) break;
+  }
   if (!match) return null;
   const verb = match[1]?.toLowerCase();
   const text = sanitize(match[2] ?? "");

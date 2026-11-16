@@ -35,6 +35,21 @@ export interface PrContext {
   changedFiles: number | null;
 }
 
+/** The context of an event that carries none of the fields. */
+export const EMPTY_PR_CONTEXT: PrContext = {
+  providerId: null,
+  title: null,
+  author: null,
+  state: null,
+  url: null,
+  providerUpdatedAt: null,
+  headBranch: null,
+  baseBranch: null,
+  additions: null,
+  deletions: null,
+  changedFiles: null,
+};
+
 /**
  * True when a capture carries every field we persist, so the API fetch adds
  * nothing and can be skipped.

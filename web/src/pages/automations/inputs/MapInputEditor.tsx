@@ -79,8 +79,8 @@ export function MapInputEditor({
 
   const addKey = (raw: string) => {
     const key = normalizeMapKey(spec.keyNoun, raw);
-    if (!isValidMapKey(spec.keyNoun, key)) {
-      setKeyError(`Enter a ${mapKeyHint(spec.keyNoun)}`);
+    if (!isValidMapKey(spec, key)) {
+      setKeyError(`Enter a ${mapKeyHint(spec)}`);
       return;
     }
     if (existing.has(key)) {
@@ -152,7 +152,7 @@ export function MapInputEditor({
         {unusedOptions.length > 0 && (
           <Select onValueChange={(key) => addKey(key)} disabled={disabled} value="">
             <SelectTrigger className="w-56" aria-label={`Add ${spec.label} from list`}>
-              <SelectValue placeholder={`Add ${mapKeyHint(spec.keyNoun)}…`} />
+              <SelectValue placeholder={`Add ${mapKeyHint(spec)}…`} />
             </SelectTrigger>
             <SelectContent>
               {unusedOptions.map((option) => (
@@ -177,7 +177,7 @@ export function MapInputEditor({
                   addKey(draftKey);
                 }
               }}
-              placeholder={`Type a ${mapKeyHint(spec.keyNoun)}`}
+              placeholder={`Type a ${mapKeyHint(spec)}`}
               className="w-64"
               disabled={disabled}
               aria-label={`New ${spec.label} key`}

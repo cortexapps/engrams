@@ -38,6 +38,10 @@ message ModelRouter {
   string decision_model = 15;
   // The connector that holds the router's key and host.
   string connector = 16;
+  // True when an admin chose the role's model; false for a built-in model.
+  bool default_model_chosen = 17;
+  bool title_model_chosen = 18;
+  bool decision_model_chosen = 19;
 }
 
 message RouterModel {

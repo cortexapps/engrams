@@ -67,8 +67,8 @@ export default ({ steps, inputs }) => {
   const card = (ids) => {
     const order = [...ids];
     if (fallback && labelOf.has(fallback) && !order.includes(fallback)) order.push(fallback);
-    // Slack shows at most 75 characters of a button; the card's labels
-    // are the profile names, cut to fit.
+    // A button shows at most 75 characters; the card's labels are the
+    // profile names, cut to fit.
     return order
       .filter((id) => labelOf.has(id))
       .slice(0, 5)
@@ -95,7 +95,7 @@ export const RESOLVE_SOURCE = `
 export default ({ steps }) => {
   const facts = steps.facts.value;
   const route = steps.route ?? {};
-  // No OpenRouter key: exactly default routing.
+  // No connected model router: exactly default routing.
   if (route.reason === "router_not_connected") {
     return { profile_id: facts.profile_id, label: "", card: "" };
   }
@@ -433,6 +433,7 @@ export function chatThreadsDefinition(v: ThreadsVariant): AutomationDefinition {
         label: "Channel overrides",
         type: "map",
         keyNoun: "channel",
+        keyHint: v.channelKeyHint,
         help: "Channels whose threads run on a different profile than the default.",
         default: {},
         valueShape: { type: "string", label: "Profile id" },
@@ -449,7 +450,7 @@ export function chatThreadsDefinition(v: ThreadsVariant): AutomationDefinition {
         label: "Routing",
         type: "enum",
         values: ["default", "smart"],
-        help: "default: threads without a channel override run on the default profile. smart: a decision model picks the profile from the thread and asks in the thread when it is not sure (needs an OpenRouter key; without one, smart works like default).",
+        help: "default: threads without a channel override run on the default profile. smart: a decision model picks the profile from the thread and asks in the thread when it is not sure (needs a connected model router that has a decision model; without one, smart works like default).",
         default: "default",
       },
       {

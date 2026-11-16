@@ -332,16 +332,20 @@ async function executeReviewPolicyGate(config: ReviewPolicyGateConfig): Promise<
 
 export const reviewRecordPostConfigSchema = z.object({
   reviewId: z.string().min(1),
-  /** The `github_review_id` output of the forge's post_pr_review: the
-   * forge's id for the review. Empty when the action found its marker
-   * already posted (a replay) — nothing to record. */
+  /** The `review_id` output of the forge's post_pr_review. Empty when the
+   * action found its marker on the pull request (a replay): there is
+   * nothing to record. */
+  providerReviewId: z.string().optional(),
+  /** The name of `providerReviewId` in a definition of an earlier version. */
   githubReviewId: z.string().optional(),
   /** The `inline_posted` output of post_pr_review, rendered through a
-   * template ("true"/"false"). "false" = the forge refused the inline anchors
-   * and the action posted the fallback summary: the findings move to
-   * `ui_only` and the pass summary becomes the fallback body. Absent or
-   * anything else = the inline comments landed (or a replay). */
+   * template ("true"/"false"). "false" means the summary quotes every
+   * finding: the findings that are not on the diff move to `ui_only`, and
+   * the pass summary becomes the fallback body. */
   inlinePosted: z.union([z.boolean(), z.string()]).optional(),
+  /** The `inline_finding_ids` output of post_pr_review, joined with commas:
+   * the findings whose comments are on the diff. */
+  inlineFindingIds: z.string().optional(),
 });
 export type ReviewRecordPostConfig = z.infer<typeof reviewRecordPostConfigSchema>;
 
@@ -350,14 +354,17 @@ function summaryOnly(value: boolean | string | undefined): boolean {
 }
 
 async function executeReviewRecordPost(config: ReviewRecordPostConfig): Promise<BlockOutcome> {
-  const id = config.githubReviewId?.trim();
+  const id = (config.providerReviewId ?? config.githubReviewId)?.trim();
   if (!id) return { kind: "ok", outputs: { review_id: config.reviewId, recorded: false } };
   await deps().reviews().setGithubReviewId(config.reviewId, id);
   const inlinePosted = !summaryOnly(config.inlinePosted);
-  if (!inlinePosted) await deps().controlPlane().recordSummaryOnlyPost(config.reviewId);
+  if (!inlinePosted) {
+    const onDiff = (config.inlineFindingIds ?? "").split(",").filter((part) => part !== "");
+    await deps().controlPlane().recordSummaryOnlyPost(config.reviewId, onDiff);
+  }
   return {
     kind: "ok",
-    outputs: { review_id: config.reviewId, recorded: true, github_review_id: id, inline_posted: inlinePosted },
+    outputs: { review_id: config.reviewId, recorded: true, provider_review_id: id, inline_posted: inlinePosted },
   };
 }
 
@@ -415,7 +422,7 @@ export function registerReviewBlocks(): void {
   registerBlock<ReviewRecordPostConfig>({
     type: REVIEW_RECORD_POST_TYPE,
     refusesDryRun: true,
-    outputs: ["review_id", "recorded", "github_review_id", "inline_posted"],
+    outputs: ["review_id", "recorded", "provider_review_id", "inline_posted"],
     configSchema: reviewRecordPostConfigSchema,
     async execute(config) {
       return executeReviewRecordPost(config);

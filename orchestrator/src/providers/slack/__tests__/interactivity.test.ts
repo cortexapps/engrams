@@ -1,7 +1,7 @@
 /**
  * Slack interactivity route (ADR 0060 P2.9) — verification + dispatch.
  *
- * The route verifies with the SDK (`isValidSlackRequest`) over the raw form
+ * The route bounds the body, verifies the Slack signature over the raw form
  * body, parses the `payload` field via the Block Kit contract, and dispatches:
  * an answer → the run whose relay asked; an "Answer…" click → open a modal.
  * The DBOS/Slack side-effects are injected here so both branches are
@@ -10,17 +10,18 @@
 
 import { expect, test, describe } from "bun:test";
 import { createHmac } from "node:crypto";
-import { answerDelivery, makeSlackInteractivityRoute } from "../interactivity.ts";
+import { MAX_WEBHOOK_BODY_BYTES } from "../../../http/bounded-body.ts";
+import { makeSlackInteractivityRoute } from "../interactivity.ts";
 import { ACTION_ANSWER, ACTION_OPEN } from "../blocks.ts";
 
 const SECRET = "test-signing-secret";
 const PATH = "/";
 const ROUTE = { team: "T1", channel: "C1", threadRoot: "100.0" };
 
-function makeApp() {
+function makeApp(resolve: () => Promise<string> = async () => SECRET) {
   const calls: { answers: unknown[]; modals: unknown[] } = { answers: [], modals: [] };
   const app = makeSlackInteractivityRoute({
-    secrets: { resolve: async () => SECRET },
+    secrets: { resolve },
     deliverAnswer: async (route, answer) => void calls.answers.push({ route, answer }),
     openModal: async (triggerId, view) => void calls.modals.push({ triggerId, view }),
   });
@@ -57,6 +58,35 @@ describe("POST /api/v1/integrations/slack/interactivity", () => {
     expect(res.status).toBe(401);
     expect(calls.answers).toHaveLength(0);
     expect(calls.modals).toHaveLength(0);
+  });
+
+  test("refuses a body over the bound before it reads the secret", async () => {
+    let secretReads = 0;
+    const { app, calls } = makeApp(async () => {
+      secretReads++;
+      return SECRET;
+    });
+    const res = await app.request(PATH, {
+      method: "POST",
+      body: "payload=" + "x".repeat(MAX_WEBHOOK_BODY_BYTES),
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+    });
+    expect(res.status).toBe(413);
+    expect(secretReads).toBe(0);
+    expect(calls.answers).toHaveLength(0);
+  });
+
+  test("a signing secret that cannot be read is 401, not a 5xx", async () => {
+    const { app, calls } = makeApp(async () => {
+      throw new Error("slack.signing_secret is not set");
+    });
+    const res = await postSigned(app, {
+      type: "block_actions",
+      trigger_id: "trig",
+      actions: [{ action_id: ACTION_ANSWER, value: JSON.stringify({ t: "tc1", q: "Pick", a: "A", r: ROUTE }) }],
+    });
+    expect(res.status).toBe(401);
+    expect(calls.answers).toHaveLength(0);
   });
 
   test("an inline option click delivers an answer to the thread", async () => {
@@ -113,31 +143,6 @@ describe("POST /api/v1/integrations/slack/interactivity", () => {
 
 describe("automation relay answers", () => {
   const RUN_ROUTE = { ...ROUTE, runId: "autorun:auto-1:slack:E1" };
-
-  test("a route carrying runId delivers a slack_answer signal to that run; a card without one is unrouted", () => {
-    const answer = { toolCallId: "tc1", answers: { Pick: ["A"] } };
-    expect(answerDelivery(RUN_ROUTE, answer)).toEqual({
-      kind: "automation",
-      runId: "autorun:auto-1:slack:E1",
-      message: {
-        kind: "signal",
-        name: "slack_answer",
-        payload: { toolCallId: "tc1", answers: { Pick: ["A"] } },
-      },
-      idempotencyKey: "slack-answer:tc1",
-    });
-    expect(answerDelivery(ROUTE, answer)).toEqual({ kind: "unrouted" });
-  });
-
-  test("a route carrying sessionId is a session question's: its answer goes to the session, not a run", () => {
-    const sessionRoute = { ...RUN_ROUTE, sessionId: "s-1" };
-    const answer = { toolCallId: "tc1", answers: { Pick: ["A"] } };
-    expect(answerDelivery(sessionRoute, answer)).toEqual({ kind: "session", sessionId: "s-1" });
-    // A slack_choice card (its answer id is prefixed) is the run's even
-    // when the route also names the session.
-    const choice = { toolCallId: "choice:ask", answers: { Pick: ["A"] } };
-    expect(answerDelivery(sessionRoute, choice)).toMatchObject({ kind: "automation", runId: RUN_ROUTE.runId });
-  });
 
   test("the runId rides the Block Kit value end to end through the route", async () => {
     const { app, calls } = makeApp();

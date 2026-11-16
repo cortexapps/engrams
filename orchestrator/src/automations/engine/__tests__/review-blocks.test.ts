@@ -112,8 +112,8 @@ function fake(options: { deduplicate?: boolean; payload?: ReviewPostPayload } = 
         }
       );
     },
-    async recordSummaryOnlyPost(reviewId) {
-      calls.push(`recordSummaryOnlyPost:${reviewId}`);
+    async recordSummaryOnlyPost(reviewId, inlineFindingIds) {
+      calls.push(`recordSummaryOnlyPost:${reviewId}:${inlineFindingIds.join("|")}`);
     },
     async cleanupSupersededReview(reviewId) {
       calls.push(`cleanupSupersededReview:${reviewId}`);
@@ -291,32 +291,50 @@ describe("review_record_post", () => {
   test("writes the posted review's id onto the pass; an empty id (a replayed post) records nothing", async () => {
     const f = fake();
     const block = getBlock(REVIEW_RECORD_POST_TYPE)!;
-    const set = await block.execute!(block.configSchema.parse({ reviewId: "review-9", githubReviewId: "5369378073" }) as never, ctx());
-    expect(set).toMatchObject({ kind: "ok", outputs: { recorded: true, github_review_id: "5369378073" } });
+    const set = await block.execute!(block.configSchema.parse({ reviewId: "review-9", providerReviewId: "5369378073" }) as never, ctx());
+    expect(set).toMatchObject({ kind: "ok", outputs: { recorded: true, provider_review_id: "5369378073" } });
     expect(f.recorded).toEqual([{ reviewId: "review-9", githubReviewId: "5369378073" }]);
 
-    const skip = await block.execute!(block.configSchema.parse({ reviewId: "review-9", githubReviewId: "" }) as never, ctx());
+    // A definition of an earlier version names the id `githubReviewId`.
+    await block.execute!(block.configSchema.parse({ reviewId: "review-9", githubReviewId: "77" }) as never, ctx());
+    expect(f.recorded.at(-1)).toEqual({ reviewId: "review-9", githubReviewId: "77" });
+
+    const skip = await block.execute!(block.configSchema.parse({ reviewId: "review-9", providerReviewId: "" }) as never, ctx());
     expect(skip).toMatchObject({ kind: "ok", outputs: { recorded: false } });
-    expect(f.recorded).toHaveLength(1);
+    expect(f.recorded).toHaveLength(2);
     expect(f.calls.filter((c) => c.startsWith("recordSummaryOnlyPost"))).toEqual([]);
   });
 
-  test("a summary-only post (GitHub refused the inline anchors) re-settles the pass", async () => {
+  test("a summary-only post (the forge refused the inline anchors) re-settles the pass", async () => {
     // The action's `inline_posted` output arrives through a template, so
-    // the block sees the string "false", not a boolean.
+    // the block sees the string "false", not a boolean. The findings whose
+    // comments are on the diff arrive joined with commas.
     const f = fake();
     const block = getBlock(REVIEW_RECORD_POST_TYPE)!;
     const out = await block.execute!(
-      block.configSchema.parse({ reviewId: "review-9", githubReviewId: "77", inlinePosted: "false" }) as never,
+      block.configSchema.parse({
+        reviewId: "review-9",
+        providerReviewId: "77",
+        inlinePosted: "false",
+        inlineFindingIds: "f-1,f-2",
+      }) as never,
       ctx(),
     );
     expect(out).toMatchObject({ kind: "ok", outputs: { recorded: true, inline_posted: false } });
-    expect(f.calls).toContain("recordSummaryOnlyPost:review-9");
+    expect(f.calls).toContain("recordSummaryOnlyPost:review-9:f-1|f-2");
+
+    // No comment on the diff: an empty list.
+    const none = fake();
+    await block.execute!(
+      block.configSchema.parse({ reviewId: "review-9", providerReviewId: "77", inlinePosted: "false", inlineFindingIds: "" }) as never,
+      ctx(),
+    );
+    expect(none.calls).toContain("recordSummaryOnlyPost:review-9:");
 
     // "true" (or an absent output on a replay) leaves the settle alone.
     const f2 = fake();
     await block.execute!(
-      block.configSchema.parse({ reviewId: "review-9", githubReviewId: "77", inlinePosted: "true" }) as never,
+      block.configSchema.parse({ reviewId: "review-9", providerReviewId: "77", inlinePosted: "true" }) as never,
       ctx(),
     );
     expect(f2.calls.filter((c) => c.startsWith("recordSummaryOnlyPost"))).toEqual([]);

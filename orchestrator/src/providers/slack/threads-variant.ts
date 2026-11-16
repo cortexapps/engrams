@@ -141,7 +141,7 @@ export const SLACK_THREADS: ThreadsVariant = {
   previousNames: ["Slack thread brain"],
   description:
     "Answers @-mentions in Slack with one session per thread, relaying the conversation both ways.",
-  definitionVersion: 15,
+  definitionVersion: 16,
   mentionEvents: ["app_mention"],
   facts: {
     type: "code",
@@ -166,6 +166,7 @@ export const SLACK_THREADS: ThreadsVariant = {
   // `coalesce`, not `default:`, whose fallback argument is strict.
   threadKeyTemplate:
     '${{ event.raw.team_id }}:${{ event.raw.event.channel }}:${{ event.raw.event | coalesce: "thread_ts", "ts" }}',
+  channelKeyHint: "channel id (C…) or #name",
   threadLabelTemplate: "${{ event.raw.event.text | strip_mentions | truncate: 80 }}",
   systemPromptAppend: SLACK_SYSTEM_PROMPT_APPEND,
 };

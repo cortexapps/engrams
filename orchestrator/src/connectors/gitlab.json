@@ -37,11 +37,11 @@
     },
     {
       "grants": ["merge_requests:read"],
-      "match": { "method": "GET", "path": "/api/v4/projects/*/merge_requests*" }
+      "match": { "method": "GET", "path": "/api/v4/projects/*/merge_requests*", "resourcePath": "/api/v4/projects/{resource:encoded}/merge_requests*" }
     },
     {
       "grants": ["merge_requests:write"],
-      "match": { "method": "POST", "path": "/api/v4/projects/*/merge_requests" },
+      "match": { "method": "POST", "path": "/api/v4/projects/*/merge_requests", "resourcePath": "/api/v4/projects/{resource:encoded}/merge_requests" },
       "asset": {
         "kind": "pull_request",
         "surface": "asset",
@@ -57,11 +57,11 @@
     },
     {
       "grants": ["issues:read"],
-      "match": { "method": "GET", "path": "/api/v4/projects/*/issues*" }
+      "match": { "method": "GET", "path": "/api/v4/projects/*/issues*", "resourcePath": "/api/v4/projects/{resource:encoded}/issues*" }
     },
     {
       "grants": ["issues:write"],
-      "match": { "method": "POST", "path": "/api/v4/projects/*/issues" },
+      "match": { "method": "POST", "path": "/api/v4/projects/*/issues", "resourcePath": "/api/v4/projects/{resource:encoded}/issues" },
       "asset": {
         "kind": "issue",
         "surface": "asset",
@@ -72,38 +72,38 @@
     },
     {
       "grants": ["pipelines:read"],
-      "match": { "method": "GET", "path": "/api/v4/projects/*/pipelines*" }
+      "match": { "method": "GET", "path": "/api/v4/projects/*/pipelines*", "resourcePath": "/api/v4/projects/{resource:encoded}/pipelines*" }
     },
     {
       "grants": ["pipelines:write"],
-      "match": { "method": "POST", "path": "/api/v4/projects/*/pipeline*" }
+      "match": { "method": "POST", "path": "/api/v4/projects/*/pipeline*", "resourcePath": "/api/v4/projects/{resource:encoded}/pipeline*" }
     },
     {
       "grants": ["repository:read"],
-      "match": { "method": "GET", "path": "/api/v4/projects/*/repository/*" }
+      "match": { "method": "GET", "path": "/api/v4/projects/*/repository/*", "resourcePath": "/api/v4/projects/{resource:encoded}/repository/*" }
     },
     {
       "grants": ["repository:write"],
-      "match": { "method": "POST", "path": "/api/v4/projects/*/repository/commits" }
+      "match": { "method": "POST", "path": "/api/v4/projects/*/repository/commits", "resourcePath": "/api/v4/projects/{resource:encoded}/repository/commits" }
     },
     {
       "grants": ["repository:read"],
-      "match": { "method": "GET", "path": "path-query:/*.git/info/refs?service=git-upload-pack" },
+      "match": { "method": "GET", "path": "path-query:/*.git/info/refs?service=git-upload-pack", "resourcePath": "path-query:/{resource}.git/info/refs?service=git-upload-pack" },
       "template": "Basic {basic:oauth2}"
     },
     {
       "grants": ["repository:read"],
-      "match": { "method": "POST", "path": "path-query:/*.git/git-upload-pack" },
+      "match": { "method": "POST", "path": "path-query:/*.git/git-upload-pack", "resourcePath": "path-query:/{resource}.git/git-upload-pack" },
       "template": "Basic {basic:oauth2}"
     },
     {
       "grants": ["repository:write"],
-      "match": { "method": "GET", "path": "path-query:/*.git/info/refs?service=git-receive-pack" },
+      "match": { "method": "GET", "path": "path-query:/*.git/info/refs?service=git-receive-pack", "resourcePath": "path-query:/{resource}.git/info/refs?service=git-receive-pack" },
       "template": "Basic {basic:oauth2}"
     },
     {
       "grants": ["repository:write"],
-      "match": { "method": "POST", "path": "path-query:/*.git/git-receive-pack" },
+      "match": { "method": "POST", "path": "path-query:/*.git/git-receive-pack", "resourcePath": "path-query:/{resource}.git/git-receive-pack" },
       "template": "Basic {basic:oauth2}"
     },
     {
@@ -118,11 +118,10 @@
         "repository:read",
         "repository:write"
       ],
-      "match": { "method": "GET", "path": "/api/v4/user" }
+      "match": { "method": "GET", "path": "/api/v4/user", "resourcePath": "/api/v4/user" }
     }
   ],
   "webhook": {
-    "verificationScheme": "generic_hmac_sha256",
     "events": [
       {
         "key": "merge_request.open",
@@ -678,7 +677,6 @@
       }
     ],
     "ingress": {
-      "scheme": "gitlab_webhook",
       "secretRef": "gitlab.webhook_secret"
     },
     "scope": {

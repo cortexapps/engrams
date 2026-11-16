@@ -6,6 +6,7 @@
  */
 
 import type { IntegrationEventSource } from "../../automations/integration-ingress.ts";
+import { verifySvixHeaders } from "../../automations/verify.ts";
 
 /** The catalog key for a Vanta event name: `v1.questionnaire.created` →
  * `questionnaire.created`. Null when the name is not one Vanta would send. */
@@ -17,6 +18,7 @@ export function vantaEventKey(name: unknown): string | null {
 
 export const vantaEventSource: IntegrationEventSource = {
   provider: "vanta",
+  verify: async (delivery) => verifySvixHeaders(delivery, await delivery.secret(), "svix"),
   extract: (headers, payload) => {
     const deliveryId = headers.get("svix-id");
     if (!deliveryId) {

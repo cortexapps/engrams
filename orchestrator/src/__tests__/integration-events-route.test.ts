@@ -7,7 +7,8 @@ import { describe, expect, test } from "bun:test";
 import { connectorRegistry } from "../connectors/registry.ts";
 import type { RecordIntegrationEventInput } from "../db/integration-events.ts";
 import { linearEventSource } from "../providers/linear/events.ts";
-import { defaultEventSources, makeIntegrationEventsRoute } from "../routes/integration-events.ts";
+import { eventSources } from "../providers/index.ts";
+import { makeIntegrationEventsRoute } from "../routes/integration-events.ts";
 
 const SECRET = "test-signing-secret";
 const NOW = new Date("2026-08-31T17:06:35.000Z");
@@ -53,11 +54,11 @@ function post(app: ReturnType<typeof route>, provider: string, signingSecret = S
 }
 
 describe("provider event route", () => {
-  test("the default sources are the connectors that declare a webhook ingress", () => {
+  test("the event sources are the connectors that declare a webhook ingress", () => {
     const declared = [...connectorRegistry().values()]
       .filter((connector) => connector.webhook?.ingress)
       .map((connector) => connector.provider);
-    expect(defaultEventSources().map((source) => source.provider).sort()).toEqual(declared.sort());
+    expect(eventSources().map((source) => source.provider).sort()).toEqual(declared.sort());
   });
 
   test("a signed delivery reaches the ledger", async () => {

@@ -40,7 +40,7 @@ export function parseLiteLlmCatalog(body: Uint8Array): CatalogModel[] {
   return [...byId.values()];
 }
 
-export const LITELLM: ModelRouterSpec = {
+export const LITELLM_ROUTER: ModelRouterSpec = {
   id: "litellm",
   label: "LiteLLM",
   description: "The models behind your own LiteLLM proxy.",
@@ -55,6 +55,8 @@ export const LITELLM: ModelRouterSpec = {
     refreshIntervalMs: 60 * 60 * 1000,
     parse: parseLiteLlmCatalog,
   },
+  // The model list does not say which models take one.
+  takesReasoningEffort: () => false,
   chat: (apiKey, host) => {
     const provider = createOpenAICompatible({
       name: "litellm",

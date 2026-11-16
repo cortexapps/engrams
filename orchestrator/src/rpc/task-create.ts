@@ -339,7 +339,6 @@ export async function compileSessionCreateInput(
     );
   }
   const router = selection?.router ?? null;
-  const routerProtocol = selection?.protocol ?? null;
   const routerHost = router ? await resolveIntegrationHost(router.connector, {
     connectors: deps.connectors,
     settingsFor: async (provider) =>
@@ -355,7 +354,7 @@ export async function compileSessionCreateInput(
     opts.model ??
     profile.model ??
     (router
-      ? (await routerModels(router, deps.modelRouters)).default ?? undefined
+      ? (await routerModels(router, deps.modelRouters)).default?.model
       : descriptor.models.find((m) => m.default)?.id ?? descriptor.models[0]?.id);
   let effortId: string | undefined =
     opts.effort ??
@@ -383,9 +382,7 @@ export async function compileSessionCreateInput(
       log.warn({ routerId: router.id, modelId, human: isHumanPrincipal(opts) }, "model router policy rejected launch");
       throw new ConnectError(`router model \`${modelId}\` is not enabled for this principal`, Code.PermissionDenied);
     }
-    if (!routedModel.supportedParameters.includes("reasoning") && !routedModel.supportedParameters.includes("reasoning_effort")) {
-      effortId = undefined;
-    }
+    if (!router.takesReasoningEffort(routedModel)) effortId = undefined;
     if (!connected.some((candidate) => candidate.id === router.id)) {
       throw new ConnectError(
         `${router.label} is not connected — an admin must save the ${router.credentialSecret} key under Settings before routed launches work`,
@@ -610,10 +607,10 @@ export async function compileSessionCreateInput(
   // carried separately in the integration policy.
   for (const [k, v] of Object.entries(modelOption?.env ?? {})) harness[k] = v;
   for (const [k, v] of Object.entries(effortOption?.env ?? {})) harness[k] = v;
-  if (router && routerProtocol && modelId) {
-    harness.ENGRAM_MODEL_ROUTER_ID = router.id;
-    harness.ENGRAM_MODEL_ROUTER_PROTOCOL = routerProtocol;
-    harness.ENGRAM_MODEL_ROUTER_BASE_URL = `https://${routerHost}${router.protocols[routerProtocol].basePath}`;
+  if (selection && modelId) {
+    harness.ENGRAM_MODEL_ROUTER_ID = selection.router.id;
+    harness.ENGRAM_MODEL_ROUTER_PROTOCOL = selection.protocol;
+    harness.ENGRAM_MODEL_ROUTER_BASE_URL = `https://${routerHost}${selection.basePath}`;
     harness.ENGRAM_MODEL_ROUTER_MODEL = modelId;
   }
   // ADR 0031 §7: git commit attribution — the initiating human authors the

@@ -2,7 +2,6 @@
 
 import {
   REVIEW_FACTS,
-  REVIEW_FACTS_TYPE,
   REVIEW_HEAD_SHA,
   REVIEW_PR_NUMBER,
   REVIEW_REPO,
@@ -30,7 +29,6 @@ export const GITLAB_REVIEW: ReviewVariant = {
     "note.merge_request",
   ],
   closedEvents: ["merge_request.close", "merge_request.merge"],
-  facts: { type: REVIEW_FACTS_TYPE, tunable: [], config: { provider: PROVIDER } },
   // The session has the connection's host in GITLAB_HOST, and the egress
   // proxy adds the token to git over HTTPS. The checkout falls back to the
   // merge request's own ref: GitLab keeps `refs/merge-requests/<iid>/head`
@@ -41,14 +39,9 @@ export const GITLAB_REVIEW: ReviewVariant = {
     `(git -C ${WORKSPACE} checkout ${REVIEW_HEAD_SHA} || ` +
     `(git -C ${WORKSPACE} fetch origin +refs/merge-requests/${REVIEW_PR_NUMBER}/head && ` +
     `git -C ${WORKSPACE} checkout ${REVIEW_HEAD_SHA}))`,
-  capabilities: ["gitlab:repository:read"],
+  capabilities: [`gitlab:repository:read@${REVIEW_REPO}`],
   // The capability opens the connection's host; a worker reaches nothing else.
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
-  actions: {
-    upsertStatus: "upsert_pr_comment",
-    updateStatus: "update_pr_comment",
-    postReview: "post_pr_review",
-  },
   // `group/project#iid`, the handle the connector declares for every
   // merge-request event.
   instanceKeyTemplate: `${PROJECT}#${IID}`,
@@ -57,5 +50,8 @@ export const GITLAB_REVIEW: ReviewVariant = {
     project: { path_with_namespace: repo },
     object_attributes: { iid: prNumber },
   }),
-  defaultMention: () => "@engrams",
+  // A GitLab user name is not the app's to choose, so an administrator sets
+  // the handle. Empty turns comment commands off.
+  defaultMention: () => "",
+  mentionOfUnsetRow: "",
 };

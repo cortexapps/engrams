@@ -3,14 +3,12 @@
  * provider module reads it while the forge registry loads. */
 
 import type { ProfileNetwork } from "../../db/schema.ts";
-import type { BlockDef } from "../engine/definition.ts";
 
 /** The event key the dispatch edge admits a run under; no forge delivery
  * carries it. Its payload is the variant's `dispatchPayload`. */
 export const REVIEW_DISPATCH_EVENT_KEY = "review.dispatch";
 
-/** The typed facts step: the forge reads the event, and shared code admits
- * it. A variant whose facts are not a code step uses it. */
+/** The facts step: the forge reads the event, and shared code admits it. */
 export const REVIEW_FACTS_TYPE = "review_facts";
 
 export const REVIEW_FACTS = "steps.facts.value";
@@ -32,13 +30,8 @@ export interface ReviewVariant {
   /** The events that start a pass, and the ones that close the pull request. */
   reviewEvents: string[];
   closedEvents: string[];
-  /** The `facts` step: `value` is null to reject the event, else `admit`,
-   * `repo`, `repo_name`, `pr_number`, `pr_url`, `trigger`, `head_sha`,
-   * `base_sha`, `pr_context`, `categories` and `instructions`. It accepts
-   * the forge's events and the dispatch event for any enrolled repository. */
-  facts: Omit<BlockDef, "id">;
   /** The payload of the dispatch event for a pull request named by
-   * coordinate. The facts step and both key templates read it. */
+   * coordinate. The forge's `reviewEvent` and both key templates read it. */
   dispatchPayload(pr: { repo: string; prNumber: number }): Record<string, unknown>;
   /** A shell command that leaves `REVIEW_HEAD_SHA` checked out in
    * `/workspace/<repo_name>`. */
@@ -47,15 +40,13 @@ export interface ReviewVariant {
    * and what it may reach. */
   capabilities: string[];
   network: ProfileNetwork;
-  /** Connector action ids. `upsertStatus` takes `repo`, `number`, `key` and
-   * `body` and outputs `commentId`; `updateStatus` takes `repo`,
-   * `commentId`, `key` and `body`; `postReview` is the forge's
-   * `post_pr_review`. */
-  actions: { upsertStatus: string; updateStatus: string; postReview: string };
   /** The workstream key and the concurrency key of an event, as templates
    * over `event.raw`. Both name one pull request. */
   instanceKeyTemplate: string;
   concurrencyKeyTemplate: string;
   /** The seeded value of the `mention` input. */
   defaultMention(): string;
+  /** The `mention` of a stored row that has none. It is part of the
+   * definition, so it does not read the deployment's configuration. */
+  mentionOfUnsetRow: string;
 }
