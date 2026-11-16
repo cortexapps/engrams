@@ -355,36 +355,83 @@ impl RequestPolicy {
 }
 
 /// Match one pattern against a request target `PATH[?QUERY]`. The pattern's
-/// path part globs the request path only.
+/// path part globs the request path only, and a path that another server
+/// could read as a different one never matches (see [`path_is_unambiguous`]).
 ///
 /// - A plain pattern: a `*` matches any run of characters, `/` included. A
 ///   pattern with a query part globs it against the request query, and a
 ///   request with no query does not match. A pattern with no query part takes
 ///   any query (API clients add paging and filter parameters).
-/// - `segment-path:` is the same, but a `*` stops at `/`. Google Cloud policies
-///   use it: the permission boundary is the resource path.
+/// - `segment-path:` is the same, but a `*` stops at `/`, and the path holds no
+///   escaped `/`. Google Cloud policies use it: the permission boundary is the
+///   resource path.
 /// - `path-query:` is for a request whose permission depends on the query
 ///   (git smart HTTP: `info/refs?service=…` is a fetch or a push). The query
-///   must equal the pattern's exactly, and a pattern with no query takes a
-///   request with none. A path that a server could resolve to another one (a
-///   `%` escape or a `..`) never matches.
+///   must equal the pattern's exactly, a pattern with no query takes a request
+///   with none, and the path holds no `%` escape at all.
 fn target_matches(pattern: &str, target: &str) -> bool {
     let (path, query) = split_target(target);
     if let Some(pattern) = pattern.strip_prefix("path-query:") {
         let (pattern_path, pattern_query) = split_target(pattern);
         return !path.contains('%')
-            && !path.contains("..")
+            && path_is_unambiguous(path, false)
             && query == pattern_query
             && glob_match(pattern_path, path);
     }
-    let (pattern, star_matches_slash) = match pattern.strip_prefix("segment-path:") {
-        Some(pattern) => (pattern, false),
-        None => (pattern, true),
+    let (pattern, segment) = match pattern.strip_prefix("segment-path:") {
+        Some(pattern) => (pattern, true),
+        None => (pattern, false),
     };
     let (pattern_path, pattern_query) = split_target(pattern);
-    glob_match_with(pattern_path, path, star_matches_slash)
+    path_is_unambiguous(path, !segment)
+        && glob_match_with(pattern_path, path, !segment)
         && pattern_query
             .is_none_or(|pattern_query| query.is_some_and(|query| glob_match(pattern_query, query)))
+}
+
+/// Does `path` name the same resource for every server that reads it? A
+/// front server can cut, decode or resolve parts of a path before the
+/// upstream routes it. After one `%` decode the path must hold no `#`, `;`,
+/// `\`, `?`, `%` (a second decode) or ASCII control character, and no `.` or
+/// `..` segment; a malformed escape fails. An escaped `/` passes only with
+/// `escaped_slash`: a plain glob's `*` already crosses `/`, and GitLab names a
+/// project `group%2Fproject`.
+fn path_is_unambiguous(path: &str, escaped_slash: bool) -> bool {
+    let Some(decoded) = percent_decode(path) else {
+        return false;
+    };
+    let ambiguous_byte =
+        |b: &u8| matches!(b, b'#' | b';' | b'\\' | b'?' | b'%') || b.is_ascii_control();
+    let escaped_slash_ok = escaped_slash || !path.to_ascii_lowercase().contains("%2f");
+    escaped_slash_ok
+        && !decoded.iter().any(ambiguous_byte)
+        && !decoded
+            .split(|&b| b == b'/')
+            .any(|segment| segment == b"." || segment == b"..")
+}
+
+/// Decode each `%XX` escape once. `None` for a `%` without two hex digits.
+fn percent_decode(path: &str) -> Option<Vec<u8>> {
+    fn hex(b: u8) -> Option<u8> {
+        char::from(b)
+            .to_digit(16)
+            .and_then(|d| u8::try_from(d).ok())
+    }
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let high = hex(*bytes.get(i + 1)?)?;
+            let low = hex(*bytes.get(i + 2)?)?;
+            out.push(high << 4 | low);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Some(out)
 }
 
 /// Split a request target (or a pattern) at its first `?`.
@@ -756,6 +803,61 @@ mod tests {
         assert!(!graphql.path_matches("/graphql?query=mutation%7BdeleteRepository%7D"));
     }
 
+    #[test]
+    fn a_path_another_server_could_read_differently_never_matches() {
+        for glob in [
+            "/api/v4/projects/*/merge_requests",
+            "segment-path:/api/v4/projects/*/merge_requests",
+        ] {
+            let rule = policy(glob);
+            for target in [
+                // A front server that cuts a fragment or a path parameter.
+                "/api/v4/projects/1/repository/commits#/merge_requests",
+                "/api/v4/projects/1/repository/commits;/merge_requests",
+                "/api/v4/projects/1%2Frepository%2Fcommits%23/merge_requests",
+                "/api/v4/projects/1%2Frepository%2Fcommits%3b/merge_requests",
+                // A front server that decodes `?`, or decodes twice.
+                "/api/v4/projects/1%2Frepository%2Fcommits%3F/merge_requests",
+                "/api/v4/projects/1%2Frepository%2Fcommits%253F/merge_requests",
+                // A backslash read as `/`, and control characters.
+                "/api/v4/projects/1\\x/merge_requests",
+                "/api/v4/projects/1%5Cx/merge_requests",
+                "/api/v4/projects/1%00/merge_requests",
+                "/api/v4/projects/1\tx/merge_requests",
+                // Dot segments, plain or escaped.
+                "/api/v4/projects/2/../1/merge_requests",
+                "/api/v4/projects/2%2F..%2F1/merge_requests",
+                "/api/v4/projects/2/%2e%2E/1/merge_requests",
+                "/api/v4/projects/./merge_requests",
+                // A malformed escape.
+                "/api/v4/projects/1%2/merge_requests",
+                "/api/v4/projects/1%zz/merge_requests",
+            ] {
+                assert!(!rule.path_matches(target), "{glob} matched {target:?}");
+            }
+        }
+
+        // An escaped `/` or `.` inside one id is a legitimate plain path.
+        let files = policy("/api/v4/projects/*/repository/files/*");
+        assert!(files.path_matches("/api/v4/projects/g%2Fp/repository/files/lib%2Fclass%2Erb"));
+        // A segment glob's `*` stops at `/`, so an escaped one could carry a
+        // nested action past it.
+        let instance = policy("segment-path:/compute/v1/projects/*/zones/*/instances/*");
+        assert!(instance.path_matches("/compute/v1/projects/p/zones/z/instances/vm-1"));
+        assert!(!instance.path_matches("/compute/v1/projects/p/zones/z/instances/vm-1%2Fstart"));
+
+        // The git rules take no escape and no ambiguous byte either.
+        let fetch = policy("path-query:/*.git/git-upload-pack");
+        for target in [
+            "/g/p.git/git-receive-pack;/git-upload-pack",
+            "/g/p.git/git-receive-pack#/git-upload-pack",
+            "/g/p.git/git-receive-pack\\..\\git-upload-pack",
+            "/g/p.git/git-receive-pack\n/git-upload-pack",
+        ] {
+            assert!(!fetch.path_matches(target), "matched {target:?}");
+        }
+    }
+
     /// Every connector operation's path, with any other operation's path
     /// text after it in the query, matches only the rules its path alone
     /// matches. The connector definitions are the rules the proxy enforces.
@@ -803,6 +905,10 @@ mod tests {
         for (provider, glob) in &rules {
             let rule = policy(glob);
             let text = concrete(glob);
+            assert!(
+                rule.path_matches(&text),
+                "{provider}: {glob:?} rejects {text:?}"
+            );
             let tails: Vec<&str> = text
                 .match_indices(['/', '?'])
                 .map(|(at, _)| &text[at..])
