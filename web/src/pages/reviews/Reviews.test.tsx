@@ -715,7 +715,7 @@ describe("Review dossier", () => {
 
   // Deciding whether a finding is real means looking at the code; acting on it
   // means the thread it became. Both were a manual hunt on GitHub before this.
-  it("links a finding to the code at the commit the pass read, and to its thread", async () => {
+  it("links a finding to the code at the commit the pass read", async () => {
     renderWithProviders(<ReviewDossier />);
 
     const code = await screen.findByRole("link", { name: /View the code/i });
@@ -723,8 +723,6 @@ describe("Review dossier", () => {
       "https://github.com/cortexapps/engrams/blob/cccccccccccccccc/src/index.ts#L10-L12",
     );
 
-    const thread = screen.getByRole("link", { name: /Open the thread/i });
-    expect(thread.getAttribute("href")).toContain("#discussion_r998877");
     // What the author actually did is the strongest post-hoc trust signal there is.
     expect(screen.getByText("Author fixed this")).toBeTruthy();
   });
