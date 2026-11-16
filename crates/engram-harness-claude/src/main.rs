@@ -4541,6 +4541,15 @@ mod adapter {
         // This budget bounds liveness only; event-order assertions stay exact.
         const SUBPROCESS_TRANSITION_TIMEOUT: Duration = Duration::from_secs(30);
 
+        /// Waits for the engine task to end. These tests assert on the events
+        /// the engine sent, not on its exit code.
+        async fn engine_exits(engine: tokio::task::JoinHandle<ExitCode>, within: Duration) {
+            let _exit_code = tokio::time::timeout(within, engine)
+                .await
+                .expect("engine exits")
+                .expect("engine task does not panic");
+        }
+
         /// The generated hook settings path an argv test doesn't care about
         /// (production derives it from the state dir).
         fn test_settings() -> &'static Path {
@@ -5430,10 +5439,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(script).await;
         }
 
@@ -5497,10 +5503,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(script).await;
         }
 
@@ -5548,10 +5551,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(script).await;
         }
 
@@ -5589,10 +5589,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(script).await;
         }
 
@@ -5669,10 +5666,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(script).await;
         }
 
@@ -6003,10 +5997,7 @@ mod adapter {
                 None => {} // channel closed = engine exited cleanly, no stray event
                 Some(ev) => panic!("unexpected event after a consumed-prompt dequeue: {ev:?}"),
             }
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine should exit on shutdown")
-                .expect("engine task should not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(&script).await;
         }
 
@@ -6121,10 +6112,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 5 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine should exit on shutdown")
-                .expect("engine task should not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(&script).await;
         }
 
@@ -6753,10 +6741,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 5 })
                 .await
                 .unwrap();
-            tokio::time::timeout(SUBPROCESS_TRANSITION_TIMEOUT, engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, SUBPROCESS_TRANSITION_TIMEOUT).await;
             let _ = tokio::fs::remove_file(&script).await;
         }
 
@@ -6895,10 +6880,7 @@ mod adapter {
 
             // Closing the command channel ends the engine cleanly.
             drop(cmd_tx);
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine should exit when the command channel closes")
-                .expect("engine task should not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(&script).await;
         }
 
@@ -6972,10 +6954,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 5 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine should exit on shutdown")
-                .expect("engine task should not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(&script).await;
         }
 
@@ -7892,10 +7871,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
 
             // The respawn mode is asserted via the STAMP above (approve →
             // default); the stamp→argv mapping is covered by
@@ -8023,10 +7999,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             // The reject-keeps-plan-mode invariant is asserted via the STAMP
             // above; the raw argv record is fixture-timing-racy under this
             // test's fast manual driving (see the approve test).
@@ -8281,10 +8254,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(script).await;
             let _ = tokio::fs::remove_file(counter).await;
         }
@@ -8405,10 +8375,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(script).await;
             let _ = tokio::fs::remove_file(counter).await;
             let _ = tokio::fs::remove_file(invocations).await;
@@ -8503,10 +8470,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(script).await;
             let _ = tokio::fs::remove_file(counter).await;
         }
@@ -8640,10 +8604,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(script).await;
             let _ = tokio::fs::remove_file(idle_marker).await;
             let _ = tokio::fs::remove_file(captured).await;
