@@ -283,9 +283,10 @@ ORCH_PATHS = ["orchestrator/",
               "docker/orchestrator.Dockerfile",
               ".bun-version",
               "crates/engram-egress-proxy/policy/google-credential-denylist.json"]
-# The connector definitions hold the path rules the Rust egress proxy
-# enforces; an egress-proxy test reads every one of them.
-CONNECTOR_PATHS = ["orchestrator/src/connectors/"]
+# Non-crate files that a Rust test reads: the connector definitions (the path
+# rules the egress proxy enforces) and the guest's git askpass helper.
+RUST_TEST_INPUT_PATHS = ["orchestrator/src/connectors/",
+                         "deploy/bundles/skills/bin/git-askpass"]
 # A lockfile/manifest/toolchain bump recompiles the whole workspace.
 RUST_COMMON = ["Cargo.lock", "Cargo.toml", "rust-toolchain.toml"]
 
@@ -558,7 +559,7 @@ def main():
         or bool(cc)
         or any_path(changed, RUST_COMMON)
         or any_path(changed, HARNESS_PATHS)
-        or any_path(changed, CONNECTOR_PATHS)
+        or any_path(changed, RUST_TEST_INPUT_PATHS)
     )
     # musl cross-compile of the FC host binaries — same closure as host_binaries.
     test_cross = ci_self or host_binaries

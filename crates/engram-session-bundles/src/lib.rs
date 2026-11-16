@@ -300,14 +300,12 @@ fn render_gitconfig(
         }
     }
     if let Some(askpass) = askpass {
-        // git consults the askpass for the password; the username is the
-        // GitHub App x-access-token convention; the empty credential.helper
+        // git asks the askpass for the username and the password, and the
+        // askpass asks the coordinator for both; the empty credential.helper
         // forces the askpass on every operation.
         s.push_str(&format!(
             "[core]\n\
              \taskPass = {}\n\
-             [credential \"https://github.com\"]\n\
-             \tusername = x-access-token\n\
              [credential]\n\
              \thelper =\n",
             askpass.display()
@@ -362,6 +360,47 @@ mod tests {
                 "provides_askpass":"bin/git-askpass"}"#,
         )
         .unwrap();
+    }
+
+    /// The shipped `git-askpass` asks `engram-agentd` for the username or the
+    /// password, for the host the prompt's URL names and for no host when the
+    /// prompt names none.
+    #[test]
+    fn the_askpass_asks_for_the_prompted_half_and_host() {
+        let askpass = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/bundles/skills/bin/git-askpass");
+        let bin = tempfile::tempdir().unwrap();
+        let agentd = bin.path().join("engram-agentd");
+        std::fs::write(&agentd, "#!/bin/sh\nprintf '%s|' \"$@\"\n").unwrap();
+        let mut perms = std::fs::metadata(&agentd).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&agentd, perms).unwrap();
+        let path = format!("{}:/usr/bin:/bin", bin.path().display());
+        for (prompt, argv) in [
+            (
+                "Username for 'https://github.com': ",
+                "forge-credential|--username|--host|github.com|",
+            ),
+            (
+                "Password for 'https://x-access-token@github.com': ",
+                "forge-credential|--host|github.com|",
+            ),
+            (
+                "Password for 'https://oauth2@gitlab.example.com:8443/g/p.git': ",
+                "forge-credential|--host|gitlab.example.com|",
+            ),
+            ("Password: ", "forge-credential|"),
+            ("Username: ", "forge-credential|--username|"),
+        ] {
+            let out = std::process::Command::new("sh")
+                .arg(&askpass)
+                .arg(prompt)
+                .env("PATH", &path)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{prompt}: {out:?}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), argv, "{prompt}");
+        }
     }
 
     /// Stage a fake `browser` bundle at reserved slot `n`.
@@ -432,7 +471,10 @@ mod tests {
         let l = Layout::under(dir.path());
         let gc = std::fs::read_to_string(&l.etc_gitconfig).unwrap();
         assert!(gc.contains("bin/git-askpass"));
-        assert!(gc.contains("x-access-token"));
+        // The username comes from the coordinator through the askpass, so no
+        // forge host or username is written here.
+        assert!(!gc.contains("x-access-token") && !gc.contains("github.com"));
+        assert!(gc.contains("[credential]\n\thelper =\n"));
     }
 
     #[test]
@@ -549,7 +591,7 @@ mod tests {
         let l = Layout::under(dir.path());
         let gc = std::fs::read_to_string(&l.etc_gitconfig).unwrap();
         assert!(gc.contains("[user]") && gc.contains("ada@example.com"));
-        assert!(gc.contains("git-askpass") && gc.contains("x-access-token"));
+        assert!(gc.contains("git-askpass"));
     }
 
     #[test]

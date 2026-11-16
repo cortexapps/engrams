@@ -691,7 +691,9 @@ pub struct ForgeRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ForgeOp {
     /// Mint a fresh git credential for `host` (optionally scoping the
-    /// installation to `owner`). The reply is [`ForgeResponse::Credential`].
+    /// installation to `owner`). An empty `host` names none: the coordinator
+    /// mints for the session's only forge. The reply is
+    /// [`ForgeResponse::Credential`], whose username git sends.
     FetchCredential { host: String, owner: Option<String> },
     /// Fetch the OAuth credential bound to this session. The caller cannot
     /// select a provider or subject; both come from the durable binding.
