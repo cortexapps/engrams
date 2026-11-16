@@ -1345,7 +1345,7 @@ jobs:
             echo "::error::the ublk tests did not end in 10 minutes"
             for exe in /proc/[0-9]*/exe; do
               case "$(sudo readlink "$exe" 2>/dev/null)" in
-                */deps/blk_source-*|*/deps/lazy_restore-*) ;;
+                */blk_source-*|*/lazy_restore-*) ;;
                 *) continue ;;
               esac
               pid=${exe#/proc/}; pid=${pid%/exe}
