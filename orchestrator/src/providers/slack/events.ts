@@ -4,14 +4,32 @@
  * retry carries the same `event_id`, so the ledger write dedupes it.
  */
 
+import { isValidSlackRequest } from "@slack/bolt";
+
 import type { IntegrationEventSource } from "../../automations/integration-ingress.ts";
 import { ownPath } from "../../automations/paths.ts";
+import type { IngressDelivery } from "../../automations/verify.ts";
 
 /** Inner event types the ledger accepts (the declared catalog keys). */
 const LEDGERED_EVENT_TYPES = new Set(["app_mention", "message", "reaction_added"]);
 
+/** Slack's `v0` request signature, with its five-minute replay window.
+ * Events and card clicks are signed the same way. */
+export async function verifySlackRequest(delivery: IngressDelivery): Promise<boolean> {
+  return isValidSlackRequest({
+    signingSecret: await delivery.secret(),
+    body: new TextDecoder().decode(delivery.rawBody),
+    headers: {
+      "x-slack-signature": delivery.headers.get("x-slack-signature") ?? "",
+      "x-slack-request-timestamp": Number(delivery.headers.get("x-slack-request-timestamp") ?? 0),
+    },
+    nowMilliseconds: delivery.now.getTime(),
+  });
+}
+
 export const slackEventSource: IntegrationEventSource = {
   provider: "slack",
+  verify: verifySlackRequest,
   extract: (_headers, payload) => {
     if (payload["type"] === "url_verification") {
       const challenge = payload["challenge"];

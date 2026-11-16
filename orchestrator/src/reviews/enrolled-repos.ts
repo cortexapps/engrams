@@ -5,7 +5,8 @@
  * this is the read the retry RPC and the CI dispatch edge make before they
  * admit a run for a repo by name. */
 
-import { reviewVariantFor } from "../forges/registry.ts";
+import { forgeFor, reviewVariantFor } from "../forges/registry.ts";
+import { enrolledEntry } from "../forges/review-facts.ts";
 import type { AutomationStore } from "../db/automations.ts";
 
 /** One `repos` entry as the built-in declares it. */
@@ -18,8 +19,7 @@ export interface RepoPolicy {
 
 export interface EnrolledRepos {
   /** The repo's policy in the forge's code-review built-in, or null when
-   * the built-in does not list it. The match ignores case, as the
-   * built-in's own admission does. */
+   * the built-in does not list it. */
   get(provider: string, repo: string): Promise<RepoPolicy | null>;
 }
 
@@ -37,16 +37,12 @@ export function makeEnrolledRepos(
 ): EnrolledRepos {
   return {
     async get(provider, repo) {
+      const forge = forgeFor(provider);
       const variant = reviewVariantFor(provider);
-      const builtin = variant === null ? null : await store.getByBuiltinKey(variant.key);
+      if (forge === null || variant === null) return null;
+      const builtin = await store.getByBuiltinKey(variant.key);
       if (!builtin || builtin.archivedAt !== null) return null;
-      const repos = builtin.inputs["repos"];
-      if (typeof repos !== "object" || repos === null || Array.isArray(repos)) return null;
-      const wanted = repo.toLowerCase();
-      const hit = Object.entries(repos as Record<string, unknown>).find(
-        ([key]) => key.toLowerCase() === wanted,
-      );
-      return hit ? policyOf(hit[1]) : null;
+      return policyOf(enrolledEntry(forge, builtin.inputs["repos"], repo));
     },
   };
 }

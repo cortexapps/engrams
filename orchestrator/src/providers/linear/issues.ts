@@ -18,7 +18,7 @@
 import {
   runIntegrationOp as defaultRunIntegrationOp,
   type IntegrationOpResult,
-} from "./run-op.ts";
+} from "../../integrations/run-op.ts";
 
 export type RunIntegrationOp = typeof defaultRunIntegrationOp;
 

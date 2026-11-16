@@ -76,8 +76,7 @@ message Review {
   // rename can move out from under a client, and a reused repo name can even
   // point two different pull requests at it.
   string target_id = 24;
-  // PR: which forge this came from. "github" today. Named for the concept rather
-  // than the vendor, so a second forge needs no field rename here.
+  // PR: the provider name of the forge this came from.
   string provider = 25;
   // PR: the forge's own stable id — the identity, and the only field a rename or
   // a transfer cannot move. Unset on a record that predates the change table, and
@@ -119,7 +118,7 @@ message ReviewFinding {
   string path = 3;
   optional int32 start_line = 4;
   optional int32 end_line = 5;
-  // "LEFT" | "RIGHT" (GitHub diff side), when line-anchored.
+  // "LEFT" | "RIGHT": the side of the diff, when the finding has a line.
   optional string side = 6;
   // security-privacy | stability-availability | data-integrity-integration |
   // functional-correctness | performance-scalability | maintainability-quality
@@ -143,10 +142,8 @@ message ReviewFinding {
   string session_id = 18;
   google.protobuf.Timestamp created_at = 19;
   // The finding's file on the forge at the commit the pass read, at the
-  // finding's lines; and the inline comment the finding became. Absent when
-  // the pull request has no URL.
+  // finding's lines. Absent when the pull request has no URL.
   optional string file_url = 20;
-  optional string thread_url = 21;
 }
 
 // The verifier's judgment on one finding.

@@ -2,9 +2,7 @@
  *
  * The spine's contract: bounded body → verify → parse (tolerant) → extract →
  * redact → ledger → dispatch seam, with provider handshakes and rejects
- * passed through. The Linear route is exercised end to end here because it
- * has no legacy path; GitHub/Slack legacy coexistence is covered in their
- * route suites.
+ * passed through. The Linear and Slack routes are exercised end to end here.
  */
 
 import { createHmac } from "node:crypto";
@@ -12,8 +10,9 @@ import { describe, expect, test } from "bun:test";
 
 import {
   handleIntegrationDelivery,
+  type DeclaredDelivery,
   type IntegrationEventDispatchInput,
-  type IntegrationEventRoute,
+  type IntegrationEventSource,
 } from "../automations/integration-ingress.ts";
 import type {
   IntegrationEventStore,
@@ -75,9 +74,8 @@ function seams() {
   };
 }
 
-const passRoute: IntegrationEventRoute = {
+const passRoute: IntegrationEventSource = {
   provider: "generic",
-  displayName: "Generic (default)",
   verify: async () => true,
   extract: (_headers, payload) => ({
     kind: "event",
@@ -86,6 +84,12 @@ const passRoute: IntegrationEventRoute = {
       deliveryId: String(payload["id"] ?? "d1"),
     },
   }),
+};
+
+const DECLARED: DeclaredDelivery = {
+  displayName: "Generic (default)",
+  secretRef: "generic.webhook_secret",
+  secrets: { resolve: async () => "secret" },
 };
 
 function request(body: string, headers: Record<string, string> = {}): Request {
@@ -101,6 +105,7 @@ describe("handleIntegrationDelivery", () => {
     const s = seams();
     const result = await handleIntegrationDelivery(
       passRoute,
+      DECLARED,
       request(JSON.stringify({ key: "issue.create", id: "d-1", token: "sekret", title: "ok" })),
       s.deps,
     );
@@ -122,8 +127,8 @@ describe("handleIntegrationDelivery", () => {
   test("a duplicate delivery ledgers once but still reaches dispatch idempotently", async () => {
     const s = seams();
     const body = JSON.stringify({ key: "k", id: "dup" });
-    await handleIntegrationDelivery(passRoute, request(body), s.deps);
-    const second = await handleIntegrationDelivery(passRoute, request(body), s.deps);
+    await handleIntegrationDelivery(passRoute, DECLARED, request(body), s.deps);
+    const second = await handleIntegrationDelivery(passRoute, DECLARED, request(body), s.deps);
     expect(second.kind).toBe("recorded");
     expect(second.kind === "recorded" && second.recorded).toBe(false);
     expect(s.recorded).toHaveLength(1);
@@ -133,6 +138,7 @@ describe("handleIntegrationDelivery", () => {
     const s = seams();
     const result = await handleIntegrationDelivery(
       { ...passRoute, verify: async () => false },
+      DECLARED,
       request("{"),
       s.deps,
     );
@@ -146,8 +152,14 @@ describe("handleIntegrationDelivery", () => {
     const result = await handleIntegrationDelivery(
       {
         ...passRoute,
-        verify: async () => {
-          throw new Error('org secret "x.webhook_secret" is not set');
+        verify: async (delivery) => (await delivery.secret()) === "secret",
+      },
+      {
+        ...DECLARED,
+        secrets: {
+          resolve: async () => {
+            throw new Error('org secret "x.webhook_secret" is not set');
+          },
         },
       },
       request("{}"),
@@ -160,7 +172,7 @@ describe("handleIntegrationDelivery", () => {
 
   test("a signed but unparseable body skips tolerantly with the raw bytes", async () => {
     const s = seams();
-    const result = await handleIntegrationDelivery(passRoute, request("not json"), s.deps);
+    const result = await handleIntegrationDelivery(passRoute, DECLARED, request("not json"), s.deps);
     expect(result.kind).toBe("skipped");
     expect(result.kind === "skipped" && new TextDecoder().decode(result.rawBody)).toBe("not json");
     expect(s.recorded).toHaveLength(0);
@@ -173,6 +185,7 @@ describe("handleIntegrationDelivery", () => {
     const { store, recorded } = fakeStore();
     const result = await handleIntegrationDelivery(
       passRoute,
+      DECLARED,
       request(JSON.stringify({ key: "k", id: "d9" })),
       {
         store,

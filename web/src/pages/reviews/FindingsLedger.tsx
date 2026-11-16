@@ -1,4 +1,4 @@
-import { ChevronRight, Code2, MessageSquare, ShieldCheck } from "lucide-react";
+import { ChevronRight, Code2, ShieldCheck } from "lucide-react";
 
 import type { Review, ReviewFinding, ReviewVerdict } from "../../gen/engram/app/v1/review_pb";
 import { Markdown } from "../../components/Markdown";
@@ -276,11 +276,6 @@ function FindingCard({
               {finding.fileUrl && (
                 <CardLink href={finding.fileUrl} icon={Code2}>
                   View the code
-                </CardLink>
-              )}
-              {finding.threadUrl && (
-                <CardLink href={finding.threadUrl} icon={MessageSquare}>
-                  Open the thread
                 </CardLink>
               )}
               {verdict && !verdict.reasoning && (

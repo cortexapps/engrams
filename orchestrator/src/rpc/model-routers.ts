@@ -7,6 +7,7 @@ import {
   type ModelRouterStore,
   type RouterModelAudience as StoreAudience,
   type RouterModelRow,
+  type RouterSettings,
 } from "../db/model-routers.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
 import {
@@ -52,9 +53,7 @@ function modelToProto(router: ModelRouterDefinition, row: RouterModelRow) {
     userEnabled: row.userEnabled,
     upstreamUrl: router.modelUrl?.(row.modelId) ?? "",
     updatedAt: row.updatedAt.toISOString(),
-    supportsReasoning:
-      row.supportedParameters.includes("reasoning") ||
-      row.supportedParameters.includes("reasoning_effort"),
+    supportsReasoning: router.takesReasoningEffort(row),
   };
 }
 
@@ -89,9 +88,12 @@ export function registerModelRouters(router: ConnectRouter, deps?: ModelRouterSe
       modelCount: models.length,
       availableModelCount: models.filter((model) => model.available).length,
       enabledModelCount: models.filter((model) => model.enabled).length,
-      defaultModel: roles.default ?? "",
-      titleModel: roles.title ?? "",
-      decisionModel: roles.decision ?? "",
+      defaultModel: roles.default?.model ?? "",
+      titleModel: roles.title?.model ?? "",
+      decisionModel: roles.decision?.model ?? "",
+      defaultModelChosen: roles.default?.chosen ?? false,
+      titleModelChosen: roles.title?.chosen ?? false,
+      decisionModelChosen: roles.decision?.chosen ?? false,
       connector: definition.connector,
     };
   }
@@ -188,14 +190,10 @@ export function registerModelRouters(router: ConnectRouter, deps?: ModelRouterSe
       const definition = getModelRouterDefinition(req.routerId);
       if (!definition) throw new ConnectError("model router not found", Code.NotFound);
       // An absent field keeps the stored choice; an empty one clears it.
-      const stored = await store.getSettings(definition.id);
-      const chosen = (model: string | undefined, kept: string | null | undefined): string | null =>
-        model === undefined ? (kept ?? null) : model.trim() || null;
-      const settings = {
-        defaultModel: chosen(req.defaultModel, stored?.defaultModel),
-        titleModel: chosen(req.titleModel, stored?.titleModel),
-        decisionModel: chosen(req.decisionModel, stored?.decisionModel),
-      };
+      const settings: Partial<RouterSettings> = {};
+      if (req.defaultModel !== undefined) settings.defaultModel = req.defaultModel.trim() || null;
+      if (req.titleModel !== undefined) settings.titleModel = req.titleModel.trim() || null;
+      if (req.decisionModel !== undefined) settings.decisionModel = req.decisionModel.trim() || null;
       // A native decisions endpoint serves models the chat catalog does not list.
       const inCatalog = [
         settings.defaultModel,

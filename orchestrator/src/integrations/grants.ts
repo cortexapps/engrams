@@ -1,5 +1,6 @@
 /** Connection-aware integration grant validation and policy projection (ADR 0109). */
 
+import { resourceScopeError } from "../connectors/registry.ts";
 import { ConnectError, Code } from "@connectrpc/connect";
 import { createHash } from "node:crypto";
 
@@ -126,6 +127,12 @@ export async function resolveIntegrationGrants(
     if (grant.resourceConstraints.some((value) => value.trim() === "")) {
       throw new ConnectError("resource constraints must not be empty", Code.InvalidArgument);
     }
+    // A scope that the egress policy cannot enforce gives the session nothing.
+    const unscoped =
+      grant.resourceConstraints.length > 0
+        ? resourceScopeError(connection.provider, grant.operation)
+        : null;
+    if (unscoped) throw new ConnectError(unscoped, Code.InvalidArgument);
     return { grant, connection };
   });
 }

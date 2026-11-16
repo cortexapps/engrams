@@ -15,8 +15,8 @@
 import { Hono, type Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 
-import type { LinearWorkspace } from "../integrations/linear-issues.ts";
-import { LinearError } from "../integrations/linear-issues.ts";
+import type { LinearWorkspace } from "../providers/linear/issues.ts";
+import { LinearError } from "../providers/linear/issues.ts";
 import { SpecTicketSyncError } from "../specs/ticket-sync.ts";
 import type {
   SpecTicketSyncOverrides,

@@ -33,7 +33,7 @@ import { createHash } from "node:crypto";
 
 import type { SpecTicketSyncState } from "@engrams/spec-document";
 import type { SpecTicketSyncOperationStatus } from "../db/schema.ts";
-import { LinearError, type LinearIssue, type LinearIssueClient } from "../integrations/linear-issues.ts";
+import { LinearError, type LinearIssue, type LinearIssueClient } from "../providers/linear/issues.ts";
 import { uuidV5 } from "./ticket-tree.ts";
 
 /** Where a spec's tickets land in Linear (R45). */

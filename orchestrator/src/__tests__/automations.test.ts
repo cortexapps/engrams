@@ -790,7 +790,7 @@ describe("AutomationService v2", () => {
       Code.InvalidArgument,
     );
     expect(err.rawMessage).toBe(
-      "inputs.repos.acme/x.mode: must be one of auto, on_request; inputs.repos.bad: not a valid owner/repo",
+      "inputs.repos.acme/x.mode: must be one of auto, on_request; inputs.repos.bad: not a valid repository path (owner/repo)",
     );
   });
 
@@ -1276,6 +1276,7 @@ describe("integration triggers + catalogs", () => {
     const { automations } = clients(
       adminDeps({
         connections: {
+          get: async () => null,
           getDefault: async () => ({
             id: "conn-github", alias: "default", provider: "github", displayName: "GitHub (default)",
             isDefault: true, config: {}, enabled: true, testedAt: null, createdAt: NOW, updatedAt: NOW,

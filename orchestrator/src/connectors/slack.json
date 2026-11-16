@@ -57,7 +57,6 @@
     }
   },
   "webhook": {
-    "verificationScheme": "slack_v0",
     "events": [
       {
         "key": "app_mention",
@@ -270,7 +269,6 @@
       }
     ],
     "ingress": {
-      "scheme": "slack_v0",
       "secretRef": "slack.signing_secret",
       "interactivity": true
     },

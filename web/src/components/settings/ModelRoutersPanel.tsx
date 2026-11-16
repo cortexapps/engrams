@@ -155,14 +155,15 @@ function RouterCard({ router }: { router: ModelRouter }) {
                 id={`${router.id}-${field}`}
                 label={label}
                 help={help}
-                stored={router[field]}
+                stored={router[`${field}Chosen`] ? router[field] : ""}
+                builtin={router[`${field}Chosen`] ? "" : router[field]}
                 models={models}
                 onSave={(model) => settings.mutateAsync({ routerId: router.id, [field]: model })}
               />
             ))}
           </div>
           <p className="mt-1 text-xs text-muted-foreground">
-            An empty role uses the router&apos;s built-in model, when it has one.
+            An empty role uses the router&apos;s built-in model, which the field then shows in grey.
           </p>
 
           <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-xs text-muted-foreground">
@@ -228,15 +229,17 @@ const ROLE_FIELDS = [
   { field: "decisionModel", label: "Decision model", help: "Decide blocks and smart routing." },
 ] as const;
 
-/** One role's model id. It saves on blur or Enter, and keeps the typed
- * value until the save succeeds. Escape drops the typed value. An empty
- * value clears the stored choice. The listed models are suggestions: the
- * server checks the id. */
+/** One role's model id. `stored` is the admin's choice; `builtin` is the
+ * model in use when there is none. It saves on blur or Enter, and keeps the
+ * typed value until the save succeeds. Escape drops the typed value and its
+ * error. An empty value clears the stored choice. The listed models are
+ * suggestions: the server checks the id. */
 function RoleModelField({
   id,
   label,
   help,
   stored,
+  builtin,
   models,
   onSave,
 }: {
@@ -244,6 +247,7 @@ function RoleModelField({
   label: string;
   help: string;
   stored: string;
+  builtin: string;
   models: RouterModel[];
   onSave: (model: string) => Promise<unknown>;
 }) {
@@ -284,12 +288,15 @@ function RoleModelField({
         id={id}
         list={`${id}-models`}
         value={draft ?? stored}
-        placeholder="none"
+        placeholder={builtin || "none"}
         onChange={(event) => setDraft(event.target.value)}
         onBlur={commit}
         onKeyDown={(event) => {
           if (event.key === "Enter") commit();
-          if (event.key === "Escape") setDraft(null);
+          if (event.key === "Escape") {
+            setDraft(null);
+            setError(null);
+          }
         }}
         className="bg-background/80 font-mono text-xs"
       />

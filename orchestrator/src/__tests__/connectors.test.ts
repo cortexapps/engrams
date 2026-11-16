@@ -132,7 +132,6 @@ describe("parseConnector", () => {
       {
         ...githubRaw,
         webhook: {
-          verificationScheme: "github_hmac_sha256",
           events: [{ key: "issues.opened", label: "Issue opened" }],
           aliases: [
             { path: "issue.title", alias: "issue.title" },
@@ -143,7 +142,6 @@ describe("parseConnector", () => {
       "github",
     );
     expect(c.webhook).toEqual({
-      verificationScheme: "github_hmac_sha256",
       events: [{ key: "issues.opened", label: "Issue opened" }],
       aliases: [
         { path: "issue.title", alias: "issue.title" },
@@ -158,21 +156,19 @@ describe("parseConnector", () => {
         {
           ...githubRaw,
           webhook: {
-            verificationScheme: "module_ref",
-            events: [],
+            events: "issues.opened",
             aliases: [],
             mapper: "./mapper.ts",
           },
         },
         "custom",
       ),
-    ).toThrow(/verificationScheme/);
+    ).toThrow(/webhook.events/);
 
     const withModuleReference = parseConnector(
       {
         ...githubRaw,
         webhook: {
-          verificationScheme: "github_hmac_sha256",
           events: [],
           aliases: [],
           mapper: "./mapper.ts",
@@ -180,18 +176,13 @@ describe("parseConnector", () => {
       },
       "custom",
     );
-    expect(Object.keys(withModuleReference.webhook ?? {}).sort()).toEqual([
-      "aliases",
-      "events",
-      "verificationScheme",
-    ]);
+    expect(Object.keys(withModuleReference.webhook ?? {}).sort()).toEqual(["aliases", "events"]);
 
     expect(() =>
       parseConnector(
         {
           ...githubRaw,
           webhook: {
-            verificationScheme: "github_hmac_sha256",
             events: [],
             aliases: [{ path: "issue.title", alias: "raw.issue" }],
           },
@@ -206,7 +197,6 @@ describe("parseConnector", () => {
           {
             ...githubRaw,
             webhook: {
-              verificationScheme: "github_hmac_sha256",
               events: [],
               aliases: [{ path: "issue.title", alias }],
             },
@@ -221,7 +211,6 @@ describe("parseConnector", () => {
         {
           ...githubRaw,
           webhook: {
-            verificationScheme: "github_hmac_sha256",
             events: [{ key: `issue.${"x".repeat(200)}`, label: "Too long" }],
             aliases: [],
           },
@@ -235,7 +224,6 @@ describe("parseConnector", () => {
         {
           ...githubRaw,
           webhook: {
-            verificationScheme: "github_hmac_sha256",
             events: [],
             aliases: [
               { path: "issue", alias: "issue" },
@@ -791,7 +779,7 @@ describe("on-disk registry", () => {
     expect(reg.get("datadog")!.credential.source).toBe("inject");
     expect(reg.get("github")!.credential.source).toBe("mint");
     expect(reg.get("github")!.webhook?.events.some((event) => event.key === "issues.opened")).toBe(true);
-    expect(reg.get("slack")!.webhook?.verificationScheme).toBe("slack_v0");
+    expect(reg.get("slack")!.webhook?.ingress?.secretRef).toBe("slack.signing_secret");
   });
 
   // ADR 0115: the shipped user-scoped facets survive the parse invariants —
@@ -2004,9 +1992,9 @@ describe("the shipped vanta connector", () => {
     expect(c.test?.path).toBe("/v1/organization");
   });
 
-  test("webhooks verify with the Svix scheme and every event has a fixture", () => {
+  test("webhooks name the signing secret and every event has a fixture", () => {
     const c = connectorRegistry().get("vanta")!;
-    expect(c.webhook?.ingress).toEqual({ scheme: "svix_hmac_sha256", secretRef: "vanta.webhook_secret" });
+    expect(c.webhook?.ingress).toEqual({ secretRef: "vanta.webhook_secret" });
     const keys = c.webhook!.events.map((e) => e.key);
     expect(keys).toContain("questionnaire.status-changed");
     expect(keys).toContain("trust-center.access-request.received");

@@ -32,7 +32,8 @@ function fakeStore(): ModelRouterStore {
     recordFailure: async () => {},
     getSettings: async (routerId) => settings.get(routerId) ?? null,
     setSettings: async (routerId, value) => {
-      settings.set(routerId, value);
+      const current = settings.get(routerId) ?? { defaultModel: null, titleModel: null, decisionModel: null };
+      settings.set(routerId, { ...current, ...value });
     },
   };
 }

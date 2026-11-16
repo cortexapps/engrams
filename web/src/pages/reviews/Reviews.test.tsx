@@ -67,7 +67,6 @@ const findings = [
     state: "posted",
     githubThreadId: "998877",
     fileUrl: "https://github.com/cortexapps/engrams/blob/cccccccccccccccc/src/index.ts#L10-L12",
-    threadUrl: "https://github.com/cortexapps/engrams/pull/100#discussion_r998877",
     resolution: "fixed",
     sessionId: "finder-sess-1",
   },

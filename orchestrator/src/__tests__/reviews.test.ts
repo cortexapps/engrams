@@ -336,21 +336,18 @@ describe("ReviewService", () => {
     expect(github.findings[0]?.fileUrl).toBe(
       "https://github.com/openai/engrams/blob/head-sha/orchestrator/src/index.ts#L10-L12",
     );
-    expect(github.findings[0]?.threadUrl).toBeUndefined();
 
     const prUrl = "https://gitlab.example.com/acme/platform/api/-/merge_requests/7";
     const gitlab = await spawn(
       makeStore({
         ...detail,
         review: reviewRow({ provider: "gitlab", repo: "acme/platform/api", prNumber: 7, prUrl, githubReviewId: "500" }),
-        findings: [{ ...findingRow(), githubThreadId: "41" }],
       }),
     ).getReview({ id: REVIEW_ID });
     expect(gitlab.review?.postedReviewUrl).toBe(`${prUrl}#note_500`);
-    expect(gitlab.findings[0]).toMatchObject({
-      fileUrl: "https://gitlab.example.com/acme/platform/api/-/blob/head-sha/orchestrator/src/index.ts#L10-12",
-      threadUrl: `${prUrl}#note_41`,
-    });
+    expect(gitlab.findings[0]?.fileUrl).toBe(
+      "https://gitlab.example.com/acme/platform/api/-/blob/head-sha/orchestrator/src/index.ts#L10-12",
+    );
 
     // A GitLab record with no URL has no host to build one from.
     const bare = await spawn(

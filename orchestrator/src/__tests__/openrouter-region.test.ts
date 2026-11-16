@@ -2,8 +2,13 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import { create } from "@bufbuild/protobuf";
 import type { LanguageModelV3 } from "@ai-sdk/provider";
 import type { DecisionsClient } from "../model-routers/decisions.ts";
-import "../model-routers/client.ts";
-import { getIntegrationClient, invalidateIntegrationClient } from "../integrations/clients.ts";
+import { getModelRouterDefinition } from "../model-routers/registry.ts";
+import {
+  asBearer,
+  getIntegrationClient,
+  invalidateIntegrationClient,
+  registerIntegrationClient,
+} from "../integrations/clients.ts";
 import { runIntegrationOp, type RunOpDeps } from "../integrations/run-op.ts";
 import { compileIntegrationPolicy, connectorRegistry } from "../connectors/registry.ts";
 import {
@@ -63,6 +68,13 @@ test("SDK and Decisions requests follow a region change while the credential is 
       }),
     },
   };
+  // `model-routers/client.ts` registers this client on its first model call,
+  // which reads the database; the test registers the router's own client.
+  const router = getModelRouterDefinition("openrouter")!;
+  registerIntegrationClient(router.connector, (cred, apiHost) => ({
+    chat: router.chat(asBearer(cred), apiHost),
+    decisions: router.decisions!(asBearer(cred), apiHost),
+  }));
   try {
     for (const configured of [undefined, "us.openrouter.ai", "eu.openrouter.ai"]) {
       host = configured;

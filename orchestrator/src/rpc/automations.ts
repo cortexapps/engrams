@@ -104,9 +104,9 @@ import {
   type AutomationSender,
 } from "../automations/engine/inbox.ts";
 import type { AutomationDispatchStore } from "../db/automations.ts";
-import { defaultChatProvider, requireChat } from "../chat/registry.ts";
+import { chatFor, defaultChatProvider } from "../chat/registry.ts";
 import { defaultForgeProvider } from "../forges/registry.ts";
-import { makeLinearIssueClient } from "../integrations/linear-issues.ts";
+import { makeLinearIssueClient } from "../providers/linear/issues.ts";
 import type { WebhookAliasMapping } from "../automations/template.ts";
 
 export type GetSession = (
@@ -141,7 +141,7 @@ export interface AutomationDeps {
     IntegrationEventStore,
     "getLatest" | "listObservedEventKeys" | "list" | "getById" | "listObservedScopeValues"
   >;
-  connections?: Pick<IntegrationConnectionStore, "getDefault">;
+  connections?: Pick<IntegrationConnectionStore, "get" | "getDefault">;
   eventSample?: typeof loadEventSample;
   aliases?: (registrationId: string) => Promise<readonly WebhookAliasMapping[]>;
   workflowStarter?: AutomationWebhookStarter;
@@ -440,8 +440,18 @@ const DESCRIBE_INPUT_KEYS_MAX = 200;
 
 function productionInputKeyOptions(
   integrationEvents: () => Pick<IntegrationEventStore, "listObservedScopeValues">,
-  connections: () => Pick<IntegrationConnectionStore, "getDefault">,
+  connections: () => Pick<IntegrationConnectionStore, "get" | "getDefault">,
 ): InputKeyOptionSource {
+  /** The chat provider of the connection; the default one with none. */
+  const chatOf = async (connectionId: string | undefined) => {
+    const connection = connectionId ? await connections().get(connectionId) : null;
+    if (connectionId && !connection) {
+      throw new ConnectError("connection not found", Code.NotFound);
+    }
+    const chat = chatFor(connection?.provider ?? defaultChatProvider());
+    if (!chat) throw new ConnectError("the connection is not a chat provider", Code.InvalidArgument);
+    return chat;
+  };
   return {
     async list(noun, connectionId) {
       switch (noun) {
@@ -456,7 +466,7 @@ function productionInputKeyOptions(
           return repos.map((repo) => ({ key: repo, label: repo }));
         }
         case "channel":
-          return requireChat(defaultChatProvider()).listChannels();
+          return (await chatOf(connectionId)).listChannels();
         case "team": {
           const workspace = await makeLinearIssueClient().readWorkspace();
           return workspace.teams.map((team) => ({ key: team.id, label: team.name }));
@@ -465,10 +475,10 @@ function productionInputKeyOptions(
           throw new ConnectError(`unknown input noun "${noun}"`, Code.InvalidArgument);
       }
     },
-    async describe(noun, keys, _connectionId) {
+    async describe(noun, keys, connectionId) {
       switch (noun) {
         case "channel":
-          return requireChat(defaultChatProvider()).describeChannels(keys);
+          return (await chatOf(connectionId)).describeChannels(keys);
         case "team": {
           const workspace = await makeLinearIssueClient().readWorkspace();
           const names = new Map(workspace.teams.map((team) => [team.id, team.name]));

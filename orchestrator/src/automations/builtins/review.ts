@@ -2,9 +2,9 @@
  * (ADR 0119 D7; a workstream per pull request, ADR 0120).
  *
  * `reviewDefinition` holds the graph every variant shares. A `ReviewVariant`
- * fills what a forge decides: the events, the facts step, the checkout, the
- * worker's reach, and the connector actions. Each variant is its own
- * built-in row with its own key, switch and inputs.
+ * fills what a forge decides: the events, the checkout and the worker's
+ * reach. Each variant is its own built-in row with its own key, switch and
+ * inputs.
  *
  * The structure is locked. The `tunable` lists name the fields an org may
  * override through block overrides, and the inputs schema holds the per-org
@@ -17,9 +17,8 @@
  * comments and the review post are generic blocks.
  *
  * The facts step derives every value later blocks template from
- * (`steps.facts.value.*`), and returns null to reject the event. A variant
- * may use a Code block for it: the admission rule reads a map input by a
- * payload value, which a structured condition cannot express.
+ * (`steps.facts.value.*`), and its value is null to reject the event. The
+ * forge reads the event; `forges/review-facts.ts` holds the admission rule.
  *
  * `settings.onFinalize` reports a terminal state through
  * `review_close_pass`: failed or deadline marks the pass failed with the
@@ -33,8 +32,8 @@ import { REVIEW_CATEGORIES } from "../../reviewers/render.ts";
 import { FINDER_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT } from "../../reviews/control-plane.ts";
 import { PR_REVIEW_CAPABILITY, REVIEW_PHASE_SIGNALS } from "../../tools/review.ts";
 import {
-  REVIEW_DISPATCH_EVENT_KEY,
   REVIEW_FACTS,
+  REVIEW_FACTS_TYPE,
   REVIEW_HEAD_SHA,
   REVIEW_PR_NUMBER,
   REVIEW_REPO,
@@ -139,16 +138,14 @@ function prompt(
 const HEAD_SHORT = "${{ steps.open.head_sha | truncate: 7, '' }}";
 /** The status line while a pass runs. */
 const REVIEWING_STATUS = `👀 engrams is reviewing ${HEAD_SHORT}.`;
-/** The pinned status comment's key: `upsert_issue_comment` finds the
- * comment by it on every pass, and every edit goes through
- * `update_pinned_comment` with the same key so the marker survives the
- * rewrite (an edit through the plain update action would drop it, and the
- * next pass would post a second comment). */
+/** The key of the status comment. `upsert_pr_comment` finds the comment by
+ * it on every pass. `update_pr_comment` takes the same key and puts the
+ * marker back on the new body, so the next pass still finds the comment. */
 const STATUS_KEY = "review-status";
 
 function reviewBlocks(v: ReviewVariant): BlockDef[] {
   return [
-    { id: "facts", ...v.facts },
+    { id: "facts", type: REVIEW_FACTS_TYPE, tunable: [], config: { provider: v.provider } },
     {
       id: "admit",
       type: "filter",
@@ -174,17 +171,15 @@ function reviewBlocks(v: ReviewVariant): BlockDef[] {
         pr: { $ref: `${F}.pr_context` },
       },
     },
-    // ONE status comment per pull request, edited across passes: the pinned
-    // comment is found by its key on every later pass (the connector's
-    // marker scan), so a PR carries a single engrams status line that always
-    // names the latest head, not one new comment per push.
+    // One status comment for each pull request: every pass finds it by its
+    // key and rewrites it, so it names the latest head.
     {
       id: "ack",
       type: "integration_action",
       tunable: ["params"],
       config: {
         provider: v.provider,
-        actionId: v.actions.upsertStatus,
+        actionId: "upsert_pr_comment",
         params: {
           repo: REPO,
           number: PR_NUMBER,
@@ -200,7 +195,7 @@ function reviewBlocks(v: ReviewVariant): BlockDef[] {
       tunable: ["params"],
       config: {
         provider: v.provider,
-        actionId: v.actions.updateStatus,
+        actionId: "update_pr_comment",
         params: {
           repo: REPO,
           commentId: { $ref: "steps.ack.commentId" },
@@ -273,15 +268,14 @@ function reviewBlocks(v: ReviewVariant): BlockDef[] {
           tunable: [],
           config: {
             provider: v.provider,
-            actionId: v.actions.postReview,
+            actionId: "post_pr_review",
             params: {
               repo: "${{ steps.gate.repo }}",
               prNumber: { $ref: "steps.gate.pr_number" },
               commitId: "${{ steps.gate.commit_id }}",
               summary: "${{ steps.gate.summary_md }}",
-              // GitHub refuses the whole batch when one anchor is outside the
-              // diff (422); the action then posts this body instead, which
-              // re-quotes every finding so the PR still shows them.
+              // The body when not every inline comment is on the diff: it
+              // quotes every finding.
               fallbackSummary: "${{ steps.gate.fallback_summary_md }}",
               comments: { $ref: "steps.gate.comments" },
             },
@@ -298,10 +292,12 @@ function reviewBlocks(v: ReviewVariant): BlockDef[] {
             reviewId: { $ref: "steps.open.review_id" },
             // Missing on a replayed post (marker already there): `default`
             // makes the absent output render empty instead of failing.
-            githubReviewId: "${{ steps.post.github_review_id | default: '' }}",
-            // "false" when the action fell back to the summary-only review:
-            // the findings settle as ui_only and the pass summary follows.
-            inlinePosted: "${{ steps.post.inline_posted | default: true }}",
+            providerReviewId: "${{ steps.post.review_id | default: '' }}",
+            // "false" when the summary quotes every finding: the findings
+            // that are not on the diff settle as ui_only.
+            // `allow_false` keeps a false: `default` alone replaces it.
+            inlinePosted: "${{ steps.post.inline_posted | default: true, allow_false: true }}",
+            inlineFindingIds: "${{ steps.post.inline_finding_ids | default: '' | join: ',' }}",
           },
         },
         {
@@ -310,7 +306,7 @@ function reviewBlocks(v: ReviewVariant): BlockDef[] {
           tunable: ["params"],
           config: {
             provider: v.provider,
-            actionId: v.actions.updateStatus,
+            actionId: "update_pr_comment",
             params: {
               repo: REPO,
               commentId: { $ref: "steps.ack.commentId" },
@@ -327,7 +323,7 @@ function reviewBlocks(v: ReviewVariant): BlockDef[] {
           tunable: ["params"],
           config: {
             provider: v.provider,
-            actionId: v.actions.updateStatus,
+            actionId: "update_pr_comment",
             params: {
               repo: REPO,
               commentId: { $ref: "steps.ack.commentId" },
@@ -352,9 +348,9 @@ export function reviewDefinition(v: ReviewVariant): AutomationDefinition {
       scope: { fromInput: "repos" },
     },
     blocks: reviewBlocks(v),
-    // ADR 0120: a pull request is a WORKSTREAM. The main entrypoint's runs
-    // open it (or join it) by the key below; `pull_request.closed` ends it, so
-    // later events for that PR drop, audited, instead of opening review runs.
+    // ADR 0120: a pull request is a workstream. The runs of the main
+    // entrypoint open it or join it by the key below. A closed event ends it,
+    // so a later event for that pull request starts no review.
     entrypoints: [
       {
         id: "closed",
@@ -399,8 +395,8 @@ export function reviewDefinition(v: ReviewVariant): AutomationDefinition {
         key: "mention",
         label: "Mention handle",
         type: "string",
-        help: 'The handle a comment must mention to request a review, e.g. "@engrams-agent review". Defaults to the review App\'s login.',
-        default: "@engrams",
+        help: 'The handle a comment must mention to give a command, e.g. "@engrams-agent review". Empty turns comment commands off.',
+        default: v.mentionOfUnsetRow,
       },
       {
         key: "categories",

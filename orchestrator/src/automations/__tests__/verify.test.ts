@@ -7,10 +7,15 @@ import {
   ResolvedCredentialSchema,
   ResolveIntegrationCredentialResponseSchema,
 } from "../../gen/engram/app/v1/integration_op_pb.ts";
+import type { IntegrationEventSource } from "../integration-ingress.ts";
+import { githubEventSource } from "../../providers/github/events.ts";
+import { gitlabEventSource } from "../../providers/gitlab/events.ts";
+import { linearEventSource } from "../../providers/linear/events.ts";
+import { slackEventSource } from "../../providers/slack/events.ts";
+import { vantaEventSource } from "../../providers/vanta/events.ts";
 import {
   makeVerificationSecretResolver,
   resetVerificationSecretCache,
-  verifyIngress,
   verifyWebhook,
 } from "../verify.ts";
 
@@ -51,57 +56,62 @@ describe("webhook verification strategies", () => {
   });
 });
 
-describe("provider ingress verification", () => {
+describe("provider event source verification", () => {
   const NOW = new Date("2026-08-21T12:00:00Z");
   const seconds = String(Math.floor(NOW.getTime() / 1000));
 
   function ingress(
-    scheme:
-      | "github_hmac_sha256"
-      | "slack_v0"
-      | "linear_hmac_sha256"
-      | "svix_hmac_sha256"
-      | "gitlab_webhook",
+    source: IntegrationEventSource,
     headers: Record<string, string>,
     secret = SECRET,
   ): Promise<boolean> {
-    return verifyIngress({
-      provider: "example",
-      ingress: { scheme, secretRef: "example.webhook_secret" },
+    return source.verify({
       headers: new Headers(headers),
       rawBody: BODY,
-      secrets: { resolve: async () => secret },
       now: NOW,
+      secret: async () => secret,
     });
   }
 
-  test("github_hmac_sha256 reads the prefixed X-Hub-Signature-256", async () => {
+  test("a secret that cannot be read rejects the verify", async () => {
+    const unreadable = githubEventSource.verify({
+      headers: new Headers({ "x-hub-signature-256": `sha256=${digest(BODY)}` }),
+      rawBody: BODY,
+      now: NOW,
+      secret: async () => {
+        throw new Error("not sealed");
+      },
+    });
+    await expect(unreadable).rejects.toThrow("not sealed");
+  });
+
+  test("GitHub reads the prefixed X-Hub-Signature-256", async () => {
     const header = "x-hub-signature-256";
-    expect(await ingress("github_hmac_sha256", { [header]: `sha256=${digest(BODY)}` })).toBe(true);
-    expect(await ingress("github_hmac_sha256", { [header]: `sha256=${digest("other")}` })).toBe(false);
-    expect(await ingress("github_hmac_sha256", { [header]: "sha256=short" })).toBe(false);
-    expect(await ingress("github_hmac_sha256", { [header]: encodeURI("💥") })).toBe(false);
-    expect(await ingress("github_hmac_sha256", {})).toBe(false);
+    expect(await ingress(githubEventSource, { [header]: `sha256=${digest(BODY)}` })).toBe(true);
+    expect(await ingress(githubEventSource, { [header]: `sha256=${digest("other")}` })).toBe(false);
+    expect(await ingress(githubEventSource, { [header]: "sha256=short" })).toBe(false);
+    expect(await ingress(githubEventSource, { [header]: encodeURI("💥") })).toBe(false);
+    expect(await ingress(githubEventSource, {})).toBe(false);
   });
 
-  test("linear_hmac_sha256 reads the bare hex Linear-Signature", async () => {
-    expect(await ingress("linear_hmac_sha256", { "linear-signature": digest(BODY) })).toBe(true);
-    expect(await ingress("linear_hmac_sha256", { "linear-signature": `sha256=${digest(BODY)}` }))
+  test("Linear reads the bare hex Linear-Signature", async () => {
+    expect(await ingress(linearEventSource, { "linear-signature": digest(BODY) })).toBe(true);
+    expect(await ingress(linearEventSource, { "linear-signature": `sha256=${digest(BODY)}` }))
       .toBe(false);
-    expect(await ingress("linear_hmac_sha256", {})).toBe(false);
+    expect(await ingress(linearEventSource, {})).toBe(false);
   });
 
-  test("slack_v0 signs the timestamp with the body and refuses a stale one", async () => {
+  test("Slack signs the timestamp with the body and refuses a stale one", async () => {
     const sign = (ts: string) => ({
       "x-slack-request-timestamp": ts,
       "x-slack-signature": `v0=${digest(Buffer.concat([Buffer.from(`v0:${ts}:`), BODY]))}`,
     });
-    expect(await ingress("slack_v0", sign(seconds))).toBe(true);
-    expect(await ingress("slack_v0", sign(String(Number(seconds) - 3600)))).toBe(false);
-    expect(await ingress("slack_v0", {})).toBe(false);
+    expect(await ingress(slackEventSource, sign(seconds))).toBe(true);
+    expect(await ingress(slackEventSource, sign(String(Number(seconds) - 3600)))).toBe(false);
+    expect(await ingress(slackEventSource, {})).toBe(false);
   });
 
-  test("svix_hmac_sha256 signs id, timestamp, and body under the decoded secret", async () => {
+  test("Vanta (Svix) signs id, timestamp, and body under the decoded secret", async () => {
     const key = Buffer.from("svix-test-key");
     const secret = `whsec_${key.toString("base64")}`;
     const sign = (ts: string) => ({
@@ -112,20 +122,20 @@ describe("provider ingress verification", () => {
         .update(BODY)
         .digest("base64")}`,
     });
-    expect(await ingress("svix_hmac_sha256", sign(seconds), secret)).toBe(true);
-    expect(await ingress("svix_hmac_sha256", sign(String(Number(seconds) - 3600)), secret))
+    expect(await ingress(vantaEventSource, sign(seconds), secret)).toBe(true);
+    expect(await ingress(vantaEventSource, sign(String(Number(seconds) - 3600)), secret))
       .toBe(false);
-    expect(await ingress("svix_hmac_sha256", {}, secret)).toBe(false);
+    expect(await ingress(vantaEventSource, {}, secret)).toBe(false);
   });
 
-  test("gitlab_webhook compares the secret token header", async () => {
-    expect(await ingress("gitlab_webhook", { "x-gitlab-token": SECRET })).toBe(true);
-    expect(await ingress("gitlab_webhook", { "x-gitlab-token": "other" })).toBe(false);
-    expect(await ingress("gitlab_webhook", {})).toBe(false);
-    expect(await ingress("gitlab_webhook", { "x-gitlab-token": "" }, "")).toBe(false);
+  test("GitLab compares the secret token header", async () => {
+    expect(await ingress(gitlabEventSource, { "x-gitlab-token": SECRET })).toBe(true);
+    expect(await ingress(gitlabEventSource, { "x-gitlab-token": "other" })).toBe(false);
+    expect(await ingress(gitlabEventSource, {})).toBe(false);
+    expect(await ingress(gitlabEventSource, { "x-gitlab-token": "" }, "")).toBe(false);
   });
 
-  test("gitlab_webhook with a signing token takes only a signature", async () => {
+  test("GitLab with a signing token takes only a signature", async () => {
     const key = Buffer.from("gitlab-test-key");
     const secret = `whsec_${key.toString("base64")}`;
     const signed = (ts: string) => ({
@@ -136,11 +146,11 @@ describe("provider ingress verification", () => {
         .update(BODY)
         .digest("base64")}`,
     });
-    expect(await ingress("gitlab_webhook", signed(seconds), secret)).toBe(true);
-    expect(await ingress("gitlab_webhook", signed(String(Number(seconds) - 3600)), secret))
+    expect(await ingress(gitlabEventSource, signed(seconds), secret)).toBe(true);
+    expect(await ingress(gitlabEventSource, signed(String(Number(seconds) - 3600)), secret))
       .toBe(false);
     // The secret in the token header does not pass in place of a signature.
-    expect(await ingress("gitlab_webhook", { "x-gitlab-token": secret }, secret)).toBe(false);
+    expect(await ingress(gitlabEventSource, { "x-gitlab-token": secret }, secret)).toBe(false);
   });
 });
 

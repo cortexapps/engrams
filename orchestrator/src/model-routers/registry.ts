@@ -4,8 +4,7 @@ import type { LanguageModel } from "ai";
 
 import { connectorRegistry } from "../connectors/registry.ts";
 import type { RouterModelInput } from "../db/model-routers.ts";
-import { LITELLM } from "../providers/litellm/router.ts";
-import { OPENROUTER } from "../providers/openrouter/router.ts";
+import { providerSpecs } from "../providers/index.ts";
 import type { DecisionsClient } from "./decisions.ts";
 
 export const ROUTER_PROTOCOLS = ["anthropic_messages", "openai_responses"] as const;
@@ -24,7 +23,8 @@ export interface ModelRouterSpec {
   description: string;
   /** The connector that holds the router's key and host. */
   connector: string;
-  protocols: Readonly<Record<RouterProtocol, { basePath: string }>>;
+  /** The protocols the router speaks. A harness needs one of them. */
+  protocols: Readonly<Partial<Record<RouterProtocol, { basePath: string }>>>;
   /** Built-in model per role. A role without one needs an admin's choice. */
   models: Partial<Record<RouterRole, string>>;
   catalog: {
@@ -32,6 +32,8 @@ export interface ModelRouterSpec {
     refreshIntervalMs: number;
     parse(body: Uint8Array): CatalogModel[];
   };
+  /** Whether a catalog model takes a reasoning effort. */
+  takesReasoningEffort(model: Pick<CatalogModel, "supportedParameters">): boolean;
   /** The public page for a model, when the router has one. */
   modelUrl?(modelId: string): string;
   /** Chat models for calls the orchestrator makes itself. */
@@ -56,27 +58,38 @@ function define(spec: ModelRouterSpec): ModelRouterDefinition {
   return { ...spec, credentialSecret: secretRef };
 }
 
-const REGISTRY = new Map([OPENROUTER, LITELLM].map((spec) => [spec.id, define(spec)]));
+const definitions = new WeakMap<ModelRouterSpec, ModelRouterDefinition>();
 
 export function listModelRouterDefinitions(): ModelRouterDefinition[] {
-  return [...REGISTRY.values()];
+  return providerSpecs().flatMap((provider) => {
+    const spec = provider.router;
+    if (!spec) return [];
+    let definition = definitions.get(spec);
+    if (!definition) definitions.set(spec, (definition = define(spec)));
+    return [definition];
+  });
 }
 
 export function getModelRouterDefinition(id: string): ModelRouterDefinition | null {
-  return REGISTRY.get(id) ?? null;
+  return listModelRouterDefinitions().find((router) => router.id === id) ?? null;
 }
 
+/** The first protocol that the router and the harness both speak. */
 function selectRouterProtocol(
   router: ModelRouterDefinition,
   harnessProtocols: readonly string[],
-): RouterProtocol | null {
-  return ROUTER_PROTOCOLS.find(
-    (protocol) => protocol in router.protocols && harnessProtocols.includes(protocol),
-  ) ?? null;
+): { protocol: RouterProtocol; basePath: string } | null {
+  for (const protocol of ROUTER_PROTOCOLS) {
+    const endpoint = router.protocols[protocol];
+    if (endpoint && harnessProtocols.includes(protocol)) {
+      return { protocol, basePath: endpoint.basePath };
+    }
+  }
+  return null;
 }
 
 export type RouterSelection =
-  | { ok: true; router: ModelRouterDefinition; protocol: RouterProtocol }
+  | { ok: true; router: ModelRouterDefinition; protocol: RouterProtocol; basePath: string }
   | {
       ok: false;
       field: "modelRouter" | "model";
@@ -102,8 +115,8 @@ export async function resolveRouterSelection(input: {
       message: `model router "${input.routerId}" is not registered`,
     };
   }
-  const protocol = selectRouterProtocol(router, input.harnessProtocols);
-  if (!protocol) {
+  const endpoint = selectRouterProtocol(router, input.harnessProtocols);
+  if (!endpoint) {
     return {
       ok: false,
       field: "modelRouter",
@@ -119,5 +132,5 @@ export async function resolveRouterSelection(input: {
       message: `model "${input.model.id}" is not in router "${router.id}"`,
     };
   }
-  return { ok: true, router, protocol };
+  return { ok: true, router, ...endpoint };
 }

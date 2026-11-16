@@ -139,7 +139,6 @@ function findingToProto(row: ReviewFindingRow, review: ReviewRow): ReviewFinding
             startLine: row.startLine,
             endLine: row.endLine,
           }),
-          ...(row.githubThreadId != null ? { threadUrl: links.comment(prUrl, row.githubThreadId) } : {}),
         }
       : {}),
     id: row.id,

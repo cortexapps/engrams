@@ -87,7 +87,7 @@ describe("validateInputValues — the review schema (shared fixture)", () => {
       },
     });
     expect(errors).toEqual([
-      { key: "repos", path: "not-a-repo", code: "map_key", message: "not a valid owner/repo" },
+      { key: "repos", path: "not-a-repo", code: "map_key", message: "not a valid repository path (owner/repo)" },
       { key: "repos", path: "acme/x", code: "shape", message: "row must be an object" },
       { key: "repos", path: "acme/y.mode", code: "enum", message: "must be one of auto, on_request" },
       { key: "repos", path: "acme/y.autofix", code: "type", message: "must be on or off" },
@@ -153,14 +153,16 @@ describe("validateInputValues — every rule", () => {
   });
 
   test("map key nouns", () => {
-    expect(isValidMapKey("repository", "Acme/Repo.js")).toBe(true);
-    expect(isValidMapKey("repository", "acme")).toBe(false);
-    expect(isValidMapKey("channel", "C0123456789")).toBe(true);
-    expect(isValidMapKey("channel", "#eng-reviews")).toBe(true);
-    expect(isValidMapKey("channel", "general")).toBe(false);
-    expect(isValidMapKey("team", "ENG")).toBe(true);
-    expect(isValidMapKey("team", "eng")).toBe(false);
-    expect(isValidMapKey(undefined, "")).toBe(false);
+    expect(isValidMapKey({ keyNoun: "repository" }, "Acme/Repo.js")).toBe(true);
+    expect(isValidMapKey({ keyNoun: "repository" }, "acme/platform/api")).toBe(true);
+    expect(isValidMapKey({ keyNoun: "repository" }, "acme")).toBe(false);
+    expect(isValidMapKey({ keyNoun: "repository" }, "acme/../api")).toBe(false);
+    expect(isValidMapKey({ keyNoun: "channel" }, "C0123456789")).toBe(true);
+    expect(isValidMapKey({ keyNoun: "channel" }, "#eng-reviews")).toBe(true);
+    expect(isValidMapKey({ keyNoun: "channel" }, "eng reviews")).toBe(false);
+    expect(isValidMapKey({ keyNoun: "team" }, "ENG")).toBe(true);
+    expect(isValidMapKey({ keyNoun: "team" }, "eng")).toBe(false);
+    expect(isValidMapKey({}, "")).toBe(false);
   });
 
   test("undeclared keys are not this function's concern", () => {
@@ -172,7 +174,7 @@ describe("validateInputValues — every rule", () => {
       validateInputValues(REVIEW_SCHEMA, { repos: { bad: { mode: "auto", autofix: true } } }),
     );
     expect(error.message).toBe(
-      "inputs rejected by the automation's schema: inputs.repos.bad: not a valid owner/repo",
+      "inputs rejected by the automation's schema: inputs.repos.bad: not a valid repository path (owner/repo)",
     );
   });
 });

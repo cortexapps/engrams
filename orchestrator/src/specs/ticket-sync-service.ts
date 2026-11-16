@@ -14,7 +14,7 @@
  */
 
 import type { SpecTicketSyncState } from "@engrams/spec-document";
-import type { LinearIssue } from "../integrations/linear-issues.ts";
+import type { LinearIssue } from "../providers/linear/issues.ts";
 import {
   mergeTarget,
   readIssueResult,

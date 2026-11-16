@@ -15,10 +15,10 @@ import meRoute from "./routes/me.ts";
 import adminRoute from "./routes/admin.ts";
 import integrationOpRoute from "./routes/integration-op.ts";
 import integrationOauthRoute from "./routes/integration-oauth.ts";
-import integrationEventsRoute from "./routes/integration-events.ts";
+import { makeIntegrationEventsRoute } from "./routes/integration-events.ts";
 import { chatSpecs } from "./chat/registry.ts";
 import hooksRoute from "./routes/hooks.ts";
-import reviewsDispatchRoute from "./routes/reviews-dispatch.ts";
+import { makeReviewsDispatchRoute } from "./routes/reviews-dispatch.ts";
 import { makeGoogleOidcRoute } from "./routes/google-oidc.ts";
 import { makeConnectionCredentialBrokerRoute } from "./routes/connection-credential-broker.ts";
 import { makeOidcKeyAdminRoute } from "./routes/oidc-key-admin.ts";
@@ -142,7 +142,7 @@ import { makeSpecPublishRoute } from "./routes/spec-publish.ts";
 import { makeSpecDecisionsRoute, PostgresSpecDecisionStore } from "./routes/spec-decisions.ts";
 import { makeSpecTicketRoute } from "./routes/spec-tickets.ts";
 import { makeSpecTicketSyncRoute } from "./routes/spec-ticket-sync.ts";
-import { makeLinearIssueClient } from "./integrations/linear-issues.ts";
+import { makeLinearIssueClient } from "./providers/linear/issues.ts";
 import { SpecTicketSyncService } from "./specs/ticket-sync-service.ts";
 import { PostgresSpecTicketSyncStore } from "./specs/ticket-sync-store.ts";
 import { makeSpecTicketSyncConnector } from "./specs/ticket-sync-connector.ts";
@@ -437,10 +437,10 @@ app.route("/", integrationOpRoute);
 // OAuth acquisition for connectors with an `oauth` facet (e.g. Slack "Add to Slack").
 app.route("/", integrationOauthRoute);
 // Provider event webhooks, verified against each connector's declared ingress.
-app.route("/", integrationEventsRoute);
+app.route("/", makeIntegrationEventsRoute());
 // A connector that declares interactivity makes the path public, so a
 // handler must be behind it, and a handler needs the declaration.
-const interactivity = new Map(chatSpecs().map((spec) => [spec.provider, spec.interactivity]));
+const interactivity = new Map(chatSpecs().map(({ provider, spec }) => [provider, spec.interactivity]));
 for (const provider of connectorRegistry().keys()) {
   const declared = declaredIngress(provider)?.ingress.interactivity === true;
   const route = interactivity.get(provider);
@@ -457,7 +457,7 @@ for (const provider of interactivity.keys()) {
 // ADR 0102: dynamically registered webhooks verify their own registration
 // secret and dispatch one-shot AutomationRunWorkflow occurrences.
 app.route("/", hooksRoute);
-app.route("/", reviewsDispatchRoute);
+app.route("/", makeReviewsDispatchRoute());
 
 // ADR 0085: in-guest IDE (code-server) HTTP proxy. Session-scoped + guarded;
 // the WS half is the upgrade hook passed to buildServer below. Mounted after

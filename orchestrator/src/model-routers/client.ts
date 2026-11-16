@@ -17,38 +17,72 @@ import {
   type DecisionsRequest,
   type DecisionsResponse,
 } from "./decisions.ts";
+import { makeModelRouterStore } from "../db/model-routers.ts";
 import { routerModels } from "./models.ts";
-import { listModelRouterDefinitions, type ModelRouterDefinition, type RouterRole } from "./registry.ts";
+import type { ModelRouterDefinition, RouterRole } from "./registry.ts";
 
 interface RouterClient {
   chat(modelId: string): LanguageModel;
   decisions?: DecisionsClient;
 }
 
-for (const router of listModelRouterDefinitions()) {
-  registerIntegrationClient(router.connector, (cred, host): RouterClient => {
-    const apiKey = asBearer(cred);
-    const decisions = router.decisions?.(apiKey, host);
-    return { chat: router.chat(apiKey, host), ...(decisions ? { decisions } : {}) };
-  });
+const registered = new WeakSet<ModelRouterDefinition>();
+
+function routerClient(router: ModelRouterDefinition): Promise<RouterClient> {
+  if (!registered.has(router)) {
+    registerIntegrationClient(router.connector, (cred, host): RouterClient => {
+      const apiKey = asBearer(cred);
+      const decisions = router.decisions?.(apiKey, host);
+      return { chat: router.chat(apiKey, host), ...(decisions ? { decisions } : {}) };
+    });
+    registered.add(router);
+  }
+  return getIntegrationClient<RouterClient>(router.connector);
 }
 
-/** The first connected router that has a model for `role`, with that model. */
-async function routerFor(
+interface RoutedModel {
+  router: ModelRouterDefinition;
+  model: string;
+}
+
+/** The connected router for `role`, with its model: the first one whose
+ * model an admin chose, else the first one that has a built-in model. */
+export async function routerFor(
   role: RouterRole,
-): Promise<{ router: ModelRouterDefinition; model: string } | null> {
-  for (const router of await connectedRoutersOrNone()) {
-    const model = (await routerModels(router))[role];
-    if (model) return { router, model };
+  deps: { routers: typeof connectedRoutersOrNone; models: typeof routerModels } = {
+    routers: connectedRoutersOrNone,
+    models: routerModels,
+  },
+): Promise<RoutedModel | null> {
+  let builtin: RoutedModel | null = null;
+  for (const router of await deps.routers()) {
+    const roleModel = (await deps.models(router))[role];
+    if (roleModel?.chosen) return { router, model: roleModel.model };
+    if (roleModel) builtin ??= { router, model: roleModel.model };
   }
-  return null;
+  return builtin;
+}
+
+/** The connected router that serves `model` for a decision: one whose
+ * decision model it is, else one whose catalog lists it, else the first. */
+async function routerForDecisionModel(model: string): Promise<RoutedModel | null> {
+  const routers = await connectedRoutersOrNone();
+  for (const router of routers) {
+    if ((await routerModels(router)).decision?.model === model) return { router, model };
+  }
+  const store = makeModelRouterStore();
+  for (const router of routers) {
+    if ((await store.getModel(router.id, model))?.available) return { router, model };
+  }
+  const [first] = routers;
+  return first ? { router: first, model } : null;
 }
 
 /** The model that titles a task; null when no connected router has one. */
 export async function titleModel(): Promise<LanguageModel | null> {
   const chosen = await routerFor("title");
   if (!chosen) return null;
-  return (await getIntegrationClient<RouterClient>(chosen.router.connector)).chat(chosen.model);
+  return (await routerClient(chosen.router)).chat(chosen.model);
 }
 
 /** Whether a connected router has a decision model. */
@@ -66,30 +100,27 @@ const TRANSIENT_LOOKUP_CODES = new Set([
 ]);
 
 /** Answer a decisions request; null when no connected router can. A request
- * that names its `model` goes to the first connected router; any other goes
- * to the first one that has a decision model. A transient failure to resolve
+ * that names its `model` goes to the router that serves the model; any other
+ * goes to the router for the decision role. A transient failure to resolve
  * the key is a retryable DecisionsApiError; a missing or rejected key stays
  * permanent. */
 export async function decide(request: DecisionsRequest): Promise<DecisionsResponse | null> {
-  let chosen: { router: ModelRouterDefinition; model: string } | null;
-  if (request.model) {
-    const [router] = await connectedRoutersOrNone();
-    chosen = router ? { router, model: request.model } : null;
-  } else {
-    try {
-      chosen = await routerFor("decision");
-    } catch (error) {
-      throw new DecisionsApiError(
-        `read the decision model: ${error instanceof Error ? error.message : String(error)}`,
-        null,
-        true,
-      );
-    }
+  let chosen: RoutedModel | null;
+  try {
+    chosen = request.model
+      ? await routerForDecisionModel(request.model)
+      : await routerFor("decision");
+  } catch (error) {
+    throw new DecisionsApiError(
+      `read the decision model: ${error instanceof Error ? error.message : String(error)}`,
+      null,
+      true,
+    );
   }
   if (!chosen) return null;
   let client: RouterClient;
   try {
-    client = await getIntegrationClient<RouterClient>(chosen.router.connector);
+    client = await routerClient(chosen.router);
   } catch (error) {
     if (error instanceof ConnectError && TRANSIENT_LOOKUP_CODES.has(error.code)) {
       throw new DecisionsApiError(`resolve the ${chosen.router.label} key: ${error.rawMessage}`, null, true);

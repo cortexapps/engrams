@@ -28,10 +28,10 @@
  * their mint scopes are compiled in Phase 5.
  */
 
+import { SAFE_REPO_PATH } from "../forges/forge.ts";
 import { readdirSync, readFileSync } from "node:fs";
 
 import type { ConnectionProvider } from "../integrations/providers/provider.ts";
-import { BUILTIN_ACTION_IDS } from "./builtin-actions-allowlist.ts";
 import { join } from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -70,6 +70,54 @@ export type Credential = InjectCredential | MintCredential;
 export interface HttpMatch {
   method?: string;
   path?: string;
+  /** The path for one resource of a grant that names resources:
+   * `{resource}` is the resource, `{resource:encoded}` is its URL-encoded
+   * form. A path with neither is the same for every resource. A connector
+   * that has one on an operation is resource-aware: a grant with resources
+   * then reaches only the operations that have one. */
+  resourcePath?: string;
+}
+
+const RESOURCE_PLACEHOLDER = /\{resource(:encoded)?\}/g;
+
+/** The path globs of `match` for a grant. Null when the grant names
+ * resources that this operation cannot be held to. */
+function grantPathGlobs(
+  match: HttpMatch | undefined,
+  resources: readonly string[],
+  resourceAware: boolean,
+): string[] | null {
+  if (!resourceAware || resources.length === 0) return match?.path ? [match.path] : [];
+  const template = match?.resourcePath;
+  // A resource goes into a glob, so it has the characters of a repository
+  // path only.
+  if (template === undefined || !resources.every((resource) => SAFE_REPO_PATH.test(resource))) {
+    return null;
+  }
+  const globs = resources.map((resource) =>
+    template.replace(RESOURCE_PLACEHOLDER, (_all, encoded) =>
+      encoded ? encodeURIComponent(resource) : resource,
+    ),
+  );
+  return [...new Set(globs)];
+}
+
+/** Why `operation` of `provider` cannot be held to a resource; null when it
+ * can, or when the connector is not resource-aware (the resource is then
+ * for the provider's own engine). */
+export function resourceScopeError(
+  provider: string,
+  operation: string,
+  registry: Map<string, Connector> = connectorRegistry(),
+): string | null {
+  const rest = (registry.get(provider)?.operations ?? []).flatMap((op) =>
+    op.match !== undefined && !isGraphqlMatch(op.match) ? [{ op, match: op.match }] : [],
+  );
+  if (!rest.some(({ match }) => match.resourcePath?.includes("{resource"))) return null;
+  const scoped = rest.some(
+    ({ op, match }) => op.grants.includes(operation) && match.resourcePath?.includes("{resource"),
+  );
+  return scoped ? null : `"${provider}:${operation}" cannot be limited to a resource`;
 }
 
 /**
@@ -411,11 +459,6 @@ export interface ConnectorSetting {
   hint?: string;
 }
 
-export type WebhookVerificationScheme =
-  | "github_hmac_sha256"
-  | "slack_v0"
-  | "generic_hmac_sha256";
-
 /** Bounded JSON-Schema subset for typed event fields and action inputs
  * (ADR 0119 D5). Deliberately tiny: enough to type a field picker and
  * validate action params, nothing more. */
@@ -460,15 +503,10 @@ export interface WebhookEventSpec {
   handleCandidates?: HandleTemplateSpec[];
 }
 
-/** Provider-owned ingress (ADR 0119 D5): how the integration event route
- * verifies deliveries and which sealed org secret signs them. */
+/** Provider-owned ingress (ADR 0119 D5): the sealed org secret that signs
+ * deliveries on the provider's event route. The provider's event source
+ * holds the signature scheme. */
 export interface WebhookIngressSpec {
-  scheme:
-    | "github_hmac_sha256"
-    | "slack_v0"
-    | "linear_hmac_sha256"
-    | "svix_hmac_sha256"
-    | "gitlab_webhook";
   secretRef: string;
   /** The provider also sends card clicks, signed the same way, to
    * `interactivityPath(provider)`. The path takes
@@ -493,10 +531,6 @@ export interface WebhookAliasSpec {
 }
 
 export interface WebhookFacet {
-  /** Custom webhook-REGISTRATION scheme hint (ADR 0102). Still read by the
-   * `/api/v1/hooks/:id` path; retires with the provider schemes in the HMAC
-   * retirement stack item. New code reads `ingress`. */
-  verificationScheme: WebhookVerificationScheme;
   events: WebhookEventSpec[];
   aliases: WebhookAliasSpec[];
   /** ADR 0119 D5: the provider-owned integration event route. */
@@ -530,6 +564,9 @@ export type ActionIdempotency =
 
 export interface ActionSpec {
   id: string;
+  /** Earlier ids of this action. A stored automation that names one runs
+   * this action. */
+  aliases?: string[];
   label: string;
   description?: string;
   /** Object-root FieldSchema; `required[]` enforced before execute. */
@@ -1522,18 +1559,6 @@ const WEBHOOK_EVENT_KEY_RE = /^[a-z0-9_-]+(?:\.[a-z0-9_-]+)*$/;
 const WEBHOOK_ALIAS_RE = /^[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)*$/;
 const WEBHOOK_PATH_RE = /^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/;
 const UNSAFE_OBJECT_PATH_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
-const WEBHOOK_SCHEMES: ReadonlySet<WebhookVerificationScheme> = new Set([
-  "github_hmac_sha256",
-  "slack_v0",
-  "generic_hmac_sha256",
-]);
-const INGRESS_SCHEMES: ReadonlySet<WebhookIngressSpec["scheme"]> = new Set([
-  "github_hmac_sha256",
-  "slack_v0",
-  "linear_hmac_sha256",
-  "svix_hmac_sha256",
-  "gitlab_webhook",
-]);
 const MAX_EVENT_DESCRIPTION_LENGTH = 300;
 const FIELD_SCHEMA_MAX_DEPTH = 8;
 const FIELD_SCHEMA_MAX_PROPERTIES = 250;
@@ -1694,16 +1719,6 @@ function checkPayloadPath(path: string): string | null {
 export function parseWebhookFacet(where: string, raw: unknown): WebhookFacet {
   if (typeof raw !== "object" || raw === null) fail(where, '"webhook" must be an object');
   const o = raw as Record<string, unknown>;
-  if (
-    typeof o.verificationScheme !== "string" ||
-    !WEBHOOK_SCHEMES.has(o.verificationScheme as WebhookVerificationScheme)
-  ) {
-    fail(
-      where,
-      '"webhook.verificationScheme" must be "github_hmac_sha256", "slack_v0", or "generic_hmac_sha256"',
-    );
-  }
-
   if (!Array.isArray(o.events)) fail(where, '"webhook.events" must be an array');
   if (o.events.length > MAX_WEBHOOK_EVENTS) {
     fail(where, `"webhook.events" has ${o.events.length} entries (max ${MAX_WEBHOOK_EVENTS})`);
@@ -1794,15 +1809,6 @@ export function parseWebhookFacet(where: string, raw: unknown): WebhookFacet {
       fail(where, '"webhook.ingress" must be an object');
     }
     const i = o.ingress as Record<string, unknown>;
-    if (
-      typeof i.scheme !== "string" ||
-      !INGRESS_SCHEMES.has(i.scheme as WebhookIngressSpec["scheme"])
-    ) {
-      fail(
-        where,
-        `"webhook.ingress.scheme" must be one of ${[...INGRESS_SCHEMES].join(", ")}`,
-      );
-    }
     if (typeof i.secretRef !== "string" || !/^\S+$/.test(i.secretRef)) {
       fail(where, '"webhook.ingress.secretRef" must be a non-empty org-secret name');
     }
@@ -1810,7 +1816,6 @@ export function parseWebhookFacet(where: string, raw: unknown): WebhookFacet {
       fail(where, '"webhook.ingress.interactivity" must be true when present');
     }
     ingress = {
-      scheme: i.scheme as WebhookIngressSpec["scheme"],
       secretRef: i.secretRef,
       ...(i.interactivity === true ? { interactivity: true as const } : {}),
     };
@@ -1838,7 +1843,6 @@ export function parseWebhookFacet(where: string, raw: unknown): WebhookFacet {
   }
 
   return {
-    verificationScheme: o.verificationScheme as WebhookVerificationScheme,
     events,
     aliases,
     ...(ingress !== undefined ? { ingress } : {}),
@@ -1867,6 +1871,18 @@ export function parseActionsFacet(
     }
     if (ids.has(a.id)) fail(actionWhere, `duplicate action id "${a.id}"`);
     ids.add(a.id);
+    let aliases: string[] | undefined;
+    if (a.aliases !== undefined) {
+      if (!Array.isArray(a.aliases)) fail(actionWhere, '"aliases" must be an array');
+      aliases = a.aliases.map((alias) => {
+        if (typeof alias !== "string" || !ACTION_ID_RE.test(alias) || alias.length > 64) {
+          fail(actionWhere, 'each alias must be a lowercase identifier');
+        }
+        if (ids.has(alias)) fail(actionWhere, `duplicate action id "${alias}"`);
+        ids.add(alias);
+        return alias;
+      });
+    }
     if (typeof a.label !== "string" || !a.label.trim() || a.label.length > 120) {
       fail(actionWhere, '"label" must be a non-empty string of at most 120 characters');
     }
@@ -1935,6 +1951,7 @@ export function parseActionsFacet(
 
     return {
       id: a.id,
+      ...(aliases !== undefined ? { aliases } : {}),
       label: a.label,
       ...(a.description !== undefined ? { description: a.description as string } : {}),
       inputSchema,
@@ -2014,8 +2031,10 @@ function parseActionExecution(
       return { kind: "graphql", document: e.document };
     }
     case "builtin": {
-      if (typeof e.id !== "string" || !BUILTIN_ACTION_IDS.has(e.id)) {
-        fail(where, `"execute.id" must be one of the registered builtin actions`);
+      // `<provider>.<name>`. A test checks that each id has an implementation;
+      // this module does not load provider code.
+      if (typeof e.id !== "string" || !/^[a-z0-9_]+\.[a-z0-9_]+$/.test(e.id)) {
+        fail(where, '"execute.id" must be "<provider>.<name>"');
       }
       return { kind: "builtin", id: e.id };
     }
@@ -2177,7 +2196,14 @@ export function parseConnector(
       } else {
         if (m.method !== undefined && typeof m.method !== "string") fail(opWhere, '"match.method" must be a string');
         if (m.path !== undefined && typeof m.path !== "string") fail(opWhere, '"match.path" must be a string');
-        match = { ...(typeof m.method === "string" ? { method: m.method } : {}), ...(typeof m.path === "string" ? { path: m.path } : {}) };
+        if (m.resourcePath !== undefined && typeof m.resourcePath !== "string") {
+          fail(opWhere, '"match.resourcePath" must be a string');
+        }
+        match = {
+          ...(typeof m.method === "string" ? { method: m.method } : {}),
+          ...(typeof m.path === "string" ? { path: m.path } : {}),
+          ...(typeof m.resourcePath === "string" ? { resourcePath: m.resourcePath } : {}),
+        };
       }
     }
     if (op.template !== undefined) {
@@ -2704,8 +2730,20 @@ export function compileIntegrationPolicy(
     // a regional or self-hosted host is opened + injected onto, never a
     // hard-coded default the deployment does not use.
     const hosts = effectiveHosts(connector, resolveSettings(connector, grant.settings));
+    const resourceAware = connector.operations.some(
+      (op) => op.match !== undefined && !isGraphqlMatch(op.match) && op.match.resourcePath !== undefined,
+    );
     for (const op of connector.operations) {
       if (!op.grants.includes(grant.operation)) continue;
+      const graphql = op.match !== undefined && isGraphqlMatch(op.match);
+      // A GraphQL operation has no path to hold to a resource.
+      const restGlobs =
+        graphql && resourceAware && grant.resourceConstraints.length > 0
+          ? null
+          : graphql
+            ? []
+            : grantPathGlobs(op.match as HttpMatch | undefined, grant.resourceConstraints, resourceAware);
+      if (restGlobs === null) continue;
       for (const h of hosts) grantedHosts.add(h);
       // ADR 0059: a GraphQL op gates `POST <graphqlEndpoint>` and is body-matched
       // by (operation, field); a REST op gates by (method, path glob). The path
@@ -2723,7 +2761,7 @@ export function compileIntegrationPolicy(
         graphql_field = op.match.field;
       } else {
         methods = op.match?.method ? [op.match.method.toUpperCase()] : [];
-        path_globs = op.match?.path ? [op.match.path] : [];
+        path_globs = restGlobs;
       }
 
       // ADR 0115: a user-scoped grant on a human compile (userSubjectId set)

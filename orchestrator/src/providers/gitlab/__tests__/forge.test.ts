@@ -8,7 +8,12 @@ import { gitlabEventSource } from "../events.ts";
 import { GITLAB_REVIEW } from "../review-variant.ts";
 import { reviewDefinition } from "../../../automations/builtins/review.ts";
 import { validateDefinition } from "../../../automations/engine/definition.ts";
-import { ForgeRequestError, SAFE_REPO_PATH, type GitForge } from "../../../forges/forge.ts";
+import {
+  ForgeRequestError,
+  SAFE_REPO_PATH,
+  type GitForge,
+  type InlineComment,
+} from "../../../forges/forge.ts";
 import { requireForge, reviewVariantFor } from "../../../forges/registry.ts";
 import { reviewFacts } from "../../../forges/review-facts.ts";
 import {
@@ -124,8 +129,12 @@ describe("GitLab event source", () => {
     });
   });
 
-  test("skips a delivery with no retry-stable id or no kind", () => {
-    expect(extract({ "x-gitlab-event-uuid": "u" }, mergeRequestHook("open"))).toMatchObject({ kind: "skip" });
+  test("refuses a delivery with no retry-stable id and skips one with no kind", () => {
+    // `x-gitlab-event-uuid` differs on each retry, so it is not a delivery id.
+    expect(extract({ "x-gitlab-event-uuid": "u" }, mergeRequestHook("open"))).toMatchObject({
+      kind: "reject",
+      status: 400,
+    });
     expect(extract({ "webhook-id": "d" }, {})).toMatchObject({ kind: "skip" });
   });
 });
@@ -248,7 +257,7 @@ describe("GitLab forge", () => {
     expect(forge.isPermanentError(new ForgeRequestError(429, "slow down", ""))).toBe(false);
   });
 
-  const comments = [
+  const comments: InlineComment[] = [
     { findingId: "f1", path: "src/a.ts", line: 4, side: "RIGHT", body: "A finding." },
     { findingId: "f2", path: "src/a.ts", line: 2, side: "LEFT", body: "Another finding." },
   ];
@@ -295,8 +304,8 @@ describe("GitLab forge", () => {
     ]);
     expect(await post(forge)).toEqual({
       providerReviewId: "500",
-      posted: true,
       inlinePosted: true,
+      inlineFindingIds: ["f1", "f2"],
       summaryMd: "summary\n\n<!-- m -->",
     });
     expect(paths(calls)).toEqual([
@@ -338,7 +347,7 @@ describe("GitLab forge", () => {
   });
 
   test("two findings on one line both post, and a retry skips only the one that is there", async () => {
-    const twice = [
+    const twice: InlineComment[] = [
       { findingId: "f1", path: "src/a.ts", line: 4, side: "RIGHT", body: "Same text." },
       { findingId: "f2", path: "src/a.ts", line: 4, side: "RIGHT", body: "Same text." },
     ];
@@ -414,8 +423,9 @@ describe("GitLab forge", () => {
     await expect(post(forge)).rejects.toBeInstanceOf(ForgeRequestError);
   });
 
-  test("a line that GitLab would run as a quick action is escaped, outside a code block", async () => {
-    const { forge, calls } = scripted([response(200, VERSIONS.slice(0, 1)), response(201, { id: 503 })]);
+  test("a column-0 line that GitLab would run as a quick action is escaped, outside a code block", async () => {
+    // With no inline comment the post reads no diff version.
+    const { forge, calls } = scripted([response(201, { id: 503 })]);
     await forge.postReview({
       repo: REPO,
       prNumber: 7,
@@ -424,8 +434,9 @@ describe("GitLab forge", () => {
       marker: "<!-- m -->",
       comments: [],
     });
-    expect(JSON.parse(calls[1]!.body as string).body).toBe(
-      "Found:\n\\/approve\n  \\/merge\n```sh\n/bin/true\n```\na/b\n<!-- m -->",
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(calls[0]!.body as string).body).toBe(
+      "Found:\n\\/approve\n  /merge\n```sh\n/bin/true\n```\na/b\n<!-- m -->",
     );
   });
 
@@ -456,19 +467,22 @@ describe("GitLab forge", () => {
         { id: 8, author: SELF, body: "status <!-- k -->" },
       ]),
     ]);
-    expect(await notes.forge.findCommentWithMarker(REPO, 7, "<!-- k -->")).toMatchObject({ id: "7:8" });
+    expect(await notes.forge.findCommentWithMarker(REPO, 7, "<!-- k -->")).toBe("7:8");
     expect(notes.calls[1]!.path).toBe(`${MR_PATH}/notes?per_page=100&page=1&sort=desc&order_by=created_at`);
+    const none = scripted([response(200, SELF), response(200, [{ id: 9, author: { id: 6 }, body: "<!-- k -->" }])]);
+    expect(await none.forge.findCommentWithMarker(REPO, 7, "<!-- k -->")).toBeNull();
+    // A forge error is not "no comment": the caller would post a second one.
     const down = scripted([response(200, SELF), response(500, {})]);
-    expect(await down.forge.findCommentWithMarker(REPO, 7, "<!-- k -->")).toBeNull();
+    await expect(down.forge.findCommentWithMarker(REPO, 7, "<!-- k -->")).rejects.toBeInstanceOf(ForgeRequestError);
   });
 
   test("a status comment's id names its merge request", async () => {
     const { forge, calls } = scripted([response(201, { id: 8 }), response(200, { id: 8 })]);
-    const id = await forge.typedReview.createComment(REPO, 7, "status");
+    const id = await forge.createComment(REPO, 7, "status");
     expect(id).toBe("7:8");
-    await forge.typedReview.updateComment(REPO, id, "new status");
+    await forge.updateComment(REPO, id, "new status");
     expect(calls[1]).toMatchObject({ method: "PUT", path: `${MR_PATH}/notes/8` });
-    await expect(forge.typedReview.updateComment(REPO, "8", "x")).rejects.toBeInstanceOf(ForgeRequestError);
+    await expect(forge.updateComment(REPO, "8", "x")).rejects.toBeInstanceOf(ForgeRequestError);
   });
 
   test("lists diff comments with their thread root", async () => {
@@ -485,8 +499,8 @@ describe("GitLab forge", () => {
       ]),
     ]);
     expect(await forge.listReviewComments(REPO, 7)).toEqual([
-      { id: "1", inReplyToId: null, authorLogin: "bot", body: "root", path: "a.ts" },
-      { id: "2", inReplyToId: "1", authorLogin: "dev", body: "reply", path: "a.ts" },
+      { id: "1", inReplyToId: null, author: "bot", body: "root", path: "a.ts" },
+      { id: "2", inReplyToId: "1", author: "dev", body: "reply", path: "a.ts" },
     ]);
   });
 

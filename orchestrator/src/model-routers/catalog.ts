@@ -49,12 +49,16 @@ export async function refreshRouterCatalog(
 }
 
 export class ModelRouterCatalogRefresher {
-  #timer: ReturnType<typeof setInterval> | null = null;
+  #timers: Array<ReturnType<typeof setInterval>> = [];
 
   constructor(private readonly deps: RouterCatalogDeps) {}
 
-  async runOnce(): Promise<void> {
-    const routers = await connectedRoutersOrNone();
+  /** Refresh the catalog of each connected router; of `routerId` only when
+   * it is given. */
+  async runOnce(routerId?: string): Promise<void> {
+    const routers = (await connectedRoutersOrNone()).filter(
+      (router) => routerId === undefined || router.id === routerId,
+    );
     await Promise.allSettled(routers.map((router) => refreshRouterCatalog(router.id, this.deps)));
   }
 
@@ -62,15 +66,15 @@ export class ModelRouterCatalogRefresher {
     // Catalog availability must not delay readiness. The seeded or stale cache
     // remains usable while the first refresh runs.
     void this.runOnce();
-    const interval = Math.min(
-      ...listModelRouterDefinitions().map((router) => router.catalog.refreshIntervalMs),
-    );
-    this.#timer = setInterval(() => void this.runOnce(), interval);
-    this.#timer.unref?.();
+    for (const router of listModelRouterDefinitions()) {
+      const timer = setInterval(() => void this.runOnce(router.id), router.catalog.refreshIntervalMs);
+      timer.unref?.();
+      this.#timers.push(timer);
+    }
   }
 
   stop(): void {
-    if (this.#timer) clearInterval(this.#timer);
-    this.#timer = null;
+    for (const timer of this.#timers) clearInterval(timer);
+    this.#timers = [];
   }
 }

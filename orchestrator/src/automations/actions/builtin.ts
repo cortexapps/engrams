@@ -1,28 +1,14 @@
-/** The builtin action table (ADR 0119 D5).
+/** The built-in action table (ADR 0119 D5).
  *
- * Connector `actions[]` entries with `execute.kind: "builtin"` name an id
- * from connectors/builtin-actions-allowlist.ts; this module holds the TS
- * implementations. Every provider call rides an injected seam, so tests
- * never touch the network or the coordinator.
+ * A connector `actions[]` entry with `execute.kind: "builtin"` names an id
+ * `<provider>.<name>`. The implementation is the provider's: its spec lists
+ * its actions, and a git forge gets the forge role's actions. Every provider
+ * call goes through a client that a test can replace.
  */
 
-import { ForgeRequestError, type GitForge, type InlineComment } from "../../forges/forge.ts";
-import { forgeProviders, requireForge } from "../../forges/registry.ts";
-import {
-  runIntegrationOp as defaultRunIntegrationOp,
-  type RunOpDeps,
-} from "../../integrations/run-op.ts";
-import { SLACK_ACTIONS, type SlackChatClient } from "../../providers/slack/actions.ts";
-import { getSlackClient } from "../../providers/slack/client.ts";
-import {
-  makeLinearIssueClient,
-  type LinearIssueClient,
-} from "../../integrations/linear-issues.ts";
-import { actionClientId } from "./client-id.ts";
-import { IntegrationActionError } from "./errors.ts";
-import { optionalString, requireString } from "./params.ts";
-
-type RunIntegrationOp = typeof defaultRunIntegrationOp;
+import { forgeActions } from "../../forges/actions.ts";
+import type { RunOpDeps } from "../../integrations/run-op.ts";
+import { providerSpecs } from "../../providers/index.ts";
 
 export interface BuiltinActionContext {
   runId: string;
@@ -32,204 +18,64 @@ export interface BuiltinActionContext {
 }
 
 export interface BuiltinActionDeps {
-  forge(provider: string): GitForge;
-  slackClient(): Promise<SlackChatClient>;
-  linearClient(): LinearIssueClient;
+  runOpDeps?: RunOpDeps;
+  /** Test seam: the client of a provider, in place of the one its actions
+   * make. */
+  clients?: Record<string, unknown>;
 }
 
-export type BuiltinActionFn = (
+export type BuiltinActionFn<Client> = (
+  params: Record<string, unknown>,
+  ctx: BuiltinActionContext,
+  client: Client,
+) => Promise<Record<string, unknown>>;
+
+/** A provider's built-in actions, by name, over the provider's client. */
+export interface ProviderActions {
+  names: string[];
+  run(
+    provider: string,
+    name: string,
+    params: Record<string, unknown>,
+    ctx: BuiltinActionContext,
+    deps: BuiltinActionDeps,
+  ): Promise<Record<string, unknown>>;
+}
+
+export function defineActions<Client>(spec: {
+  client(provider: string, runOpDeps?: RunOpDeps): Client | Promise<Client>;
+  actions: Record<string, BuiltinActionFn<Client>>;
+}): ProviderActions {
+  return {
+    names: Object.keys(spec.actions),
+    async run(provider, name, params, ctx, deps) {
+      const action = spec.actions[name];
+      if (!action) throw new Error(`"${provider}" has no built-in action "${name}"`);
+      // A test supplies the client of the provider it names, so the cast holds.
+      const injected = deps.clients?.[provider] as Client | undefined;
+      return action(params, ctx, injected ?? (await spec.client(provider, deps.runOpDeps)));
+    },
+  };
+}
+
+export type BuiltinAction = (
   params: Record<string, unknown>,
   ctx: BuiltinActionContext,
   deps: BuiltinActionDeps,
 ) => Promise<Record<string, unknown>>;
 
-export type BuiltinActionTable = Record<string, BuiltinActionFn>;
-
-export function defaultBuiltinActionDeps(runOpDeps?: RunOpDeps): BuiltinActionDeps {
-  const runOp: RunIntegrationOp = (provider, req) => defaultRunIntegrationOp(provider, req, runOpDeps);
-  return {
-    forge: (provider) => requireForge(provider, { runIntegrationOp: runOp }),
-    slackClient: () => getSlackClient(runOpDeps),
-    linearClient: () => makeLinearIssueClient({ runIntegrationOp: runOp }),
-  };
-}
-
-async function hasReviewWithMarker(
-  forge: GitForge,
-  repo: string,
-  prNumber: number,
-  marker: string,
-): Promise<boolean> {
-  try {
-    return await forge.hasReviewWithMarker(repo, prNumber, marker);
-  } catch (error) {
-    if (!(error instanceof ForgeRequestError)) throw error;
-    const { status } = error;
-    throw new IntegrationActionError(
-      status >= 400 ? `list pull request reviews returned ${status}` : error.message,
-      status >= 400 && status < 500 && status !== 429,
-      status,
-    );
+/** Every built-in action, by id. */
+export function builtinActions(): Map<string, BuiltinAction> {
+  const table = new Map<string, BuiltinAction>();
+  for (const spec of providerSpecs()) {
+    for (const actions of [spec.actions, spec.forge ? forgeActions : undefined]) {
+      if (!actions) continue;
+      for (const name of actions.names) {
+        table.set(`${spec.provider}.${name}`, (params, ctx, deps) =>
+          actions.run(spec.provider, name, params, ctx, deps),
+        );
+      }
+    }
   }
+  return table;
 }
-
-function readComments(params: Record<string, unknown>): InlineComment[] {
-  const raw = params["comments"];
-  if (raw === undefined) return [];
-  if (!Array.isArray(raw)) {
-    throw new IntegrationActionError(`"comments" must be an array`, true);
-  }
-  return raw.map((item, i) => {
-    const record = item as Record<string, unknown>;
-    const path = record["path"];
-    const line = record["line"];
-    const body = record["body"];
-    if (typeof path !== "string" || typeof line !== "number" || typeof body !== "string") {
-      throw new IntegrationActionError(`comments[${i}] needs path, line, body`, true);
-    }
-    // A caller with a findings ledger (the PR-review built-in's review_settle
-    // output) names each comment's finding so the ledger row and the posted
-    // comment stay linked; a caller without one gets a positional id.
-    const findingId = typeof record["finding_id"] === "string" ? record["finding_id"] : `automation:${i}`;
-    const startLine = typeof record["start_line"] === "number" ? record["start_line"] : undefined;
-    return {
-      findingId,
-      path,
-      line,
-      ...(startLine !== undefined ? { startLine } : {}),
-      side: typeof record["side"] === "string" ? (record["side"] as string) : "RIGHT",
-      body,
-    };
-  });
-}
-
-/** Post a review on a pull request of `provider`'s forge. */
-function postPrReview(provider: string): BuiltinActionFn {
-  return async (params, ctx, deps) => {
-    const forge = deps.forge(provider);
-    const repo = requireString(params, "repo");
-    const prNumber = params["prNumber"];
-    if (typeof prNumber !== "number") {
-      throw new IntegrationActionError(`missing required integer "prNumber"`, true);
-    }
-    const summary = requireString(params, "summary");
-    // The body for a review the forge takes only without its inline
-    // comments: a caller with a findings ledger passes one that quotes every
-    // finding. Without it the summary is the body either way.
-    const fallbackSummary = optionalString(params, "fallbackSummary") ?? summary;
-    const marker = ctx.marker ?? `<!-- engrams-automation:${ctx.runId}:${ctx.stepPath} -->`;
-    // The guard for a crash between a posted review and its checkpoint.
-    if (await hasReviewWithMarker(forge, repo, prNumber, marker)) {
-      return { posted: false, already_posted: true };
-    }
-    const commitId =
-      optionalString(params, "commitId") ?? (await forge.fetchPullRequest(repo, prNumber)).headSha;
-    const result = await forge.postReview({
-      repo,
-      prNumber,
-      commitId,
-      buildSummary: (inlinePosted) => `${inlinePosted ? summary : fallbackSummary}\n\n${marker}`,
-      marker,
-      comments: readComments(params),
-    });
-    return {
-      posted: result.posted,
-      inline_posted: result.inlinePosted,
-      already_posted: false,
-      // The output name is in stored automations; it is the forge's review id.
-      ...(result.providerReviewId !== undefined ? { github_review_id: result.providerReviewId } : {}),
-    };
-  };
-}
-
-function forgeFailure(error: unknown): never {
-  if (!(error instanceof ForgeRequestError)) throw error;
-  const { status } = error;
-  throw new IntegrationActionError(error.message, status >= 400 && status < 500 && status !== 429, status);
-}
-
-function requireMarker(ctx: BuiltinActionContext): string {
-  if (ctx.marker === null) {
-    throw new IntegrationActionError("this action needs marker_comment idempotency", true);
-  }
-  return ctx.marker;
-}
-
-function requireComments(forge: GitForge): NonNullable<GitForge["typedReview"]> {
-  if (!forge.typedReview) {
-    throw new IntegrationActionError(`"${forge.provider}" has no comment action`, true);
-  }
-  return forge.typedReview;
-}
-
-/** Post a comment on a pull request once per marker: a later call with the
- * same marker returns the id of the comment an earlier call posted. */
-function upsertPrComment(provider: string): BuiltinActionFn {
-  return async (params, ctx, deps) => {
-    const forge = deps.forge(provider);
-    const comments = requireComments(forge);
-    const repo = requireString(params, "repo");
-    const number = params["number"];
-    if (typeof number !== "number") {
-      throw new IntegrationActionError(`missing required integer "number"`, true);
-    }
-    const marker = requireMarker(ctx);
-    const existing = await forge.findCommentWithMarker(repo, number, marker);
-    if (existing !== null) return { commentId: String(existing["id"]) };
-    try {
-      const body = `${requireString(params, "body")}\n\n${marker}`;
-      return { commentId: await comments.createComment(repo, number, body) };
-    } catch (error) {
-      return forgeFailure(error);
-    }
-  };
-}
-
-/** Rewrite a comment that `upsert_pr_comment` posted. The marker goes back
- * on the new body, so a later upsert still finds the comment. */
-function updatePrComment(provider: string): BuiltinActionFn {
-  return async (params, ctx, deps) => {
-    const comments = requireComments(deps.forge(provider));
-    const commentId = requireString(params, "commentId");
-    try {
-      await comments.updateComment(
-        requireString(params, "repo"),
-        commentId,
-        `${requireString(params, "body")}\n\n${requireMarker(ctx)}`,
-      );
-    } catch (error) {
-      return forgeFailure(error);
-    }
-    return { commentId };
-  };
-}
-
-export const BUILTIN_ACTIONS: BuiltinActionTable = {
-  ...Object.fromEntries(
-    forgeProviders().flatMap((provider) => [
-      [`${provider}.post_pr_review`, postPrReview(provider)],
-      // A forge with no comment methods posts its comments as plain HTTP
-      // actions of its connector.
-      ...(requireForge(provider).typedReview
-        ? [
-            [`${provider}.upsert_pr_comment`, upsertPrComment(provider)],
-            [`${provider}.update_pr_comment`, updatePrComment(provider)],
-          ]
-        : []),
-    ]),
-  ),
-
-  ...SLACK_ACTIONS,
-
-  "linear.create_issue": async (params, ctx, deps) => {
-    // CreateLinearIssueInput takes a caller-minted id (the in-repo spec-ticket
-    // precedent), so client_id idempotency is real: a retried create adopts.
-    const issue = await deps.linearClient().createIssue({
-      id: actionClientId(ctx.runId, ctx.stepPath),
-      teamId: requireString(params, "teamId"),
-      title: requireString(params, "title"),
-      description: optionalString(params, "description") ?? "",
-    });
-    return { id: issue.id, identifier: issue.identifier, url: issue.url };
-  },
-};

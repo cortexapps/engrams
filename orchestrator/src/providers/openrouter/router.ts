@@ -48,7 +48,7 @@ export function parseOpenRouterCatalog(body: Uint8Array): CatalogModel[] {
   return [...byId.values()];
 }
 
-export const OPENROUTER: ModelRouterSpec = {
+export const OPENROUTER_ROUTER: ModelRouterSpec = {
   id: "openrouter",
   label: "OpenRouter",
   description: "Shared access to tool-capable models through OpenRouter.",
@@ -68,6 +68,9 @@ export const OPENROUTER: ModelRouterSpec = {
     refreshIntervalMs: 6 * 60 * 60 * 1000,
     parse: parseOpenRouterCatalog,
   },
+  takesReasoningEffort: (model) =>
+    model.supportedParameters.includes("reasoning") ||
+    model.supportedParameters.includes("reasoning_effort"),
   // Model pages are on the public website, whatever the API region.
   modelUrl: (modelId) => `https://openrouter.ai/${modelId}`,
   chat: (apiKey, host) => {

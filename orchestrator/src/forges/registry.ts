@@ -1,40 +1,34 @@
 /** The git forges, keyed by the provider name of their connector. */
 
-import { GITHUB_FORGE } from "../providers/github/forge.ts";
-import { GITLAB_FORGE } from "../providers/gitlab/forge.ts";
 import type { ReviewVariant } from "../automations/builtins/review-variant.ts";
+import { providerSpecs } from "../providers/index.ts";
 import type { ForgeDeps, GitForge, GitForgeSpec } from "./forge.ts";
 
-// Built on first use: a provider module can load before this one, and its
-// spec is not initialized until its own module body ends.
-let specs: ReadonlyMap<string, GitForgeSpec> | null = null;
-function specTable(): ReadonlyMap<string, GitForgeSpec> {
-  return (specs ??= new Map([GITHUB_FORGE, GITLAB_FORGE].map((spec) => [spec.provider, spec])));
+function specs(): Array<[string, GitForgeSpec]> {
+  return providerSpecs().flatMap((spec) => (spec.forge ? [[spec.provider, spec.forge]] : []));
 }
-const production = new Map<string, GitForge>();
+// Keyed by the spec, so a test's provider list gets its own instances.
+const production = new WeakMap<GitForgeSpec, GitForge>();
 
-export function forgeProviders(): string[] {
-  return [...specTable().keys()];
-}
-
-/** The code-review built-in of each forge that has one. */
+/** The code-review built-in of each forge. */
 export function reviewVariants(): ReviewVariant[] {
-  return [...specTable().values()].flatMap((spec) => (spec.review ? [spec.review] : []));
+  return specs().map(([, spec]) => spec.review);
 }
 
-/** A forge's code-review built-in variant; null when it has none. */
+/** A forge's code-review built-in variant; null when the provider is not a
+ * forge. */
 export function reviewVariantFor(provider: string): ReviewVariant | null {
-  return specTable().get(provider)?.review ?? null;
+  return specs().find(([name]) => name === provider)?.[1].review ?? null;
 }
 
 /** The forge for `provider`, or null when the provider is not a forge. With
  * `deps` it is a fresh instance over those seams. */
 export function forgeFor(provider: string, deps?: ForgeDeps): GitForge | null {
-  const spec = specTable().get(provider);
+  const spec = specs().find(([name]) => name === provider)?.[1];
   if (!spec) return null;
   if (deps) return spec.make(deps);
-  let forge = production.get(provider);
-  if (!forge) production.set(provider, (forge = spec.make({})));
+  let forge = production.get(spec);
+  if (!forge) production.set(spec, (forge = spec.make({})));
   return forge;
 }
 
@@ -46,6 +40,7 @@ export function requireForge(provider: string, deps?: ForgeDeps): GitForge {
 
 /** The forge that a stored row or block config with no provider means. */
 export function defaultForgeProvider(): string {
-  for (const spec of specTable().values()) if (spec.legacyDefault) return spec.provider;
-  throw new Error("no git forge is the legacy default");
+  const found = specs().find(([, spec]) => spec.legacyDefault);
+  if (!found) throw new Error("no git forge is the legacy default");
+  return found[0];
 }

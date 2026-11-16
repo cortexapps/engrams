@@ -69,7 +69,7 @@ function commentPayload(body: string, assoc = "MEMBER"): Record<string, unknown>
     action: "created",
     repository: { full_name: "acme/other", name: "other" },
     issue: { number: 5, pull_request: { url: "x" }, html_url: "https://github.com/acme/other/pull/5" },
-    comment: { body, author_association: assoc },
+    comment: { body, author_association: assoc, user: { login: "dev" } },
     sender: { type: "User" },
   };
 }
@@ -115,6 +115,8 @@ function harness(options: {
   decision?: ReviewPostPayload;
   /** The forge's variant of the built-in (default: GitHub). */
   variant?: ReviewVariant;
+  /** What post_pr_review returns (default: a review with every comment inline). */
+  postOutput?: Record<string, unknown>;
 }): Harness {
   const definition = reviewDefinition(options.variant ?? GITHUB_REVIEW);
   const names: string[] = [];
@@ -175,8 +177,8 @@ function harness(options: {
       cpCalls.push("decideReviewResults");
       return options.decision ?? PAYLOAD;
     },
-    async recordSummaryOnlyPost(reviewId) {
-      cpCalls.push(`recordSummaryOnlyPost:${reviewId}`);
+    async recordSummaryOnlyPost(reviewId, inlineFindingIds) {
+      cpCalls.push(`recordSummaryOnlyPost:${reviewId}:${inlineFindingIds.join("|")}`);
     },
     async cleanupSupersededReview() {
       cpCalls.push("cleanupSupersededReview");
@@ -291,12 +293,21 @@ function harness(options: {
           throw new Error(`invalid params for ${input.actionId}: ${violations[0]!.path} ${violations[0]!.message}`);
         }
         actions.push({ actionId: input.actionId, params });
-        if (input.actionId === "create_issue_comment") return { commentId: 777, status: 201 };
-        // The pinned status comment: found or created, its id comes back.
-        if (input.actionId === "upsert_issue_comment") return { commentId: 777 };
-        if (input.actionId === "upsert_pr_comment") return { commentId: "17:777" };
+        // The outputs of the forge actions (`forges/actions.ts`). The pinned
+        // status comment: found or created, its forge token comes back.
+        if (input.actionId === "upsert_pr_comment") {
+          return { commentId: input.provider === "gitlab" ? "17:777" : "777" };
+        }
+        if (input.actionId === "update_pr_comment") return { commentId: params["commentId"] };
         if (input.actionId === "post_pr_review") {
-          return { posted: true, inline_posted: true, already_posted: false, github_review_id: "9001" };
+          return options.postOutput ?? {
+            posted: true,
+            inline_posted: true,
+            inline_finding_ids: ["f1"],
+            already_posted: false,
+            review_id: "9001",
+            github_review_id: "9001",
+          };
         }
         return { status: 200 };
       },
@@ -349,16 +360,16 @@ describe("PR-review built-in on the interpreter", () => {
     // head) → the review (structured comments passed by $ref) → the status
     // line pointing at it.
     expect(h.actions.map((a) => a.actionId)).toEqual([
-      "upsert_issue_comment",
-      "update_pinned_comment",
+      "upsert_pr_comment",
+      "update_pr_comment",
       "post_pr_review",
-      "update_pinned_comment",
+      "update_pr_comment",
     ]);
     expect(h.actions[0]!.params).toMatchObject({ repo: "acme/repo", number: 17, key: "review-status" });
     expect(String(h.actions[0]!.params["body"])).toContain("reviewing");
     // Every edit of the pinned comment carries the key, so the marker survives.
-    expect(h.actions[1]!.params).toMatchObject({ commentId: 777, key: "review-status" });
-    expect(h.actions[3]!.params).toMatchObject({ commentId: 777, key: "review-status" });
+    expect(h.actions[1]!.params).toMatchObject({ commentId: "777", key: "review-status" });
+    expect(h.actions[3]!.params).toMatchObject({ commentId: "777", key: "review-status" });
     // The posted review's id lands on the pass (the dossier's link).
     expect(h.recorded).toEqual([{ reviewId: "review-1", githubReviewId: "9001" }]);
     expect(h.actions[2]!.params).toMatchObject({
@@ -367,7 +378,7 @@ describe("PR-review built-in on the interpreter", () => {
       commitId: HEAD,
       comments: PAYLOAD.comments,
     });
-    expect(h.actions[3]!.params).toMatchObject({ commentId: 777 });
+    expect(h.actions[3]!.params).toMatchObject({ commentId: "777" });
     expect(String(h.actions[3]!.params["body"])).toContain("see the review");
     // Explicit end_session ran; finalize found nothing left to end.
     expect(h.ended).toEqual(["s-finder"]);
@@ -384,9 +395,9 @@ describe("PR-review built-in on the interpreter", () => {
     const result = await interpretAutomation(RUN, h.deps);
     expect(result.status).toBe("completed");
     expect(h.actions.map((a) => a.actionId)).toEqual([
-      "upsert_issue_comment",
-      "update_pinned_comment",
-      "update_pinned_comment",
+      "upsert_pr_comment",
+      "update_pr_comment",
+      "update_pr_comment",
     ]);
     expect(String(h.actions[2]!.params["body"])).toContain("no findings");
     expect(h.actions[2]!.params).toMatchObject({ key: "review-status" });
@@ -406,6 +417,45 @@ describe("PR-review built-in on the interpreter", () => {
     expect(result.status).toBe("completed");
     expect(h.actions.map((a) => a.actionId)).toContain("post_pr_review");
     expect(h.recorded).toEqual([{ reviewId: "review-1", githubReviewId: "9001" }]);
+  });
+
+  // Todo: Liquid's `default` replaces `false`, so
+  // `steps.post.inline_posted | default: true` in builtins/review.ts renders
+  // "true" and record_post never re-settles a summary-only post.
+  test("(a2) a summary-only post settles the findings whose comments are not on the diff", async () => {
+    const h = harness({
+      eventKey: "pull_request.opened",
+      payload: prPayload(),
+      recv: [finderDone(0)],
+      postOutput: {
+        posted: true,
+        inline_posted: false,
+        inline_finding_ids: [],
+        already_posted: false,
+        review_id: "9002",
+        github_review_id: "9002",
+      },
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.recorded).toEqual([{ reviewId: "review-1", githubReviewId: "9002" }]);
+    expect(h.cpCalls).toContain("recordSummaryOnlyPost:review-1:");
+  });
+
+  // Todo: on a replay post_pr_review returns no `inline_finding_ids`, and
+  // `steps.post.inline_finding_ids | join: ','` in builtins/review.ts throws
+  // "undefined variable" before `default` applies, so record_post fails.
+  test("(a3) a replayed post (the marker is on the pull request) records nothing and completes", async () => {
+    const h = harness({
+      eventKey: "pull_request.opened",
+      payload: prPayload(),
+      recv: [finderDone(0)],
+      postOutput: { posted: false, already_posted: true },
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe("completed");
+    expect(h.recorded).toEqual([]);
   });
 
   test("(b) candidates: the verifier pair runs before the gate", async () => {
@@ -501,7 +551,7 @@ describe("PR-review built-in on the interpreter", () => {
     expect(result.status).toBe("superseded");
     expect(h.prompts).toHaveLength(1);
     expect(h.cpCalls).not.toContain("decideReviewResults");
-    expect(h.actions.map((a) => a.actionId)).toEqual(["upsert_issue_comment", "update_pinned_comment"]);
+    expect(h.actions.map((a) => a.actionId)).toEqual(["upsert_pr_comment", "update_pr_comment"]);
     // No explicit end_session ran (the graph was cut short); finalize ended
     // the finder because the built-in creates workers with keep=false.
     expect(h.ended).toEqual(["s-finder"]);
@@ -527,7 +577,7 @@ describe("PR-review built-in on the interpreter", () => {
     const fail = h.cpCalls.find((c) => c.startsWith("failReview:"));
     expect(fail).toBeDefined();
     expect(fail).toMatch(/deadline/);
-    expect(h.actions.map((a) => a.actionId)).toEqual(["upsert_issue_comment", "update_pinned_comment"]);
+    expect(h.actions.map((a) => a.actionId)).toEqual(["upsert_pr_comment", "update_pr_comment"]);
     expect(h.names).toContain("step:__finalize__.report_failure:0");
     expect(h.names.at(-1)).toBe("step:__finalize__:0");
     // The hook is a step with its own ledger row, succeeded.
@@ -576,7 +626,7 @@ describe("merge-request review built-in on the interpreter", () => {
     ]);
     expect(h.sessions[0]).toMatchObject({
       keep: false,
-      capabilityOverride: ["engram:pr_review", "gitlab:repository:read"],
+      capabilityOverride: ["engram:pr_review", "gitlab:repository:read@acme/repo"],
     });
     expect(h.execs[0]!.command).toContain('git clone "https://${GITLAB_HOST:?}/acme/repo.git" /workspace/repo');
     expect(h.execs[0]!.command).toContain("fetch origin +refs/merge-requests/17/head");

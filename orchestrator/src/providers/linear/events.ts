@@ -7,11 +7,13 @@
 
 import type { IntegrationEventSource } from "../../automations/integration-ingress.ts";
 import { ownPath } from "../../automations/paths.ts";
+import { verifyHmacSha256Header } from "../../automations/verify.ts";
 
 const TIMESTAMP_SKEW_MS = 60_000;
 
 export const linearEventSource: IntegrationEventSource = {
   provider: "linear",
+  verify: (delivery) => verifyHmacSha256Header(delivery, "linear-signature"),
   extract: (headers, payload, now) => {
     const timestamp = payload["webhookTimestamp"];
     if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) {
