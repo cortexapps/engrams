@@ -47,14 +47,20 @@ pub(crate) struct SessionForge {
 }
 
 /// The session's forges, one per capability provider that serves a git host.
-pub(crate) async fn session_forges(state: &SharedState, caps: &[Capability]) -> Vec<SessionForge> {
+/// A provider the session names but the deployment has not connected is no
+/// forge; a provider whose configuration cannot be read is an error, so a
+/// caller never reads a broken forge as an absent one.
+pub(crate) async fn session_forges(
+    state: &SharedState,
+    caps: &[Capability],
+) -> Result<Vec<SessionForge>, String> {
     let providers: BTreeSet<&str> = caps.iter().map(|c| c.provider.as_str()).collect();
     let mut forges = Vec::new();
     for provider in providers {
         let Some(integration) = state
             .integrations
             .resolve(provider, &state.services.secrets)
-            .await
+            .await?
         else {
             continue;
         };
@@ -66,7 +72,7 @@ pub(crate) async fn session_forges(state: &SharedState, caps: &[Capability]) -> 
             });
         }
     }
-    forges
+    Ok(forges)
 }
 
 /// Why the session got no git credential.
@@ -119,7 +125,9 @@ async fn fetch_git_credential(
         .get_session_capabilities(session)
         .await
         .map_err(|e| Failed(format!("read session capabilities: {e}")))?;
-    let mut forges = session_forges(state, &caps).await;
+    let mut forges = session_forges(state, &caps)
+        .await
+        .map_err(|e| Failed(format!("resolve the session's git forges: {e}")))?;
     if let Some(host) = &host {
         forges.retain(|forge| forge.host.eq_ignore_ascii_case(host));
     }

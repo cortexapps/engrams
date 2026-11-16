@@ -1815,7 +1815,9 @@ pub(crate) async fn inject_forge_env(
         .meta
         .get_session_capabilities(session_id)
         .await?;
-    let forges = crate::api::forge::session_forges(state, &caps).await;
+    let forges = crate::api::forge::session_forges(state, &caps)
+        .await
+        .map_err(|e| ApiError::Internal(format!("resolve the session's git forges: {e}")))?;
     let git_caps: Vec<&engram_core::types::Capability> = caps
         .iter()
         .filter(|c| forges.iter().any(|f| f.provider == c.provider))
