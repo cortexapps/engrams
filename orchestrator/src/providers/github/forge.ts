@@ -23,7 +23,9 @@ import {
   unusable,
   type Json,
 } from "../../forges/http.ts";
+import { config } from "../../config.ts";
 import { EMPTY_PR_CONTEXT } from "../../forges/pr-context.ts";
+import { normalizeMentionHandle } from "../../forges/review-command.ts";
 import {
   runIntegrationOp as defaultRunIntegrationOp,
   type IntegrationOpResult,
@@ -211,9 +213,20 @@ function reviewEvent(eventKey: string, payload: Json): ReviewEvent | null {
 }
 
 export function makeGithubForge(
-  deps: { runIntegrationOp?: typeof defaultRunIntegrationOp } = {},
+  deps: {
+    runIntegrationOp?: typeof defaultRunIntegrationOp;
+    /** The app's login (`GITHUB_APP_LOGIN`); empty when it is not set. */
+    appLogin?: string;
+  } = {},
 ): GitForge {
   const runOp = deps.runIntegrationOp ?? defaultRunIntegrationOp;
+  const appSlug = normalizeMentionHandle(deps.appLogin ?? config.githubAppLogin).toLowerCase();
+  /** Whether the app wrote the comment. With no configured login, every
+   * bot's comment passes: the forge has no call that names the app. */
+  const isOwn = (user: unknown): boolean =>
+    isObject(user) &&
+    user["type"] === "Bot" &&
+    (appSlug === "" || String(user["login"] ?? "").toLowerCase() === `${appSlug}[bot]`);
   const send = (method: string, path: string, body?: unknown): Promise<IntegrationOpResult> =>
     runOp(PROVIDER, {
       method,
@@ -296,7 +309,7 @@ export function makeGithubForge(
     },
 
     // The newest 100 comments. A marker in a comment proves nothing by
-    // itself: any commenter can post one. The app's comments are a bot's.
+    // itself: any commenter can post one.
     async findCommentWithMarker(repo, prNumber, marker) {
       const comments = await list(
         "list comments",
@@ -305,7 +318,7 @@ export function makeGithubForge(
       for (const item of comments) {
         if (!isObject(item) || typeof item["body"] !== "string" || !item["body"].includes(marker)) continue;
         const id = positiveInt(item["id"]);
-        if (id !== null && isObject(item["user"]) && item["user"]["type"] === "Bot") return String(id);
+        if (id !== null && isOwn(item["user"])) return String(id);
       }
       return null;
     },

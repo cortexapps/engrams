@@ -49,6 +49,11 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
   ([#1793])
 - A GitLab capability that names a project (`gitlab:repository:read@group/project`) limits
   the session to that project. ([#1793])
+- GitLab `projects:read` reaches the project list and one project. It no longer reaches a
+  project's merge requests, issues, pipelines or files; each of those has its own power.
+  ([#1793])
+- With `GITHUB_APP_LOGIN` set, the review edits only a status comment that the app wrote.
+  ([#1793])
 - With more than one model router connected, a role uses the router whose model an admin
   chose. ([#1793])
 - A Decide block and smart routing work with any connected router that has a decision
