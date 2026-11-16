@@ -24,7 +24,6 @@ parking_lot.workspace = true
 rcgen.workspace = true
 time.workspace = true
 rustls.workspace = true
-rustls-pemfile.workspace = true
 webpki-roots.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -39,6 +38,7 @@ hickory-proto.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
+rustls-pemfile.workspace = true
 tempfile = "3"
 hex.workspace = true
 # Reads back the DER a mint produced, so the validity window is asserted

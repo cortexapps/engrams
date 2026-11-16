@@ -11,6 +11,11 @@ description = "Portable host-agent core: the side-effect seams (CoordControlPlan
 [lints.rust]
 unsafe_code = "deny"
 
+[lints.cargo]
+# `workspace-hack` is a dependency of every crate and no crate names it, and a
+# dependency that one platform uses reads as unused on the other.
+unused_dependencies = "allow"
+
 # Copied from the root Cargo.toml: `workspace = true` cannot coexist
 # with a crate-local lint.
 [lints.clippy]

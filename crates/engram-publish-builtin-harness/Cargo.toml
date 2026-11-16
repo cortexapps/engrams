@@ -20,6 +20,9 @@ repository.workspace = true
 name = "engram-publish-builtin-harness"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 clap.workspace = true
 engram-oci.workspace = true
