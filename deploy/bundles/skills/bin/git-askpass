@@ -3,19 +3,22 @@
 # bundle (ADR 0027); /etc/gitconfig (written by agentd for forge sessions)
 # points `core.askPass` at this path.
 #
-# git invokes this with the prompt string as $1. The username half returns
-# the fixed `x-access-token` (also set via credential.<host>.username, so
-# this branch is belt-and-suspenders); the password half asks the engrams
-# host for a fresh, short-lived credential over the forge vsock bridge.
-# The real token never persists in the guest.
+# git invokes this with the prompt string as $1, for example
+# "Username for 'https://github.com': " or
+# "Password for 'https://x-access-token@github.com': ". Both halves ask the
+# engrams host for a fresh, short-lived credential over the forge bridge and
+# print its username or its password. The real token never persists in the
+# guest.
+#
+# The host is the one the prompt's URL names, without user or port. A prompt
+# with no URL names no host, and the coordinator then mints for the
+# session's only forge.
+url=$(printf '%s' "$1" | sed -n "s|.*'\([a-zA-Z][a-zA-Z0-9+.-]*://[^']*\)'.*|\1|p")
+host=${url#*://}
+host=${host%%/*}
+host=${host##*@}
+host=${host%%:*}
 case "$1" in
-    *[Uu]sername*) printf 'x-access-token' ;;
-    *)
-        # ADR 0056 P2: parse the git host out of git's prompt (e.g.
-        # "Password for 'https://x-access-token@github.com': " → github.com) so the
-        # forge bridge mints for the right git-forge provider — no hardcoded host.
-        # Falls back to github.com if the prompt can't be parsed.
-        host=$(printf '%s' "$1" | sed -n 's|.*@\([a-zA-Z0-9.-]*\).*|\1|p')
-        exec engram-agentd forge-credential --host "${host:-github.com}"
-        ;;
+    *[Uu]sername*) exec engram-agentd forge-credential --username ${host:+--host "$host"} ;;
+    *) exec engram-agentd forge-credential ${host:+--host "$host"} ;;
 esac
