@@ -22,8 +22,9 @@ A provider is two things in `orchestrator/`:
 - **A module**, `src/providers/<name>/`. It holds every line of code that knows the
   provider. Code outside this directory does not name a provider; a test fails when it does.
 
-The role's registry lists the provider's spec, and that one line is the only edit outside
-the provider's own files.
+The module's `index.ts` exports one `ProviderSpec`: the roles the provider fills, its event
+source, and its automation actions. Add that spec to the list in `src/providers/index.ts`.
+That one line is the only edit outside the provider's own files.
 
 ## A connector alone
 
@@ -32,11 +33,14 @@ operations, and the egress proxy adds the credential to each allowed request. Th
 never sees the credential. Start here; many services need nothing more.
 
 A service that sends webhooks declares them in the connector's `webhook` section and adds
-`src/providers/<name>/events.ts`, which says what a verified delivery is: its event key, its
-delivery id, and the fields automations can filter on. Every provider's deliveries arrive at
-`/api/v1/integrations/<name>/events`. The connector's ingress scheme selects how a delivery
-is verified. If the service signs or authenticates deliveries in a way no scheme covers, add
-a scheme to `src/automations/verify.ts`.
+`src/providers/<name>/events.ts`, which verifies a delivery and says what it is: its event
+key, its delivery id, and the fields automations can filter on. Every provider's deliveries
+arrive at `/api/v1/integrations/<name>/events`. The connector names the secret, and
+`src/automations/verify.ts` has helpers for the common signatures (an HMAC-SHA256 header,
+Standard Webhooks).
+
+An action that one HTTP request cannot express is code: export a `defineActions` table from
+`src/providers/<name>/actions.ts`, and name each action `<name>.<action>` in the connector.
 
 ## A model router
 
@@ -44,7 +48,8 @@ Implement `ModelRouterSpec` (`src/model-routers/registry.ts`):
 
 - the protocols the router serves (Anthropic Messages, OpenAI Responses) and the base path
   of each;
-- the path of its model list and a parser for it;
+- the path of its model list, a parser for it, and whether a model takes a reasoning
+  effort;
 - a chat-model factory for the calls the orchestrator makes itself (titles, decisions);
 - optionally a built-in model for each role, a public page for a model, and a native
   decisions endpoint.
@@ -60,16 +65,18 @@ git's credential helper in the session. A forge with a static token declares the
 (`info/refs`, `git-upload-pack`, `git-receive-pack`) as operations in its connector, and the
 egress proxy adds the token, so the token never enters the session.
 
-For the pull request review, implement `GitForge` (`src/forges/forge.ts`): read a pull
-request, list its review comments, post a review, find a posted review by its marker, parse
-a pull request URL, and build the links to a pull request, a review, a comment, and a file.
-Then add a review variant (`src/automations/builtins/review-variant.ts`): the events that
-start and close a review, the checkout command, and the capabilities a reviewer session
-needs. The review's graph is shared; the variant fills its provider-shaped slots.
+For the pull request review, implement `GitForge` (`src/forges/forge.ts`): say what an
+event is, say whether a commenter may ask for a review, read a pull request, list its review
+comments, post a review, create, edit and find a status comment, parse a pull request URL,
+and build the links to a pull request, a review, and a file. Then add a review variant
+(`src/automations/builtins/review-variant.ts`): the events that start and close a review,
+the checkout command, and the capabilities a reviewer session needs. The review's graph,
+its admission rule and its actions are shared; the variant fills the provider-shaped slots.
+`src/providers/gitlab/` is the example to copy.
 
-A forge that can check a commenter's permission and edit a comment declares `typedReview`,
-and its variant uses the built-in `review_facts` step. `src/providers/gitlab/` is the
-example to copy.
+Give each repository-scoped operation in the connector a `resourcePath`, so a capability
+such as `<name>:repository:read@group/project` limits a reviewer session to that
+repository.
 
 ## A chat provider
 
@@ -99,6 +106,7 @@ Each role has tests to extend, and all of them run under `bun test` in `orchestr
   classification, admission, read, post, and a post that resumes after a failure.
 - A built-in variant: the definition must validate, and one scenario suite drives each
   variant through the interpreter.
-- The definitions of the GitHub review and the Slack thread bot are pinned by hash. A change
-  to a shared builder that moves either hash fails a test, because a new definition stops
-  the active runs of that built-in on every deployment.
+- The definitions of the built-ins are pinned by hash. A change to a shared builder that
+  moves a hash fails a test, because a new definition stops the active runs of that
+  built-in at the next deployment. Change the hash in the test on purpose, and say so in
+  the pull request.

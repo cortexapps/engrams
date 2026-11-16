@@ -23,6 +23,9 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
   ([#1793])
 - **A rollback past this release** makes a profile routed to LiteLLM, and the GitLab
   review, fail until you upgrade again. Nothing else changes back. ([#1793])
+- **The upgrade stops the pull request reviews and the Slack thread runs that are active
+  when it deploys.** Both built-ins have a new definition. A push or a `review` comment
+  starts the review again, and the next mention continues a thread. ([#1793])
 
 ### Added
 
@@ -40,8 +43,14 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 
 - **Git forges, chat services and model routers are roles.** GitHub, Slack and OpenRouter
   are implementations of them, and a new provider that fills a role gets the features built
-  on it. The pull request review and the Slack thread bot are unchanged. The site's "Add a
-  provider" page says what a provider implements. ([#1793])
+  on it. The site's "Add a provider" page says what a provider implements. ([#1793])
+- A pull request comment gives a command when the mention of the review app starts a line
+  or follows a space, on every forge. The `stop` command follows the same rule as `review`.
+  ([#1793])
+- A GitLab capability that names a project (`gitlab:repository:read@group/project`) limits
+  the session to that project. ([#1793])
+- With more than one model router connected, a role uses the router whose model an admin
+  chose. ([#1793])
 - A Decide block and smart routing work with any connected router that has a decision
   model. A router with no decisions endpoint answers with a structured chat completion.
   ([#1793])
