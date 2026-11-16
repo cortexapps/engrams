@@ -296,8 +296,7 @@ function validateScalar(
 const MAP_KEY_RE: Record<KeyNoun, RegExp> = {
   // A path of two or more names: every forge's repository has one. No name
   // is `.` or `..`, and none starts with `-`.
-  repository:
-    /^(?!-|\.{1,2}(?:\/|$))[A-Za-z0-9._-]+(?:\/(?!-|\.{1,2}(?:\/|$))[A-Za-z0-9._-]+)+$/,
+  repository: /^(?!-|\.{1,2}(?:\/|$))[A-Za-z0-9._-]+(?:\/(?!-|\.{1,2}(?:\/|$))[A-Za-z0-9._-]+)+$/,
   // A chat provider's own id or name for a channel.
   channel: /^\S+$/,
   // Linear team keys are short uppercase identifiers.
