@@ -16,9 +16,7 @@ export function parseHandle(handle: string): ParsedHandle {
       provider: provider!,
       label: `${repository}#${number}`,
       // The handle has no host. Only GitHub's is known without one.
-      ...(provider === "github"
-        ? { href: `https://github.com/${repository}/pull/${number}` }
-        : {}),
+      ...(provider === "github" ? { href: `https://github.com/${repository}/pull/${number}` } : {}),
     };
   }
 
