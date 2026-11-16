@@ -247,14 +247,20 @@ jobs:
             done
           done
       # A backend selector has no default, so an install states its cloud.
+      # The render must fail on that selector, not on something else.
       - name: helm template (an unset backend selector fails)
         run: |
           set -euo pipefail
           check() {
             chart="deploy/helm/$1"
-            if helm template test-release "$chart" \
-              -f "$chart/ci/render-values.yaml" --set "$2=" > /dev/null 2>&1; then
+            if stderr="$(helm template test-release "$chart" \
+              -f "$chart/ci/render-values.yaml" --set "$2=" 2>&1 > /dev/null)"; then
               echo "$1 renders with $2 unset" >&2
+              exit 1
+            fi
+            if ! printf '%s\n' "$stderr" | grep -qF "$2 is required"; then
+              echo "$1 with $2 unset failed for another reason:" >&2
+              printf '%s\n' "$stderr" >&2
               exit 1
             fi
           }
