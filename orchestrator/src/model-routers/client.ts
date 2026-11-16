@@ -9,6 +9,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import type { LanguageModel } from "ai";
 
 import { asBearer, getIntegrationClient, registerIntegrationClient } from "../integrations/clients.ts";
+import type { RunOpDeps } from "../integrations/run-op.ts";
 import { decideByChat } from "./chat-decisions.ts";
 import { connectedRoutersOrNone } from "./connected.ts";
 import {
@@ -21,14 +22,18 @@ import { makeModelRouterStore } from "../db/model-routers.ts";
 import { routerModels } from "./models.ts";
 import type { ModelRouterDefinition, RouterRole } from "./registry.ts";
 
-interface RouterClient {
+export interface RouterClient {
   chat(modelId: string): LanguageModel;
   decisions?: DecisionsClient;
 }
 
 const registered = new WeakSet<ModelRouterDefinition>();
 
-function routerClient(router: ModelRouterDefinition): Promise<RouterClient> {
+/** The router's client. `deps` is a test seam for the key lookup. */
+export function routerClient(
+  router: ModelRouterDefinition,
+  deps?: RunOpDeps,
+): Promise<RouterClient> {
   if (!registered.has(router)) {
     registerIntegrationClient(router.connector, (cred, host): RouterClient => {
       const apiKey = asBearer(cred);
@@ -37,7 +42,7 @@ function routerClient(router: ModelRouterDefinition): Promise<RouterClient> {
     });
     registered.add(router);
   }
-  return getIntegrationClient<RouterClient>(router.connector);
+  return getIntegrationClient<RouterClient>(router.connector, deps);
 }
 
 interface RoutedModel {
