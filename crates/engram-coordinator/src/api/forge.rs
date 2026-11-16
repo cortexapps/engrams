@@ -209,7 +209,7 @@ pub async fn git_credential(
 /// `POST /api/hosts/forge` — ADR 0023 split-mode forge forwarding.
 ///
 /// On a split deployment the FC host can't run the forge `ForgeSink`
-/// locally: the sink needs the coord's `GitForge` + the broker-token
+/// locally: the sink needs the coord's integrations + the broker-token
 /// map, and the closure can't cross the coord↔host gRPC boundary
 /// (`RemoteHostClient::set_forge_sink` is a no-op). So the host-agent
 /// reads the in-guest [`ForgeRequest`] off the vsock stream and POSTs it
