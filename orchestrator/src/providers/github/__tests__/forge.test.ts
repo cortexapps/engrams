@@ -424,7 +424,7 @@ describe("the GitHub forge", () => {
       ]),
       response(200, [{ id: 4, user: { type: "User" }, body: "<!-- m -->" }]),
     ]);
-    const forge = makeGithubForge({ runIntegrationOp: fake.run });
+    const forge = makeGithubForge({ runIntegrationOp: fake.run, appLogin: "" });
 
     expect(await forge.findCommentWithMarker("acme/app", 7, "<!-- m -->")).toBe("1");
     expect(fake.calls[0]?.request).toMatchObject({
@@ -433,6 +433,19 @@ describe("the GitHub forge", () => {
     });
     // A person's comment that quotes the marker is not the app's.
     expect(await forge.findCommentWithMarker("acme/app", 7, "<!-- m -->")).toBeNull();
+  });
+
+  test("findCommentWithMarker takes only the app's comment when the app login is set", async () => {
+    const fake = fakeRunOp([
+      response(200, [
+        { id: 3, user: { type: "Bot", login: "other-app[bot]" }, body: "<!-- m -->" },
+        { id: 2, user: { type: "User", login: "acme-reviewer[bot]" }, body: "<!-- m -->" },
+        { id: 1, user: { type: "Bot", login: "Acme-Reviewer[bot]" }, body: "<!-- m -->" },
+      ]),
+    ]);
+    const forge = makeGithubForge({ runIntegrationOp: fake.run, appLogin: "@acme-reviewer" });
+
+    expect(await forge.findCommentWithMarker("acme/app", 7, "<!-- m -->")).toBe("1");
   });
 
   test("createComment returns the id; updateComment refuses an id that is not GitHub's", async () => {
