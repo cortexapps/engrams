@@ -1658,12 +1658,6 @@ pub(crate) async fn delete_session_core(
     .await
 }
 
-/// ADR 0023: when a forge is configured and the image declares `[git]`,
-/// mint a per-session credential-broker token (stored in
-/// `state.git_broker_tokens`) and inject the forge env so the in-session
-/// `GIT_ASKPASS` helper can fetch credentials + open PRs. No-op when no
-/// forge is configured or the image has no `[git]` block. Re-minting on
-/// resume is fine — the latest token wins.
 /// Mint-or-reuse the session's broker token (stored in
 /// `state.git_broker_tokens`). Idempotent: a later call from the
 /// `/exec` path returns the SAME token rather than orphaning a fresh
@@ -1804,6 +1798,11 @@ pub(crate) async fn inject_harness_env(
     Ok(())
 }
 
+/// Inject the forge env for a session that holds a capability for a forge
+/// whose integration mints git credentials: the broker token the in-guest
+/// `GIT_ASKPASS` helper authenticates with, the owner hint and, on the
+/// loopback path, the endpoint. No-op for any other session. A forge whose
+/// configuration cannot be read is an error.
 pub(crate) async fn inject_forge_env(
     state: &SharedState,
     session_id: SessionId,
