@@ -292,23 +292,21 @@ mod tests {
 
     #[test]
     fn request_policy_allows_method_and_path() {
-        // A trailing `*` lets the glob swallow the query string + sub-paths —
-        // the shape the orchestrator emits for read ops (e.g. datadog logs).
+        // A trailing `*` reaches sub-paths; a pattern with no query part takes
+        // any query — the shape the orchestrator emits for read ops.
         let p = RequestPolicy {
             methods: vec!["GET".into()],
             path_globs: vec!["/api/v2/logs*".into()],
             graphql: None,
         };
         assert!(p.allows("GET", "/api/v2/logs/events"));
-        assert!(p.allows("GET", "/api/v2/logs/events?query=x")); // query swallowed by `*`
+        assert!(p.allows("GET", "/api/v2/logs/events?query=x"));
         assert!(p.allows("get", "/api/v2/logs/events")); // case-insensitive method
         assert!(!p.allows("POST", "/api/v2/logs/events")); // method not allowed
         assert!(!p.allows("GET", "/api/v2/metrics")); // path doesn't match
 
-        // The granularity fix: a write op pinned to `/repos/*/pulls` must match
-        // the create-PR call but NOT a sibling `/repos/o/r/git/refs` (the coarse
-        // `/repos/` prefix used to over-match both — injecting the token and
-        // emitting a junk asset on branch creation).
+        // A write op pinned to `/repos/*/pulls` matches the create-PR call but
+        // not a sibling `/repos/o/r/git/refs`.
         let pulls = RequestPolicy {
             methods: vec!["POST".into()],
             path_globs: vec!["/repos/*/pulls".into()],
