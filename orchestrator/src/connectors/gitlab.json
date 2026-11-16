@@ -33,7 +33,11 @@
   "operations": [
     {
       "grants": ["projects:read"],
-      "match": { "method": "GET", "path": "/api/v4/projects*" }
+      "match": { "method": "GET", "path": "/api/v4/projects" }
+    },
+    {
+      "grants": ["projects:read"],
+      "match": { "method": "GET", "path": "segment-id:/api/v4/projects/*", "resourcePath": "/api/v4/projects/{resource:encoded}" }
     },
     {
       "grants": ["merge_requests:read"],

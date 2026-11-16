@@ -365,6 +365,9 @@ impl RequestPolicy {
 /// - `segment-path:` is the same, but a `*` stops at `/`, and the path holds no
 ///   escaped `/`. Google Cloud policies use it: the permission boundary is the
 ///   resource path.
+/// - `segment-id:` is `segment-path:` for an upstream that reads an escaped
+///   `/` as part of one segment (GitLab names a project `group%2Fproject`): a
+///   `*` stops at `/`, and an escaped `/` stays in its segment.
 /// - `path-query:` is for a request whose permission depends on the query
 ///   (git smart HTTP: `info/refs?service=…` is a fetch or a push). The query
 ///   must equal the pattern's exactly, a pattern with no query takes a request
@@ -378,12 +381,16 @@ fn target_matches(pattern: &str, target: &str) -> bool {
             && query == pattern_query
             && glob_match(pattern_path, path);
     }
-    let (pattern, segment) = match pattern.strip_prefix("segment-path:") {
-        Some(pattern) => (pattern, true),
-        None => (pattern, false),
-    };
+    let (pattern, segment, escaped_slash) =
+        if let Some(pattern) = pattern.strip_prefix("segment-path:") {
+            (pattern, true, false)
+        } else if let Some(pattern) = pattern.strip_prefix("segment-id:") {
+            (pattern, true, true)
+        } else {
+            (pattern, false, true)
+        };
     let (pattern_path, pattern_query) = split_target(pattern);
-    path_is_unambiguous(path, !segment)
+    path_is_unambiguous(path, escaped_slash)
         && glob_match_with(pattern_path, path, !segment)
         && pattern_query
             .is_none_or(|pattern_query| query.is_some_and(|query| glob_match(pattern_query, query)))
@@ -804,6 +811,21 @@ mod tests {
     }
 
     #[test]
+    fn a_segment_id_rule_takes_one_segment_with_an_escaped_slash() {
+        let project = policy("segment-id:/api/v4/projects/*");
+        assert!(project.path_matches("/api/v4/projects/42"));
+        assert!(project.path_matches("/api/v4/projects/group%2Fproject"));
+        assert!(project.path_matches("/api/v4/projects/group%2Fproject?statistics=true"));
+        // A sub-resource of a project is another operation's.
+        assert!(!project.path_matches("/api/v4/projects/42/merge_requests"));
+        assert!(!project.path_matches("/api/v4/projects/group%2Fproject/repository/tree"));
+        assert!(!project.path_matches("/api/v4/projects/group%2F..%2Fother"));
+        // `segment-path:` refuses the escaped slash.
+        assert!(!policy("segment-path:/api/v4/projects/*")
+            .path_matches("/api/v4/projects/group%2Fproject"));
+    }
+
+    #[test]
     fn a_path_another_server_could_read_differently_never_matches() {
         for glob in [
             "/api/v4/projects/*/merge_requests",
@@ -891,7 +913,7 @@ mod tests {
 
         // A concrete path for a pattern: each `*` becomes one segment.
         let concrete = |glob: &str| -> String {
-            let glob = ["path-query:", "segment-path:"]
+            let glob = ["path-query:", "segment-path:", "segment-id:"]
                 .iter()
                 .find_map(|prefix| glob.strip_prefix(prefix))
                 .unwrap_or(glob);

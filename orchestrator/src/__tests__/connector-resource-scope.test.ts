@@ -31,7 +31,8 @@ describe("a grant that names resources on a resource-aware connector", () => {
 
   test("an operation with no path for a resource cannot take one", () => {
     expect(resourceScopeError("gitlab", "repository:read")).toBeNull();
-    expect(resourceScopeError("gitlab", "projects:read")).toContain("cannot be limited");
+    expect(resourceScopeError("gitlab", "projects:read")).toBeNull();
+    expect(resourceScopeError("gitlab", "no_such:operation")).toContain("cannot be limited");
     // A connector with no resource paths: its own engine reads the resource.
     expect(resourceScopeError("github", "contents:read")).toBeNull();
   });
