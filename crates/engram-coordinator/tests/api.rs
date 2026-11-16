@@ -206,6 +206,32 @@ async fn ask_git_credential(app: &axum::Router, sid: SessionId) -> (StatusCode, 
     (http.status(), body_json(forward.into_body()).await)
 }
 
+#[tokio::test]
+async fn a_session_with_no_forge_capability_gets_no_git_credential() {
+    let no_caps: &[&str] = &[];
+    for caps in [no_caps, &["linear:issues:read"]] {
+        let forge = Arc::new(engram_git_dev::StaticGitHubIntegration::github(
+            "ghs_test_xyz",
+        ));
+        let (app, sid) = build_forge_app_with(
+            caps,
+            Arc::new(InMemorySecretStore::new()),
+            engram_coordinator::integrations::IntegrationBroker::with(forge.clone()),
+        )
+        .await;
+        let (status, forward) = ask_git_credential(&app, sid).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "caps {caps:?}");
+        assert_eq!(
+            forward["Error"]["message"], "this session has no git forge for that host",
+            "caps {caps:?}: {forward:?}"
+        );
+        assert!(
+            forge.recorded_mint_caps().is_empty(),
+            "caps {caps:?} minted"
+        );
+    }
+}
+
 /// A secret store whose backend is down.
 struct UnreachableSecrets;
 
