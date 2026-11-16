@@ -1084,10 +1084,17 @@ async fn mint_inject_header(
     if provider == "gcp" {
         return mint_remote_connection_inject_header(session_id, connection_id).await;
     }
-    let engine = state
+    let engine = match state
         .integrations
         .resolve(provider, &state.services.secrets)
-        .await?;
+        .await
+    {
+        Ok(engine) => engine?,
+        Err(error) => {
+            tracing::warn!(provider, %error, "mint inject: provider unavailable; skipping injection");
+            return None;
+        }
+    };
     // Scope the mint to this provider's caps; owner from a cap's `@owner/repo`.
     let scoped: Vec<engram_core::types::Capability> = caps
         .iter()

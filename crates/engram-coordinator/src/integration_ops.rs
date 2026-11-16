@@ -223,7 +223,7 @@ async fn apply_credential(
             state
                 .integrations
                 .resolve(&spec.mint_provider, &state.services.secrets)
-                .await
+                .await?
                 .ok_or_else(|| "mint credentials are not configured".to_string())?
         };
         let hint = CredentialHint {
@@ -270,7 +270,7 @@ async fn mint_scoped(state: &SharedState, provider: &str) -> Result<ScopedCreden
     let engine = state
         .integrations
         .resolve(provider, &state.services.secrets)
-        .await
+        .await?
         .ok_or_else(|| "mint credentials are not configured".to_string())?;
     let hint = CredentialHint {
         served_host: None,
