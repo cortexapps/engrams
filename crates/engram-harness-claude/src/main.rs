@@ -2179,6 +2179,26 @@ mod adapter {
         Condemned,
     }
 
+    /// The router env for a session routed over the Anthropic Messages
+    /// protocol, read through `var`. `Ok(None)` for a session with no router.
+    /// A routed session missing a router variable is an error.
+    pub(super) fn routed_launch_env(
+        var: impl Fn(&str) -> Option<String>,
+    ) -> Result<Option<[(&'static str, String); 9]>, String> {
+        if var("ENGRAM_MODEL_ROUTER_PROTOCOL").as_deref() != Some("anthropic_messages") {
+            return Ok(None);
+        }
+        let required = |name: &str| {
+            var(name)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("routed claude launch is missing {name}"))
+        };
+        let model = required("ENGRAM_MODEL_ROUTER_MODEL")?;
+        let base_url = required("ENGRAM_MODEL_ROUTER_BASE_URL")?;
+        let token = required("ENGRAM_MODEL_ROUTER_API_KEY")?;
+        Ok(Some(model_router_env(&model, &base_url, &token)))
+    }
+
     /// Convert the normalized router contract into Claude Code's Anthropic
     /// gateway contract. Every model tier is pinned to the selected model so
     /// that a routed session cannot fall back to a native Anthropic model.
@@ -2448,14 +2468,19 @@ mod adapter {
             // visible behavior is preserved.
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        if std::env::var("ENGRAM_MODEL_ROUTER_PROTOCOL").as_deref() == Ok("anthropic_messages") {
-            let model = std::env::var("ENGRAM_MODEL_ROUTER_MODEL").unwrap_or_default();
-            let base_url = std::env::var("ENGRAM_MODEL_ROUTER_BASE_URL").unwrap_or_default();
-            let token = std::env::var("ENGRAM_MODEL_ROUTER_API_KEY").unwrap_or_default();
-            for (name, value) in model_router_env(&model, &base_url, &token) {
-                command.env(name, value);
+        match routed_launch_env(|name| std::env::var(name).ok()) {
+            Ok(None) => {}
+            Ok(Some(env)) => {
+                for (name, value) in env {
+                    command.env(name, value);
+                }
+                command.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
             }
-            command.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+            Err(e) => {
+                // A routed session never falls back to the native model.
+                tracing::error!(error = %e, "routed claude launch is misconfigured");
+                return SessionOutcome::SpawnFailed;
+            }
         }
         let mut child = match command.spawn() {
             Ok(c) => c,
@@ -8698,6 +8723,33 @@ mod tests {
             ] {
                 assert_eq!(env[name], "deepseek/deepseek-v4-pro-0813");
             }
+        }
+    }
+
+    #[test]
+    fn a_routed_launch_missing_a_router_variable_is_an_error() {
+        let full = HashMap::from([
+            ("ENGRAM_MODEL_ROUTER_PROTOCOL", "anthropic_messages"),
+            ("ENGRAM_MODEL_ROUTER_MODEL", "deepseek/deepseek-v4-pro-0813"),
+            ("ENGRAM_MODEL_ROUTER_BASE_URL", "https://openrouter.ai/api"),
+            ("ENGRAM_MODEL_ROUTER_API_KEY", "router-secret"),
+        ]);
+        let launch = |env: &HashMap<&str, &str>| {
+            routed_launch_env(|name| env.get(name).map(|value| value.to_string()))
+        };
+        assert!(launch(&HashMap::new()).unwrap().is_none());
+        assert!(launch(&full).unwrap().is_some());
+        for missing in [
+            "ENGRAM_MODEL_ROUTER_MODEL",
+            "ENGRAM_MODEL_ROUTER_BASE_URL",
+            "ENGRAM_MODEL_ROUTER_API_KEY",
+        ] {
+            let mut env = full.clone();
+            env.remove(missing);
+            let error = launch(&env).unwrap_err();
+            assert!(error.contains(missing), "{error}");
+            env.insert(missing, "");
+            assert!(launch(&env).is_err(), "empty {missing}");
         }
     }
 
