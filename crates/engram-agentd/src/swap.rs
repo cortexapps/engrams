@@ -155,10 +155,7 @@ fn arm_device(
             return false;
         }
     }
-    if !run("swapon", &[node]) {
-        return false;
-    }
-    true
+    run("swapon", &[node])
 }
 
 /// The swap device is the only WRITABLE non-vda virtio disk (aux
