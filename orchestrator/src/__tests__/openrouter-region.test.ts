@@ -1,14 +1,8 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { create } from "@bufbuild/protobuf";
-import type { LanguageModelV3 } from "@ai-sdk/provider";
-import type { DecisionsClient } from "../model-routers/decisions.ts";
+import { routerClient } from "../model-routers/client.ts";
 import { getModelRouterDefinition } from "../model-routers/registry.ts";
-import {
-  asBearer,
-  getIntegrationClient,
-  invalidateIntegrationClient,
-  registerIntegrationClient,
-} from "../integrations/clients.ts";
+import { invalidateIntegrationClient } from "../integrations/clients.ts";
 import { runIntegrationOp, type RunOpDeps } from "../integrations/run-op.ts";
 import { compileIntegrationPolicy, connectorRegistry } from "../connectors/registry.ts";
 import {
@@ -68,21 +62,17 @@ test("SDK and Decisions requests follow a region change while the credential is 
       }),
     },
   };
-  // `model-routers/client.ts` registers this client on its first model call,
-  // which reads the database; the test registers the router's own client.
   const router = getModelRouterDefinition("openrouter")!;
-  registerIntegrationClient(router.connector, (cred, apiHost) => ({
-    chat: router.chat(asBearer(cred), apiHost),
-    decisions: router.decisions!(asBearer(cred), apiHost),
-  }));
   try {
     for (const configured of [undefined, "us.openrouter.ai", "eu.openrouter.ai"]) {
       host = configured;
-      const clients = await getIntegrationClient<{ chat(modelId: string): LanguageModelV3; decisions: DecisionsClient }>("openrouter", deps);
-      await clients.chat("test-model").doGenerate({
+      const clients = await routerClient(router, deps);
+      const model = clients.chat("test-model");
+      if (typeof model === "string") throw new Error("expected a model object");
+      await model.doGenerate({
         prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
       });
-      await clients.decisions.decide({ model: "test-model", state: "hello", questions: {} });
+      await clients.decisions!.decide({ model: "test-model", state: "hello", questions: {} });
       expect(urls.splice(0)).toEqual([
         `https://${host ?? "openrouter.ai"}/api/v1/chat/completions`,
         `https://${host ?? "openrouter.ai"}/api/alpha/decisions`,
