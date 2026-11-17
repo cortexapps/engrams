@@ -10,14 +10,14 @@
 import { z } from "zod";
 
 import { resolveEngramsUser } from "../../../chat/identity.ts";
-import { defaultChatProvider } from "../../../chat/registry.ts";
+import { chatProviderSchema } from "./relay.ts";
 import { registerBlock } from "./registry.ts";
 
 export const RESOLVE_USER_TYPE = "resolve_user";
 
 export const resolveUserConfigSchema = z.object({
-  /** The identity provider the external id belongs to. */
-  provider: z.string().min(1).default(defaultChatProvider),
+  /** The chat provider the external id belongs to. */
+  provider: chatProviderSchema,
   /** The provider's user id. Empty = unlinked. */
   externalUserId: z.string(),
 });

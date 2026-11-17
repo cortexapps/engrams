@@ -35,11 +35,11 @@ describe("resolveEngramsUser", () => {
     expect(id).toBeNull();
   });
 
-  test("a provider that is not a chat provider is no user", async () => {
-    const id = await resolveEngramsUser("other", "U1", {
+  test("a provider that is not a chat provider is an error, not an unlinked person", async () => {
+    const lookup = resolveEngramsUser("other", "U1", {
       chat: chat("a@example.com"),
       lookupByEmail: async () => "user-1",
     });
-    expect(id).toBeNull();
+    await expect(lookup).rejects.toThrow("not a chat provider");
   });
 });

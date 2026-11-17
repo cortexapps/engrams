@@ -17,14 +17,17 @@ export interface ResolveIdentityDeps {
   lookupByEmail?: (email: string) => Promise<string | null>;
 }
 
-/** The engrams user id for a chat user; null when the provider is not a chat
- * provider, gives no email address, or no user has that address. */
+/** The engrams user id for a chat user; null when the provider gives no
+ * email address or no user has that address. A provider that is not a chat
+ * provider is an error: "no such user" would tell a linked person to log in. */
 export async function resolveEngramsUser(
   provider: string,
   externalUserId: string,
   deps: ResolveIdentityDeps = {},
 ): Promise<string | null> {
-  const email = await (deps.chat ?? chatFor)(provider)?.userEmail(externalUserId);
+  const chat = (deps.chat ?? chatFor)(provider);
+  if (!chat) throw new Error(`"${provider}" is not a chat provider`);
+  const email = await chat.userEmail(externalUserId);
   if (!email) return null;
   return (deps.lookupByEmail ?? lookupUserIdByEmail)(email);
 }
