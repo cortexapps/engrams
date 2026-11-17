@@ -45,7 +45,11 @@
     },
     {
       "grants": ["pull_requests:write"],
-      "match": { "method": "POST", "path": "/*/_apis/git/repositories/*/pullRequests/*/threads*" }
+      "match": { "method": "POST", "path": "/*/_apis/git/repositories/*/pullRequests*" }
+    },
+    {
+      "grants": ["pull_requests:write"],
+      "match": { "method": "PATCH", "path": "/*/_apis/git/repositories/*/pullRequests/*" }
     },
     {
       "grants": ["work_items:read"],

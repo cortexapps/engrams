@@ -41,11 +41,11 @@
     },
     {
       "grants": ["merge_requests:read"],
-      "match": { "method": "GET", "path": "/api/v4/projects/*/merge_requests*", "resourcePath": "/api/v4/projects/{resource:encoded}/merge_requests*" }
+      "match": { "method": "GET", "path": "segment-id:/api/v4/projects/*/merge_requests**", "resourcePath": "/api/v4/projects/{resource:encoded}/merge_requests*" }
     },
     {
       "grants": ["merge_requests:write"],
-      "match": { "method": "POST", "path": "/api/v4/projects/*/merge_requests", "resourcePath": "/api/v4/projects/{resource:encoded}/merge_requests" },
+      "match": { "method": "POST", "path": "segment-id:/api/v4/projects/*/merge_requests", "resourcePath": "/api/v4/projects/{resource:encoded}/merge_requests" },
       "asset": {
         "kind": "pull_request",
         "surface": "asset",
@@ -61,11 +61,11 @@
     },
     {
       "grants": ["issues:read"],
-      "match": { "method": "GET", "path": "/api/v4/projects/*/issues*", "resourcePath": "/api/v4/projects/{resource:encoded}/issues*" }
+      "match": { "method": "GET", "path": "segment-id:/api/v4/projects/*/issues**", "resourcePath": "/api/v4/projects/{resource:encoded}/issues*" }
     },
     {
       "grants": ["issues:write"],
-      "match": { "method": "POST", "path": "/api/v4/projects/*/issues", "resourcePath": "/api/v4/projects/{resource:encoded}/issues" },
+      "match": { "method": "POST", "path": "segment-id:/api/v4/projects/*/issues", "resourcePath": "/api/v4/projects/{resource:encoded}/issues" },
       "asset": {
         "kind": "issue",
         "surface": "asset",
@@ -76,19 +76,19 @@
     },
     {
       "grants": ["pipelines:read"],
-      "match": { "method": "GET", "path": "/api/v4/projects/*/pipelines*", "resourcePath": "/api/v4/projects/{resource:encoded}/pipelines*" }
+      "match": { "method": "GET", "path": "segment-id:/api/v4/projects/*/pipelines**", "resourcePath": "/api/v4/projects/{resource:encoded}/pipelines*" }
     },
     {
       "grants": ["pipelines:write"],
-      "match": { "method": "POST", "path": "/api/v4/projects/*/pipeline*", "resourcePath": "/api/v4/projects/{resource:encoded}/pipeline*" }
+      "match": { "method": "POST", "path": "segment-id:/api/v4/projects/*/pipeline**", "resourcePath": "/api/v4/projects/{resource:encoded}/pipeline*" }
     },
     {
       "grants": ["repository:read"],
-      "match": { "method": "GET", "path": "/api/v4/projects/*/repository/*", "resourcePath": "/api/v4/projects/{resource:encoded}/repository/*" }
+      "match": { "method": "GET", "path": "segment-id:/api/v4/projects/*/repository/**", "resourcePath": "/api/v4/projects/{resource:encoded}/repository/*" }
     },
     {
       "grants": ["repository:write"],
-      "match": { "method": "POST", "path": "/api/v4/projects/*/repository/commits", "resourcePath": "/api/v4/projects/{resource:encoded}/repository/commits" }
+      "match": { "method": "POST", "path": "segment-id:/api/v4/projects/*/repository/commits", "resourcePath": "/api/v4/projects/{resource:encoded}/repository/commits" }
     },
     {
       "grants": ["repository:read"],

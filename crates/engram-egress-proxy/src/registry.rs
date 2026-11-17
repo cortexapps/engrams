@@ -371,15 +371,15 @@ impl RequestPolicy {
 /// - `path-query:` is for a request whose permission depends on the query
 ///   (git smart HTTP: `info/refs?service=…` is a fetch or a push). The query
 ///   must equal the pattern's exactly, a pattern with no query takes a request
-///   with none, and the path holds no `%` escape at all.
+///   with none, and the path holds no escaped `/`.
+///
+/// In the two segment forms, a `**` at the end of the pattern matches any run
+/// of characters, `/` included.
 fn target_matches(pattern: &str, target: &str) -> bool {
     let (path, query) = split_target(target);
     if let Some(pattern) = pattern.strip_prefix("path-query:") {
         let (pattern_path, pattern_query) = split_target(pattern);
-        return !path.contains('%')
-            && path_is_unambiguous(path, false)
-            && query == pattern_query
-            && glob_match(pattern_path, path);
+        return query == pattern_query && path_matches_glob(pattern_path, path, true, false);
     }
     let (pattern, segment, escaped_slash) =
         if let Some(pattern) = pattern.strip_prefix("segment-path:") {
@@ -390,25 +390,50 @@ fn target_matches(pattern: &str, target: &str) -> bool {
             (pattern, false, true)
         };
     let (pattern_path, pattern_query) = split_target(pattern);
-    path_is_unambiguous(path, escaped_slash)
-        && glob_match_with(pattern_path, path, !segment)
+    path_matches_glob(pattern_path, path, !segment, escaped_slash)
         && pattern_query
             .is_none_or(|pattern_query| query.is_some_and(|query| glob_match(pattern_query, query)))
 }
 
-/// Does `path` name the same resource for every server that reads it? A
-/// front server can cut, decode or resolve parts of a path before the
-/// upstream routes it. After one `%` decode the path must hold no `#`, `;`,
-/// `\`, `?`, `%` (a second decode) or ASCII control character, and no `.` or
-/// `..` segment; a malformed escape fails. An escaped `/` passes only with
-/// `escaped_slash`: a plain glob's `*` already crosses `/`, and GitLab names a
-/// project `group%2Fproject`.
+/// Does the request path match the pattern's path part, for every server
+/// that reads it? The path must pass [`path_is_unambiguous`]. A front server
+/// can also cut a path at a `#` or a `?`, plain or escaped, so the path up to
+/// each such character must match the pattern too: the request that the
+/// upstream routes is then one that the rule permits. A file path with an
+/// escaped `#` (`/repos/o/r/contents/C%23/x.cs`) matches `/repos/*/contents/*`.
+fn path_matches_glob(
+    pattern: &str,
+    path: &str,
+    star_matches_slash: bool,
+    escaped_slash: bool,
+) -> bool {
+    path_is_unambiguous(path, escaped_slash)
+        && glob_match_with(pattern, path, star_matches_slash)
+        && cut_points(path).all(|at| glob_match_with(pattern, &path[..at], star_matches_slash))
+}
+
+/// The offsets in `path` of each `#` and `?`, plain or escaped.
+fn cut_points(path: &str) -> impl Iterator<Item = usize> + '_ {
+    let bytes = path.as_bytes();
+    (0..bytes.len()).filter(move |&at| match bytes[at] {
+        b'#' | b'?' => true,
+        b'%' => bytes
+            .get(at + 1..at + 3)
+            .is_some_and(|hex| hex == b"23" || hex.eq_ignore_ascii_case(b"3f")),
+        _ => false,
+    })
+}
+
+/// Can no server read `path` as another path by a decode or a resolve? After
+/// one `%` decode the path must hold no `;`, `\`, `%` (a second decode) or
+/// ASCII control character, and no `.` or `..` segment; a malformed escape
+/// fails. An escaped `/` passes only with `escaped_slash`: a plain glob's `*`
+/// already crosses `/`, and GitLab names a project `group%2Fproject`.
 fn path_is_unambiguous(path: &str, escaped_slash: bool) -> bool {
     let Some(decoded) = percent_decode(path) else {
         return false;
     };
-    let ambiguous_byte =
-        |b: &u8| matches!(b, b'#' | b';' | b'\\' | b'?' | b'%') || b.is_ascii_control();
+    let ambiguous_byte = |b: &u8| matches!(b, b';' | b'\\' | b'%') || b.is_ascii_control();
     let escaped_slash_ok = escaped_slash || !path.to_ascii_lowercase().contains("%2f");
     escaped_slash_ok
         && !decoded.iter().any(ambiguous_byte)
@@ -456,8 +481,15 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 /// Iterative glob with backtracking (O(n·m), no recursion). With
-/// `star_matches_slash` false, a `*` stops at `/`.
+/// `star_matches_slash` false, a `*` stops at `/` and a `**` at the end of
+/// the pattern does not.
 fn glob_match_with(pattern: &str, text: &str, star_matches_slash: bool) -> bool {
+    if let (false, Some(head)) = (star_matches_slash, pattern.strip_suffix("**")) {
+        // The head matches a prefix of the text; the `**` takes the rest.
+        return (0..=text.len())
+            .filter(|&at| text.is_char_boundary(at))
+            .any(|at| glob_match_with(head, &text[..at], false));
+    }
     let p = pattern.as_bytes();
     let t = text.as_bytes();
     let (mut pi, mut ti) = (0usize, 0usize);
@@ -868,16 +900,92 @@ mod tests {
         assert!(instance.path_matches("/compute/v1/projects/p/zones/z/instances/vm-1"));
         assert!(!instance.path_matches("/compute/v1/projects/p/zones/z/instances/vm-1%2Fstart"));
 
-        // The git rules take no escape and no ambiguous byte either.
+        // The git rules take no escaped `/` and no ambiguous byte either.
         let fetch = policy("path-query:/*.git/git-upload-pack");
         for target in [
             "/g/p.git/git-receive-pack;/git-upload-pack",
             "/g/p.git/git-receive-pack#/git-upload-pack",
+            "/g/p.git/git-receive-pack%23/git-upload-pack",
             "/g/p.git/git-receive-pack\\..\\git-upload-pack",
             "/g/p.git/git-receive-pack\n/git-upload-pack",
+            "/g%2Fp.git/git-upload-pack",
         ] {
             assert!(!fetch.path_matches(target), "matched {target:?}");
         }
+        // A name with a space is one path for every server.
+        let azure = policy("path-query:/*/_git/*/info/refs?service=git-upload-pack");
+        assert!(azure
+            .path_matches("/org/My%20Project/_git/my%20repo/info/refs?service=git-upload-pack"));
+    }
+
+    #[test]
+    fn an_escaped_cut_character_matches_when_the_cut_path_matches_too() {
+        // The path up to the `#` is a path of the same rule.
+        let contents = policy("/repos/*/contents/*");
+        assert!(contents.path_matches("/repos/o/r/contents/src/C%23/x.cs"));
+        assert!(contents.path_matches("/repos/o/r/contents/what%3F.md?ref=main"));
+        let refs = policy("/repos/*/git/ref*");
+        assert!(refs.path_matches("/repos/o/r/git/ref/heads/fix%23123"));
+        // The path up to the `#` is another operation's.
+        assert!(!contents.path_matches("/repos/o/r/git/refs%23/contents/x"));
+        assert!(!policy("/repos/*/pulls").path_matches("/repos/o/r/git/refs%3F/pulls"));
+    }
+
+    #[test]
+    fn a_double_star_at_the_end_of_a_segment_rule_crosses_slashes() {
+        let rule = policy("segment-id:/api/v4/projects/*/merge_requests**");
+        assert!(rule.path_matches("/api/v4/projects/7/merge_requests"));
+        assert!(rule.path_matches("/api/v4/projects/g%2Fp/merge_requests/3/notes?page=2"));
+        // The project is one segment, so the rule's text in a deeper path
+        // of another operation does not match.
+        assert!(!rule.path_matches("/api/v4/projects/7/repository/files/merge_requests"));
+        assert!(!rule.path_matches("/api/v4/projects/7/repository/merge_requests/1"));
+    }
+
+    /// A GitLab power reaches no path under another power's sub-resource:
+    /// the project id is one segment in every project rule.
+    #[test]
+    fn a_gitlab_rule_does_not_reach_into_the_repository_of_a_project() {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../orchestrator/src/connectors/gitlab.json"),
+        )
+        .expect("connector file");
+        let connector: serde_json::Value = serde_json::from_str(&text).expect("connector JSON");
+        let mut checked = 0usize;
+        for operation in connector["operations"].as_array().expect("operations") {
+            let grants = operation["grants"].as_array().expect("grants");
+            if grants
+                .iter()
+                .any(|g| g.as_str().is_some_and(|g| g.starts_with("repository:")))
+            {
+                continue;
+            }
+            for key in ["path", "resourcePath"] {
+                let Some(glob) = operation["match"][key].as_str() else {
+                    continue;
+                };
+                let Some((_, tail)) = glob.split_once("/projects/") else {
+                    continue;
+                };
+                let Some((_, name)) = tail.split_once('/') else {
+                    continue;
+                };
+                let name = name.trim_end_matches('*');
+                let rule = policy(&glob.replace("{resource:encoded}", "g%2Fp"));
+                for project in ["1", "g%2Fp"] {
+                    for target in [
+                        format!("/api/v4/projects/{project}/repository/files/{name}"),
+                        format!("/api/v4/projects/{project}/repository/files/{name}.yml/raw"),
+                        format!("/api/v4/projects/{project}/variables/{name}"),
+                    ] {
+                        assert!(!rule.path_matches(&target), "{glob:?} matched {target:?}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked >= 36, "only {checked} requests");
     }
 
     /// Every connector operation's path, with any other operation's path
@@ -900,8 +1008,14 @@ mod tests {
                 .expect("provider")
                 .to_string();
             for operation in connector["operations"].as_array().into_iter().flatten() {
-                if let Some(glob) = operation["match"]["path"].as_str() {
-                    rules.push((provider.clone(), glob.to_string()));
+                // `resourcePath` is the rule of a grant limited to a resource.
+                for key in ["path", "resourcePath"] {
+                    if let Some(glob) = operation["match"][key].as_str() {
+                        let glob = glob
+                            .replace("{resource:encoded}", "g%2Fp")
+                            .replace("{resource}", "g/p");
+                        rules.push((provider.clone(), glob));
+                    }
                 }
             }
         }
