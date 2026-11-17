@@ -14,9 +14,8 @@
  * frozen JSON in, bounded JSON out, a time budget), so evaluating it is
  * side-effect free, and the built-ins compute admission in a Code block —
  * without its `steps.<id>.value` every filter after it would report a false
- * "fail". Its row shows the value it produced, not its source. A
- * prelude-only walk (dispatch's admission) also runs the blocks registered
- * with `admission`.
+ * "fail". Its row shows the value it produced, not its source. A block
+ * registered with `admission` only reads, and it runs too.
  *
  * A filter whose conditions read the outputs of an EXECUTING block (a
  * `resolve_user` gate, a `session_status` probe) cannot be decided here:
@@ -264,22 +263,24 @@ export async function previewDefinition(input: PreviewInput): Promise<PreviewRes
         if (config.mode === "boolean" && value !== true) return false;
         continue;
       }
-      const admission = input.preludeOnly ? getBlock(block.type) : undefined;
+      const admission = getBlock(block.type);
       if (admission?.admission && admission.execute) {
-        // A failure decides nothing: dispatch admits, and the run fails on
-        // the same block.
+        blocks.push(result);
         try {
           const outcome = await admission.execute(admission.configSchema.parse(rendered), ctx);
           if (outcome.kind !== "ok") {
             throw new Error(outcome.kind === "error" ? outcome.message : `the block ended the run (${outcome.status})`);
           }
           ctx.steps[block.id] = outcome.outputs;
+          continue;
         } catch (error) {
           errorFor(block.id)("config", error);
-          blocks.push(result);
-          return false;
         }
-        blocks.push(result);
+        // A failure decides nothing. Dispatch admits, and the run fails on
+        // the same block; a full preview walks on with the outputs unknown.
+        if (input.preludeOnly) return false;
+        ctx.steps[block.id] = {};
+        executing.add(block.id);
         continue;
       }
       if (block.type === "filter") {

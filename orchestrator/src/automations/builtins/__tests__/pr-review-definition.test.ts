@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { registerEngineBlocks } from "../../engine/blocks/index.ts";
 import { evaluateAdmissionPrelude } from "../../engine/admission.ts";
 import { validateDefinition, applyBlockOverrides } from "../../engine/definition.ts";
-import { admissionPrelude } from "../../engine/preview.ts";
+import { admissionPrelude, previewDefinition } from "../../engine/preview.ts";
 import { makeCodeBlockRuntime } from "../../code/runtime.ts";
 import { renderAutomationTemplateInScope } from "../../template.ts";
 import { requireForge } from "../../../forges/registry.ts";
@@ -128,6 +128,25 @@ describe("PR_REVIEW_BUILTIN definition", () => {
     test("a review command from a member is admitted", async () => {
       expect(await verdict(commentEvent("@engrams review"), "issue_comment.created")).toEqual({ kind: "admit" });
     });
+  });
+
+  test("a full preview decides admission and renders the blocks that read the facts", async () => {
+    const preview = await previewDefinition({
+      definition: PR_REVIEW_DEFINITION,
+      inputs,
+      automationId: "a1",
+      automationName: "review",
+      trigger: {
+        kind: "integration",
+        receivedAt: "2026-08-21T00:00:00Z",
+        eventKey: "pull_request.opened",
+        payload: prEvent("opened").raw,
+      },
+      aliases: [],
+      code: makeCodeBlockRuntime(),
+    });
+    expect(preview.blocks.find((b) => b.blockId === "admit")?.filterPass).toBe(true);
+    expect(preview.errors.filter((e) => e.message.includes("steps.facts"))).toEqual([]);
   });
 
   test("every tunable field exists in its block's config", () => {
