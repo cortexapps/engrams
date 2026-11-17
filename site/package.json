@@ -16,7 +16,7 @@
     "@astrojs/starlight": "^0.42.9",
     "@fontsource-variable/jetbrains-mono": "^5.3.0",
     "@fontsource-variable/saira": "5.3.0",
-    "astro": "^7.4.7",
+    "astro": "^7.4.10",
     "sharp": "^0.35.5",
     "starlight-links-validator": "^0.27.0"
   },
