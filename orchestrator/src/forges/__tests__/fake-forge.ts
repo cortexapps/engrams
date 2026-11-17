@@ -3,13 +3,14 @@
  * payload means is the payload's `event` field. */
 
 import { EMPTY_PR_CONTEXT } from "../pr-context.ts";
-import type {
-  GitForge,
-  PostReviewInput,
-  PostReviewResult,
-  ReviewCommentEvent,
-  ReviewEvent,
-  ReviewEventPullRequest,
+import {
+  ForgeRequestError,
+  type GitForge,
+  type PostReviewInput,
+  type PostReviewResult,
+  type ReviewCommentEvent,
+  type ReviewEvent,
+  type ReviewEventPullRequest,
 } from "../forge.ts";
 
 export const FAKE_PROVIDER = "fakeforge";
@@ -83,7 +84,7 @@ export function makeFakeForge(state: Partial<FakeForgeState> = {}): { forge: Git
     },
     repoKey: (repo) => repo.toLowerCase().replace(/\.git$/, ""),
     parsePullRequestUrl: unused("parsePullRequestUrl"),
-    isPermanentError: () => false,
+    isPermanentError: (error) => error instanceof ForgeRequestError && error.isClientError,
     reviewEvent: (_eventKey, payload) => (payload["event"] as ReviewEvent | undefined) ?? null,
     async mayRequestReview(comment) {
       s.asked.push(comment.authorId);

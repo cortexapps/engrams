@@ -83,10 +83,7 @@ function isDraft(mr: Json): boolean {
 /** GitLab answers 404 for a project the token cannot see. A 403 is a missing
  * scope or role. Neither changes on a retry. */
 function isPermanentError(error: unknown): boolean {
-  return (
-    error instanceof ForgeRequestError
-    && (error.status === 401 || error.status === 403 || error.status === 404 || error.status === 410)
-  );
+  return error instanceof ForgeRequestError && error.isClientError;
 }
 
 /** `/<group>/<project>/-/merge_requests/<iid>`, with any number of groups. */

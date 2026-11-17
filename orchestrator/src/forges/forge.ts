@@ -122,6 +122,13 @@ export class ForgeRequestError extends Error {
     super(message);
     this.name = "ForgeRequestError";
   }
+
+  /** A 4xx that a retry cannot change: all of them except a timeout (408)
+   * and a rate limit (429). A forge that reports a rate limit with another
+   * status excludes it in its own `isPermanentError`. */
+  get isClientError(): boolean {
+    return this.status >= 400 && this.status < 500 && this.status !== 408 && this.status !== 429;
+  }
 }
 
 /** A file at a commit, with the lines of a finding. */
@@ -168,8 +175,8 @@ export interface GitForge {
    * is not this forge's pull-request path. The host is not checked. `number`
    * is null when the URL has none. */
   parsePullRequestUrl(url: string): { repo: string; number: number | null } | null;
-  /** True when a retry cannot succeed: the pull request is gone or access to
-   * it is. */
+  /** True when a retry cannot succeed: the forge refused the request, and
+   * not for a rate limit. */
   isPermanentError(error: unknown): boolean;
 
   /** The meaning of an event for a review; null when the event is not about

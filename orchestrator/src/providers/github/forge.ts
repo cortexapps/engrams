@@ -83,7 +83,7 @@ function isRateLimitResponseBody(body: string): boolean {
 function isPermanentError(error: unknown): boolean {
   if (!(error instanceof ForgeRequestError)) return false;
   if (error.status === 403) return !isRateLimitResponseBody(error.responseBody);
-  return error.status === 401 || error.status === 404 || error.status === 410;
+  return error.isClientError;
 }
 
 /** The id of a review that is posted. A body that cannot be read gives no
@@ -221,12 +221,10 @@ export function makeGithubForge(
 ): GitForge {
   const runOp = deps.runIntegrationOp ?? defaultRunIntegrationOp;
   const appSlug = normalizeMentionHandle(deps.appLogin ?? config.githubAppLogin).toLowerCase();
-  /** Whether the app wrote the comment. With no configured login, every
-   * bot's comment passes: the forge has no call that names the app. */
-  const isOwn = (user: unknown): boolean =>
-    isObject(user) &&
-    user["type"] === "Bot" &&
-    (appSlug === "" || String(user["login"] ?? "").toLowerCase() === `${appSlug}[bot]`);
+  const isBot = (user: unknown): user is Record<string, unknown> =>
+    isObject(user) && user["type"] === "Bot";
+  const hasAppLogin = (user: Record<string, unknown>): boolean =>
+    String(user["login"] ?? "").toLowerCase() === `${appSlug}[bot]`;
   const send = (method: string, path: string, body?: unknown): Promise<IntegrationOpResult> =>
     runOp(PROVIDER, {
       method,
@@ -309,18 +307,25 @@ export function makeGithubForge(
     },
 
     // The newest 100 comments. A marker in a comment proves nothing by
-    // itself: any commenter can post one.
+    // itself: any commenter can post one, so the comment must be a bot's.
+    // The forge has no call that names the app, and `GITHUB_APP_LOGIN` can
+    // be a mention alias and not the app's login: a comment with that login
+    // is preferred, and the newest bot comment is taken when there is none.
     async findCommentWithMarker(repo, prNumber, marker) {
       const comments = await list(
         "list comments",
         `/repos/${repo}/issues/${prNumber}/comments?per_page=${PER_PAGE}&sort=created&direction=desc`,
       );
+      let newestBot: string | null = null;
       for (const item of comments) {
         if (!isObject(item) || typeof item["body"] !== "string" || !item["body"].includes(marker)) continue;
         const id = positiveInt(item["id"]);
-        if (id !== null && isOwn(item["user"])) return String(id);
+        const user = item["user"];
+        if (id === null || !isBot(user)) continue;
+        if (hasAppLogin(user)) return String(id);
+        newestBot ??= String(id);
       }
-      return null;
+      return newestBot;
     },
 
     async listReviewComments(repo, prNumber) {

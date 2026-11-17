@@ -145,9 +145,9 @@ describe("upsert_pr_comment and update_pr_comment", () => {
     expect(state.comments.size).toBe(0);
   });
 
-  test("update rewrites the comment and keeps the marker; a numeric id is accepted", async () => {
+  test("update rewrites the comment and keeps the marker", async () => {
     const comments: FakeForgeState["comments"] = new Map([["7", { prNumber: 7, body: "old", ours: true }]]);
-    const { result } = run("update_pr_comment", { repo: "acme/app", commentId: 7, body: "Done." }, MARKED, {
+    const { result } = run("update_pr_comment", { repo: "acme/app", commentId: "7", body: "Done." }, MARKED, {
       comments,
     });
     expect(await result).toEqual({ commentId: "7" });

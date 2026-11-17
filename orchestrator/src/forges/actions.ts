@@ -13,14 +13,13 @@ import { runIntegrationOp } from "../integrations/run-op.ts";
 import { ForgeRequestError, type GitForge, type InlineComment } from "./forge.ts";
 import { requireForge } from "./registry.ts";
 
-/** A forge failure as an action failure: a 4xx other than 429 is permanent. */
-async function forgeCall<T>(call: () => Promise<T>): Promise<T> {
+/** A forge failure as an action failure. */
+async function forgeCall<T>(forge: GitForge, call: () => Promise<T>): Promise<T> {
   try {
     return await call();
   } catch (error) {
     if (!(error instanceof ForgeRequestError)) throw error;
-    const { status } = error;
-    throw new IntegrationActionError(error.message, status >= 400 && status < 500 && status !== 429, status);
+    throw new IntegrationActionError(error.message, forge.isPermanentError(error), error.status);
   }
 }
 
@@ -67,7 +66,7 @@ const postPrReview: BuiltinActionFn<GitForge> = async (params, ctx, forge) => {
   // Without it the summary is the body either way.
   const fallbackSummary = optionalString(params, "fallbackSummary") ?? summary;
   const marker = ctx.marker ?? `<!-- engrams-automation:${ctx.runId}:${ctx.stepPath} -->`;
-  return forgeCall(async () => {
+  return forgeCall(forge, async () => {
     // The guard for a crash between a posted review and its checkpoint.
     if (await forge.hasReviewWithMarker(repo, prNumber, marker)) {
       return { posted: false, already_posted: true };
@@ -105,7 +104,7 @@ const upsertPrComment: BuiltinActionFn<GitForge> = async (params, ctx, forge) =>
   const number = requireInteger(params, "number");
   const marker = requireMarker(ctx);
   const body = `${requireString(params, "body")}\n\n${marker}`;
-  return forgeCall(async () => ({
+  return forgeCall(forge, async () => ({
     commentId:
       (await forge.findCommentWithMarker(repo, number, marker)) ??
       (await forge.createComment(repo, number, body)),
@@ -115,11 +114,9 @@ const upsertPrComment: BuiltinActionFn<GitForge> = async (params, ctx, forge) =>
 /** Rewrite a comment that `upsert_pr_comment` posted. The marker goes back
  * on the new body, so a later upsert still finds the comment. */
 const updatePrComment: BuiltinActionFn<GitForge> = async (params, ctx, forge) => {
-  const raw = params["commentId"];
-  // An id from a stored automation can be a number.
-  const commentId = typeof raw === "number" ? String(raw) : requireString(params, "commentId");
+  const commentId = requireString(params, "commentId");
   const body = `${requireString(params, "body")}\n\n${requireMarker(ctx)}`;
-  await forgeCall(() => forge.updateComment(requireString(params, "repo"), commentId, body));
+  await forgeCall(forge, () => forge.updateComment(requireString(params, "repo"), commentId, body));
   return { commentId };
 };
 

@@ -435,17 +435,20 @@ describe("the GitHub forge", () => {
     expect(await forge.findCommentWithMarker("acme/app", 7, "<!-- m -->")).toBeNull();
   });
 
-  test("findCommentWithMarker takes only the app's comment when the app login is set", async () => {
-    const fake = fakeRunOp([
-      response(200, [
-        { id: 3, user: { type: "Bot", login: "other-app[bot]" }, body: "<!-- m -->" },
-        { id: 2, user: { type: "User", login: "acme-reviewer[bot]" }, body: "<!-- m -->" },
-        { id: 1, user: { type: "Bot", login: "Acme-Reviewer[bot]" }, body: "<!-- m -->" },
-      ]),
-    ]);
-    const forge = makeGithubForge({ runIntegrationOp: fake.run, appLogin: "@acme-reviewer" });
+  test("findCommentWithMarker prefers the comment with the configured app login", async () => {
+    const comments = [
+      { id: 3, user: { type: "Bot", login: "other-app[bot]" }, body: "<!-- m -->" },
+      { id: 2, user: { type: "User", login: "acme-reviewer[bot]" }, body: "<!-- m -->" },
+      { id: 1, user: { type: "Bot", login: "Acme-Reviewer[bot]" }, body: "<!-- m -->" },
+    ];
+    const fake = fakeRunOp([response(200, comments), response(200, comments)]);
 
+    const forge = makeGithubForge({ runIntegrationOp: fake.run, appLogin: "@acme-reviewer" });
     expect(await forge.findCommentWithMarker("acme/app", 7, "<!-- m -->")).toBe("1");
+    // The configured login is a mention alias and not the app's login: the
+    // status comment is still found, so a pass does not post a second one.
+    const aliased = makeGithubForge({ runIntegrationOp: fake.run, appLogin: "@reviewer" });
+    expect(await aliased.findCommentWithMarker("acme/app", 7, "<!-- m -->")).toBe("3");
   });
 
   test("createComment returns the id; updateComment refuses an id that is not GitHub's", async () => {
