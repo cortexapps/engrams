@@ -19,8 +19,10 @@ export function normalizeMentionHandle(handle: string): string {
 
 /** The command on the first line that has a mention of `handle` and then a
  * verb. The mention starts the line or follows a space, and prose may come
- * before it. A `[bot]` suffix on the mention is accepted. Null when there is
- * no command, or when the handle is blank (mention commands are then off). */
+ * before it. A `[bot]` suffix on the mention is accepted. A Markdown quote
+ * line (`> ...`) holds another person's text, so it is not a command. Null
+ * when there is no command, or when the handle is blank (mention commands
+ * are then off). */
 export function parseReviewCommand(body: string, handle: string): EngramsCommand | null {
   const slug = normalizeMentionHandle(handle);
   if (!slug) return null;
@@ -30,7 +32,9 @@ export function parseReviewCommand(body: string, handle: string): EngramsCommand
   );
   let match: RegExpExecArray | null = null;
   for (const line of body.split(/\r?\n/)) {
-    match = command.exec(line.trim());
+    const text = line.trim();
+    if (text.startsWith(">")) continue;
+    match = command.exec(text);
     if (match) break;
   }
   if (!match) return null;

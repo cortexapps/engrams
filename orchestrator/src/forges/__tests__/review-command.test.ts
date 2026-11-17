@@ -39,6 +39,14 @@ describe("parseReviewCommand", () => {
     expect(parseReviewCommand("@acme-reviewer stop now", handle)).toBeNull();
   });
 
+  test("a quoted line is not a command; a command after the quote is", () => {
+    expect(parseReviewCommand("> @acme-reviewer stop\n\nwhy did this stop?", "acme-reviewer")).toBeNull();
+    expect(parseReviewCommand("  > > @acme-reviewer review", "acme-reviewer")).toBeNull();
+    expect(parseReviewCommand("> @acme-reviewer stop\n\n@acme-reviewer review", "acme-reviewer")).toEqual({
+      kind: "review",
+    });
+  });
+
   test("strips control characters and caps focus at 500 characters", () => {
     const parsed = parseReviewCommand(`@acme-reviewer review auth\u0000${"x".repeat(600)}`, handle);
     expect(parsed?.kind).toBe("review");
