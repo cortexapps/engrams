@@ -13,6 +13,11 @@ description = "`engrams tui`: a terminal client for engrams sessions (ADR 0124).
 [lints.rust]
 unsafe_code = "deny"
 
+[lints.cargo]
+# `workspace-hack` is a dependency of every crate and no crate names it, and a
+# dependency that one platform uses reads as unused on the other.
+unused_dependencies = "allow"
+
 [lints.clippy]
 disallowed_methods = "deny"
 

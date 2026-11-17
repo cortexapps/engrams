@@ -12,6 +12,19 @@ repository.workspace = true
 # which is a blocking thread that must never grow tokio/tonic (the
 # engram-migrate-proto / peer.rs discipline).
 
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.cargo]
+# `workspace-hack` is a dependency of every crate and no crate names it, and a
+# dependency that one platform uses reads as unused on the other.
+unused_dependencies = "allow"
+
+# Copied from the root Cargo.toml: `workspace = true` cannot coexist
+# with a crate-local lint.
+[lints.clippy]
+disallowed_methods = "deny"
+
 [dependencies]
 engram-core.workspace = true
 bincode.workspace = true
