@@ -36,6 +36,8 @@ const FORGE = "GitLab";
 const PER_PAGE = 100;
 // IntegrationOp returns no response headers, so a short page is the end.
 const MAX_PAGES = 20;
+const DIFF_REFS_ATTEMPTS = 5;
+const DIFF_REFS_WAIT_MS = 1_000;
 /** Developer: the lowest role that can push to a project. */
 const MIN_ACCESS_TO_REQUEST_REVIEW = 30;
 /** A project or group access token acts as a bot user with this name. */
@@ -351,10 +353,23 @@ function parseCommentId(id: string): { prNumber: string; noteId: string } {
   return { prNumber: match[1]!, noteId: match[2]! };
 }
 
+/** A suggestion in a comment body is the forge-neutral fence
+ * ```suggestion. On GitLab that fence replaces the commented line only, and
+ * a range anchors on its last line, so the fence of a range names the lines
+ * above it: `suggestion:-N+0`. */
+export function withRangeSuggestion(body: string, comment: Pick<InlineComment, "line" | "startLine">): string {
+  const above = comment.startLine === undefined ? 0 : comment.line - comment.startLine;
+  return above > 0 ? body.replace(/^```suggestion$/gm, `\`\`\`suggestion:-${above}+0`) : body;
+}
+
 export function makeGitlabForge(
-  deps: { runIntegrationOp?: typeof defaultRunIntegrationOp } = {},
+  deps: {
+    runIntegrationOp?: typeof defaultRunIntegrationOp;
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
 ): GitForge {
   const runOp = deps.runIntegrationOp ?? defaultRunIntegrationOp;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const send = (method: string, path: string, body?: unknown): Promise<IntegrationOpResult> =>
     runOp(GITLAB_PROVIDER, {
       method,
@@ -386,17 +401,42 @@ export function makeGitlabForge(
     if (!isObject(value)) throw unusable(operation, "a non-object response");
     return value;
   };
+  /** The items of a list, a page at a time. A list longer than `MAX_PAGES`
+   * pages is an error after the last of them. */
+  async function* pages(operation: string, path: string, query = ""): AsyncGenerator<Json[]> {
+    for (let page = 1; page <= MAX_PAGES; page++) {
+      const value = await request(operation, "GET", `${path}?per_page=${PER_PAGE}&page=${page}${query}`);
+      if (!Array.isArray(value)) throw unusable(operation, "a non-array response");
+      yield value.filter(isObject);
+      if (value.length < PER_PAGE) return;
+    }
+    throw unusable(operation, `more than ${MAX_PAGES * PER_PAGE} items`);
+  }
   /** Every item of a list. A list longer than `MAX_PAGES` pages is an error:
    * a caller that read a part of it would act on a wrong answer. */
   const list = async (operation: string, path: string, query = ""): Promise<Json[]> => {
     const items: Json[] = [];
-    for (let page = 1; page <= MAX_PAGES; page++) {
-      const value = await request(operation, "GET", `${path}?per_page=${PER_PAGE}&page=${page}${query}`);
-      if (!Array.isArray(value)) throw unusable(operation, "a non-array response");
-      items.push(...value.filter(isObject));
-      if (value.length < PER_PAGE) return items;
+    for await (const page of pages(operation, path, query)) items.push(...page);
+    return items;
+  };
+  /** The newest note of the merge request that passes `wanted`. The search
+   * stops at its note, so a long merge request is an error only when the
+   * newest `MAX_PAGES` pages have no such note. */
+  const newestNote = async (
+    repo: string,
+    prNumber: number,
+    wanted: (note: Json) => boolean,
+  ): Promise<Json | null> => {
+    const notes = pages(
+      "list merge request notes",
+      `${mergeRequest(repo, prNumber)}/notes`,
+      "&sort=desc&order_by=created_at",
+    );
+    for await (const page of notes) {
+      const found = page.find(wanted);
+      if (found) return found;
     }
-    throw unusable(operation, `more than ${MAX_PAGES * PER_PAGE} items`);
+    return null;
   };
   /** The user of the connection's token. */
   const selfId = async (): Promise<string> => {
@@ -483,9 +523,15 @@ export function makeGitlabForge(
     },
 
     async fetchPullRequest(repo, prNumber) {
-      const mr = await readMergeRequest(repo, prNumber);
-      const refs = readDiffRefs(mr);
-      // GitLab fills `diff_refs` a moment after it creates the merge request.
+      let mr = await readMergeRequest(repo, prNumber);
+      // GitLab fills `diff_refs` a moment after it creates the merge request,
+      // and the review of a new merge request reads it at once.
+      let refs = readDiffRefs(mr);
+      for (let attempt = 1; refs === null && attempt < DIFF_REFS_ATTEMPTS; attempt++) {
+        await sleep(DIFF_REFS_WAIT_MS);
+        mr = await readMergeRequest(repo, prNumber);
+        refs = readDiffRefs(mr);
+      }
       if (refs === null) throw unusable("get merge request", "no diff refs yet");
       return { headSha: refs.head_sha, baseSha: refs.base_sha, pr: readPrContext(mr) };
     },
@@ -515,19 +561,18 @@ export function makeGitlabForge(
     // that the review is complete. The inline comments carry the marker too.
     async hasReviewWithMarker(repo, prNumber, marker) {
       const self = await selfId();
-      return (await discussionNotes(repo, prNumber)).some((notes) =>
-        notes.some((note) => note["type"] !== "DiffNote" && isOwn(note, self, marker)),
+      const summary = await newestNote(
+        repo,
+        prNumber,
+        (note) => note["type"] !== "DiffNote" && isOwn(note, self, marker),
       );
+      return summary !== null;
     },
 
     async findCommentWithMarker(repo, prNumber, marker) {
       const self = await selfId();
-      const notes = await list(
-        "list merge request notes",
-        `${mergeRequest(repo, prNumber)}/notes`,
-        "&sort=desc&order_by=created_at",
-      );
-      const id = identifier(notes.find((item) => isOwn(item, self, marker))?.["id"]);
+      const note = await newestNote(repo, prNumber, (item) => isOwn(item, self, marker));
+      const id = identifier(note?.["id"]);
       return id === null ? null : commentId(prNumber, id);
     },
 
@@ -563,7 +608,7 @@ export function makeGitlabForge(
             continue;
           }
           const response = await send("POST", `${base}/discussions`, {
-            body: `${withoutQuickActions(comment.body)}\n\n${marker}`,
+            body: `${withoutQuickActions(withRangeSuggestion(comment.body, comment))}\n\n${marker}`,
             position: where,
           });
           // GitLab refuses a position it cannot place. The other comments

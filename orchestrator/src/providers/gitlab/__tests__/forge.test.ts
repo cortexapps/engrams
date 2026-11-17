@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 // This module loads before the forge registry here; the registry must not
 // read a provider's spec while it loads.
-import { makeGitlabForge } from "../forge.ts";
+import { makeGitlabForge, withRangeSuggestion } from "../forge.ts";
 import { registerEngineBlocks } from "../../../automations/engine/blocks/index.ts";
 import { gitlabEventSource } from "../events.ts";
 import { GITLAB_REVIEW } from "../review-variant.ts";
@@ -36,6 +36,7 @@ function response(status: number, body: unknown): IntegrationOpResult {
 /** A forge over scripted responses, in call order. */
 function scripted(responses: IntegrationOpResult[]) {
   const calls: IntegrationOpRequest[] = [];
+  const waits: number[] = [];
   const run: typeof runIntegrationOp = async (provider, request) => {
     expect(provider).toBe("gitlab");
     calls.push(request);
@@ -43,7 +44,8 @@ function scripted(responses: IntegrationOpResult[]) {
     if (!next) throw new Error("no scripted response left");
     return next;
   };
-  return { calls, forge: makeGitlabForge({ runIntegrationOp: run }) };
+  const sleep = async (ms: number) => void waits.push(ms);
+  return { calls, waits, forge: makeGitlabForge({ runIntegrationOp: run, sleep }) };
 }
 
 const REPO = "acme/platform/api";
@@ -243,11 +245,18 @@ describe("GitLab forge", () => {
     expect(calls[0]).toMatchObject({ method: "GET", path: MR_PATH });
   });
 
-  test("a merge request with no diff refs yet is a failure a retry can clear", async () => {
-    const { forge } = scripted([response(200, { ...MERGE_REQUEST, diff_refs: null })]);
-    const error = await forge.fetchPullRequest(REPO, 7).catch((e: unknown) => e);
+  test("a new merge request is read again until it has its diff refs", async () => {
+    const pending = response(200, { ...MERGE_REQUEST, diff_refs: null });
+    const ready = scripted([pending, pending, response(200, { ...MERGE_REQUEST, diff_refs: DIFF_REFS })]);
+    expect(await ready.forge.fetchPullRequest(REPO, 7)).toMatchObject({ headSha: DIFF_REFS.head_sha });
+    expect(ready.waits).toHaveLength(2);
+
+    // No diff refs after the last read is a failure a retry can clear.
+    const never = scripted(Array.from({ length: 5 }, () => pending));
+    const error = await never.forge.fetchPullRequest(REPO, 7).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(ForgeRequestError);
-    expect(forge.isPermanentError(error)).toBe(false);
+    expect(never.forge.isPermanentError(error)).toBe(false);
+    expect(never.calls).toHaveLength(5);
   });
 
   test("a project the token cannot see is a permanent failure", async () => {
@@ -443,20 +452,37 @@ describe("GitLab forge", () => {
   test("a list that does not end is an error, not a part of the answer", async () => {
     const full = Array.from({ length: 100 }, (_, id) => ({ id: `d${id}`, notes: [] }));
     const { forge } = scripted(Array.from({ length: 20 }, () => response(200, full)));
-    await expect(forge.hasReviewWithMarker(REPO, 7, "<!-- m -->")).rejects.toBeInstanceOf(ForgeRequestError);
+    await expect(forge.listReviewComments(REPO, 7)).rejects.toBeInstanceOf(ForgeRequestError);
+  });
+
+  test("a marker search stops at its note, so a long merge request is no error", async () => {
+    const others = Array.from({ length: 100 }, (_, id) => ({ id: id + 10, author: { id: 6 }, body: "talk" }));
+    const summary = { id: 3, author: SELF, body: "summary\n\n<!-- m -->", type: null };
+    const long = scripted([response(200, SELF), response(200, others), response(200, [summary, ...others.slice(1)])]);
+    expect(await long.forge.hasReviewWithMarker(REPO, 7, "<!-- m -->")).toBe(true);
+    expect(long.calls).toHaveLength(3);
+  });
+
+  test("the suggestion of a range names the lines above the commented line", () => {
+    const body = "Use the helper.\n\n```suggestion\nconst a = helper();\n```";
+    expect(withRangeSuggestion(body, { line: 12, startLine: 10 })).toBe(
+      "Use the helper.\n\n```suggestion:-2+0\nconst a = helper();\n```",
+    );
+    expect(withRangeSuggestion(body, { line: 12 })).toBe(body);
+    expect(withRangeSuggestion(body, { line: 12, startLine: 12 })).toBe(body);
   });
 
   test("finds a posted review, and a status comment, by its marker and its author", async () => {
     // Only the summary says the review is complete: an inline comment with
     // the marker is a review that stopped before its summary.
-    const inline = { id: "d2", notes: [{ id: 2, author: SELF, body: "A finding.\n\n<!-- m -->", type: "DiffNote" }] };
-    const summary = { id: "d3", notes: [{ id: 3, author: SELF, body: "summary\n\n<!-- m -->", type: null }] };
+    const inline = { id: 2, author: SELF, body: "A finding.\n\n<!-- m -->", type: "DiffNote" };
+    const summary = { id: 3, author: SELF, body: "summary\n\n<!-- m -->", type: null };
     const found = scripted([response(200, SELF), response(200, [inline, summary])]);
     expect(await found.forge.hasReviewWithMarker(REPO, 7, "<!-- m -->")).toBe(true);
     const partial = scripted([response(200, SELF), response(200, [inline])]);
     expect(await partial.forge.hasReviewWithMarker(REPO, 7, "<!-- m -->")).toBe(false);
     // Any commenter can post the marker.
-    const forged = { id: "d4", notes: [{ id: 4, author: { id: 6 }, body: "<!-- m -->", type: null }] };
+    const forged = { id: 4, author: { id: 6 }, body: "<!-- m -->", type: null };
     const other = scripted([response(200, SELF), response(200, [forged])]);
     expect(await other.forge.hasReviewWithMarker(REPO, 7, "<!-- m -->")).toBe(false);
 
