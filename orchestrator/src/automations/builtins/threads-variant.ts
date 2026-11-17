@@ -4,7 +4,8 @@
 
 import type { BlockDef } from "../engine/definition.ts";
 
-/** Where the facts step's value is, for a variant's templates. */
+/** Where the facts step's value is, for a variant's templates: the place
+ * of the mention, plus the profile the graph chose for it. */
 export const THREADS_FACTS = "steps.facts.value";
 
 export interface ThreadsVariant {
@@ -19,12 +20,11 @@ export interface ThreadsVariant {
   definitionVersion: number;
   /** The events that are a mention of the app. */
   mentionEvents: string[];
-  /** The `facts` step: `value` is null to reject the event, else `admit`,
-   * `team`, `channel`, `thread_ts`, `mention_ts`, `user_id`, `event_id`,
-   * `title`, `profile_id` (the channel's profile, else the default) and
-   * `smart` (true when smart routing chooses the profile), plus what the
-   * variant's own steps read. */
-  facts: Omit<BlockDef, "id">;
+  /** The `place` step says where a mention is: `value` is null when the
+   * event is no mention to answer, else `team`, `channel`, `thread_ts`,
+   * `mention_ts`, `user_id`, `event_id`, `text` and `title`, plus what the
+   * variant's own steps read. The graph's `facts` step adds the profile. */
+  place: Omit<BlockDef, "id">;
   /** The `replies` step reads the thread, from `steps.previous.mention_ts`
    * on when a session continues. The `turn` step folds it into `value`:
    * `text` is the prompt, and `has_text` false ends the run. */

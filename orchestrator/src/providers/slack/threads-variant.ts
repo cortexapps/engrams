@@ -16,10 +16,10 @@ Links are formatted as <url|optional link title>
 Bold is single asterisks surrounding text, like *this*.
 Italics are underlines surrounding text like _this_.`;
 
-/** Admission + fact derivation. Returns null to reject; else the facts. Pure,
- * runs in the QuickJS cage. */
-export const SLACK_FACTS_SOURCE = `
-export default ({ event, inputs, trigger }) => {
+/** The place of a mention; null when the event is no mention to answer.
+ * Pure, runs in the QuickJS cage. */
+export const SLACK_PLACE_SOURCE = `
+export default ({ event, trigger }) => {
   const raw = event.raw ?? {};
   const ev = raw.event ?? {};
   const key = trigger.event ?? "";
@@ -29,23 +29,12 @@ export default ({ event, inputs, trigger }) => {
   if (ev.bot_id || ev.subtype === "bot_message") return null;
   // Only a mention is a turn. A plain reply rides the next mention's fold.
   if (key !== "app_mention") return null;
-  const channels = inputs.channels ?? {};
-  const override = channels[channel] ?? "";
-  // Smart routing decides where no override does; the default profile is
-  // its fallback. Without either, the mention is not answered.
-  const smart = !override && inputs.routing === "smart";
-  const profile = override || inputs.default_profile || "";
-  if (!profile && !smart) return null;
   const text = String(ev.text ?? "")
     .replace(/<@[^>]+>/g, " ")
     .replace(/[^\\S\\n]+/g, " ")
     .trim();
   const str = (v) => (v === undefined || v === null ? "" : String(v));
   return {
-    admit: true,
-    profile_id: String(profile),
-    override: Boolean(override),
-    smart,
     team: str(raw.team_id),
     channel,
     thread_ts: str(ev.thread_ts || ev.ts),
@@ -141,11 +130,11 @@ export const SLACK_THREADS: ThreadsVariant = {
   previousNames: ["Slack thread brain"],
   description:
     "Answers @-mentions in Slack with one session per thread, relaying the conversation both ways.",
-  definitionVersion: 16,
+  definitionVersion: 17,
   mentionEvents: ["app_mention"],
-  facts: {
+  place: {
     type: "code",
-    config: { source: SLACK_FACTS_SOURCE, mode: "value" },
+    config: { source: SLACK_PLACE_SOURCE, mode: "value" },
   },
   // A continued session reads only what came after its previous turn: the
   // page is capped, and a long thread must not push the new messages off it.

@@ -691,7 +691,7 @@ describe("Slack thread brain — smart routing", () => {
     expect(h.choices).toEqual([]);
     expect(h.sessions).toEqual([expect.objectContaining({ profileId: "p-infra" })]);
     // The verdict is a line in the thread, then the session's link.
-    expect(posts(h)).toEqual(["Profile: *Infra* (routed by Jev, 91% confident)"]);
+    expect(posts(h)).toEqual(["Profile: *Infra* (smart routing, 91% confident)"]);
     expect(h.policyCalls).toEqual(["started:s-1"]);
   });
 
@@ -741,7 +741,7 @@ describe("Slack thread brain — smart routing", () => {
     expect(result.status).toBe("completed");
     expect(h.sessions).toEqual([expect.objectContaining({ profileId: "p-infra" })]);
     expect(h.actions.find((a) => a.actionId === "update_message")!.params["text"]).toBe(
-      "Profile: *Infra* (no answer, so routed by Jev, 41% confident)",
+      "Profile: *Infra* (no answer, so smart routing, 41% confident)",
     );
   });
 

@@ -10,8 +10,22 @@ import {
   walkBlocks,
 } from "../../engine/definition.ts";
 import { evaluateCode } from "../../code/sandbox.ts";
-import { RESOLVE_SOURCE, TRIAGE_SOURCE, chatThreadsBuiltin, chatThreadsDefinition } from "../chat-threads.ts";
-import { SLACK_THREADS, SLACK_FACTS_SOURCE } from "../../../providers/slack/threads-variant.ts";
+import {
+  RESOLVE_SOURCE,
+  THREADS_FACTS_SOURCE,
+  TRIAGE_SOURCE,
+  chatThreadsBuiltin,
+  chatThreadsDefinition,
+} from "../chat-threads.ts";
+import { SLACK_THREADS, SLACK_PLACE_SOURCE } from "../../../providers/slack/threads-variant.ts";
+
+/** The graph's first two steps: Slack's place of the event, then the facts. */
+async function threadFacts(event: Record<string, unknown>, eventKey: string, inputs: Record<string, unknown>) {
+  const scope = { event: { raw: event }, inputs, trigger: { event: eventKey } };
+  const place = await evaluateCode(SLACK_PLACE_SOURCE, scope, "value");
+  if (!place.ok) return place;
+  return evaluateCode(THREADS_FACTS_SOURCE, { ...scope, steps: { place: { value: place.value } } }, "value");
+}
 
 const SLACK_BRAIN_BUILTIN = chatThreadsBuiltin(SLACK_THREADS);
 const SLACK_BRAIN_DEFINITION = chatThreadsDefinition(SLACK_THREADS);
@@ -22,6 +36,7 @@ describe("Slack thread brain built-in — definition", () => {
   test("validates and is an agent with one way in: admit, fold, route, and the engine's agent step", () => {
     const parsed = validateDefinition(SLACK_BRAIN_DEFINITION);
     expect(parsed.blocks.map((b) => b.id)).toEqual([
+      "place",
       "facts",
       "admit",
       "identity",
@@ -116,12 +131,7 @@ describe("Slack thread brain built-in — definition", () => {
 });
 
 describe("Slack thread brain — admission code", () => {
-  const run = (event: Record<string, unknown>, eventKey: string, inputs: Record<string, unknown>) =>
-    evaluateCode(
-      SLACK_FACTS_SOURCE,
-      { event: { raw: event }, inputs, trigger: { event: eventKey } },
-      "value",
-    );
+  const run = threadFacts;
 
   const mention = {
     team_id: "T1",
@@ -181,11 +191,7 @@ describe("Slack thread brain — smart routing code", () => {
     event: { type: "app_mention", channel: "C1", user: "U1", ts: "1.1", text: "<@UBOT> fix the deploy" },
   };
   const facts = async (inputs: Record<string, unknown>) => {
-    const out = await evaluateCode(
-      SLACK_FACTS_SOURCE,
-      { event: { raw: mention }, inputs, trigger: { event: "app_mention" } },
-      "value",
-    );
+    const out = await threadFacts(mention, "app_mention", inputs);
     return out.ok ? (out.value as Record<string, unknown> | null) : undefined;
   };
 
@@ -238,6 +244,17 @@ describe("Slack thread brain — smart routing code", () => {
     expect((await triage(decided(0.7), { default_profile: "p-d", smart_min_confidence: 0.8 }))!.ask).toBe(true);
   });
 
+  test("triage: a pick with no ranking gives a card of the pick and the other candidates", async () => {
+    const route = {
+      decided: true,
+      answers: { profile: { value: "p-web", confidence: 0.4, ranked: ["p-web"] }, wants_choice: { yes: 0 } },
+    };
+    const card = await triage(route, {});
+    expect(card!.ask).toBe(true);
+    expect(card!.options[0]!.value).toBe("p-web");
+    expect(card!.options.length).toBeGreaterThan(1);
+  });
+
   test("triage: no OpenRouter → never a card; a failed call asks only when there is no default", async () => {
     expect(await triage({ decided: false, reason: "router_not_connected" }, {})).toEqual({ ask: false, options: [] });
     expect((await triage({ decided: false, reason: "decision_failed: 529" }))!.ask).toBe(false);
@@ -259,14 +276,14 @@ describe("Slack thread brain — smart routing code", () => {
     });
     expect(picked).toMatchObject({ profile_id: "p-web", card: "Profile: *Web* (picked in the thread)" });
     const routed = await resolve({ facts: smartFacts, candidates: { options }, route: decided(0.82) });
-    expect(routed).toMatchObject({ profile_id: "p-infra", label: " on *Infra* (routed by Jev, 82% confident)" });
+    expect(routed).toMatchObject({ profile_id: "p-infra", label: " on *Infra* (smart routing, 82% confident)" });
     const timedOut = await resolve({
       facts: smartFacts,
       candidates: { options },
       route: decided(0.4),
       ask: { outcome: "deadline" },
     });
-    expect(timedOut!.card).toBe("Profile: *Infra* (no answer, so routed by Jev, 40% confident)");
+    expect(timedOut!.card).toBe("Profile: *Infra* (no answer, so smart routing, 40% confident)");
     const fallback = await resolve({
       facts: smartFacts,
       candidates: { options },

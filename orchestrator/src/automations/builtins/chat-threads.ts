@@ -52,6 +52,23 @@ export const THREADS_DEFAULT_ASK_TIMEOUT_S = 600;
 
 const F = THREADS_FACTS;
 
+/** Admission and the profile of a mention: the place the variant read, plus
+ * the routing rule, which is the same for every chat provider. Null rejects
+ * the event. */
+export const THREADS_FACTS_SOURCE = `
+export default ({ steps, inputs }) => {
+  const place = steps.place?.value;
+  if (!place) return null;
+  const override = (inputs.channels ?? {})[place.channel] ?? "";
+  // Smart routing decides where no override does; the default profile is
+  // its fallback. Without either, the mention is not answered.
+  const smart = !override && inputs.routing === "smart";
+  const profile = override || inputs.default_profile || "";
+  if (!profile && !smart) return null;
+  return { ...place, admit: true, profile_id: String(profile), override: Boolean(override), smart };
+};
+`.trim();
+
 /** Smart routing's verdict on the model's answer: ask the person when the
  * model is not confident or the person asks to choose, with the model's
  * best candidates (and the default profile) as the card's buttons. When the
@@ -83,7 +100,12 @@ export default ({ steps, inputs }) => {
   const min = Number(inputs.smart_min_confidence ?? ${THREADS_DEFAULT_MIN_CONFIDENCE});
   const wants = Number(route.answers.wants_choice?.yes ?? 0);
   const ask = options.length > 1 && (pick.confidence < min || wants >= 0.5);
-  return { ask, options: ask ? card(pick.ranked.slice(0, 4)) : [] };
+  // A model that gives no probabilities ranks its pick only: the card then
+  // offers the pick and the other candidates.
+  const ranked = pick.ranked.length > 1
+    ? pick.ranked
+    : [pick.value, ...options.map((o) => o.value).filter((id) => id !== pick.value)];
+  return { ask, options: ask ? card(ranked.slice(0, 4)) : [] };
 };
 `.trim();
 
@@ -110,7 +132,7 @@ export default ({ steps }) => {
     how = "picked in the thread";
   } else if (pick) {
     id = pick.value;
-    how = (steps.ask?.outcome === "deadline" ? "no answer, so " : "") + "routed by Jev, " + pct + "% confident";
+    how = (steps.ask?.outcome === "deadline" ? "no answer, so " : "") + "smart routing, " + pct + "% confident";
   } else if (facts.profile_id) {
     id = facts.profile_id;
     how = (steps.ask?.outcome === "deadline" ? "no answer, so " : "") + "the default profile";
@@ -132,7 +154,8 @@ export default ({ steps }) => {
 
 export function chatThreadsDefinition(v: ThreadsVariant): AutomationDefinition {
   const admit: BlockDef[] = [
-    { id: "facts", ...v.facts },
+    { id: "place", ...v.place },
+    { id: "facts", type: "code", config: { source: THREADS_FACTS_SOURCE, mode: "value" } },
     {
       id: "admit",
       type: "filter",

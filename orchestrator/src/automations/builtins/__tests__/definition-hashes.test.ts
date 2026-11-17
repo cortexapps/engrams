@@ -21,5 +21,5 @@ test("the PR review definition hash is unchanged", () => {
 });
 
 test("the Slack threads definition hash is unchanged", () => {
-  expect(definitionContentHash(SLACK_BRAIN_DEFINITION)).toBe("149b38fdd5b2065dff989f54201ead291522add58dd209ed446ef753f7cfb719");
+  expect(definitionContentHash(SLACK_BRAIN_DEFINITION)).toBe("586d7df6354a66026352ed3c4a4b6620567d338b47a13cbaeb175eaebe880298");
 });
