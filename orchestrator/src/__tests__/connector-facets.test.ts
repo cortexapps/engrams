@@ -138,13 +138,23 @@ describe("actions facet", () => {
       pathTemplate: "/repos/{input.repo}/issues/{input.number}/comments",
       bodyTemplate: { body: "{input.body}" },
     },
-    idempotency: { kind: "marker_comment" },
+    idempotency: { kind: "none" },
     ...overrides,
   });
 
   test("accepts a valid http action", () => {
     const c = parseConnector({ ...base, actions: [action()] }, "x", BUILTIN);
     expect(c.actions?.[0]?.id).toBe("create_issue_comment");
+  });
+
+  test("rejects marker_comment idempotency on an action that is not builtin", () => {
+    expect(() =>
+      parseConnector(
+        { ...base, actions: [action({ idempotency: { kind: "marker_comment" } })] },
+        "x",
+        BUILTIN,
+      ),
+    ).toThrow(/marker_comment needs a builtin action/);
   });
 
   test("rejects actions on custom (non-builtin) connectors", () => {

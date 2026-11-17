@@ -1959,6 +1959,10 @@ export function parseActionsFacet(
     }
 
     const idempotency = parseActionIdempotency(actionWhere, a.idempotency);
+    // Only a builtin action can search for its marker before it posts.
+    if (idempotency.kind === "marker_comment" && execute.kind !== "builtin") {
+      fail(actionWhere, '"idempotency.kind" marker_comment needs a builtin action');
+    }
 
     let successStatus: number[] | undefined;
     if (a.successStatus !== undefined) {

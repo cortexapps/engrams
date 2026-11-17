@@ -246,13 +246,7 @@ export async function executeIntegrationAction(
 
   switch (action.execute.kind) {
     case "http": {
-      // The marker goes on a `body` param, so a later search can find what
-      // this call posts.
-      const text = config.params["body"];
-      const params =
-        marker !== null && typeof text === "string"
-          ? { ...config.params, body: `${text}\n\n${marker}` }
-          : config.params;
+      const params = config.params;
       const path = renderPathTemplate(action.execute.pathTemplate, params);
       const body =
         action.execute.bodyTemplate !== undefined
