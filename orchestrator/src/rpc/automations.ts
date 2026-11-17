@@ -105,7 +105,7 @@ import {
 } from "../automations/engine/inbox.ts";
 import type { AutomationDispatchStore } from "../db/automations.ts";
 import { chatFor, defaultChatProvider } from "../chat/registry.ts";
-import { defaultForgeProvider } from "../forges/registry.ts";
+import { defaultForgeProvider, forgeFor } from "../forges/registry.ts";
 import { makeLinearIssueClient } from "../providers/linear/issues.ts";
 import type { WebhookAliasMapping } from "../automations/template.ts";
 
@@ -438,18 +438,29 @@ const log = rootLog.child({ component: "automations-rpc" });
 /** Keys one describe call may carry: a page of threads, not a workspace. */
 const DESCRIBE_INPUT_KEYS_MAX = 200;
 
-function productionInputKeyOptions(
+export function productionInputKeyOptions(
   integrationEvents: () => Pick<IntegrationEventStore, "listObservedScopeValues">,
   connections: () => Pick<IntegrationConnectionStore, "get" | "getDefault">,
 ): InputKeyOptionSource {
-  /** The chat provider of the connection; the default one with none. */
+  /** The connection `connectionId` names when its provider has the role of
+   * the noun; null otherwise. The caller passes the connection of the
+   * automation's trigger for every noun, and a GitHub trigger can have an
+   * input keyed by channel. */
+  const connectionWithRole = async (
+    connectionId: string | undefined,
+    hasRole: (provider: string) => boolean,
+  ) => {
+    if (!connectionId) return null;
+    const connection = await connections().get(connectionId);
+    if (!connection) throw new ConnectError("connection not found", Code.NotFound);
+    return hasRole(connection.provider) ? connection : null;
+  };
+  /** The chat provider of the connection; the default one for a connection
+   * of another role. */
   const chatOf = async (connectionId: string | undefined) => {
-    const connection = connectionId ? await connections().get(connectionId) : null;
-    if (connectionId && !connection) {
-      throw new ConnectError("connection not found", Code.NotFound);
-    }
+    const connection = await connectionWithRole(connectionId, (provider) => chatFor(provider) !== null);
     const chat = chatFor(connection?.provider ?? defaultChatProvider());
-    if (!chat) throw new ConnectError("the connection is not a chat provider", Code.InvalidArgument);
+    if (!chat) throw new ConnectError("no chat provider is available", Code.FailedPrecondition);
     return chat;
   };
   return {
@@ -458,9 +469,9 @@ function productionInputKeyOptions(
         case "repository": {
           // Repositories observed on the forge connection's ledger: the
           // orchestrator has no call that lists a forge's repositories.
-          const connection = connectionId
-            ? { id: connectionId }
-            : await connections().getDefault(defaultForgeProvider());
+          const connection =
+            (await connectionWithRole(connectionId, (provider) => forgeFor(provider) !== null)) ??
+            (await connections().getDefault(defaultForgeProvider()));
           if (!connection) return [];
           const repos = await integrationEvents().listObservedScopeValues(connection.id);
           return repos.map((repo) => ({ key: repo, label: repo }));
