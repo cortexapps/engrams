@@ -26,6 +26,11 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 - **The upgrade stops the pull request reviews and the Slack thread runs that are active
   when it deploys.** Both built-ins have a new definition. A push or a `review` comment
   starts the review again, and the next mention continues a thread. ([#1793])
+- **A capability that names a resource is refused when nothing can enforce the resource.**
+  Only GitHub and GitLab hold a session to a resource. A profile that has a resource on a
+  capability of another connector (for example `datadog:metrics:read@name`) does not save,
+  and a task on it does not start, until you remove the resource. Before, the resource was
+  accepted and ignored. ([#1793])
 
 ### Added
 

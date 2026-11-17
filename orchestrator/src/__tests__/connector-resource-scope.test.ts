@@ -33,8 +33,12 @@ describe("a grant that names resources on a resource-aware connector", () => {
     expect(resourceScopeError("gitlab", "repository:read")).toBeNull();
     expect(resourceScopeError("gitlab", "projects:read")).toBeNull();
     expect(resourceScopeError("gitlab", "no_such:operation")).toContain("cannot be limited");
-    // A connector with no resource paths: its own engine reads the resource.
+    // A minted credential carries the limit.
     expect(resourceScopeError("github", "contents:read")).toBeNull();
+    // A static key with no resource path: nothing would hold the session
+    // to the resource.
+    expect(resourceScopeError("azure_devops", "code:write")).toContain("cannot be limited");
+    expect(resourceScopeError("jira", "issues:read")).toContain("cannot be limited");
   });
 
   test("reaches nothing when a resource is not a repository path", () => {

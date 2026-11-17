@@ -103,17 +103,23 @@ function grantPathGlobs(
 }
 
 /** Why `operation` of `provider` cannot be held to a resource; null when it
- * can, or when the connector is not resource-aware (the resource is then
- * for the provider's own engine). */
+ * can. A connector with no resource-aware operation holds a resource only
+ * when it mints its credential: the minted credential then carries the
+ * limit. A static credential reaches all that the key can reach. */
 export function resourceScopeError(
   provider: string,
   operation: string,
   registry: Map<string, Connector> = connectorRegistry(),
 ): string | null {
-  const rest = (registry.get(provider)?.operations ?? []).flatMap((op) =>
+  const connector = registry.get(provider);
+  const rest = (connector?.operations ?? []).flatMap((op) =>
     op.match !== undefined && !isGraphqlMatch(op.match) ? [{ op, match: op.match }] : [],
   );
-  if (!rest.some(({ match }) => match.resourcePath?.includes("{resource"))) return null;
+  if (!rest.some(({ match }) => match.resourcePath?.includes("{resource"))) {
+    return connector?.credential.source === "inject"
+      ? `"${provider}" grants cannot be limited to a resource`
+      : null;
+  }
   const scoped = rest.some(
     ({ op, match }) => op.grants.includes(operation) && match.resourcePath?.includes("{resource"),
   );

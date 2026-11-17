@@ -378,14 +378,30 @@ describe("ProfileService — auth + field filtering", () => {
       const r = await s.client.createProfile({
         name: "Capable", description: "", icon: "Bot", imageId: "img-1", harness: "claude", includeUserTokens: false, envVars: {},
         integrationGrants: [
-          protoGrant("github:issues:write"),
-          protoGrant("datadog:metrics:read@idx-1"),
+          protoGrant("github:issues:write@acme/app"),
+          protoGrant("datadog:metrics:read"),
         ],
       });
       expect(r.profile!.integrationGrants).toEqual([
-        protoGrant("github:issues:write"),
-        protoGrant("datadog:metrics:read@idx-1"),
+        protoGrant("github:issues:write@acme/app"),
+        protoGrant("datadog:metrics:read"),
       ]);
+    } finally { await s.close(); }
+  });
+
+  test("admin CreateProfile refuses a resource on a static-key connector that cannot hold it", async () => {
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"), store: makeFakeStore(),
+      images: fakeImages(["img-1"]), mountCatalog: fakeCatalog([]),
+    });
+    try {
+      await expectErr(
+        s.client.createProfile({
+          name: "Scoped", description: "", icon: "Bot", imageId: "img-1", harness: "claude", includeUserTokens: false, envVars: {},
+          integrationGrants: [protoGrant("datadog:metrics:read@idx-1")],
+        }),
+        Code.InvalidArgument,
+      );
     } finally { await s.close(); }
   });
 
