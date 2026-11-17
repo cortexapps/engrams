@@ -28,7 +28,6 @@
  * their mint scopes are compiled in Phase 5.
  */
 
-import { SAFE_REPO_PATH } from "../forges/forge.ts";
 import { readdirSync, readFileSync } from "node:fs";
 
 import type { ConnectionProvider } from "../integrations/providers/provider.ts";
@@ -78,10 +77,72 @@ export interface HttpMatch {
   resourcePath?: string;
 }
 
-const RESOURCE_PLACEHOLDER = /\{resource(:encoded)?\}/g;
+const RESOURCE_PLACEHOLDER = /\{resource(:encoded)?\}/;
 
-/** The path globs of `match` for a grant. Null when the grant names
- * resources that this operation cannot be held to. */
+/** A resource of a grant goes into a path glob, so it is `/`-separated names
+ * of letters, digits, `.`, `_` and `-`. No name is `.` or `..`, and none
+ * starts with `-`. */
+const SAFE_RESOURCE =
+  /^(?!-|\.{1,2}(?:\/|$))[A-Za-z0-9._-]+(?:\/(?!-|\.{1,2}(?:\/|$))[A-Za-z0-9._-]+)*$/;
+
+function restMatch(op: Operation): HttpMatch | undefined {
+  return op.match !== undefined && !isGraphqlMatch(op.match) ? op.match : undefined;
+}
+
+function holdsResource(op: Operation): boolean {
+  const template = restMatch(op)?.resourcePath;
+  return template !== undefined && RESOURCE_PLACEHOLDER.test(template);
+}
+
+/** Whether the connector's paths can hold a grant to a resource. */
+function isResourceAware(connector: Connector): boolean {
+  return connector.operations.some(holdsResource);
+}
+
+/** A grant as the resource check reads it. `userScoped`: the session uses
+ * the person's own credential. */
+export interface ResourceScopedGrant {
+  provider: string;
+  operation: string;
+  resourceConstraints: readonly string[];
+  userScoped?: boolean;
+}
+
+/** Why the egress policy cannot hold `grant` to its resources; null when it
+ * can, and when the grant names none. Profile save refuses a grant with an
+ * error, and the policy compile gives it no credential.
+ *
+ * A resource-aware connector holds the resource in the path. Any other
+ * connector holds it only in a credential that the coordinator mints for the
+ * session: a static key and a person's own token reach all that they can
+ * reach. */
+export function resourceScopeError(
+  grant: ResourceScopedGrant,
+  registry: Map<string, Connector>,
+): string | null {
+  if (grant.resourceConstraints.length === 0) return null;
+  const connector = registry.get(grant.provider);
+  const unlimited = `"${grant.provider}" grants cannot be limited to a resource`;
+  if (!connector) return unlimited;
+  if (!isResourceAware(connector)) {
+    if (connector.credential.source === "inject") return unlimited;
+    return grant.userScoped === true && connector.userCredential !== undefined
+      ? `a "${grant.provider}" grant that uses the person's own credential cannot be limited to a resource`
+      : null;
+  }
+  if (!connector.operations.some((op) => op.grants.includes(grant.operation) && holdsResource(op))) {
+    return `"${grant.provider}:${grant.operation}" cannot be limited to a resource`;
+  }
+  const pattern =
+    connector.resourcePattern !== undefined ? new RegExp(connector.resourcePattern) : undefined;
+  const invalid = grant.resourceConstraints.find(
+    (resource) => !SAFE_RESOURCE.test(resource) || pattern?.test(resource) === false,
+  );
+  return invalid !== undefined ? `"${invalid}" is not a resource of "${grant.provider}"` : null;
+}
+
+/** The path globs of `match` for a grant that passes {@link resourceScopeError}.
+ * Null when the grant names resources and this operation has no path for one. */
 function grantPathGlobs(
   match: HttpMatch | undefined,
   resources: readonly string[],
@@ -89,41 +150,13 @@ function grantPathGlobs(
 ): string[] | null {
   if (!resourceAware || resources.length === 0) return match?.path ? [match.path] : [];
   const template = match?.resourcePath;
-  // A resource goes into a glob, so it has the characters of a repository
-  // path only.
-  if (template === undefined || !resources.every((resource) => SAFE_REPO_PATH.test(resource))) {
-    return null;
-  }
+  if (template === undefined) return null;
   const globs = resources.map((resource) =>
-    template.replace(RESOURCE_PLACEHOLDER, (_all, encoded) =>
+    template.replace(new RegExp(RESOURCE_PLACEHOLDER, "g"), (_all, encoded) =>
       encoded ? encodeURIComponent(resource) : resource,
     ),
   );
   return [...new Set(globs)];
-}
-
-/** Why `operation` of `provider` cannot be held to a resource; null when it
- * can. A connector with no resource-aware operation holds a resource only
- * when it mints its credential: the minted credential then carries the
- * limit. A static credential reaches all that the key can reach. */
-export function resourceScopeError(
-  provider: string,
-  operation: string,
-  registry: Map<string, Connector> = connectorRegistry(),
-): string | null {
-  const connector = registry.get(provider);
-  const rest = (connector?.operations ?? []).flatMap((op) =>
-    op.match !== undefined && !isGraphqlMatch(op.match) ? [{ op, match: op.match }] : [],
-  );
-  if (!rest.some(({ match }) => match.resourcePath?.includes("{resource"))) {
-    return connector?.credential.source === "inject"
-      ? `"${provider}" grants cannot be limited to a resource`
-      : null;
-  }
-  const scoped = rest.some(
-    ({ op, match }) => op.grants.includes(operation) && match.resourcePath?.includes("{resource"),
-  );
-  return scoped ? null : `"${provider}:${operation}" cannot be limited to a resource`;
 }
 
 /**
@@ -603,6 +636,9 @@ export interface Connector {
    * Defaulted to `/graphql` when any operation has a GraphQL match; absent for a
    * pure-REST connector. */
   graphqlEndpoint?: string;
+  /** A regular expression that each resource of a grant must match (GitLab:
+   * a project path of two or more names). */
+  resourcePattern?: string;
   operations: Operation[];
   /** Always defaulted from `provider` when absent (see {@link parseConnector}). */
   display: ConnectorDisplay;
@@ -2536,6 +2572,17 @@ export function parseConnector(
     graphqlEndpoint = "/graphql";
   }
 
+  let resourcePattern: string | undefined;
+  if (o.resourcePattern !== undefined) {
+    if (typeof o.resourcePattern !== "string") fail(where, '"resourcePattern" must be a string');
+    try {
+      new RegExp(o.resourcePattern);
+    } catch {
+      fail(where, '"resourcePattern" must be a regular expression');
+    }
+    resourcePattern = o.resourcePattern;
+  }
+
   const actions =
     o.actions !== undefined
       ? parseActionsFacet(where, o.actions, {
@@ -2557,6 +2604,7 @@ export function parseConnector(
     credential,
     hosts,
     ...(graphqlEndpoint ? { graphqlEndpoint } : {}),
+    ...(resourcePattern !== undefined ? { resourcePattern } : {}),
     operations,
     display,
     ...(cli ? { cli } : {}),
@@ -2736,9 +2784,16 @@ export function compileIntegrationPolicy(
     // a regional or self-hosted host is opened + injected onto, never a
     // hard-coded default the deployment does not use.
     const hosts = effectiveHosts(connector, resolveSettings(connector, grant.settings));
-    const resourceAware = connector.operations.some(
-      (op) => op.match !== undefined && !isGraphqlMatch(op.match) && op.match.resourcePath !== undefined,
-    );
+    // ADR 0115: a user-scoped grant on a human compile (userSubjectId set)
+    // swaps the VALUE SOURCE to the launching user's sealed credential; the
+    // gating and the header shape are unchanged. Programmatic sessions never
+    // supply a subject, so they compile the org credential below.
+    const userScoped =
+      grant.userScoped === true &&
+      inputs?.userSubjectId !== undefined &&
+      connector.userCredential !== undefined;
+    if (resourceScopeError({ ...grant, userScoped }, registry) !== null) continue;
+    const resourceAware = isResourceAware(connector);
     for (const op of connector.operations) {
       if (!op.grants.includes(grant.operation)) continue;
       const graphql = op.match !== undefined && isGraphqlMatch(op.match);
@@ -2770,14 +2825,6 @@ export function compileIntegrationPolicy(
         path_globs = restGlobs;
       }
 
-      // ADR 0115: a user-scoped grant on a human compile (userSubjectId set)
-      // swaps the VALUE SOURCE to the launching user's sealed credential; the
-      // gating and the header shape are unchanged. Programmatic sessions never
-      // supply a subject, so they compile the org credential below.
-      const userScoped =
-        grant.userScoped === true &&
-        inputs?.userSubjectId !== undefined &&
-        connector.userCredential !== undefined;
       const userMintSource = (): CredentialMintSourceJson => ({
         oauth_user: {
           user_id: inputs?.userSubjectId ?? "",

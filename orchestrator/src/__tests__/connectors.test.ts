@@ -456,7 +456,7 @@ describe("compileIntegrationPolicy", () => {
     // Git over HTTPS takes the token as a Basic password; the REST API as a bearer.
     expect(templateFor("GET", "path-query:/*.git/info/refs?service=git-upload-pack")).toBe("Basic {basic:oauth2}");
     expect(templateFor("POST", "path-query:/*.git/git-receive-pack")).toBe("Basic {basic:oauth2}");
-    expect(templateFor("GET", "/api/v4/projects/*/repository/*")).toBe("Bearer {}");
+    expect(templateFor("GET", "segment-id:/api/v4/projects/*/repository/**")).toBe("Bearer {}");
     expect(policy.injects.every((i) => i.secret_ref === "gitlab.api_token")).toBe(true);
 
     // A read grant alone opens fetch and not push.
@@ -542,10 +542,10 @@ describe("compileIntegrationPolicy", () => {
     expect(policy.network.allow_hosts).toEqual(["api.linear.app"]);
   });
 
-  test("the resource suffix is ignored for inject gating", () => {
-    const a = compileIntegrationPolicy(["datadog:logs:read"], reg);
-    const b = compileIntegrationPolicy(["datadog:logs:read@idx-1"], reg);
-    expect(b).toEqual(a);
+  test("a resource that a static key cannot be held to compiles no inject", () => {
+    const policy = compileIntegrationPolicy(["datadog:logs:read@idx-1"], reg);
+    expect(policy.injects).toEqual([]);
+    expect(policy.network.allow_hosts).toEqual([]);
   });
 
   test("a mint capability compiles to a minted inject (ADR 0056 amendment)", () => {

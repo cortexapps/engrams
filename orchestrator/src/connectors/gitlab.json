@@ -29,6 +29,7 @@
     }
   ],
   "hosts": [],
+  "resourcePattern": "^[^/]+(/[^/]+)+$",
   "test": { "path": "/api/v4/user" },
   "operations": [
     {

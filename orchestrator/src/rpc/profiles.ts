@@ -544,12 +544,9 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       const harness = await assertHarnessValid(catalogOptionId(req.harness), modelRouter, model, effort);
       await assertSkillsValid(req.skills ?? []);
       const integrationGrants = normalizeIntegrationGrants(req.integrationGrants ?? []);
-      const resolvedGrants = await resolveIntegrationGrants(integrationGrants, connections);
-      assertResolvedGrantsValid(
-        resolvedGrants,
-        await loadRegistry(connectors),
-        toolCapabilities(),
-      );
+      const registry = await loadRegistry(connectors);
+      const resolvedGrants = await resolveIntegrationGrants(integrationGrants, connections, registry);
+      assertResolvedGrantsValid(resolvedGrants, registry, toolCapabilities());
       const network = normalizeNetwork(req.network);
       const secrets = normalizeSecrets(req.secrets ?? []);
       assertNetworkValid(network);
@@ -588,12 +585,9 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       const harness = await assertHarnessValid(catalogOptionId(req.harness), modelRouter, model, effort);
       await assertSkillsValid(req.skills ?? []);
       const integrationGrants = normalizeIntegrationGrants(req.integrationGrants ?? []);
-      const resolvedGrants = await resolveIntegrationGrants(integrationGrants, connections);
-      assertResolvedGrantsValid(
-        resolvedGrants,
-        await loadRegistry(connectors),
-        toolCapabilities(),
-      );
+      const registry = await loadRegistry(connectors);
+      const resolvedGrants = await resolveIntegrationGrants(integrationGrants, connections, registry);
+      assertResolvedGrantsValid(resolvedGrants, registry, toolCapabilities());
       const network = normalizeNetwork(req.network);
       const secrets = normalizeSecrets(req.secrets ?? []);
       assertNetworkValid(network);

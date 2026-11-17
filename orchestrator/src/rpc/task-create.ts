@@ -488,7 +488,7 @@ export async function compileSessionCreateInput(
     opts.capabilityOverride !== undefined
       ? overrideGrants
       : [...profile.integrationGrants, ...overrideGrants];
-  const resolvedEffectiveGrants = await resolveIntegrationGrants(effectiveGrants, connections);
+  const resolvedEffectiveGrants = await resolveIntegrationGrants(effectiveGrants, connections, registry);
   const disabledConnection = resolvedEffectiveGrants.find(({ connection }) => !connection.enabled);
   if (disabledConnection) {
     throw new ConnectError(
@@ -554,7 +554,7 @@ export async function compileSessionCreateInput(
     opts.capabilityOverride !== undefined
       ? capabilities
       : grantsToCapabilities(
-          (await resolveIntegrationGrants(profile.integrationGrants, connections)).filter(
+          (await resolveIntegrationGrants(profile.integrationGrants, connections, registry)).filter(
             grantAvailable,
           ),
         );

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Code } from "@connectrpc/connect";
 
-import type { IntegrationPolicyJson } from "../connectors/registry.ts";
+import { connectorRegistry, type IntegrationPolicyJson } from "../connectors/registry.ts";
 import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
 import {
   appendGooglePolicy,
@@ -120,6 +120,7 @@ describe("Google egress policy", () => {
         resourceConstraints: [],
       }],
       store,
+      connectorRegistry(),
     )).rejects.toMatchObject({ code: Code.InvalidArgument });
 
     const observerReads = await resolveIntegrationGrants(
@@ -136,6 +137,7 @@ describe("Google egress policy", () => {
         },
       ],
       store,
+      connectorRegistry(),
     );
     expect(observerReads.map(({ grant: resolved }) => resolved.operation)).toEqual([
       "monitoring.metricdescriptors.list",
