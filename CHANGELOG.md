@@ -46,7 +46,7 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
   on it. The site's "Add a provider" page says what a provider implements. ([#1793])
 - A pull request comment gives a command when the mention of the review app starts a line
   or follows a space, on every forge. The `stop` command follows the same rule as `review`.
-  ([#1793])
+  A quoted line (`> ...`) is not a command. ([#1793])
 - A GitLab capability that names a project (`gitlab:repository:read@group/project`) limits
   the session to that project. ([#1793])
 - GitLab `projects:read` reaches the project list and one project. It no longer reaches a
