@@ -4,7 +4,7 @@
 
 import type { GitForge, ReviewEvent } from "./forge.ts";
 import type { PrContext } from "./pr-context.ts";
-import { parseReviewCommand } from "./review-command.ts";
+import { authorizedCommand } from "./review-command.ts";
 
 /** The value of the built-in's `facts` step. */
 export interface ReviewFacts {
@@ -51,10 +51,8 @@ async function reviewTrigger(
     case "change":
       return event.draft || mode !== "auto" ? null : event.trigger;
     case "comment": {
-      if (event.fromBot) return null;
-      const command = parseReviewCommand(event.body, typeof mention === "string" ? mention : "");
-      if (command?.kind !== "review") return null;
-      return (await forge.mayRequestReview(event)) ? "command" : null;
+      const handle = typeof mention === "string" ? mention : "";
+      return (await authorizedCommand(forge, event, handle, ["review"])) ? "command" : null;
     }
     case "dispatch":
       // An explicit request: it does not need mode "auto".

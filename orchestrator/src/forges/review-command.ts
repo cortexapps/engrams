@@ -1,6 +1,8 @@
 /** The commands a person gives the review app in a pull-request comment:
  * `@<handle> review [focus]`, `@<handle> fix <text>`, `@<handle> stop`. */
 
+import type { GitForge, ReviewCommentEvent } from "./forge.ts";
+
 export type EngramsCommand =
   | { kind: "review"; focus?: string }
   | { kind: "fix"; text: string }
@@ -53,4 +55,18 @@ function sanitize(value: string): string {
     .replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
     .trim()
     .slice(0, 500);
+}
+
+/** The command of `comment` when it is one of `kinds` and its author may
+ * give it; null otherwise. The forge is asked only about such a command. */
+export async function authorizedCommand(
+  forge: Pick<GitForge, "mayRequestReview">,
+  comment: ReviewCommentEvent,
+  mention: string,
+  kinds: readonly EngramsCommand["kind"][],
+): Promise<EngramsCommand | null> {
+  if (comment.fromBot) return null;
+  const command = parseReviewCommand(comment.body, mention);
+  if (command === null || !kinds.includes(command.kind)) return null;
+  return (await forge.mayRequestReview(comment)) ? command : null;
 }

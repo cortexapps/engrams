@@ -2,11 +2,12 @@
  * the record of a reviewed pull request current, and it runs the `stop`
  * mention command. The event route calls it for every forge. */
 
-import { makeAutomationStore, type AutomationStore } from "../db/automations.ts";
+import { reviewDefinition } from "../automations/builtins/review.ts";
+import { makeAutomationStore, resolveAutomationInputs, type AutomationStore } from "../db/automations.ts";
 import { makeReviewStore, type ReviewStore, type UpsertReviewTargetInput } from "../db/reviews.ts";
 import type { GitForge, ReviewCommentEvent, ReviewEventPullRequest } from "../forges/forge.ts";
 import { reviewVariantFor } from "../forges/registry.ts";
-import { parseReviewCommand } from "../forges/review-command.ts";
+import { authorizedCommand } from "../forges/review-command.ts";
 import { log as rootLog } from "../log.ts";
 import {
   stopAutomationReview,
@@ -50,10 +51,11 @@ async function builtinMention(
   provider: string,
 ): Promise<string> {
   const variant = reviewVariantFor(provider);
-  const builtin = variant === null ? null : await store.getByBuiltinKey(variant.key);
-  const mention = builtin?.inputs["mention"];
-  // The same value a run reads: a row with no mention has the variant's.
-  return typeof mention === "string" ? mention : (variant?.mentionOfUnsetRow ?? "");
+  if (variant === null) return "";
+  const builtin = await store.getByBuiltinKey(variant.key);
+  // The same value a run reads: the stored inputs over the schema defaults.
+  const inputs = resolveAutomationInputs(reviewDefinition(variant).inputsSchema, builtin?.inputs ?? {});
+  return typeof inputs["mention"] === "string" ? inputs["mention"] : "";
 }
 
 export function makeForgeDeliveryHandler(deps: ForgeDeliveryDeps = {}) {
@@ -89,18 +91,10 @@ export function makeForgeDeliveryHandler(deps: ForgeDeliveryDeps = {}) {
   }
 
   async function command(forge: GitForge, comment: ReviewCommentEvent): Promise<void> {
-    const parsed = parseReviewCommand(comment.body, await mentionHandle(forge.provider));
     // The built-in's own admission starts a review from a `review` comment.
-    if (parsed === null || parsed.kind === "review") return;
+    const mention = await mentionHandle(forge.provider);
+    if ((await authorizedCommand(forge, comment, mention, ["stop"])) === null) return;
     const where = { provider: forge.provider, repo: comment.pr.repo, prNumber: comment.pr.number };
-    if (comment.fromBot || !(await forge.mayRequestReview(comment))) {
-      log.info({ ...where, command: parsed.kind }, "a command from this author is ignored");
-      return;
-    }
-    if (parsed.kind === "fix") {
-      log.info(where, "the fix command is not supported");
-      return;
-    }
     log.info({ ...where, ...(await stop(where)) }, "a stop command reached the review run");
   }
 
