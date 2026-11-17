@@ -22,15 +22,24 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
   session clones and pushes to them through the egress proxy of the new host agent.
   ([#1793])
 - **A rollback past this release** makes a profile routed to LiteLLM, and the GitLab
-  review, fail until you upgrade again. Nothing else changes back. ([#1793])
+  review, fail until you upgrade again. A custom connector with a `webhook` section that
+  was saved on this release does not load on the earlier one, because the earlier one
+  requires `webhook.verificationScheme`. Nothing else changes back. ([#1793])
 - **The upgrade stops the pull request reviews and the Slack thread runs that are active
   when it deploys.** Both built-ins have a new definition. A push or a `review` comment
   starts the review again, and the next mention continues a thread. ([#1793])
 - **A capability that names a resource is refused when nothing can enforce the resource.**
-  Only GitHub and GitLab hold a session to a resource. A profile that has a resource on a
+  GitHub and GitLab hold a session to a resource. A profile that has a resource on a
   capability of another connector (for example `datadog:metrics:read@name`) does not save,
   and a task on it does not start, until you remove the resource. Before, the resource was
-  accepted and ignored. ([#1793])
+  accepted and ignored. The same rule refuses a resource on a GitHub capability that uses
+  a person's own credential, and a GitLab resource that is not a project path
+  (`group/project`). ([#1793])
+- **A connector path rule refuses a path that two servers can read differently.** A rule
+  no longer matches a path with `;`, `\`, a `.` or `..` segment, or a percent sign that
+  is itself escaped. A path with an escaped `?` or `#` matches only when the part before
+  it also matches. A custom connector whose requests depend on such a path is refused
+  until its rule changes. ([#1793])
 
 ### Added
 
@@ -57,8 +66,15 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 - GitLab `projects:read` reaches the project list and one project. It no longer reaches a
   project's merge requests, issues, pipelines or files; each of those has its own power.
   ([#1793])
-- With `GITHUB_APP_LOGIN` set, the review edits only a status comment that the app wrote.
-  ([#1793])
+- The review edits only a status comment that an app wrote. With `GITHUB_APP_LOGIN` set
+  it prefers the comment of that app. ([#1793])
+- A review step fails when the forge cannot list the comments of a pull request. Before,
+  the step read that as "no comment" and could post a second status comment. ([#1793])
+- A segment rule of a connector (`segment-path:`, `segment-id:`) can end in `**`, which
+  matches the rest of the path. ([#1793])
+- The line a Slack thread shows for a routed profile says "smart routing". When the
+  decision model gives one answer, the "which profile?" card offers that answer and the
+  other candidates. ([#1793])
 - With more than one model router connected, a role uses the router whose model an admin
   chose. ([#1793])
 - A Decide block and smart routing work with any connected router that has a decision
