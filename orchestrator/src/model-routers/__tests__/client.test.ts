@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { routerFor } from "../client.ts";
+import { routerFor, routerForDecisionModel } from "../client.ts";
 import type { RouterModels } from "../models.ts";
 import { listModelRouterDefinitions } from "../registry.ts";
 
@@ -32,5 +32,45 @@ describe("routerFor", () => {
 
   test("no router has a model for the role", async () => {
     expect(await pick({})).toBeNull();
+  });
+});
+
+describe("routerForDecisionModel", () => {
+  const routers = listModelRouterDefinitions();
+  const native = routers.find((router) => router.decisions !== undefined);
+  const plain = routers.find((router) => router.decisions === undefined);
+  if (!native || !plain) throw new Error("the test needs a router with a decisions endpoint and one without");
+  const pick = (
+    connected: typeof routers,
+    opts: { decision?: Record<string, string>; listed?: Record<string, string[]> } = {},
+  ) =>
+    routerForDecisionModel("acme/decider", {
+      routers: async () => connected,
+      models: async (router) => {
+        const model = opts.decision?.[router.id];
+        return { ...NONE, decision: model ? { model, chosen: true } : null };
+      },
+      listed: async (routerId, model) => opts.listed?.[routerId]?.includes(model) ?? false,
+    });
+
+  test("the router whose decision model it is wins over one that lists it", async () => {
+    const chosen = await pick([native, plain], {
+      decision: { [plain.id]: "acme/decider" },
+      listed: { [native.id]: ["acme/decider"] },
+    });
+    expect(chosen).toEqual({ router: plain, model: "acme/decider" });
+  });
+
+  test("a router whose catalog lists the model serves it", async () => {
+    const chosen = await pick([native, plain], { listed: { [plain.id]: ["acme/decider"] } });
+    expect(chosen).toEqual({ router: plain, model: "acme/decider" });
+  });
+
+  test("an unlisted model goes to a router with a decisions endpoint", async () => {
+    expect(await pick([plain, native])).toEqual({ router: native, model: "acme/decider" });
+  });
+
+  test("a router with no decisions endpoint does not get a model it does not list", async () => {
+    expect(await pick([plain])).toBeNull();
   });
 });

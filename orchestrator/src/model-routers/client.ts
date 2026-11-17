@@ -9,7 +9,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import type { LanguageModel } from "ai";
 
 import { asBearer, getIntegrationClient, registerIntegrationClient } from "../integrations/clients.ts";
-import type { RunOpDeps } from "../integrations/run-op.ts";
+import { ConnectorHostUnsetError, type RunOpDeps } from "../integrations/run-op.ts";
 import { decideByChat } from "./chat-decisions.ts";
 import { connectedRoutersOrNone } from "./connected.ts";
 import {
@@ -69,18 +69,31 @@ export async function routerFor(
 }
 
 /** The connected router that serves `model` for a decision: one whose
- * decision model it is, else one whose catalog lists it, else the first. */
-async function routerForDecisionModel(model: string): Promise<RoutedModel | null> {
-  const routers = await connectedRoutersOrNone();
+ * decision model it is, else one whose catalog lists it, else the first
+ * that has a decisions endpoint (its decision models are not in a catalog
+ * of chat models). Null when no connected router serves the model. */
+export async function routerForDecisionModel(
+  model: string,
+  deps: {
+    routers: typeof connectedRoutersOrNone;
+    models: typeof routerModels;
+    listed(routerId: string, model: string): Promise<boolean>;
+  } = {
+    routers: connectedRoutersOrNone,
+    models: routerModels,
+    listed: async (routerId, modelId) =>
+      (await makeModelRouterStore().getModel(routerId, modelId))?.available === true,
+  },
+): Promise<RoutedModel | null> {
+  const routers = await deps.routers();
   for (const router of routers) {
-    if ((await routerModels(router)).decision?.model === model) return { router, model };
+    if ((await deps.models(router)).decision?.model === model) return { router, model };
   }
-  const store = makeModelRouterStore();
   for (const router of routers) {
-    if ((await store.getModel(router.id, model))?.available) return { router, model };
+    if (await deps.listed(router.id, model)) return { router, model };
   }
-  const [first] = routers;
-  return first ? { router: first, model } : null;
+  const native = routers.find((router) => router.decisions !== undefined);
+  return native ? { router: native, model } : null;
 }
 
 /** The model that titles a task; null when no connected router has one. */
@@ -130,6 +143,8 @@ export async function decide(request: DecisionsRequest): Promise<DecisionsRespon
     if (error instanceof ConnectError && TRANSIENT_LOOKUP_CODES.has(error.code)) {
       throw new DecisionsApiError(`resolve the ${chosen.router.label} key: ${error.rawMessage}`, null, true);
     }
+    // A key with no host: the router cannot be reached, so it is not connected.
+    if (error instanceof ConnectorHostUnsetError) return null;
     throw error;
   }
   const resolved = { ...request, model: chosen.model };

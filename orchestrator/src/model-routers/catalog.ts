@@ -1,7 +1,7 @@
 import type { ModelRouterStore } from "../db/model-routers.ts";
 import { runIntegrationOp } from "../integrations/run-op.ts";
 import { errorMessage, log } from "../log.ts";
-import { getModelRouterDefinition, listModelRouterDefinitions } from "./registry.ts";
+import { getModelRouterDefinition, listModelRouterDefinitions, storedCatalogModel } from "./registry.ts";
 import { connectedRoutersOrNone } from "./connected.ts";
 
 export interface RouterCatalogRefreshResult {
@@ -32,7 +32,9 @@ export async function refreshRouterCatalog(
       throw new Error(`catalog returned HTTP ${response.status}`);
     }
     if (response.truncated) throw new Error("catalog response was truncated");
-    const models = router.catalog.parse(response.body).map((model) => ({ ...model, routerId }));
+    const models = router.catalog
+      .parse(response.body)
+      .map((model) => ({ ...storedCatalogModel(model), routerId }));
     if (models.length === 0) throw new Error("catalog contained no eligible models");
     const { markedUnavailable } = await deps.store.replaceCatalog(routerId, models, now);
     log.info(

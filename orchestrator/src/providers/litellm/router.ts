@@ -23,17 +23,8 @@ export function parseLiteLlmCatalog(body: Uint8Array): CatalogModel[] {
   for (const raw of parsed.data) {
     byId.set(raw.id, {
       modelId: raw.id,
-      canonicalSlug: raw.id,
       name: raw.id,
       author: raw.owned_by ?? null,
-      description: null,
-      contextLength: 0,
-      promptPrice: null,
-      completionPrice: null,
-      inputModalities: [],
-      outputModalities: [],
-      supportedParameters: [],
-      huggingFaceId: null,
       upstream: raw as Record<string, unknown>,
     });
   }

@@ -10,7 +10,29 @@ import type { DecisionsClient } from "./decisions.ts";
 export const ROUTER_PROTOCOLS = ["anthropic_messages", "openai_responses"] as const;
 export type RouterProtocol = (typeof ROUTER_PROTOCOLS)[number];
 
-export type CatalogModel = Omit<RouterModelInput, "routerId">;
+/** A model as the catalog stores it. */
+export type StoredCatalogModel = Omit<RouterModelInput, "routerId">;
+
+/** A model as a router's list states it. A router gives the facts that its
+ * list has; the catalog stores an empty value for each of the others. */
+export type CatalogModel = Pick<StoredCatalogModel, "modelId" | "name" | "author" | "upstream"> &
+  Partial<StoredCatalogModel>;
+
+/** The stored form of a listed model. */
+export function storedCatalogModel(model: CatalogModel): StoredCatalogModel {
+  return {
+    canonicalSlug: model.modelId,
+    description: null,
+    contextLength: 0,
+    promptPrice: null,
+    completionPrice: null,
+    inputModalities: [],
+    outputModalities: [],
+    supportedParameters: [],
+    huggingFaceId: null,
+    ...model,
+  };
+}
 
 /** What a router's model is used for: `default` runs a routed launch that
  * names no model, `title` titles a task, `decision` answers a decide block. */
@@ -32,8 +54,9 @@ export interface ModelRouterSpec {
     refreshIntervalMs: number;
     parse(body: Uint8Array): CatalogModel[];
   };
-  /** Whether a catalog model takes a reasoning effort. */
-  takesReasoningEffort(model: Pick<CatalogModel, "supportedParameters">): boolean;
+  /** Whether a model takes a reasoning effort, from the facts the router
+   * listed for it. */
+  takesReasoningEffort(model: StoredCatalogModel): boolean;
   /** The public page for a model, when the router has one. */
   modelUrl?(modelId: string): string;
   /** Chat models for calls the orchestrator makes itself. */
