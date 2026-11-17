@@ -350,7 +350,10 @@ function IntegrationActionInspector(props: BlockInspectorProps) {
   const actionId = typeof block.config["actionId"] === "string" ? block.config["actionId"] : "";
   const providers = useAutomationProviders("actions", provider);
   const catalog = useActionCatalog(provider || undefined);
-  const action = catalog.data?.actions.find((a) => a.id === actionId);
+  // A stored block can name an action by an earlier id.
+  const action = catalog.data?.actions.find(
+    (a) => a.id === actionId || a.aliases.includes(actionId),
+  );
   const schema = useMemo<FieldSchema | undefined>(() => {
     if (!action?.inputSchemaJson) return undefined;
     try {
@@ -405,7 +408,7 @@ function IntegrationActionInspector(props: BlockInspectorProps) {
       >
         <FieldLabel>Action</FieldLabel>
         <Select
-          value={actionId}
+          value={action?.id ?? actionId}
           onValueChange={(next) =>
             onChange({ ...block, config: { ...block.config, actionId: next, params: {} } })
           }

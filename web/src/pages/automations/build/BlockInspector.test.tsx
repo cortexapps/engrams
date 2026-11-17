@@ -25,6 +25,7 @@ vi.mock("@/hooks/useAutomationEditor", () => ({
       actions: [
         {
           id: "create_issue_comment",
+          aliases: ["upsert_issue_comment"],
           label: "Create issue comment",
           description: "",
           inputSchemaJson: JSON.stringify({
@@ -140,6 +141,19 @@ describe("BlockInspector", () => {
     expect(await screen.findByTestId("field-params.repo")).toBeTruthy();
     expect(screen.getByTestId("field-params.number")).toBeTruthy();
     expect(screen.getByTestId("field-params.body").querySelector("textarea")).not.toBeNull();
+  });
+
+  it("integration_action finds the action of a block that names an earlier id", async () => {
+    mount(
+      {
+        id: "ack",
+        type: "integration_action",
+        config: { provider: "github", actionId: "upsert_issue_comment", params: {} },
+      },
+      false,
+    );
+    expect(await screen.findByTestId("field-params.repo")).toBeTruthy();
+    expect(screen.getByTestId("field-params.number")).toBeTruthy();
   });
 
   it("integration_action numeric params are written as numbers, never strings", async () => {

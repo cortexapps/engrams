@@ -740,6 +740,8 @@ message ActionCatalogEntry {
   string label = 2;
   string description = 3;
   string input_schema_json = 4;
+  // Earlier ids of the action. A stored block that names one is this action.
+  repeated string aliases = 5;
 }
 
 message ListActionCatalogResponse {

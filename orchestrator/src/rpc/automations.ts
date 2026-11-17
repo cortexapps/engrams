@@ -1523,6 +1523,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
           label: action.label,
           description: action.description ?? "",
           inputSchemaJson: JSON.stringify(action.inputSchema),
+          aliases: action.aliases ?? [],
         })),
       };
     },
