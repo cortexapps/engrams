@@ -22,6 +22,7 @@ import { createHash } from "node:crypto";
 import { makeAutomationStore, type AutomationRow, type AutomationStore } from "../../db/automations.ts";
 import { defaultAutomationSender, inboxKeys } from "../engine/inbox.ts";
 import { makeIntegrationConnectionStore } from "../../db/integration-connections.ts";
+import { connectorRegistry } from "../../connectors/registry.ts";
 import { isUniqueViolation } from "../../db/pg-errors.ts";
 import { log as rootLog } from "../../log.ts";
 import { overrideTargets } from "../engine/definition.ts";
@@ -112,10 +113,9 @@ async function materialize(
       const provider = trigger.provider;
       let id = resolved.get(provider);
       if (id === undefined) {
-        const connection = await deps.connections.ensureDefault(
-          provider,
-          `${provider.charAt(0).toUpperCase()}${provider.slice(1)} (default)`,
-        );
+        // The name the event route gives the same row.
+        const name = connectorRegistry().get(provider)?.display.name ?? provider;
+        const connection = await deps.connections.ensureDefault(provider, `${name} (default)`);
         id = connection.id;
         resolved.set(provider, id);
       }
