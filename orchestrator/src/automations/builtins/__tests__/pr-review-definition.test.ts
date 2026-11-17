@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
 import { registerEngineBlocks } from "../../engine/blocks/index.ts";
+import { evaluateAdmissionPrelude } from "../../engine/admission.ts";
 import { validateDefinition, applyBlockOverrides } from "../../engine/definition.ts";
+import { admissionPrelude } from "../../engine/preview.ts";
+import { makeCodeBlockRuntime } from "../../code/runtime.ts";
 import { renderAutomationTemplateInScope } from "../../template.ts";
 import { requireForge } from "../../../forges/registry.ts";
 import { reviewFacts } from "../../../forges/review-facts.ts";
@@ -90,6 +93,41 @@ describe("PR_REVIEW_BUILTIN definition", () => {
     expect(closed.blocks.map((b) => b.type)).toEqual(["instance_close"]);
     // A close only ends a workstream that exists.
     expect(instance.entrypoints).toEqual({ closed: { admit: "require" } });
+  });
+
+  describe("admission before the concurrency claim", () => {
+    const verdict = (event: { raw: Record<string, unknown> }, eventKey: string) =>
+      evaluateAdmissionPrelude({
+        definition: PR_REVIEW_DEFINITION,
+        inputs,
+        automationId: "a1",
+        automationName: "review",
+        trigger: { kind: "integration", receivedAt: "2026-08-21T00:00:00Z", eventKey, payload: event.raw },
+        aliases: [],
+        entrypointId: "main",
+        code: makeCodeBlockRuntime(),
+      });
+
+    test("the prelude is the facts step and the admit filter", () => {
+      expect(admissionPrelude(PR_REVIEW_DEFINITION.blocks).map((b) => b.id)).toEqual(["facts", "admit"]);
+    });
+
+    test("a comment that is no command is rejected, so it does not supersede the active review", async () => {
+      expect(await verdict(commentEvent("LGTM"), "issue_comment.created")).toMatchObject({
+        kind: "reject",
+        blockId: "admit",
+      });
+    });
+
+    test("a review command from a person who may not ask is rejected", async () => {
+      expect(await verdict(commentEvent("@engrams review", "NONE"), "issue_comment.created")).toMatchObject({
+        kind: "reject",
+      });
+    });
+
+    test("a review command from a member is admitted", async () => {
+      expect(await verdict(commentEvent("@engrams review"), "issue_comment.created")).toEqual({ kind: "admit" });
+    });
   });
 
   test("every tunable field exists in its block's config", () => {

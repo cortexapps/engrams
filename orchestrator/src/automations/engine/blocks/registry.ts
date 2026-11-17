@@ -51,6 +51,10 @@ export interface BlockExecutor<C = unknown> {
    * it only while a connected router can answer; the engine runs it either
    * way, and the block reports `decided: false` when none can. */
   requiresDecisions?: true;
+  /** The block only reads, and a filter after it admits the delivery.
+   * Dispatch executes it in the admission prelude, before a run exists;
+   * the run executes it again. */
+  admission?: true;
   configSchema: z.ZodType<C>;
   /** Data half: runs inside one DBOS step. Absent for pure waits. */
   execute?(config: C, ctx: RunContext): Promise<BlockOutcome>;

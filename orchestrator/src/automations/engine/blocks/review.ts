@@ -407,6 +407,7 @@ export async function executeReviewFinalize(config: ReviewFinalizeConfig): Promi
 export function registerReviewBlocks(): void {
   registerBlock<z.infer<typeof reviewFactsConfigSchema>>({
     type: REVIEW_FACTS_TYPE,
+    admission: true,
     outputs: ["value"],
     configSchema: reviewFactsConfigSchema,
     async execute(config, ctx) {

@@ -14,7 +14,9 @@
  * frozen JSON in, bounded JSON out, a time budget), so evaluating it is
  * side-effect free, and the built-ins compute admission in a Code block —
  * without its `steps.<id>.value` every filter after it would report a false
- * "fail". Its row shows the value it produced, not its source.
+ * "fail". Its row shows the value it produced, not its source. A
+ * prelude-only walk (dispatch's admission) also runs the blocks registered
+ * with `admission`.
  *
  * A filter whose conditions read the outputs of an EXECUTING block (a
  * `resolve_user` gate, a `session_status` probe) cannot be decided here:
@@ -25,6 +27,7 @@
 
 import { ConditionParseError, type FilterCondition, type FilterGroup, evaluateFilter, parseFilterGroup } from "./conditions.ts";
 import { buildRunContext, type RunContext, type RunSnapshot } from "./context.ts";
+import { getBlock } from "./blocks/registry.ts";
 import type { AutomationDefinition, BlockDef } from "./definition.ts";
 import { entrypointOf, MAIN_ENTRYPOINT_ID } from "./definition.ts";
 import type { CodeBlockRuntime, EngineDeps } from "./deps.ts";
@@ -69,14 +72,19 @@ export interface PreviewInput {
   preludeOnly?: boolean;
 }
 
-/** The admission prelude of a block list: its leading run of `code` and
- * `filter` blocks. Pure and side-effect free, so it can be evaluated before
- * a run exists; the interpreter re-walks it inside the run (same scope,
- * same verdict). A built-in's "facts + admit" pair is the canonical case. */
+function isAdmissionBlock(block: BlockDef): boolean {
+  return block.type === "code" || block.type === "filter" || getBlock(block.type)?.admission === true;
+}
+
+/** The admission prelude of a block list: its leading run of `code` blocks,
+ * `filter` blocks and blocks registered with `admission`. None has a side
+ * effect, so it can be evaluated before a run exists; the interpreter
+ * re-walks it inside the run (same scope, same verdict). A built-in's
+ * "facts + admit" pair is the canonical case. */
 export function admissionPrelude(blocks: readonly BlockDef[]): BlockDef[] {
   const prelude: BlockDef[] = [];
   for (const block of blocks) {
-    if (block.type !== "code" && block.type !== "filter") break;
+    if (!isAdmissionBlock(block)) break;
     prelude.push(block);
   }
   return prelude;
@@ -254,6 +262,24 @@ export async function previewDefinition(input: PreviewInput): Promise<PreviewRes
           ...(config.mode === "boolean" ? { filterPass: value === true } : {}),
         });
         if (config.mode === "boolean" && value !== true) return false;
+        continue;
+      }
+      const admission = input.preludeOnly ? getBlock(block.type) : undefined;
+      if (admission?.admission && admission.execute) {
+        // A failure decides nothing: dispatch admits, and the run fails on
+        // the same block.
+        try {
+          const outcome = await admission.execute(admission.configSchema.parse(rendered), ctx);
+          if (outcome.kind !== "ok") {
+            throw new Error(outcome.kind === "error" ? outcome.message : `the block ended the run (${outcome.status})`);
+          }
+          ctx.steps[block.id] = outcome.outputs;
+        } catch (error) {
+          errorFor(block.id)("config", error);
+          blocks.push(result);
+          return false;
+        }
+        blocks.push(result);
         continue;
       }
       if (block.type === "filter") {
