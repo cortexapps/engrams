@@ -188,7 +188,7 @@ bytes = "1"
 base64 = { version = "0.23", default-features = false, features = ["std"] }
 # guest clock discipline — agentd steps CLOCK_REALTIME to the host KVM PTP
 # clock (/dev/ptp0) after snapshot/restore. The clock layer behind ntpd-rs.
-clock-steering = "0.2.1"
+clock-steering = "0.3.1"
 
 # wire codecs
 bincode = "1.3"

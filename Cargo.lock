@@ -1435,11 +1435,12 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clock-steering"
-version = "0.2.1"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2410abf030f2eb46cba840d343455078538e7c8755507b37ffd4074064f08f62"
+checksum = "367eb650ea6ba40abeb35107432d840290295c64215d2310a945dd704746adb0"
 dependencies = [
  "libc",
+ "statime-base",
 ]
 
 [[package]]
@@ -7821,6 +7822,15 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "statime-base"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb9da483f2a8c672a3ef88aae31e6eaa4346a79b4ad7a1b161c6e40cb0d18233"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "stringprep"
