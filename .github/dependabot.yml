@@ -257,6 +257,17 @@ updates:
       #                                  ^0.14, so 0.15 is unreachable and the
       #                                  bump collapses to an empty diff under
       #                                  `generate --diff`.
+      #   #1801  bindgen 0.69.5 -> 0.73.2 Hakari-only. bindgen is only a
+      #                                  build-dependency of libublk-rs-sys and
+      #                                  userfaultfd-sys (both ^0.69); the
+      #                                  generated pin is 0.69 and 0.73 is
+      #                                  unreachable. `generate --diff` puts
+      #                                  0.69 straight back.
+      #   #1802  prettyplease 0.2.37->0.3.0 Hakari-only. bindgen 0.69.5 wants
+      #                                  ^0.2 while prost-build 0.14.5 wants
+      #                                  0.3; the union pin stays 0.2 so the two
+      #                                  coexist in the lockfile and `generate
+      #                                  --diff` puts 0.2 back.
       #
       # NOT added here: `sha2`, `base64`, `jsonwebtoken`. Dependabot read the
       # OLD generation from the generated file (0.10 / 0.22 / 10) and proposed
@@ -295,6 +306,7 @@ updates:
       # means it is a live dependency: it does not belong in this list, it
       # belongs in `[final-excludes]` in `.config/hakari.toml`.
       - dependency-name: "axum-core"
+      - dependency-name: "bindgen"
       - dependency-name: "der"
       - dependency-name: "hashbrown"
       - dependency-name: "itertools"
@@ -302,6 +314,7 @@ updates:
       - dependency-name: "num-bigint-dig"
       - dependency-name: "phf_shared"
       - dependency-name: "pkcs8"
+      - dependency-name: "prettyplease"
       - dependency-name: "spki"
       - dependency-name: "sqlx-core"
       - dependency-name: "sqlx-postgres"

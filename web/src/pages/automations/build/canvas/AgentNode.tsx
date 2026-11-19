@@ -168,17 +168,27 @@ export function AddAgentNode({ onAdd }: { onAdd: () => void }) {
 }
 
 /** The bus: a line across the way-in columns' centres, a drop to the node.
- * `columns` is how many ways in sit above (each the same width), so the
- * line runs from the first column's centre to the last's. */
-export function AgentBus({ columns, children }: { columns: number; children: React.ReactNode }) {
-  const inset = `calc(100% / ${columns * 2})`;
+ * `left` and `right` are the first and last columns' half widths, so the
+ * line runs from the first column's centre to the last's. `joins` is false
+ * for a single column, which drops straight to the node. */
+export function AgentBus({
+  left,
+  right,
+  joins,
+  children,
+}: {
+  left: number;
+  right: number;
+  joins: boolean;
+  children: React.ReactNode;
+}) {
   return (
     <div className="flex shrink-0 flex-col items-center" data-testid="agent-bus">
       <div className="relative h-px w-full">
-        {columns > 1 && (
+        {joins && (
           <div
             className="absolute inset-y-0 border-t border-foreground/45"
-            style={{ left: inset, right: inset }}
+            style={{ left, right }}
           />
         )}
       </div>
