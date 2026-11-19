@@ -11,6 +11,7 @@ import {
   DayRunCountSchema,
   type AutomationSummary,
 } from "@/gen/engram/app/v1/automation_pb";
+import { TagSchema, TagSummarySchema } from "@/gen/engram/app/v1/tag_pb";
 import { renderWithProviders } from "../../test-utils";
 import { AutomationsList, orderAutomations } from "./AutomationsList";
 
@@ -20,6 +21,7 @@ const state = vi.hoisted(() => ({
   automations: [] as unknown[],
   builtin: null as unknown,
   pending: false,
+  tagSummaries: [] as unknown[],
 }));
 
 vi.mock("@/hooks/useAutomations", () => ({
@@ -36,9 +38,20 @@ vi.mock("@/hooks/useAutomations", () => ({
   useCreateWebhookRegistration: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useDeleteWebhookRegistration: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
+vi.mock("@/hooks/useTags", () => ({
+  useTags: () => ({ data: { tags: state.tagSummaries }, isPending: false, error: null }),
+}));
 vi.mock("@/hooks/useIntegrations", () => ({
   useConnectors: () => ({ data: { connectors: [] } }),
 }));
+
+function tagOf(name: string) {
+  return create(TagSchema, { id: `t-${name}`, name, color: "#1f6feb", description: "" });
+}
+
+function tagSummary(name: string, automationCount = 1) {
+  return create(TagSummarySchema, { tag: tagOf(name), automationCount });
+}
 
 function summary(
   id: string,
@@ -51,6 +64,8 @@ function summary(
     endedAt?: string;
     failedToday?: number;
     scoped?: boolean;
+    tags?: string[];
+    description?: string;
   } = {},
 ): AutomationSummary {
   return create(AutomationSummarySchema, {
@@ -60,6 +75,8 @@ function summary(
       kind: opts.kind ?? "user",
       enabled: opts.enabled ?? true,
       currentVersion: 1,
+      tags: (opts.tags ?? []).map(tagOf),
+      description: opts.description ?? "",
       ...(opts.scoped
         ? {
             version: create(AutomationVersionSchema, {
@@ -112,6 +129,7 @@ beforeEach(() => {
   setEnabled.mockClear();
   duplicate.mockClear();
   state.pending = false;
+  state.tagSummaries = [];
   state.builtin = create(AutomationSchema, {
     id: "builtin-pr",
     name: "PR review",
@@ -149,6 +167,7 @@ describe("AutomationsList", () => {
     expect(await screen.findByRole("table")).toBeTruthy();
     expect(screen.getAllByRole("columnheader").map((cell) => cell.textContent)).toEqual([
       "Automation",
+      "Tags",
       "Trigger",
       "Last run",
       "7 days",
@@ -162,6 +181,18 @@ describe("AutomationsList", () => {
     expect(screen.queryByRole("button", { name: /archive/i })).toBeNull();
     // Duplicate lives on a built-in's own editor, not on the list.
     expect(screen.queryByRole("button", { name: /duplicate/i })).toBeNull();
+  });
+
+  it("hides the scope badge in a narrow table so the name stays readable", async () => {
+    renderWithProviders(<AutomationsList />);
+    expect((await screen.findByRole("table")).classList.contains("@container")).toBe(true);
+    const rows = await screen.findAllByTestId("automation-row");
+    expect(within(rows[0]!).getByText("per PR").classList.contains("@max-[68rem]:hidden")).toBe(
+      true,
+    );
+    expect(within(rows[0]!).getByText("built-in").classList.contains("@max-[68rem]:hidden")).toBe(
+      false,
+    );
   });
 
   it("encodes the last run as an instrument-toned status dot", async () => {
@@ -201,5 +232,130 @@ describe("AutomationsList", () => {
     expect(screen.queryByRole("button", { name: /duplicate/i })).toBeNull();
     // Header action + the empty-state call to action.
     expect(screen.getAllByRole("link", { name: /new automation/i })).toHaveLength(2);
+  });
+});
+
+describe("AutomationsList tag filter", () => {
+  const SPECIAL = "a&b/50%";
+
+  beforeEach(() => {
+    state.automations = [
+      summary("a-one", "One", { tags: ["Ops"] }),
+      summary("a-two", "Two", { tags: [SPECIAL] }),
+      summary("a-three", "Three"),
+    ];
+    state.tagSummaries = [tagSummary("Ops"), tagSummary(SPECIAL)];
+  });
+
+  const rowNames = async () =>
+    (await screen.findAllByTestId("automation-row")).map(
+      (row) => within(row).getAllByRole("link")[0]!.textContent,
+    );
+
+  it("shows each automation's tags in its row", async () => {
+    renderWithProviders(<AutomationsList />, { initialPath: "/automations" });
+    const rows = await screen.findAllByTestId("automation-row");
+    expect(within(rows[0]!).getByText("Ops")).toBeTruthy();
+    expect(within(rows[1]!).queryByText("Ops")).toBeNull();
+  });
+
+  it("puts the tags in their own column and keeps the description in the name link", async () => {
+    state.automations = [
+      summary("a-one", "One", { tags: ["Ops"], description: "Runs every night" }),
+    ];
+    renderWithProviders(<AutomationsList />, { initialPath: "/automations" });
+    const [row] = await screen.findAllByTestId("automation-row");
+    const [nameCell, tagsCell] = within(row!).getAllByRole("cell");
+    expect(nameCell!.querySelector(".tag-chip")).toBeNull();
+    expect(within(nameCell!).getByRole("link").textContent).toContain("Runs every night");
+    expect([...tagsCell!.querySelectorAll(".tag-chip")].map((chip) => chip.textContent)).toEqual([
+      "Ops",
+    ]);
+  });
+
+  it("filters by a tag from the URL and shows the count as shown of total", async () => {
+    renderWithProviders(<AutomationsList />, { initialPath: "/automations?tags=Ops" });
+    expect(await rowNames()).toEqual(["One"]);
+    expect(screen.getByText("1 of 3")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Tag: Ops/ })).toBeTruthy();
+  });
+
+  it("filters untagged automations with No tags", async () => {
+    renderWithProviders(<AutomationsList />, {
+      initialPath: `/automations?tags=${encodeURIComponent(JSON.stringify([""]))}`,
+    });
+    expect(await rowNames()).toEqual(["Three"]);
+  });
+
+  it("round-trips a tag name with URL-special characters", async () => {
+    const user = userEvent.setup();
+    const first = renderWithProviders(<AutomationsList />, {
+      initialPath: "/automations?tags=Ops",
+    });
+    await user.click(await screen.findByRole("button", { name: /^Tag: Ops/ }));
+    await user.click(await screen.findByRole("option", { name: SPECIAL }));
+    await waitFor(() =>
+      expect(first.router.state.location.search).toEqual({ tags: ["Ops", SPECIAL] }),
+    );
+    expect(await rowNames()).toEqual(["One", "Two"]);
+
+    const href = first.router.state.location.href;
+    first.unmount();
+    renderWithProviders(<AutomationsList />, { initialPath: href });
+    expect(await rowNames()).toEqual(["One", "Two"]);
+  });
+
+  it("keeps a stale tag from the URL selectable and shows the empty result", async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<AutomationsList />, { initialPath: "/automations?tags=Gone" });
+    expect(await screen.findByText("No automations have these tags.")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Clear filter" })).toBeTruthy();
+    // The stale name is an option, so it can be unselected like any tag.
+    await user.click(screen.getByRole("button", { name: /^Tag: Gone/ }));
+    await user.click(await screen.findByRole("option", { name: "Gone" }));
+    // The list sorts by name.
+    expect(await rowNames()).toEqual(["One", "Three", "Two"]);
+  });
+
+  it("shows each tag's color in the filter menu, and no swatch for No tags or a stale name", async () => {
+    const user = userEvent.setup();
+    state.tagSummaries = [
+      tagSummary("Ops"),
+      create(TagSummarySchema, {
+        tag: create(TagSchema, {
+          id: "t-billing",
+          name: "Billing",
+          color: "#8250df",
+          description: "",
+        }),
+        automationCount: 0,
+      }),
+    ];
+    renderWithProviders(<AutomationsList />, {
+      initialPath: `/automations?tags=${encodeURIComponent(JSON.stringify(["Ops", "Gone"]))}`,
+    });
+    await user.click(await screen.findByRole("button", { name: /^Tag: Ops/ }));
+    const swatch = (name: string) =>
+      (
+        screen.getByRole("option", { name }).querySelector(".tag-chip") as HTMLElement | null
+      )?.style.getPropertyValue("--tag-color");
+    await screen.findByRole("option", { name: "Billing" });
+    expect(swatch("Billing")).toBe("#8250df");
+    expect(swatch("Ops")).toBe("#1f6feb");
+    expect(swatch("Gone")).toBeUndefined();
+    expect(swatch("No tags")).toBeUndefined();
+  });
+
+  it("links Manage tags to Settings", async () => {
+    renderWithProviders(<AutomationsList />, { initialPath: "/automations" });
+    const link = await screen.findByRole("link", { name: "Manage tags" });
+    expect(link.getAttribute("href")).toBe("/settings/tags");
+  });
+
+  it("hides the filter when no tag exists", async () => {
+    state.tagSummaries = [];
+    renderWithProviders(<AutomationsList />, { initialPath: "/automations" });
+    await screen.findAllByTestId("automation-row");
+    expect(screen.queryByRole("button", { name: "Filter" })).toBeNull();
   });
 });

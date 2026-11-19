@@ -12,6 +12,8 @@ import { useNavigate, useParams } from "@tanstack/react-router";
 import { toast } from "sonner";
 
 import { SkeletonRows } from "@/components/skeleton-rows";
+import { TagChip } from "@/components/tags/TagChip";
+import { TagPicker } from "@/components/tags/TagPicker";
 import { errorMessage } from "@/lib/errors";
 
 import {
@@ -251,6 +253,17 @@ export function SettingsTab({ automationId }: SettingsTabProps) {
           </div>
         )}
       </section>
+      {automation && (
+        <section className="flex max-w-xl flex-col gap-3" aria-label="tags">
+          <h3 className="text-sm font-semibold">Tags</h3>
+          <div className="flex flex-wrap items-center gap-2">
+            {automation.tags.map((tag) => (
+              <TagChip key={tag.id} tag={tag} />
+            ))}
+            <TagPicker automationId={automation.id} tags={automation.tags} />
+          </div>
+        </section>
+      )}
       <section className="flex max-w-xl flex-col gap-4" aria-label="run settings">
         <h3 className="text-sm font-semibold">Run settings</h3>
         {withAgent && (

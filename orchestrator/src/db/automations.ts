@@ -9,6 +9,7 @@ import {
   automationSession as automationSessionTable,
   automationSessionRelay as relayTable,
   automationStepRun as stepRunTable,
+  automationTag as automationTagTable,
   automationVersion as versionTable,
   task as taskTable,
   taskSession as taskSessionTable,
@@ -104,6 +105,9 @@ export interface CreateAutomationInput {
   /** Fixed id for idempotent creates (DraftAutomation derives it from the
    * caller's idempotency key). Default: a random uuid. */
   id?: string;
+  /** Tags linked in the same write. The caller keeps the list within the
+   * per-automation tag limit. */
+  tagIds?: string[];
 }
 
 /** saveVersion's in-transaction fence tripped: the row advanced past the
@@ -776,6 +780,11 @@ export function makeAutomationStore(
           settings: definition.settings,
           createdByUserId,
         });
+        if (input.tagIds && input.tagIds.length > 0) {
+          await tx
+            .insert(automationTagTable)
+            .values(input.tagIds.map((tagId) => ({ automationId: id, tagId })));
+        }
       });
       const row = await this.get(id);
       if (!row) throw new Error(`automation ${id} disappeared after insert`);

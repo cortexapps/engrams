@@ -26,6 +26,7 @@ import {
 } from "@tanstack/react-router";
 import type { AuthState } from "./auth/AuthProvider";
 import { hasNextParam } from "./lib/next-url";
+import { parseTagSearch } from "./lib/tag-filter";
 import { RootLayout } from "./pages/RootLayout";
 import { Login } from "./pages/Login";
 import { DeviceAuth } from "./pages/DeviceAuth";
@@ -51,6 +52,7 @@ import { NewSpecPage } from "./pages/specmode/NewSpecPage";
 import { SpecShellPage } from "./pages/specmode/SpecShellPage";
 import { Papercuts } from "./pages/settings/Papercuts";
 import { Retention } from "./pages/settings/Retention";
+import { Tags } from "./pages/settings/Tags";
 import { Fleet } from "./pages/Fleet";
 import { Storage } from "./pages/Storage";
 import { SettingsLayout } from "./pages/settings/SettingsLayout";
@@ -522,6 +524,12 @@ const retentionRoute = createRoute({
   beforeLoad: requireAdmin,
   component: Retention,
 });
+const tagsRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "tags",
+  beforeLoad: requireAdmin,
+  component: Tags,
+});
 const papercutsRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "papercuts",
@@ -562,6 +570,10 @@ const automationsLayoutRoute = createRoute({
 const automationsIndexRoute = createRoute({
   getParentRoute: () => automationsLayoutRoute,
   path: "/",
+  validateSearch: (search: Record<string, unknown>): { tags?: string[] } => {
+    const tags = parseTagSearch(search);
+    return tags.length > 0 ? { tags } : {};
+  },
   component: AutomationsList,
 });
 /** Builder v2: "New automation" lands on the plain-English composer; the
@@ -731,6 +743,7 @@ export const routeTree = rootRoute.addChildren([
       secretsRoute,
       apiKeysRoute,
       retentionRoute,
+      tagsRoute,
       harnessesRoute,
       modelRoutersRoute,
       integrationsRoute,

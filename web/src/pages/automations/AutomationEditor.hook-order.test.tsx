@@ -131,6 +131,7 @@ const loaded = {
     currentVersion: 1,
     inputsJson: "{}",
     blockOverridesJson: "{}",
+    tags: [],
     archived: false,
     createdAt: "",
     updatedAt: "",

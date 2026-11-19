@@ -1422,6 +1422,40 @@ export const automation = pgTable(
   ],
 );
 
+/** An installation-wide label with a color. Names are unique without regard
+ * to case. */
+export const tag = pgTable(
+  "tag",
+  {
+    id: text("id").primaryKey(),
+    name: text("name").notNull(),
+    /** `#rrggbb`, lowercase. */
+    color: text("color").notNull(),
+    description: text("description").notNull().default(""),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("tag_name_lower_unique").on(sql`lower(${t.name})`)],
+);
+
+/** Which tags an automation has. */
+export const automationTag = pgTable(
+  "automation_tag",
+  {
+    automationId: text("automation_id")
+      .notNull()
+      .references(() => automation.id, { onDelete: "cascade" }),
+    tagId: text("tag_id")
+      .notNull()
+      .references(() => tag.id, { onDelete: "cascade" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.automationId, t.tagId] }),
+    index("automation_tag_tag_idx").on(t.tagId),
+  ],
+);
+
 /** Immutable definition snapshots (ADR 0119 D1). Every save writes version
  * N+1; a run pins the version it started with. */
 export const automationVersion = pgTable(

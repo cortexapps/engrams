@@ -8,6 +8,7 @@ import {
   type ArchiveAutomationRequest,
   type UpdateAutomationMetaRequest,
 } from "@/gen/engram/app/v1/automation_pb";
+import { TagService } from "@/gen/engram/app/v1/tag_pb";
 import { renderWithProviders } from "@/test-utils";
 import { SettingsTab, settingsFromDraft } from "./SettingsTab";
 
@@ -62,13 +63,19 @@ function automation(kind: "user" | "builtin", agent?: Record<string, unknown>) {
 type MetaImpl = (req: UpdateAutomationMetaRequest) => { automation: ReturnType<typeof automation> };
 type ArchiveImpl = (req: ArchiveAutomationRequest) => { automation: ReturnType<typeof automation> };
 
+type TagView = { id: string; name: string; color: string; description: string };
+
 function transportFor(
   kind: "user" | "builtin",
   stubs: { updateAutomationMeta?: MetaImpl; archiveAutomation?: ArchiveImpl } = {},
   agent?: Record<string, unknown>,
+  tags: TagView[] = [],
 ) {
-  const row = automation(kind, agent);
+  const row = { ...automation(kind, agent), tags };
   return createRouterTransport((router) => {
+    router.service(TagService, {
+      listTags: () => ({ tags: tags.map((tag) => ({ tag, automationCount: 1 })) }),
+    });
     router.service(AutomationService, {
       getAutomation: () => ({ automation: row }),
       listVersions: () => ({
@@ -136,6 +143,24 @@ describe("settingsFromDraft", () => {
 });
 
 describe("SettingsTab", () => {
+  it("shows the automation's tags with an Edit tags button", async () => {
+    const ops = { id: "t-ops", name: "Ops", color: "#1f6feb", description: "" };
+    renderWithProviders(<SettingsTab automationId="auto-1" />, {
+      transport: transportFor("user", {}, undefined, [ops]),
+    });
+    const section = await screen.findByRole("region", { name: "tags" });
+    expect(within(section).getByText("Ops").classList.contains("tag-chip")).toBe(true);
+    expect(within(section).getByRole("button", { name: "Edit tags" })).toBeTruthy();
+  });
+
+  it("offers Add tag when the automation has no tags, on a built-in too", async () => {
+    renderWithProviders(<SettingsTab automationId="auto-1" />, {
+      transport: transportFor("builtin"),
+    });
+    const section = await screen.findByRole("region", { name: "tags" });
+    expect(within(section).getByRole("button", { name: "Add tag" })).toBeTruthy();
+  });
+
   it("saves changed settings as settings_json on a user automation", async () => {
     const updateAutomationMeta = vi.fn<MetaImpl>(() => ({ automation: automation("user") }));
     renderWithProviders(<SettingsTab automationId="auto-1" />, {

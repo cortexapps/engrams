@@ -207,5 +207,6 @@ export function renderWithProviders(
   return {
     ...render(<RouterProvider router={router} />, renderOptions),
     queryClient: client,
+    router,
   };
 }

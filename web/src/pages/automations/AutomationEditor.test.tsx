@@ -149,6 +149,7 @@ function automation(kind: "user" | "builtin") {
     inputsJson: "{}",
     blockOverridesJson: "{}",
     archived: false,
+    tags: [] as Array<{ id: string; name: string; color: string; description: string }>,
     createdAt: "",
     updatedAt: "",
     version: {
@@ -425,6 +426,15 @@ describe("AutomationEditor", () => {
     expect(sent.entrypoints[0].blocks[0].config.promptTemplate).toBe("review feedback arrived");
   });
 
+  it("the header shows no tags; they live in the Settings tab", () => {
+    const saved = automation("user");
+    saved.tags = [{ id: "t-ops", name: "Ops", color: "#1f6feb", description: "" }];
+    automationHolder.value = { automation: saved };
+    render(<AutomationEditor mode="edit" />);
+    expect(screen.queryByText("Ops")).toBeNull();
+    expect(screen.queryByRole("button", { name: /^(Add tag|Edit tags)$/ })).toBeNull();
+  });
+
   it("selects the tab from the search param and navigates on tab change", async () => {
     automationHolder.value = { automation: automation("user") };
     searchHolder.value = { tab: "activity" };
@@ -575,6 +585,12 @@ describe("AutomationEditor", () => {
       search: (p: Record<string, unknown>) => unknown;
     };
     expect(call.search({ tab: "build", run: "run-7" })).toEqual({ tab: "build" });
+  });
+
+  it("create mode has no tags yet, so it shows no tag picker", () => {
+    automationHolder.value = undefined;
+    render(<AutomationEditor mode="create" />);
+    expect(screen.queryByRole("button", { name: /^(Add tag|Edit tags)$/ })).toBeNull();
   });
 
   it("a created automation is saved: the move to its editor is not blocked as unsaved", async () => {

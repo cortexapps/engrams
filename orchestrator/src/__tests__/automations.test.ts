@@ -27,6 +27,7 @@ import {
   WebhookRegistrationService,
 } from "../gen/engram/app/v1/automation_pb.ts";
 import { invalidateRegistry } from "../connectors/registry.ts";
+import { makeMemoryTagStore } from "./support/memory-tag-store.ts";
 import {
   registerAutomations,
   triggerSummary,
@@ -107,6 +108,12 @@ function fakeStore(seed?: {
   const steps = seed?.steps ?? [];
   const claims = new Map<string, string>();
   let sequence = 0;
+  const tags = makeMemoryTagStore({
+    isActiveAutomation: (id) => {
+      const a = automations.get(id);
+      return a !== undefined && a.meta.archivedAt === null;
+    },
+  });
 
   const row = (stored: Stored): AutomationRow => ({
     ...stored.meta,
@@ -193,6 +200,7 @@ function fakeStore(seed?: {
         archivedAt: null,
       };
       automations.set(id, { meta, versions: new Map([[1, versionOf(id, 1, input.definition, createdByUserId)]]) });
+      if (input.tagIds && input.tagIds.length > 0) tags.links.set(id, new Set(input.tagIds));
       return row(automations.get(id)!);
     },
     async saveVersion(automationId, definition, by, patch) {
@@ -403,7 +411,7 @@ function fakeStore(seed?: {
       return true;
     },
   };
-  return { store, automations, runs, registrations };
+  return { store, automations, runs, registrations, tags };
 }
 
 function clients(deps: AutomationDeps) {
@@ -449,6 +457,7 @@ function adminDeps(overrides: Partial<AutomationDeps> = {}): AutomationDeps & { 
   return {
     getSession: session("admin-1", "admin"),
     store: fake.store,
+    tags: fake.tags,
     profiles: { getActive: async (id: string) => (id === "profile-1" ? profile() : null) },
     harnessCatalog: catalog(),
     connectors: { async list() { return []; } },
@@ -1652,5 +1661,108 @@ describe("workstream kickoff + instance RPCs (ADR 0120)", () => {
     await expect(runsApi.getInstance({ id: "ai_ghost" })).rejects.toMatchObject({
       code: Code.NotFound,
     });
+  });
+});
+
+describe("automation tags", () => {
+  async function setup() {
+    const deps = adminDeps();
+    deps.fake.automations.set("builtin-1", builtinStored());
+    const { automations } = clients(deps);
+    const created = await automations.createAutomation({
+      name: "Nightly cleanup",
+      description: "",
+      enabled: false,
+      definitionJson: JSON.stringify(cronDefinition()),
+      inputsJson: "{}",
+    });
+    const id = created.automation!.id;
+    const tag = async (name: string) => {
+      const result = await deps.fake.tags.create({ name, color: "#1f6feb", description: "" });
+      if (!("tag" in result)) throw new Error(`tag ${name} was refused`);
+      return result.tag.id;
+    };
+    return { deps, automations, id, tag };
+  }
+
+  test("member and anonymous callers are refused", async () => {
+    const member = clients(adminDeps({ getSession: session("user-1", "user") }));
+    await expectCode(member.automations.addAutomationTag({ automationId: "a", tagId: "t" }), Code.PermissionDenied);
+    await expectCode(member.automations.removeAutomationTag({ automationId: "a", tagId: "t" }), Code.PermissionDenied);
+    const anonymous = clients(adminDeps({ getSession: session(null) }));
+    await expectCode(anonymous.automations.addAutomationTag({ automationId: "a", tagId: "t" }), Code.Unauthenticated);
+  });
+
+  test("add and remove return the automation with its tags in name order", async () => {
+    const { automations, id, tag } = await setup();
+    const ops = await tag("Ops");
+    const billing = await tag("billing");
+    await automations.addAutomationTag({ automationId: id, tagId: ops });
+    const added = await automations.addAutomationTag({ automationId: id, tagId: billing });
+    expect(added.automation?.tags.map((t) => [t.name, t.color])).toEqual([
+      ["billing", "#1f6feb"],
+      ["Ops", "#1f6feb"],
+    ]);
+    const removed = await automations.removeAutomationTag({ automationId: id, tagId: ops });
+    expect(removed.automation?.tags.map((t) => t.id)).toEqual([billing]);
+  });
+
+  test("add is idempotent; an 11th tag is refused", async () => {
+    const { automations, id, tag } = await setup();
+    const ids: string[] = [];
+    for (let i = 0; i < 10; i++) ids.push(await tag(`t${i}`));
+    for (const tagId of ids) await automations.addAutomationTag({ automationId: id, tagId });
+    const extra = await tag("eleven");
+    const error = await expectCode(automations.addAutomationTag({ automationId: id, tagId: extra }), Code.FailedPrecondition);
+    expect(error.rawMessage).toBe("an automation can have at most 10 tags");
+    const again = await automations.addAutomationTag({ automationId: id, tagId: ids[0]! });
+    expect(again.automation?.tags).toHaveLength(10);
+  });
+
+  test("works on a built-in and makes no new version", async () => {
+    const { automations, tag } = await setup();
+    const review = await tag("review");
+    const result = await automations.addAutomationTag({ automationId: "builtin-1", tagId: review });
+    expect(result.automation?.tags.map((t) => t.name)).toEqual(["review"]);
+    expect(result.automation?.currentVersion).toBe(1);
+  });
+
+  test("refuses an archived automation", async () => {
+    const { automations, id, tag } = await setup();
+    const ops = await tag("Ops");
+    await automations.archiveAutomation({ id });
+    for (const call of [
+      automations.addAutomationTag({ automationId: id, tagId: ops }),
+      automations.removeAutomationTag({ automationId: id, tagId: ops }),
+    ]) {
+      const error = await expectCode(call, Code.FailedPrecondition);
+      expect(error.rawMessage).toBe("automation is archived");
+    }
+  });
+
+  test("an unknown tag or automation is NotFound", async () => {
+    const { automations, id, tag } = await setup();
+    const unknownTag = await expectCode(automations.addAutomationTag({ automationId: id, tagId: "nope" }), Code.NotFound);
+    expect(unknownTag.rawMessage).toBe("tag not found");
+    const ops = await tag("Ops");
+    await expectCode(automations.addAutomationTag({ automationId: "nope", tagId: ops }), Code.NotFound);
+  });
+
+  test("list, get and duplicate carry the tags", async () => {
+    const { automations, id, tag } = await setup();
+    const ops = await tag("Ops");
+    await automations.addAutomationTag({ automationId: id, tagId: ops });
+
+    const listed = (await automations.listAutomations({})).automations.find((s) => s.automation?.id === id);
+    expect(listed?.automation?.tags.map((t) => t.name)).toEqual(["Ops"]);
+    const builtin = (await automations.listAutomations({})).automations.find((s) => s.automation?.id === "builtin-1");
+    expect(builtin?.automation?.tags).toEqual([]);
+
+    const fetched = await automations.getAutomation({ lookup: { case: "id", value: id } });
+    expect(fetched.automation?.tags.map((t) => t.name)).toEqual(["Ops"]);
+
+    const copy = await automations.duplicateAutomation({ automationId: id });
+    expect(copy.automation?.id).not.toBe(id);
+    expect(copy.automation?.tags.map((t) => t.name)).toEqual(["Ops"]);
   });
 });

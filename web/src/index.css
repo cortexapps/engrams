@@ -108,6 +108,17 @@
      the dark ground below. */
   --mark-entry: #b85c0a;
   --mark-terminal: #3a6b5c;
+
+  /* Tag chips redraw any stored tag color at a fixed lightness per theme
+     with a capped chroma, so only the hue carries over and the text stays
+     readable. Measured minimum text contrast over the whole hue circle:
+     6.2:1 here, 7.9:1 in the dark theme. */
+  --tag-bg-l: 0.94;
+  --tag-bg-c: 0.06;
+  --tag-fg-l: 0.42;
+  --tag-fg-c: 0.13;
+  --tag-border-l: 0.82;
+  --tag-border-c: 0.1;
 }
 
 .dark {
@@ -167,6 +178,13 @@
 
   --mark-entry: #e0913d; /* amber goes muddy on green-black; lift it */
   --mark-terminal: oklch(0.7 0.085 178); /* #5EB09E — brighter verdigris on dark ground */
+
+  --tag-bg-l: 0.32;
+  --tag-bg-c: 0.06;
+  --tag-fg-l: 0.87;
+  --tag-fg-c: 0.11;
+  --tag-border-l: 0.46;
+  --tag-border-c: 0.09;
 }
 
 /* The section rail (the second sidebar) is cut from --shell, the same ground
@@ -239,6 +257,23 @@
       0 1px 2px oklch(0 0 0 / 0.4),
       0 12px 34px -10px oklch(0 0 0 / 0.6);
     border-top-color: oklch(1 0 0 / 0.09);
+  }
+
+  /* A tag drawn from `--tag-color` (the stored hex). A declaration with
+     var() always parses, so an unsupported relative color would not fall
+     back to an earlier value; the tint therefore sits behind @supports, and
+     other browsers keep the neutral chip. */
+  .tag-chip {
+    border: 1px solid var(--border);
+    background-color: var(--secondary);
+    color: var(--secondary-foreground);
+  }
+  @supports (color: oklch(from red l min(c, 0.1) h)) {
+    .tag-chip {
+      border-color: oklch(from var(--tag-color) var(--tag-border-l) min(c, var(--tag-border-c)) h);
+      background-color: oklch(from var(--tag-color) var(--tag-bg-l) min(c, var(--tag-bg-c)) h);
+      color: oklch(from var(--tag-color) var(--tag-fg-l) min(c, var(--tag-fg-c)) h);
+    }
   }
 }
 

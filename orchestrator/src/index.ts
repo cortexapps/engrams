@@ -47,6 +47,7 @@ import { registerTasks } from "./rpc/tasks.ts";
 import { registerProfiles } from "./rpc/profiles.ts";
 import { registerPapercuts } from "./rpc/papercuts.ts";
 import { registerRetention } from "./rpc/retention.ts";
+import { registerTags } from "./rpc/tags.ts";
 import { registerPrRefs } from "./rpc/pr-refs.ts";
 import { registerReviews } from "./rpc/reviews.ts";
 import { registerMountCatalog } from "./rpc/mount-catalog.ts";
@@ -479,6 +480,9 @@ const server = buildServer(
 
     // Native RetentionService: the org's retention policy (Settings → Retention).
     registerRetention(router);
+
+    // Native TagService: installation-wide tags (Settings → Tags).
+    registerTags(router);
 
     // Native PrRefService: durable task/session links to authored PRs (ADR 0100).
     registerPrRefs(router);
