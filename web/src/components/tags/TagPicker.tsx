@@ -76,7 +76,9 @@ export function TagPicker({
     });
 
   const option = (tag: TagView) => (
-    <CommandItem key={tag.id} value={`${tag.name} ${tag.id}`} onSelect={() => void toggle(tag)}>
+    // The search scores the value, so it holds the name only (names are
+    // unique); an id in it would match unrelated searches.
+    <CommandItem key={tag.id} value={tag.name} onSelect={() => void toggle(tag)}>
       <Check className={own.has(tag.id) ? "opacity-100" : "opacity-0"} aria-hidden />
       <TagChip tag={tag} />
       {own.has(tag.id) && <span className="sr-only">added</span>}

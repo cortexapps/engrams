@@ -109,6 +109,26 @@ describe("TagPicker", () => {
     expect(within(list).getByRole("option", { name: /Ops/ })).toBeTruthy();
   });
 
+  it("searches tag names only, never the ids behind them", async () => {
+    const idWithOps = create(TagSchema, {
+      id: "a7c3-ops-91",
+      name: "Billing",
+      color: "#8250df",
+      description: "",
+    });
+    state.all = [idWithOps, ops].map((tag) =>
+      create(TagSummarySchema, { tag, automationCount: 1 }),
+    );
+    render(<TagPicker automationId="a1" tags={[]} />);
+    const list = await openPicker("Add tag");
+    await userEvent.type(screen.getByRole("combobox", { name: "Search tags" }), "ops");
+    expect(
+      within(list)
+        .getAllByRole("option")
+        .map((option) => option.querySelector(".tag-chip")?.textContent),
+    ).toEqual(["Ops"]);
+  });
+
   it("shows the server's message when a tag is refused", async () => {
     addTag.mockRejectedValue(
       new ConnectError("an automation can have at most 10 tags", Code.FailedPrecondition),
