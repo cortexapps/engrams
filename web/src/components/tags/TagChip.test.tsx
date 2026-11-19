@@ -52,15 +52,15 @@ describe("TagChipRow", () => {
     ]);
   });
 
-  // jsdom has no layout, so this pins the class contract that keeps two long
-  // chips inside a narrow name column: the row and its chips may shrink.
-  it("lets its chips shrink and truncate in a narrow row instead of overflowing", () => {
+  // jsdom has no layout, so this pins the class contract for a narrow column:
+  // the row may shrink, the first chip keeps its width, the others truncate.
+  it("keeps the first chip whole and lets the following chips truncate in a narrow row", () => {
     const { container } = render(<TagChipRow tags={[tag("a"), tag("b"), tag("c")]} />);
     expect(container.firstElementChild!.classList.contains("min-w-0")).toBe(true);
-    for (const chip of container.querySelectorAll(".tag-chip")) {
-      expect(chip.classList.contains("shrink-0")).toBe(false);
-      expect(chip.classList.contains("min-w-0")).toBe(true);
-    }
+    const [first, second] = [...container.querySelectorAll(".tag-chip")];
+    expect(first!.classList.contains("shrink-0")).toBe(true);
+    expect(second!.classList.contains("shrink-0")).toBe(false);
+    expect(second!.classList.contains("min-w-0")).toBe(true);
   });
 
   it("renders nothing without tags", () => {

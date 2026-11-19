@@ -23,8 +23,10 @@ export function TagChipRow({
 
   return (
     <span className="flex min-w-0 items-center gap-1">
-      {ordered.slice(0, max).map((tag) => (
-        <TagChip key={tag.id} tag={tag} />
+      {/* The first chip keeps its width; the next ones truncate first, so a
+          long neighbour never squeezes the leading tag to "…". */}
+      {ordered.slice(0, max).map((tag, index) => (
+        <TagChip key={tag.id} tag={tag} className={index === 0 ? "shrink-0" : undefined} />
       ))}
       {hidden > 0 && (
         <TooltipProvider delayDuration={200}>

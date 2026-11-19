@@ -32,9 +32,9 @@ export const PR_REVIEW_BUILTIN_KEY = "pr_review";
 // One set of tracks for the header, the rows and the loading skeleton, applied
 // as an inline template so the three cannot drift.
 const TABLE_COLUMNS = [
-  "minmax(0,1.4fr)",
+  "minmax(0,1.6fr)",
   "minmax(0,1fr)",
-  "minmax(0,1fr)",
+  "minmax(0,0.8fr)",
   "minmax(200px,0.9fr)",
   "64px",
   "90px",
@@ -301,7 +301,7 @@ export function AutomationsList() {
         </h2>
         {automations.isPending && (
           <div role="table" className="overflow-x-auto rounded-lg border bg-card">
-            <div className="min-w-[980px]">
+            <div className="min-w-[860px]">
               <AutomationTableHeader />
               <SkeletonRows
                 rows={3}
@@ -353,7 +353,7 @@ export function AutomationsList() {
         )}
         {loaded && visible.length > 0 && (
           <div role="table" className="overflow-x-auto rounded-lg border bg-card">
-            <div className="min-w-[980px]">
+            <div className="min-w-[860px]">
               <AutomationTableHeader />
               <div role="rowgroup" className="divide-y">
                 {visible.map((summary) => (
