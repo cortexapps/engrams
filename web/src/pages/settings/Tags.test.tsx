@@ -105,6 +105,17 @@ describe("Tags", () => {
     );
   });
 
+  it("an edit sends only the fields that changed, so it cannot revert another admin's change", async () => {
+    renderWithProviders(<Tags />);
+    await userEvent.click(await screen.findByRole("button", { name: "Edit Platform" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Hex color" }), {
+      target: { value: "#8250df" },
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(updateTag).toHaveBeenCalledTimes(1));
+    expect(updateTag.mock.calls[0]![0]).toEqual({ id: "t-platform", color: "#8250df" });
+  });
+
   it("asks before deleting and says how many automations lose the tag", async () => {
     renderWithProviders(<Tags />);
     await userEvent.click(await screen.findByRole("button", { name: "Delete Platform" }));

@@ -38,6 +38,16 @@ function automationCount(n: number): string {
   return `${n} automation${n === 1 ? "" : "s"}`;
 }
 
+/** The fields an edit changed. A save sends only these, so it never writes
+ * back a field this admin left alone over another admin's newer value. */
+function changedFields(before: TagFields, after: TagFields): Partial<TagFields> {
+  return {
+    ...(after.name !== before.name ? { name: after.name } : {}),
+    ...(after.description !== before.description ? { description: after.description } : {}),
+    ...(after.color !== before.color ? { color: after.color } : {}),
+  };
+}
+
 /** The one form for a new tag and for an edit. `onSave` resolves true when
  * the server accepted the tag. */
 function TagForm({
@@ -181,7 +191,9 @@ export function Tags() {
                       key={tag.id}
                       initial={{ name: tag.name, description: tag.description, color: tag.color }}
                       onSave={(fields) =>
-                        save(() => updateTag.mutateAsync({ id: tag.id, ...fields }))
+                        save(() =>
+                          updateTag.mutateAsync({ id: tag.id, ...changedFields(tag, fields) }),
+                        )
                       }
                       onCancel={() => setEditing(null)}
                     />
