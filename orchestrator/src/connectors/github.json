@@ -1648,7 +1648,7 @@
       ],
       "match": {
         "method": "GET",
-        "path": "/repos/*/activity*"
+        "path": "segment-path:/repos/*/*/events"
       }
     },
     {
@@ -1657,7 +1657,7 @@
       ],
       "match": {
         "method": "GET",
-        "path": "/repos/*/events*"
+        "path": "segment-path:/repos/*/*/forks"
       }
     },
     {
@@ -1666,7 +1666,7 @@
       ],
       "match": {
         "method": "GET",
-        "path": "/repos/*/forks*"
+        "path": "segment-path:/repos/*/*/license"
       }
     },
     {
@@ -1675,7 +1675,7 @@
       ],
       "match": {
         "method": "GET",
-        "path": "/repos/*/license*"
+        "path": "segment-path:/repos/*/*/stargazers"
       }
     },
     {
@@ -1684,7 +1684,7 @@
       ],
       "match": {
         "method": "GET",
-        "path": "/repos/*/stargazers*"
+        "path": "segment-path:/repos/*/*/subscribers"
       }
     },
     {
@@ -1693,7 +1693,7 @@
       ],
       "match": {
         "method": "GET",
-        "path": "/repos/*/subscribers*"
+        "path": "segment-path:/repos/*/*/stats/*"
       }
     },
     {
@@ -1702,7 +1702,7 @@
       ],
       "match": {
         "method": "GET",
-        "path": "/repos/*/teams*"
+        "path": "segment-path:/repos/*/*/rules/branches/*"
       }
     },
     {
@@ -1711,7 +1711,7 @@
       ],
       "match": {
         "method": "GET",
-        "path": "/repos/*/stats/*"
+        "path": "segment-path:/repos/*/*/rulesets"
       }
     },
     {
@@ -1720,7 +1720,7 @@
       ],
       "match": {
         "method": "GET",
-        "path": "/repos/*/rules/*"
+        "path": "segment-path:/repos/*/*/rulesets/*"
       }
     },
     {
@@ -1729,7 +1729,7 @@
       ],
       "match": {
         "method": "GET",
-        "path": "/repos/*/rulesets*"
+        "path": "segment-path:/repos/*/*/properties/values"
       }
     },
     {
@@ -1738,7 +1738,7 @@
       ],
       "match": {
         "method": "GET",
-        "path": "/repos/*/properties/values*"
+        "path": "segment-path:/repos/*/*/topics"
       }
     },
     {
@@ -1747,16 +1747,7 @@
       ],
       "match": {
         "method": "GET",
-        "path": "/repos/*/codeowners/errors*"
-      }
-    },
-    {
-      "grants": [
-        "metadata:read"
-      ],
-      "match": {
-        "method": "GET",
-        "path": "/repos/*/community/profile*"
+        "path": "segment-path:/repos/*/*/languages"
       }
     },
     {
@@ -1846,6 +1837,15 @@
       ],
       "match": {
         "method": "GET",
+        "path": "segment-path:/repos/*/*/contents"
+      }
+    },
+    {
+      "grants": [
+        "contents:read"
+      ],
+      "match": {
+        "method": "GET",
         "path": "/repos/*/compare/*"
       }
     },
@@ -1855,7 +1855,7 @@
       ],
       "match": {
         "method": "GET",
-        "path": "/repos/*/tarball*"
+        "path": "/repos/*/tarball/*"
       }
     },
     {
@@ -1864,7 +1864,7 @@
       ],
       "match": {
         "method": "GET",
-        "path": "/repos/*/zipball*"
+        "path": "/repos/*/zipball/*"
       }
     },
     {
@@ -1873,7 +1873,61 @@
       ],
       "match": {
         "method": "GET",
-        "path": "/repos/*/dependency-graph/*"
+        "path": "segment-path:/repos/*/*/dependency-graph/*"
+      }
+    },
+    {
+      "grants": [
+        "contents:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/dependency-graph/sbom"
+      }
+    },
+    {
+      "grants": [
+        "contents:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/activity"
+      }
+    },
+    {
+      "grants": [
+        "contents:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/codeowners/errors"
+      }
+    },
+    {
+      "grants": [
+        "contents:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/community/profile"
+      }
+    },
+    {
+      "grants": [
+        "contents:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/comments"
+      }
+    },
+    {
+      "grants": [
+        "contents:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/comments/*"
       }
     },
     {
@@ -2071,6 +2125,24 @@
     },
     {
       "grants": [
+        "issues:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/assignees"
+      }
+    },
+    {
+      "grants": [
+        "issues:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/assignees/*"
+      }
+    },
+    {
+      "grants": [
         "issues:write"
       ],
       "match": {
@@ -2144,6 +2216,24 @@
       "match": {
         "method": "GET",
         "path": "/repos/*/actions/*"
+      }
+    },
+    {
+      "grants": [
+        "actions:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/environments"
+      }
+    },
+    {
+      "grants": [
+        "actions:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/environments/*"
       }
     },
     {
@@ -2350,7 +2440,16 @@
       ],
       "match": {
         "method": "GET",
-        "path": "/repos/*/dependabot/alerts*"
+        "path": "segment-path:/repos/*/*/dependabot/alerts"
+      }
+    },
+    {
+      "grants": [
+        "vulnerability_alerts:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/dependabot/alerts/*"
       }
     },
     {
@@ -2359,7 +2458,7 @@
       ],
       "match": {
         "method": "PATCH",
-        "path": "/repos/*/dependabot/alerts/*"
+        "path": "segment-path:/repos/*/*/dependabot/alerts/*"
       }
     },
     {

@@ -788,8 +788,15 @@ describe("on-disk registry", () => {
     const metadata = globs("github:metadata:read");
     expect(metadata).toContain("segment-path:/repos/*/*");
     expect(metadata).not.toContain("/repos/*");
+    // Every metadata glob is one exact path below the owner/name prefix.
+    for (const glob of metadata.filter((g) => g.startsWith("/repos/"))) {
+      expect(["/repos/*/languages", "/repos/*/topics", "/repos/*/contributors*", "/repos/*/collaborators*"]).toContain(glob);
+    }
     expect(metadata.some((glob) => glob.includes("dependabot"))).toBe(false);
-    expect(globs("github:vulnerability_alerts:read")).toEqual(["/repos/*/dependabot/alerts*"]);
+    expect(globs("github:vulnerability_alerts:read")).toEqual([
+      "segment-path:/repos/*/*/dependabot/alerts",
+      "segment-path:/repos/*/*/dependabot/alerts/*",
+    ]);
   });
 
   test("the shipped datadog connector scopes REST and MCP header spellings to their hosts", () => {
