@@ -24,6 +24,9 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 
   A `GET` that only the old rule let through, such as code scanning or `teams`, is now
   refused. Dependabot alerts need the new `vulnerability_alerts:read`. ([#1822])
+- **The Slack `users:read` and `usergroups:read` powers name their methods.** They gave every
+  `users.*` and `usergroups.*` method, including writes such as `users.setPresence` and
+  `usergroups.create`. They now give the read methods only. ([#1822])
 - **To use the new GitHub powers,** the GitHub App needs the matching permission:
   Dependabot alerts (`vulnerability_alerts`) for `vulnerability_alerts:read` and `:write`.
   ([#1822])
@@ -40,6 +43,13 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
   or reset the stream, so clients printed nothing or a framing error. ([#1822])
 - The bundled integration CLIs split a `field=value` that held a newline into two curl
   arguments, so a multiline Slack message lost all but its first line. ([#1822])
+- Every Slack power showed as "write" in the catalog and the profile editor, and so did
+  some Datadog and Notion read powers, because their APIs read over `POST`. A power's
+  access now comes from the level in its name. ([#1822])
+- `slack upload` used `files.upload`, which Slack retired. It now uses the two-step upload
+  (`files.getUploadURLExternal`, an upload to `files.slack.com`, then
+  `files.completeUploadExternal`). `files:read` can also download a file's `url_private`.
+  ([#1822])
 - The GitHub power `variables:read` and `:write` minted no permission, because the GitHub
   App permission is `actions_variables`. ([#1822])
 - A session on a routed model recorded zero tokens for every model call, and its run cost
