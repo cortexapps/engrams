@@ -764,6 +764,40 @@ describe("buildMessages — Phase 1b queued/optimistic greying", () => {
     expect(isRunning).toBe(true);
   });
 
+  test("a prompt the coordinator gave up delivering says so and is not awaited work", () => {
+    const { messages, isRunning } = buildMessages(
+      indexed([
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u1",
+          role: "user",
+          text: "hello?",
+          prompt_id: "p1",
+          at: AT,
+        },
+        {
+          type: "prompt_undeliverable",
+          prompt_id: "p1",
+          reason: "could not be delivered after\n      repeated attempts",
+          attempts: 20,
+        },
+      ]),
+      SID,
+      "active",
+    );
+    const user = real(messages).find((m) => m.role === "user");
+    expect(user?.id).toBe("p1");
+    expect(user?.metadata?.custom?.pending).toBe(true);
+    expect(user?.metadata?.custom?.undeliverable).toBe(true);
+    expect(user?.metadata?.custom?.delivering).toBeUndefined();
+    expect(user?.metadata?.custom?.undeliverableReason).toBe(
+      "could not be delivered after repeated attempts",
+    );
+    // It will never run, so the composer is not "working…".
+    expect(isRunning).toBe(false);
+  });
+
   test("the pending bubble transitions to normal (same id) once run_started consumes it", () => {
     const { messages } = buildMessages(
       indexed([

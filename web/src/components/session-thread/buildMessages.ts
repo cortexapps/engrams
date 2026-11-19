@@ -420,6 +420,10 @@ export function buildMessages(
   // not queued) renders as a PENDING tail bubble instead of being withheld
   // (ADR 0108 — see the post-loop render).
   const heldUserText = new Map<string, { text: string; at: string }>();
+  // Held echoes the coordinator gave up delivering: prompt_id → reason. Such
+  // a prompt never gets a run_started, so its tail bubble says so instead of
+  // "delivering…" forever.
+  const undeliverable = new Map<string, string>();
 
   // ADR 0052: the harness-owned queue, mirrored from events. prompt_id →
   // summary, insertion-ordered (oldest→newest). Entries leave on run_started
@@ -1228,6 +1232,10 @@ export function buildMessages(
         if (queued.has(ev.prompt_id)) queued.set(ev.prompt_id, ev.summary ?? "");
         break;
       }
+      case "prompt_undeliverable": {
+        undeliverable.set(ev.prompt_id, (ev.reason ?? "").replace(/\s+/g, " ").trim());
+        break;
+      }
       case "prompt_dequeued": {
         queued.delete(ev.prompt_id);
         // Recalled before consumption (back in the composer / cancelled) — drop
@@ -1301,7 +1309,11 @@ export function buildMessages(
       content: [{ type: "text", text: held.text }],
       id: promptId,
       createdAt: new Date(held.at),
-      metadata: { custom: { pending: true, delivering: true } },
+      metadata: {
+        custom: undeliverable.has(promptId)
+          ? { pending: true, undeliverable: true, undeliverableReason: undeliverable.get(promptId) }
+          : { pending: true, delivering: true },
+      },
     });
   }
 
@@ -1410,8 +1422,7 @@ export function buildMessages(
 }
 
 // Walk back from the tail (skipping durability markers, which don't imply
-// work in flight) to decide whether we're awaiting the assistant — mirrors
-// Transcript's `isBusy`.
+// work in flight) to decide whether we're awaiting the assistant.
 function tailAwaiting(out: Draft[]): boolean {
   for (let i = out.length - 1; i >= 0; i--) {
     const m = out[i]!;
@@ -1421,7 +1432,11 @@ function tailAwaiting(out: Draft[]): boolean {
       return false;
     }
     if (m.role === "assistant") return m.status?.type === "running";
-    if (m.role === "user") return true;
+    // A prompt the coordinator gave up delivering is not awaited work.
+    if (m.role === "user") {
+      if (m.metadata?.custom?.undeliverable === true) continue;
+      return true;
+    }
   }
   return false;
 }
