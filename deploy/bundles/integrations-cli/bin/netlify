@@ -67,8 +67,6 @@ write() {
 # Build a JSON object on stdout from field=value pairs (string values only).
 json_body() {
     if command -v jq >/dev/null 2>&1; then
-        set -- "$@"
-        jq_args=""
         obj='{}'
         for kv in "$@"; do
             k=${kv%%=*}
