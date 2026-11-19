@@ -9642,7 +9642,7 @@ mod tests {
             &deferred_names,
             &mut pending,
             &mut Vec::new(),
-            &mut std::collections::HashSet::new(),
+            &mut GenerationLedger::default(),
         )
         .unwrap();
         assert!(events
@@ -9662,7 +9662,7 @@ mod tests {
             &deferred_names,
             &mut pending,
             &mut Vec::new(),
-            &mut std::collections::HashSet::new(),
+            &mut GenerationLedger::default(),
         )
         .unwrap();
         assert!(
@@ -9732,7 +9732,7 @@ mod tests {
             &deferred_names,
             &mut pending,
             &mut suppressed,
-            &mut std::collections::HashSet::new(),
+            &mut GenerationLedger::default(),
         )
         .unwrap();
         assert!(
@@ -9752,7 +9752,7 @@ mod tests {
             &deferred_names,
             &mut pending,
             &mut suppressed,
-            &mut std::collections::HashSet::new(),
+            &mut GenerationLedger::default(),
         )
         .unwrap();
         assert!(
