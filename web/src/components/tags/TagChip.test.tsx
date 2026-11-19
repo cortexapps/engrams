@@ -5,20 +5,20 @@ import { TagChip } from "./TagChip";
 import { TagChipRow } from "./TagChipRow";
 
 describe("TagChip", () => {
-  it("draws the name from the stored color, with the description as its tooltip", () => {
+  it("draws the name from the stored color, with the full name and description as its tooltip", () => {
     render(
       <TagChip tag={{ name: "Platform", color: "#1f6feb", description: "Owned by platform" }} />,
     );
     const chip = screen.getByText("Platform");
     expect([...chip.classList]).toEqual(expect.arrayContaining(["tag-chip", "rounded-sm"]));
     expect(chip.style.getPropertyValue("--tag-color")).toBe("#1f6feb");
-    expect(chip.getAttribute("title")).toBe("Owned by platform");
+    expect(chip.getAttribute("title")).toBe("Platform: Owned by platform");
   });
 
-  it("has no tooltip without a description and is never interactive", () => {
+  it("shows the full name on hover without a description, and is never interactive", () => {
     render(<TagChip tag={{ name: "Ops", color: "#8250df", description: "" }} />);
     const chip = screen.getByText("Ops");
-    expect(chip.hasAttribute("title")).toBe(false);
+    expect(chip.getAttribute("title")).toBe("Ops");
     expect(chip.hasAttribute("tabindex")).toBe(false);
     expect(screen.queryByRole("button")).toBeNull();
     expect(screen.queryByRole("link")).toBeNull();
@@ -28,12 +28,12 @@ describe("TagChip", () => {
 const tag = (name: string) => ({ id: `t-${name}`, name, color: "#1f6feb", description: "" });
 
 describe("TagChipRow", () => {
-  it("shows two chips and a +N control that names every tag", () => {
+  it("shows two chips and a +N control whose name starts with its visible text and lists every tag", () => {
     render(<TagChipRow tags={[tag("Billing"), tag("Ops"), tag("Platform")]} />);
     expect(screen.getByText("Billing")).toBeTruthy();
     expect(screen.getByText("Ops")).toBeTruthy();
     expect(screen.queryByText("Platform")).toBeNull();
-    const more = screen.getByRole("button", { name: "All tags: Billing, Ops, Platform" });
+    const more = screen.getByRole("button", { name: "+1 more. All tags: Billing, Ops, Platform" });
     expect(more.textContent).toBe("+1");
   });
 
@@ -50,6 +50,17 @@ describe("TagChipRow", () => {
       "c",
       "a",
     ]);
+  });
+
+  // jsdom has no layout, so this pins the class contract that keeps two long
+  // chips inside a narrow name column: the row and its chips may shrink.
+  it("lets its chips shrink and truncate in a narrow row instead of overflowing", () => {
+    const { container } = render(<TagChipRow tags={[tag("a"), tag("b"), tag("c")]} />);
+    expect(container.firstElementChild!.classList.contains("min-w-0")).toBe(true);
+    for (const chip of container.querySelectorAll(".tag-chip")) {
+      expect(chip.classList.contains("shrink-0")).toBe(false);
+      expect(chip.classList.contains("min-w-0")).toBe(true);
+    }
   });
 
   it("renders nothing without tags", () => {

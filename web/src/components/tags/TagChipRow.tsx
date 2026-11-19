@@ -22,7 +22,7 @@ export function TagChipRow({
   const names = ordered.map((tag) => tag.name).join(", ");
 
   return (
-    <span className="flex shrink-0 items-center gap-1">
+    <span className="flex min-w-0 items-center gap-1">
       {ordered.slice(0, max).map((tag) => (
         <TagChip key={tag.id} tag={tag} />
       ))}
@@ -32,8 +32,8 @@ export function TagChipRow({
             <TooltipTrigger asChild>
               <button
                 type="button"
-                aria-label={`All tags: ${names}`}
-                className="rounded-sm border px-1.5 py-0.5 text-xs leading-4 font-medium text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+                aria-label={`+${hidden} more. All tags: ${names}`}
+                className="shrink-0 rounded-sm border px-1.5 py-0.5 text-xs leading-4 font-medium text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
               >
                 +{hidden}
               </button>

@@ -152,7 +152,9 @@ function AutomationRow({
             <span className="flex min-w-0 items-center gap-1.5">
               <TagChipRow tags={automation.tags} selected={selectedTags} />
               {automation.description && (
-                <span className="min-w-0 truncate text-xs text-muted-foreground">
+                // Zero basis: the description takes only the space the tags
+                // leave, so it truncates before they do.
+                <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
                   {automation.description}
                 </span>
               )}

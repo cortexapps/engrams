@@ -17,11 +17,12 @@ export function TagChip({
   return (
     <span
       className={cn(
-        "tag-chip inline-block max-w-32 shrink-0 truncate rounded-sm px-1.5 py-0.5 align-middle text-xs leading-4 font-medium",
+        "tag-chip inline-block max-w-32 min-w-0 truncate rounded-sm px-1.5 py-0.5 align-middle text-xs leading-4 font-medium",
         className,
       )}
       style={style}
-      title={tag.description || undefined}
+      // A long name truncates, so the tooltip always carries the full name.
+      title={tag.description ? `${tag.name}: ${tag.description}` : tag.name}
     >
       {tag.name}
     </span>
