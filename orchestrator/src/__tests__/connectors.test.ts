@@ -24,6 +24,7 @@ import {
   invalidateRegistry,
   connectorStatus,
   buildProviderCatalog,
+  powerAccess,
   defaultDisplayName,
   defaultIconMono,
   effectiveHosts,
@@ -1148,6 +1149,17 @@ describe("buildProviderCatalog", () => {
     expect(gh.capabilities).toEqual([{ action: "issues:write", access: "write" }]);
     // No secret material (mint kind, secretRef, header, template) leaks to members.
     expect(JSON.stringify(cat)).not.toMatch(/secretRef|header|template|github_app|datadog-api-key/);
+  });
+
+  test("a power's declared level decides its access, so POST-only APIs read", () => {
+    const cat = buildProviderCatalog(connectorRegistry(), new Map());
+    const slack = cat.find((e) => e.provider === "slack")!;
+    const access = Object.fromEntries(slack.capabilities.map((c) => [c.action, c.access]));
+    expect(access["channels:read"]).toBe("read");
+    expect(access["users:read"]).toBe("read");
+    expect(access["chat:write"]).toBe("write");
+    expect(access["channels:manage"]).toBe("write");
+    expect(powerAccess("cloudsql.postgres.connect", "read")).toBe("read");
   });
 
   test("carries the asset kind for an asset-bearing op (from the on-disk seeds)", () => {

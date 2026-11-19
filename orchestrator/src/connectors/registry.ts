@@ -2962,7 +2962,7 @@ export type CatalogAccess = "read" | "write";
 export interface CatalogCapability {
   /** The capability `action` (e.g. `issues:write`). */
   action: string;
-  /** Derived from the op's HTTP method (GET/HEAD/OPTIONS → read, else write). */
+  /** See `powerAccess`. */
   access: CatalogAccess;
   /** The asset kind this op surfaces, if any (e.g. `pull_request`). */
   asset?: string;
@@ -3001,6 +3001,16 @@ function accessOf(method: string | undefined): CatalogAccess {
   return m === "GET" || m === "HEAD" || m === "OPTIONS" ? "read" : "write";
 }
 
+/** A power's access is the level its name declares: `<resource>:read` reads,
+ * any other level writes. Only a power with no level takes its operation's
+ * access, because an RPC-style API (Slack, Notion search) reads over POST.
+ * Mirrored by the web's `powerAccess` (lib/connectorModel.ts). */
+export function powerAccess(action: string, operationAccess: CatalogAccess): CatalogAccess {
+  const colon = action.lastIndexOf(":");
+  if (colon < 0) return operationAccess;
+  return action.slice(colon + 1) === "read" ? "read" : "write";
+}
+
 /**
  * Project the registry into the member-safe provider catalog. Powers are the
  * union of every operation's `grants`, deduped by action (an asset spec on any
@@ -3017,7 +3027,8 @@ export function buildProviderCatalog(
     const byAction = new Map<string, CatalogCapability>();
     for (const op of connector.operations) {
       // ADR 0059: a GraphQL op's access derives from its operation type
-      // (query → read, mutation/subscription → write); a REST op from its method.
+      // (query → read, mutation/subscription → write); a REST op from its
+      // method. A power's level in its name overrides both (`powerAccess`).
       const access: CatalogAccess =
         op.match && isGraphqlMatch(op.match)
           ? op.match.operation === "query"
@@ -3030,7 +3041,11 @@ export function buildProviderCatalog(
           if (existing.asset === undefined && op.asset) existing.asset = op.asset.kind;
           continue;
         }
-        byAction.set(action, { action, access, ...(op.asset ? { asset: op.asset.kind } : {}) });
+        byAction.set(action, {
+          action,
+          access: powerAccess(action, access),
+          ...(op.asset ? { asset: op.asset.kind } : {}),
+        });
       }
     }
     entries.push({
