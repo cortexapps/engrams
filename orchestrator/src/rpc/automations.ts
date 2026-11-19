@@ -44,6 +44,9 @@ import {
   type WebhookRegistrationRow,
 } from "../db/automations.ts";
 import { getDb } from "../db/client.ts";
+import { makeTagStore, type TagRow, type TagStore } from "../db/tags.ts";
+import { MAX_TAGS_PER_AUTOMATION } from "../tags/rules.ts";
+import { toProtoTag } from "./tags.ts";
 import { inputErrorField, validateInputValues } from "../automations/inputs.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
@@ -131,6 +134,7 @@ export interface InputKeyOptionSource {
 export interface AutomationDeps {
   getSession?: GetSession;
   store?: AutomationStore & AutomationDispatchStore;
+  tags?: TagStore;
   profiles?: Pick<ProfileStore, "getActive">;
   harnessCatalog?: HarnessCatalogClient;
   modelRouters?: ModelRouterStore;
@@ -354,7 +358,7 @@ function toProtoVersion(row: AutomationVersionRow): ProtoVersion {
   };
 }
 
-function toProtoAutomation(row: AutomationRow): ProtoAutomation {
+function toProtoAutomation(row: AutomationRow, tags: readonly TagRow[]): ProtoAutomation {
   return create(AutomationSchema, {
     id: row.id,
     name: row.name,
@@ -373,6 +377,7 @@ function toProtoAutomation(row: AutomationRow): ProtoAutomation {
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
     version: toProtoVersion(row.version),
+    tags: tags.map(toProtoTag),
   });
 }
 
@@ -598,6 +603,7 @@ function productionInputKeyOptions(
 export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps): void {
   const getSession = deps?.getSession ?? getSessionFromHeaders;
   const store = deps?.store ?? makeAutomationStore(getDb());
+  const tags = deps?.tags ?? makeTagStore(getDb());
   const profiles = () => deps?.profiles ?? makeProfileStore(getDb());
   const harnessCatalog = (): HarnessCatalogClient =>
     deps?.harnessCatalog ?? (defaultHarnessCatalog as unknown as HarnessCatalogClient);
@@ -810,13 +816,23 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
     }
   }
 
+  /** The response form of one automation, with its tags. */
+  async function protoAutomation(row: AutomationRow): Promise<ProtoAutomation> {
+    const byAutomation = await tags.tagsForAutomations([row.id]);
+    return toProtoAutomation(row, byAutomation.get(row.id) ?? []);
+  }
+
   async function summaries(rows: AutomationRow[]) {
     const ids = rows.map((row) => row.id);
-    const [latest, counts] = await Promise.all([store.latestRuns(ids), store.runCounts7d(ids, now())]);
+    const [latest, counts, tagsByAutomation] = await Promise.all([
+      store.latestRuns(ids),
+      store.runCounts7d(ids, now()),
+      tags.tagsForAutomations(ids),
+    ]);
     return rows.map((row) => {
       const last = latest.get(row.id);
       return {
-        automation: toProtoAutomation(row),
+        automation: toProtoAutomation(row, tagsByAutomation.get(row.id) ?? []),
         triggerSummary: triggerSummary(definitionOf(row.version)),
         ...(last ? { lastRun: toProtoRunBrief(last) } : {}),
         runs7d: (counts.get(row.id) ?? []).map(toProtoDayCount),
@@ -1053,7 +1069,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         throw new ConnectError("id or builtin_key is required", Code.InvalidArgument);
       }
       if (!row) throw new ConnectError("automation not found", Code.NotFound);
-      return { automation: toProtoAutomation(row) };
+      return { automation: await protoAutomation(row) };
     },
 
     async createAutomation(req, ctx) {
@@ -1073,7 +1089,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         },
         userId,
       );
-      return { automation: toProtoAutomation(row) };
+      return { automation: await protoAutomation(row) };
     },
 
     async draftAutomation(req, ctx) {
@@ -1124,7 +1140,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       });
       if (!saved) throw new ConnectError("automation not found", Code.NotFound);
       if (overrides !== row.blockOverrides) await store.setBlockOverrides(row.id, overrides);
-      return { automation: toProtoAutomation((await store.get(row.id)) ?? saved) };
+      return { automation: await protoAutomation((await store.get(row.id)) ?? saved) };
     },
 
     async listVersions(req, ctx) {
@@ -1151,7 +1167,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
             : null;
       const row = await store.setEnabled(id, req.enabled, nextFireAt);
       if (!row) throw new ConnectError("automation not found", Code.NotFound);
-      return { automation: toProtoAutomation(row) };
+      return { automation: await protoAutomation(row) };
     },
 
     async updateAutomationMeta(req, ctx) {
@@ -1177,11 +1193,40 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         const { definition: validated } = await parseDefinition(JSON.stringify(definition));
         const saved = await store.saveVersion(row.id, validated, userId, patch);
         if (!saved) throw new ConnectError("automation not found", Code.NotFound);
-        return { automation: toProtoAutomation(saved) };
+        return { automation: await protoAutomation(saved) };
       }
       const updated = await store.updateMeta(row.id, patch);
       if (!updated) throw new ConnectError("automation not found", Code.NotFound);
-      return { automation: toProtoAutomation(updated) };
+      return { automation: await protoAutomation(updated) };
+    },
+
+    async addAutomationTag(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const row = await requireAutomation(req.automationId);
+      if (row.archivedAt) throw new ConnectError("automation is archived", Code.FailedPrecondition);
+      switch (await tags.addToAutomation(row.id, req.tagId, MAX_TAGS_PER_AUTOMATION)) {
+        case "added":
+          return { automation: await protoAutomation(row) };
+        case "full":
+          throw new ConnectError(
+            `an automation can have at most ${MAX_TAGS_PER_AUTOMATION} tags`,
+            Code.FailedPrecondition,
+          );
+        case "tag_missing":
+          throw new ConnectError("tag not found", Code.NotFound);
+        case "automation_missing":
+          throw new ConnectError("automation not found", Code.NotFound);
+      }
+    },
+
+    async removeAutomationTag(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const row = await requireAutomation(req.automationId);
+      if (row.archivedAt) throw new ConnectError("automation is archived", Code.FailedPrecondition);
+      if ((await tags.removeFromAutomation(row.id, req.tagId)) === "automation_missing") {
+        throw new ConnectError("automation not found", Code.NotFound);
+      }
+      return { automation: await protoAutomation(row) };
     },
 
     async setInputs(req, ctx) {
@@ -1200,7 +1245,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       const updated = await store.setInputs(row.id, inputs);
       if (!updated) throw new ConnectError("automation not found", Code.NotFound);
       // The Slack route's per-channel window reads this row through a cache.
-      return { automation: toProtoAutomation(updated) };
+      return { automation: await protoAutomation(updated) };
     },
 
     async setInputValue(req, ctx) {
@@ -1227,7 +1272,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       assertInputValues([spec], { [inputKey]: value });
       const updated = await store.setInputValue(row.id, inputKey, value);
       if (!updated) throw new ConnectError("automation not found", Code.NotFound);
-      return { automation: toProtoAutomation(updated) };
+      return { automation: await protoAutomation(updated) };
     },
 
     async setMapInputEntry(req, ctx) {
@@ -1259,7 +1304,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       }
       const updated = await store.setMapInputEntry(row.id, inputKey, entryKey, value, req.enable);
       if (!updated) throw new ConnectError("automation not found", Code.NotFound);
-      return { automation: toProtoAutomation(updated) };
+      return { automation: await protoAutomation(updated) };
     },
 
     async setBlockOverrides(req, ctx) {
@@ -1284,7 +1329,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       }
       const updated = await store.setBlockOverrides(row.id, overrides);
       if (!updated) throw new ConnectError("automation not found", Code.NotFound);
-      return { automation: toProtoAutomation(updated) };
+      return { automation: await protoAutomation(updated) };
     },
 
     async duplicateAutomation(req, ctx) {
@@ -1297,12 +1342,21 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         definition.trigger.kind === "cron"
           ? nextCronFire(definition.trigger.schedule, definition.trigger.timezone, now())
           : null;
+      const sourceTags = (await tags.tagsForAutomations([row.id])).get(row.id) ?? [];
       const copy = await store.create(
-        { name, description: row.description, enabled: false, definition, nextFireAt: null, inputs: row.inputs },
+        {
+          name,
+          description: row.description,
+          enabled: false,
+          definition,
+          nextFireAt: null,
+          inputs: row.inputs,
+          tagIds: sourceTags.map((tag) => tag.id),
+        },
         userId,
       );
       void nextFireAt;
-      return { automation: toProtoAutomation(copy) };
+      return { automation: await protoAutomation(copy) };
     },
 
     async archiveAutomation(req, ctx) {
@@ -1311,7 +1365,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       refuseOnBuiltin(row, "archiving");
       const archived = await store.archive(row.id);
       if (!archived) throw new ConnectError("automation not found", Code.NotFound);
-      return { automation: toProtoAutomation(archived) };
+      return { automation: await protoAutomation(archived) };
     },
 
     async testRender(req, ctx) {
