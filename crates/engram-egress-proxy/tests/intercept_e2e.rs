@@ -812,14 +812,11 @@ async fn rejects_request_shape_outside_policy() {
     );
 }
 
-// WS4 (campaign C2 regression): a rejected request must NEVER surface to the
-// guest as an empty success-shaped response. The reject path closes the
-// connection, so the guest reads ZERO bytes (an unambiguous transport failure)
-// — not a synthesized `HTTP/1.1 204`/`200` with an empty body that a stale-token
-// branch DELETE could be mistaken for succeeding. (The stale-token root cause is
-// fixed by the TTL-aware re-mint; this pins the shape invariant regardless.)
+// A rejected request must never reach the guest as a success: a synthesized
+// `204`/`200` would let a client read a denied branch DELETE as done. The guest
+// gets one `403` that names the denied request, and the connection closes.
 #[tokio::test]
-async fn reject_writes_no_response_to_the_guest() {
+async fn reject_answers_the_guest_with_a_403_that_names_the_request() {
     let ca = ca();
     let mint = Arc::new(CertMint::new(ca.clone()));
     let server_cfg = build_server_config(mint);
@@ -878,11 +875,14 @@ async fn reject_writes_no_response_to_the_guest() {
         matches!(outcome, Err(InterceptError::RequestRejected { .. })),
         "expected RequestRejected, got: {outcome:?}",
     );
+    let resp = String::from_utf8_lossy(&resp);
     assert!(
-        resp.is_empty(),
-        "reject must write NO response to the guest (no synthesized 2xx/204); got: {:?}",
-        String::from_utf8_lossy(&resp),
+        resp.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+        "reject must answer 403, never a 2xx; got: {resp:?}",
     );
+    assert!(resp.contains("Connection: close\r\n"));
+    assert!(resp.contains("\"error\":\"egress_policy_denied\""));
+    assert!(resp.contains("DELETE /repos/o/r/git/refs/heads/x"));
     assert!(
         captured.lock().is_empty(),
         "upstream must see nothing on reject"
