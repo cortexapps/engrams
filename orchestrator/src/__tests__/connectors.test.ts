@@ -767,7 +767,17 @@ describe("on-disk registry", () => {
     expect(userScopes).toContain("channels:write");
     expect(userScopes).toContain("chat:write");
     expect(reg.get("sentry")!.userCredential?.token?.hint).toContain("User Auth Tokens");
-    expect(reg.get("github")!.userCredential?.oauth).toBeUndefined();
+    // GitHub's personal OAuth is the App's own user flow: it exchanges the
+    // code on github.com and names the account by its login.
+    expect(reg.get("github")!.userCredential?.oauth).toBe(true);
+    expect(reg.get("github")!.userCredential?.oauthFacet).toMatchObject({
+      authorizeUrl: "https://github.com/login/oauth/authorize",
+      tokenUrl: "https://github.com/login/oauth/access_token",
+      scopes: [],
+      clientIdRef: "github_app.client_id",
+      clientSecretRef: "github_app.client_secret",
+      metadata: { probe: { path: "/user", map: { accountId: "id", displayName: "login" } } },
+    });
     expect(reg.get("github")!.userCredential?.token?.identity).toEqual({
       path: "/user",
       map: { displayName: "login" },
@@ -1495,16 +1505,60 @@ describe("user-scoped credentials (ADR 0115)", () => {
       expect(() => parseConnector(noInject, "t")).toThrow(/"inject" is required on a mint connector/);
     });
 
-    test("rejects oauth mode on a mint connector", () => {
-      const withOauth = {
-        ...acmeMintRaw,
-        userCredential: {
-          oauth: true,
-          token: { hint: "x" },
-          inject: { header: "Authorization", template: "Bearer {}" },
+    // A mint connector has no org OAuth facet, so its personal flow is a
+    // complete authorization-code flow of its own (GitHub's App user flow).
+    const mintFlow = {
+      authorizeUrl: "https://acmemint.test/login/oauth/authorize",
+      acquisitionHosts: ["acmemint.test"],
+      tokenUrl: "https://acmemint.test/login/oauth/access_token",
+      clientIdRef: "acme_app.client_id",
+      clientSecretRef: "acme_app.client_secret",
+    };
+    const withMintOauth = (oauth: unknown) => ({
+      ...acmeMintRaw,
+      userCredential: {
+        oauth,
+        token: { hint: "x" },
+        inject: { header: "Authorization", template: "Bearer {}" },
+      },
+    });
+
+    test("accepts a mint connector's own personal OAuth flow", () => {
+      const c = parseConnector(withMintOauth(mintFlow), "acmemint");
+      expect(c.userCredential?.oauth).toBe(true);
+      // The token URL may sit on an acquisition host, and no scopes is fine.
+      expect(c.userCredential?.oauthFacet).toMatchObject({
+        grant: "authorization_code",
+        tokenUrl: "https://acmemint.test/login/oauth/access_token",
+        scopes: [],
+        clientIdRef: "acme_app.client_id",
+      });
+    });
+
+    test("rejects a mint connector's oauth that is not a flow of its own", () => {
+      expect(() => parseConnector(withMintOauth(true), "t")).toThrow(/must declare its own flow/);
+      expect(() =>
+        parseConnector(withMintOauth({ ...mintFlow, grant: "client_credentials" }), "t"),
+      ).toThrow(/"authorization_code" for a personal flow/);
+      expect(() =>
+        parseConnector(
+          withMintOauth({ ...mintFlow, tokenUrl: "https://elsewhere.test/token" }),
+          "t",
+        ),
+      ).toThrow(/"oauth.tokenUrl" host "elsewhere.test"/);
+    });
+
+    test("an org OAuth facet keeps its token URL on the connector's hosts", () => {
+      // The relaxation is for a personal flow only.
+      const org = {
+        ...acmeRaw,
+        credential: {
+          source: "inject",
+          injects: [{ header: "Authorization", template: "Bearer {}" }],
         },
+        oauth: { ...mintFlow, scopes: ["read"], tokenUrl: "https://acmemint.test/token" },
       };
-      expect(() => parseConnector(withOauth, "t")).toThrow(/token" mode only/);
+      expect(() => parseConnector(org, "t")).toThrow(/"oauth.tokenUrl" host/);
     });
 
     test("rejects oauth mode without the top-level oauth facet", () => {

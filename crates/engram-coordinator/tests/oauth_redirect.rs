@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use engram_coordinator::oauth::OAuthManager;
@@ -28,6 +29,8 @@ use serde_json::{json, Value};
 struct Provider {
     token_response: Arc<Mutex<Value>>,
     token_requests: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+    /// The `Accept` header of each token request.
+    token_accepts: Arc<Mutex<Vec<String>>>,
     viewer_response: Arc<Mutex<Value>>,
 }
 
@@ -35,13 +38,20 @@ async fn serve(provider: Provider) -> String {
     let router = Router::new()
         .route(
             "/oauth/token",
-            post(|State(p): State<Provider>, body: String| async move {
-                let form: BTreeMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
-                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
-                    .collect();
-                p.token_requests.lock().push(form);
-                Json(p.token_response.lock().clone())
-            }),
+            post(
+                |State(p): State<Provider>, headers: HeaderMap, body: String| async move {
+                    let accept = headers.get("accept").and_then(|v| v.to_str().ok());
+                    p.token_accepts
+                        .lock()
+                        .push(accept.unwrap_or_default().to_owned());
+                    let form: BTreeMap<String, String> =
+                        url::form_urlencoded::parse(body.as_bytes())
+                            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                            .collect();
+                    p.token_requests.lock().push(form);
+                    Json(p.token_response.lock().clone())
+                },
+            ),
         )
         .route(
             "/graphql",
@@ -258,6 +268,11 @@ async fn complete_publishes_bundle_with_rotation_and_probe_metadata() {
     assert_eq!(reqs[0]["client_id"], "client-123");
     assert_eq!(reqs[0]["client_secret"], "secret-456");
     assert_eq!(reqs[0]["redirect_uri"], "https://cb.example.com/x");
+    // GitHub answers in form encoding unless the request asks for JSON.
+    assert_eq!(
+        *fx.provider.token_accepts.lock(),
+        vec!["application/json".to_owned()]
+    );
 
     // Probe metadata extracted; expiry mirrored outside the ciphertext.
     assert_eq!(row.metadata.account_id, "app-user-1");
@@ -744,6 +759,33 @@ async fn invalid_grant_breaks_the_credential_and_reconnect_repairs_it() {
         .await
         .expect("repaired");
     assert_eq!(resolved.secret, "at-3");
+}
+
+#[tokio::test]
+async fn github_bad_refresh_token_breaks_the_credential() {
+    let fx = fixture().await;
+    let sp = spec(&fx.host, false);
+    connected(&fx, &sp).await;
+
+    // GitHub's shape: HTTP 200, its own error code.
+    *fx.provider.token_response.lock() = json!({
+        "error": "bad_refresh_token",
+        "error_description": "The refresh token passed is incorrect or expired.",
+    });
+    fx.clock.advance(std::time::Duration::from_secs(19 * 3600));
+    let sweep = fx
+        .manager
+        .run_connector_refresh_once()
+        .await
+        .expect("sweep");
+    assert_eq!(sweep.broke, 1, "{sweep:?}");
+    let row = fx
+        .meta
+        .get_oauth_credential(&linear_key())
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(row.broken_reason.as_deref(), Some("invalid_grant"));
 }
 
 #[tokio::test]

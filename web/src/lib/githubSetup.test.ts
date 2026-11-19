@@ -93,6 +93,12 @@ describe("buildGithubManifest", () => {
     expect(m.hook_attributes.active).toBe(true);
   });
 
+  test("registers the OAuth callback members connect through", () => {
+    expect(parse().callback_urls).toEqual([
+      "https://engrams.example.com/api/v1/integrations/github/oauth/callback",
+    ]);
+  });
+
   test("carries the derived permissions as default_permissions", () => {
     const m = parse();
     expect(m.default_permissions.metadata).toBe("read");

@@ -112,6 +112,20 @@ export function makeIntegrationOauthRoute(deps?: IntegrationOauthDeps): Hono {
     return conn;
   }
 
+  /** A connector a member can connect with their own OAuth consent: through
+   * the org facet (Linear, Slack) or through a personal flow of its own on a
+   * mint connector (GitHub). */
+  async function userOauthConnector(provider: string): Promise<Connector> {
+    const registry = await loadRegistry(connectorSource());
+    const conn = registry.get(provider);
+    if (conn?.userCredential?.oauth === undefined) {
+      throw new HTTPException(404, {
+        message: `connector "${provider}" has no user-scoped OAuth flow`,
+      });
+    }
+    return conn;
+  }
+
   async function subjectFor(connector: Connector) {
     const id = await connectionIdFor(
       connector.provider,
@@ -162,12 +176,7 @@ export function makeIntegrationOauthRoute(deps?: IntegrationOauthDeps): Hono {
   app.get("/api/v1/me/connector-credentials/:provider/oauth/authorize", async (c) => {
     const user = await requireUser(c.req.raw.headers);
     const provider = c.req.param("provider");
-    const connector = await oauthConnector(provider);
-    if (connector.userCredential?.oauth === undefined) {
-      throw new HTTPException(404, {
-        message: `connector "${provider}" has no user-scoped OAuth flow`,
-      });
-    }
+    const connector = await userOauthConnector(provider);
     const force = c.req.query("force") === "1";
     const { authorizeUrl } = await oauthCredential.beginRedirectFlow({
       subject: { kind: OauthSubjectKind.USER_CONNECTOR, id: user.id },
@@ -267,7 +276,9 @@ export function makeIntegrationOauthRoute(deps?: IntegrationOauthDeps): Hono {
       await requireAdmin(c.req.raw.headers);
     }
 
-    const connector = await oauthConnector(provider);
+    const connector = isUserFlow
+      ? await userOauthConnector(provider)
+      : await oauthConnector(provider);
     const done = isUserFlow ? finishUser : finish;
     try {
       await oauthCredential.completeRedirectFlow({

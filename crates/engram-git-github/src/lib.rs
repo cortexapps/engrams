@@ -560,7 +560,9 @@ async fn ensure_ok(
 /// ID + RSA private-key PEM. An admin supplies both via the integrations UI (the
 /// PEM sealed in the org-secret store); the coordinator resolves the two fields
 /// (org secrets `github_app.app_id` / `github_app.private_key_pem`, name =
-/// `<kind>.<field>`) and calls `build` to construct the engine lazily. This is
+/// `<kind>.<field>`) and calls `build` to construct the engine lazily. The
+/// optional `client_id` / `client_secret` are the App's OAuth client, which
+/// the GitHub connector's personal OAuth flow reads. This is
 /// the data-driven frame around minting — the mint logic stays in [`GitHubApp`].
 pub fn github_app_descriptor() -> MintKindDescriptor {
     MintKindDescriptor {
@@ -579,6 +581,21 @@ pub fn github_app_descriptor() -> MintKindDescriptor {
                 label: "Private key (PEM)",
                 field_kind: MintFieldKind::SealedSecret,
                 required: true,
+            },
+            // The App's own OAuth client. Optional: with both set, members
+            // can connect their personal GitHub account through the App
+            // instead of pasting a token. Minting does not use them.
+            MintFieldSchema {
+                name: "client_id",
+                label: "Client ID (optional, for personal connect)",
+                field_kind: MintFieldKind::Config,
+                required: false,
+            },
+            MintFieldSchema {
+                name: "client_secret",
+                label: "Client secret (optional, for personal connect)",
+                field_kind: MintFieldKind::SealedSecret,
+                required: false,
             },
         ],
         build: |fields: &ResolvedFields| {

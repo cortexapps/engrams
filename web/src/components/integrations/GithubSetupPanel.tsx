@@ -21,6 +21,7 @@ import {
   CopyIcon,
   KeyRoundIcon,
   ShieldCheckIcon,
+  UserRoundIcon,
   WebhookIcon,
 } from "lucide-react";
 
@@ -29,6 +30,7 @@ import { Text } from "@/components/ui/text";
 import {
   WEBHOOK_EVENTS,
   buildGithubManifest,
+  githubOAuthCallbackUrl,
   githubWebhookUrl,
   isMinimumPermission,
   permissionLabel,
@@ -40,14 +42,15 @@ import type { ConnectorView } from "./useConnectorViews";
 const NEW_APP_URL = "https://github.com/settings/apps/new";
 
 export function GithubSetupPanel({ view }: { view: ConnectorView }) {
-  const [copied, setCopied] = useState<"url" | "manifest" | null>(null);
+  const [copied, setCopied] = useState<"url" | "callback" | "manifest" | null>(null);
 
   const origin = API_ORIGIN || (typeof window !== "undefined" ? window.location.origin : "");
   const permissions = permissionsForCapabilities(view.capabilities);
   const webhookUrl = githubWebhookUrl(origin);
+  const callbackUrl = githubOAuthCallbackUrl(origin);
   const manifest = buildGithubManifest({ origin, permissions, events: WEBHOOK_EVENTS });
 
-  const copy = (what: "url" | "manifest", text: string) => {
+  const copy = (what: "url" | "callback" | "manifest", text: string) => {
     if (typeof navigator === "undefined" || !navigator.clipboard) return;
     void navigator.clipboard.writeText(text).then(() => {
       setCopied(what);
@@ -199,6 +202,42 @@ export function GithubSetupPanel({ view }: { view: ConnectorView }) {
             <span className="font-medium">.pem</span> into the fields below.
           </span>
         </p>
+      </section>
+
+      {/* Step 5 — optional personal connect */}
+      <section className="flex flex-col gap-2">
+        <StepHeader n={5} label="Let members connect their own account (optional)" />
+        <p className="text-xs leading-relaxed text-muted-foreground">
+          So members can connect GitHub in Settings → Credentials instead of pasting a token, set
+          the App's <span className="font-medium">Callback URL</span> to this URL. Then generate a
+          client secret, and copy the <span className="font-medium">Client ID</span> and the{" "}
+          <span className="font-medium">client secret</span> into the optional fields below. The
+          manifest already sets the callback URL.
+        </p>
+        <div className="flex flex-col gap-1.5">
+          <Text variant="label" className="flex items-center gap-1.5">
+            <UserRoundIcon className="size-3.5" />
+            Callback URL
+          </Text>
+          <code className="select-all rounded-md border bg-card px-3 py-2 font-mono text-xs break-all">
+            {callbackUrl}
+          </code>
+          <div className="mt-1">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => copy("callback", callbackUrl)}
+            >
+              {copied === "callback" ? (
+                <CheckIcon className="size-3.5 text-instrument-nominal" />
+              ) : (
+                <CopyIcon className="size-3.5" />
+              )}
+              Copy callback URL
+            </Button>
+          </div>
+        </div>
       </section>
     </div>
   );
