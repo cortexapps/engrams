@@ -5,6 +5,7 @@ import { createConnectQueryKey, useMutation, useQuery } from "@connectrpc/connec
 import { useQueryClient } from "@tanstack/react-query";
 
 import {
+  addAutomationTag,
   archiveAutomation,
   createAutomation,
   duplicateAutomation,
@@ -13,6 +14,7 @@ import {
   listAutomations,
   listEventCatalog,
   listVersions,
+  removeAutomationTag,
   saveVersion,
   setAutomationEnabled,
   setBlockOverrides,
@@ -22,6 +24,7 @@ import {
   createWebhookRegistration,
   listWebhookRegistrations,
 } from "@/gen/engram/app/v1/automation-WebhookRegistrationService_connectquery";
+import { useInvalidateTagViews } from "./useTags";
 
 export function useEditorAutomation(id: string | undefined) {
   return useQuery(
@@ -96,6 +99,17 @@ export function useSetBlockOverrides() {
 export function useUpdateAutomationMetaV2() {
   const invalidate = useInvalidateEditor();
   return useMutation(updateAutomationMeta, { onSuccess: invalidate });
+}
+
+/** Tag changes also move the tag counts, so they refresh the tag list too. */
+export function useAddAutomationTag() {
+  const invalidate = useInvalidateTagViews();
+  return useMutation(addAutomationTag, { onSuccess: invalidate });
+}
+
+export function useRemoveAutomationTag() {
+  const invalidate = useInvalidateTagViews();
+  return useMutation(removeAutomationTag, { onSuccess: invalidate });
 }
 
 export function useSetAutomationEnabledV2() {
