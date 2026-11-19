@@ -25,7 +25,8 @@ import type { SessionConsumer } from "./consumer.ts";
 
 const log = rootLog.child({ component: "child-report-consumer" });
 
-/** Bound on the child message text that goes into the parent's prompt. */
+/** Bound on the child message text that goes into the parent's prompt. A
+ *  longer message keeps its end, where a child states its result. */
 export const REPORT_MESSAGE_CHARS = 4000;
 
 /** Sends per run end before the consumer stops retrying a transient error. */
@@ -97,7 +98,7 @@ export function renderChildReport(input: {
   if (message === "") {
     body = "The child sent no assistant message in this turn.";
   } else if (message.length > REPORT_MESSAGE_CHARS) {
-    body = `${message.slice(0, REPORT_MESSAGE_CHARS)}\n\n[Truncated: the first ${REPORT_MESSAGE_CHARS} of ${message.length} characters.]`;
+    body = `[Truncated: the last ${REPORT_MESSAGE_CHARS} of ${message.length} characters.]\n\n${message.slice(-REPORT_MESSAGE_CHARS)}`;
   } else {
     body = message;
   }

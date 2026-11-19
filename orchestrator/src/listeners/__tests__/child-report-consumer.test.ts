@@ -156,16 +156,16 @@ describe("child report consumer", () => {
 });
 
 describe("renderChildReport", () => {
-  test("truncates a long message and says so", () => {
+  test("keeps the end of a long message, where the child states its result, and says so", () => {
     const text = renderChildReport({
       canonicalTaskName: "a",
       childSessionId: CHILD,
       outcome: "completed",
-      lastMessage: "x".repeat(REPORT_MESSAGE_CHARS + 500),
+      lastMessage: "q".repeat(500) + "x".repeat(REPORT_MESSAGE_CHARS - 6) + "STATUS",
     });
-    const note = `[Truncated: the first ${REPORT_MESSAGE_CHARS} of ${REPORT_MESSAGE_CHARS + 500} characters.]`;
-    expect(text).toContain(`${"x".repeat(REPORT_MESSAGE_CHARS)}\n\n${note}`);
-    expect(text).not.toContain("x".repeat(REPORT_MESSAGE_CHARS + 1));
+    const note = `[Truncated: the last ${REPORT_MESSAGE_CHARS} of ${REPORT_MESSAGE_CHARS + 500} characters.]`;
+    expect(text).toContain(`${note}\n\n${"x".repeat(REPORT_MESSAGE_CHARS - 6)}STATUS`);
+    expect(text).not.toContain("q");
     expect(text.endsWith("Use read_session for its full output.")).toBe(true);
   });
 
