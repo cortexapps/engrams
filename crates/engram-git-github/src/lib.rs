@@ -35,9 +35,9 @@ const API_VERSION: &str = "2022-11-28";
 /// session's bound `github:` capabilities. A capability action is
 /// `<resource>:<level>` (e.g. `contents:write`, `pulls:write`); the App
 /// permission key is the resource, except `pulls` → `pull_requests` and
-/// `variables` → `actions_variables`, and the level is the highest granted (read < write < admin). Returns an empty map
-/// when no `github:` cap is bound — the caller then falls back to the default
-/// scopes (today's behavior), so a capability-less profile is unaffected.
+/// `variables` → `actions_variables`, and the level is the highest granted
+/// (read < write < admin). Returns an empty map when no `github:` cap is
+/// bound; the caller then requests the default scopes.
 fn permissions_for_caps(caps: &[Capability]) -> BTreeMap<String, String> {
     let rank = |l: &str| match l {
         "admin" => 3,
