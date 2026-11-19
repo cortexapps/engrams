@@ -22,6 +22,9 @@ pub struct Script {
     pub agent_message: Option<String>,
     pub send_run_completed: bool,
     pub plan_flow: bool,
+    /// When set, each tool call also stays open until this file exists, so a
+    /// test can hold it open across an operation of unknown length.
+    pub tool_release_file: Option<std::path::PathBuf>,
 }
 
 impl Default for Script {
@@ -35,6 +38,7 @@ impl Default for Script {
             agent_message: Some("noop assistant message".into()),
             send_run_completed: false,
             plan_flow: false,
+            tool_release_file: None,
         }
     }
 }
@@ -74,6 +78,11 @@ async fn run_turn(
         .await?;
         // The engine owns this sleep. A transport reconnect cannot cancel it.
         tokio::time::sleep(script.tool_sleep).await;
+        if let Some(release) = &script.tool_release_file {
+            while !release.exists() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
         send_event(
             tx,
             HarnessEvent::ToolCallCompleted {
@@ -422,6 +431,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(engine.await.unwrap(), ExitCode::SUCCESS);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tool_call_stays_open_until_its_release_file_exists() {
+        let dir = std::env::temp_dir().join(format!("noop-release-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let release = dir.join("release");
+        let _ = std::fs::remove_file(&release);
+        let channels = Channels::new();
+        let mut events = channels.event_rx;
+        let engine = tokio::spawn(run_engine(
+            Script {
+                autorun: false,
+                tool_calls: 1,
+                tool_sleep: Duration::ZERO,
+                agent_message: None,
+                tool_release_file: Some(release.clone()),
+                ..Script::default()
+            },
+            channels.command_rx,
+            channels.reattach.clone(),
+            channels.event_tx,
+        ));
+        channels
+            .command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "p1".into(),
+                text: "work".into(),
+                mode: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(HarnessEvent::RunStarted { .. })
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(HarnessEvent::ToolCallStarted { .. })
+        ));
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert!(events.try_recv().is_err(), "the tool call must stay open");
+        std::fs::write(&release, b"").unwrap();
+        tokio::time::advance(Duration::from_millis(50)).await;
+        assert!(matches!(
+            events.recv().await,
+            Some(HarnessEvent::ToolCallCompleted { .. })
+        ));
+        channels
+            .command_tx
+            .send(HarnessCommand::Shutdown { grace_secs: 0 })
+            .await
+            .unwrap();
+        assert_eq!(engine.await.unwrap(), ExitCode::SUCCESS);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(start_paused = true)]
