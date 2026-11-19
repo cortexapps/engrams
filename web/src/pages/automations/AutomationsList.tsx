@@ -9,6 +9,7 @@ import { EmptyState } from "@/components/empty-state";
 import { PageHeading } from "@/components/page-heading";
 import { SkeletonRows } from "@/components/skeleton-rows";
 import { StatusDot } from "@/components/status-dot";
+import { TagSwatch } from "@/components/tags/TagChip";
 import { TagChipRow } from "@/components/tags/TagChipRow";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -254,9 +255,10 @@ export function AutomationsList() {
       selectedTags,
     ),
   );
-  const tagNames = (tags.data?.tags ?? []).flatMap((summary) =>
-    summary.tag ? [summary.tag.name] : [],
+  const knownTags = (tags.data?.tags ?? []).flatMap((summary) =>
+    summary.tag ? [summary.tag] : [],
   );
+  const tagNames = knownTags.map((tag) => tag.name);
   // A name in the URL that matches no tag (renamed, deleted) stays an option,
   // so the admin can see it is selected and remove it.
   const staleNames = selectedTags.filter((name) => name !== NO_TAGS && !tagNames.includes(name));
@@ -265,7 +267,12 @@ export function AutomationsList() {
     label: "Tag",
     icon: <TagIcon className="size-3.5" />,
     options: [
-      ...[...tagNames, ...staleNames].map((name) => ({ value: name, label: name })),
+      ...knownTags.map((tag) => ({
+        value: tag.name,
+        label: tag.name,
+        icon: <TagSwatch color={tag.color} />,
+      })),
+      ...staleNames.map((name) => ({ value: name, label: name })),
       { value: NO_TAGS, label: "No tags" },
     ],
   };

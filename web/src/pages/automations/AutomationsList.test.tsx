@@ -305,6 +305,35 @@ describe("AutomationsList tag filter", () => {
     expect(await rowNames()).toEqual(["One", "Three", "Two"]);
   });
 
+  it("shows each tag's color in the filter menu, and no swatch for No tags or a stale name", async () => {
+    const user = userEvent.setup();
+    state.tagSummaries = [
+      tagSummary("Ops"),
+      create(TagSummarySchema, {
+        tag: create(TagSchema, {
+          id: "t-billing",
+          name: "Billing",
+          color: "#8250df",
+          description: "",
+        }),
+        automationCount: 0,
+      }),
+    ];
+    renderWithProviders(<AutomationsList />, {
+      initialPath: `/automations?tags=${encodeURIComponent(JSON.stringify(["Ops", "Gone"]))}`,
+    });
+    await user.click(await screen.findByRole("button", { name: /^Tag: Ops/ }));
+    const swatch = (name: string) =>
+      (
+        screen.getByRole("option", { name }).querySelector(".tag-chip") as HTMLElement | null
+      )?.style.getPropertyValue("--tag-color");
+    await screen.findByRole("option", { name: "Billing" });
+    expect(swatch("Billing")).toBe("#8250df");
+    expect(swatch("Ops")).toBe("#1f6feb");
+    expect(swatch("Gone")).toBeUndefined();
+    expect(swatch("No tags")).toBeUndefined();
+  });
+
   it("links Manage tags to Settings", async () => {
     renderWithProviders(<AutomationsList />, { initialPath: "/automations" });
     const link = await screen.findByRole("link", { name: "Manage tags" });

@@ -28,3 +28,10 @@ export function TagChip({
     </span>
   );
 }
+
+/** A tag's color as a small square, drawn by the same rule as its chip, for
+ * places that list tags by name (the filter menu). */
+export function TagSwatch({ color }: { color: string }) {
+  const style: CSSProperties & { "--tag-color": string } = { "--tag-color": color };
+  return <span aria-hidden className="tag-chip inline-block size-3 rounded-[3px]" style={style} />;
+}
