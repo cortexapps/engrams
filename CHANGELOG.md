@@ -41,6 +41,9 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 
 ### Fixed
 
+- A session could stop taking prompts after a burst of prompts broke its harness connection.
+  The harness waited forever to exit while another task held its event channel, so it was
+  never replaced. It now exits within seconds and a fresh harness takes over. ([#1826])
 - A request that a session's grants do not permit now gets a `403` with a JSON body that
   names the request. Before, HTTP/1 closed the connection and HTTP/2 sent an empty `403`
   or reset the stream, so clients printed nothing or a framing error. ([#1822])
@@ -440,3 +443,4 @@ The first tagged release. See the
 [#1789]: https://github.com/cortexapps/engrams/pull/1789
 [#1822]: https://github.com/cortexapps/engrams/pull/1822
 [#1825]: https://github.com/cortexapps/engrams/pull/1825
+[#1826]: https://github.com/cortexapps/engrams/pull/1826
