@@ -147,8 +147,9 @@ function AutomationRow({
                   built-in
                 </Badge>
               )}
+              {/* In a narrow table the scope badge gives its width to the name. */}
               {scope && (
-                <Badge variant="secondary" className="shrink-0 rounded-sm">
+                <Badge variant="secondary" className="shrink-0 rounded-sm @max-[68rem]:hidden">
                   {scope}
                 </Badge>
               )}
@@ -300,7 +301,7 @@ export function AutomationsList() {
           Automations
         </h2>
         {automations.isPending && (
-          <div role="table" className="overflow-x-auto rounded-lg border bg-card">
+          <div role="table" className="@container overflow-x-auto rounded-lg border bg-card">
             <div className="min-w-[860px]">
               <AutomationTableHeader />
               <SkeletonRows
@@ -352,7 +353,7 @@ export function AutomationsList() {
           </EmptyState>
         )}
         {loaded && visible.length > 0 && (
-          <div role="table" className="overflow-x-auto rounded-lg border bg-card">
+          <div role="table" className="@container overflow-x-auto rounded-lg border bg-card">
             <div className="min-w-[860px]">
               <AutomationTableHeader />
               <div role="rowgroup" className="divide-y">

@@ -183,6 +183,18 @@ describe("AutomationsList", () => {
     expect(screen.queryByRole("button", { name: /duplicate/i })).toBeNull();
   });
 
+  it("hides the scope badge in a narrow table so the name stays readable", async () => {
+    renderWithProviders(<AutomationsList />);
+    expect((await screen.findByRole("table")).classList.contains("@container")).toBe(true);
+    const rows = await screen.findAllByTestId("automation-row");
+    expect(within(rows[0]!).getByText("per PR").classList.contains("@max-[68rem]:hidden")).toBe(
+      true,
+    );
+    expect(within(rows[0]!).getByText("built-in").classList.contains("@max-[68rem]:hidden")).toBe(
+      false,
+    );
+  });
+
   it("encodes the last run as an instrument-toned status dot", async () => {
     renderWithProviders(<AutomationsList />);
     const rows = await screen.findAllByTestId("automation-row");

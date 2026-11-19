@@ -37,9 +37,33 @@ describe("TagChipRow", () => {
     expect(more.textContent).toBe("+1");
   });
 
-  it("shows no +N control when every tag fits", () => {
+  it("with every tag shown, has only the compact +N that a narrow cell uses", () => {
     render(<TagChipRow tags={[tag("Billing"), tag("Ops")]} />);
-    expect(screen.queryByRole("button")).toBeNull();
+    const buttons = screen.getAllByRole("button");
+    expect(buttons.map((button) => button.getAttribute("aria-label"))).toEqual([
+      "+1 more. All tags: Billing, Ops",
+    ]);
+    expect([...buttons[0]!.classList]).toEqual(
+      expect.arrayContaining(["hidden", "@max-[11rem]:inline-flex"]),
+    );
+  });
+
+  // jsdom has no layout, so this pins the container-query contract: below
+  // 11rem the row shows its first chip and a +N that counts every other tag.
+  it("adapts to a narrow cell: later chips and the wide +N hide, the compact +N shows", () => {
+    const { container } = render(<TagChipRow tags={[tag("a"), tag("b"), tag("c")]} />);
+    expect(container.firstElementChild!.classList.contains("@container")).toBe(true);
+    const [first, second] = [...container.querySelectorAll(".tag-chip")];
+    expect(first!.classList.contains("@max-[11rem]:hidden")).toBe(false);
+    // In a narrow cell the first chip may shrink too, so the +N stays inside.
+    expect(first!.classList.contains("@max-[11rem]:shrink")).toBe(true);
+    expect(second!.classList.contains("@max-[11rem]:hidden")).toBe(true);
+    const wide = screen.getByRole("button", { name: "+1 more. All tags: a, b, c" });
+    const compact = screen.getByRole("button", { name: "+2 more. All tags: a, b, c" });
+    expect(wide.classList.contains("@max-[11rem]:hidden")).toBe(true);
+    expect([...compact.classList]).toEqual(
+      expect.arrayContaining(["hidden", "@max-[11rem]:inline-flex"]),
+    );
   });
 
   it("puts the selected tags first", () => {
