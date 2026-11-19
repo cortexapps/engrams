@@ -780,6 +780,18 @@ describe("on-disk registry", () => {
     expect(reg.get("datadog")!.userCredential).toBeUndefined();
   });
 
+  test("the shipped github metadata:read power reaches the repository, not every path below it", () => {
+    const globs = (capability: string) =>
+      compileIntegrationPolicy([capability]).injects
+        .filter((i) => i.methods.includes("GET"))
+        .flatMap((i) => i.path_globs);
+    const metadata = globs("github:metadata:read");
+    expect(metadata).toContain("segment-path:/repos/*/*");
+    expect(metadata).not.toContain("/repos/*");
+    expect(metadata.some((glob) => glob.includes("dependabot"))).toBe(false);
+    expect(globs("github:vulnerability_alerts:read")).toEqual(["/repos/*/dependabot/alerts*"]);
+  });
+
   test("the shipped datadog connector scopes REST and MCP header spellings to their hosts", () => {
     const policy = compileIntegrationPolicy(["datadog:metrics:read"]);
     // metrics:read activates several ops (query, metric metadata, v2 query); each
