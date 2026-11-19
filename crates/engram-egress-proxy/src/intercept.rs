@@ -61,6 +61,10 @@ const REQUEST_BODY_BUDGET: usize = 1024 * 1024;
 /// GraphQL endpoint pay this — REST/bypass hosts keep the header-only early stop.
 const GRAPHQL_REQUEST_BODY_BUDGET: usize = 256 * 1024;
 
+/// The `GraphqlRejected` reason for an operation the grants do not cover (the
+/// other reasons are request shapes no grant can fix).
+const GRAPHQL_NOT_PERMITTED: &str = "operation not permitted by integration policy";
+
 #[derive(Debug)]
 pub enum InterceptError {
     Io(std::io::Error),
@@ -441,7 +445,9 @@ where
         Ok(gated) => gated,
         Err(error) => {
             if let Some(status) = policy_denial_status(&error) {
-                write_h1_denial(&mut client_tls, status, &error).await;
+                let unread_body = declared_content_length(&prefix[..head_end])
+                    .map_or(0, |len| len.saturating_sub(prefix.len() - head_end));
+                write_h1_denial(&mut client_tls, status, &error, unread_body).await;
             }
             return Err(error);
         }
@@ -626,13 +632,12 @@ async fn process_h2_stream(
         .path_and_query()
         .map_or_else(|| "/".to_string(), ToString::to_string);
     if let Err(error) = deny_credential_operation(context.sni, &method, &path) {
-        let (_, mut request_body) = request.into_parts();
-        drain_h2_body(&mut request_body).await;
-        deny_h2(
+        let stream = deny_h2(
             &mut respond,
             http::StatusCode::FORBIDDEN,
             &denial_message(&error),
         )?;
+        finish_denied_h2(stream, request.into_body()).await;
         return Err(error);
     }
 
@@ -647,7 +652,7 @@ async fn process_h2_stream(
                             deny_h2(
                                 &mut respond,
                                 http::StatusCode::BAD_REQUEST,
-                                "the GraphQL request could not be parsed",
+                                "The GraphQL request could not be parsed.",
                             )?;
                             return Ok(());
                         }
@@ -655,11 +660,12 @@ async fn process_h2_stream(
                     (Some(body), trailers, Some(parsed))
                 }
                 Err(_) => {
-                    deny_h2(
+                    let stream = deny_h2(
                         &mut respond,
                         http::StatusCode::PAYLOAD_TOO_LARGE,
-                        "the GraphQL request body exceeds the inspection limit",
+                        "The GraphQL request body exceeds the inspection limit.",
                     )?;
+                    finish_denied_h2(stream, request_body).await;
                     return Ok(());
                 }
             }
@@ -672,9 +678,9 @@ async fn process_h2_stream(
     let plan = match evaluate_stream(context, &method, &path, parsed_graphql.as_ref()).await {
         Ok(plan) => plan,
         Err(error) => {
-            drain_h2_body(&mut request_body).await;
             let status = policy_denial_status(&error).unwrap_or(http::StatusCode::FORBIDDEN);
-            deny_h2(&mut respond, status, &denial_message(&error))?;
+            let stream = deny_h2(&mut respond, status, &denial_message(&error))?;
+            finish_denied_h2(stream, request_body).await;
             return Err(error);
         }
     };
@@ -784,7 +790,7 @@ async fn process_h2_stream(
             deny_h2(
                 &mut respond,
                 http::StatusCode::BAD_GATEWAY,
-                "the upstream response cannot be inspected",
+                "The upstream response cannot be inspected.",
             )?;
             return Ok(());
         }
@@ -904,7 +910,7 @@ async fn evaluate_stream<'a>(
     } else if let Some(document) = parsed_graphql {
         gate_graphql_injects(context.injects, method, path, document).ok_or(
             InterceptError::GraphqlRejected {
-                reason: "operation not permitted by integration policy",
+                reason: GRAPHQL_NOT_PERMITTED,
             },
         )?
     } else {
@@ -1007,12 +1013,22 @@ fn policy_denial_status(error: &InterceptError) -> Option<http::StatusCode> {
     }
 }
 
-/// What the guest reads when the policy refuses a request.
+/// What the guest reads when the policy refuses a request. Only a request the
+/// grants do not cover can be fixed by granting a power.
 fn denial_message(error: &InterceptError) -> String {
-    format!(
-        "{error}. This session's integration grants do not permit this request; \
-         an administrator can grant the matching power on the session's profile."
-    )
+    let grantable = match error {
+        InterceptError::RequestRejected { .. } => true,
+        InterceptError::GraphqlRejected { reason } => *reason == GRAPHQL_NOT_PERMITTED,
+        _ => false,
+    };
+    if grantable {
+        format!(
+            "{error}. This session's integration grants do not permit this request; \
+             an administrator can grant the matching power on the session's profile."
+        )
+    } else {
+        format!("{error}. No integration grant permits this request.")
+    }
 }
 
 /// The denial body. Its shape suits the common API clients: Slack clients read
@@ -1026,21 +1042,19 @@ fn denial_body(message: &str) -> bytes::Bytes {
     bytes::Bytes::from(body.to_string())
 }
 
-/// Bytes of an unread request body the proxy reads before it answers a denial.
-/// h2 resets a stream whose request body is dropped unread, and clients report
-/// that reset (curl: "Stream error in the HTTP/2 framing layer") instead of the
-/// denial.
-const DENIAL_DRAIN_BUDGET: usize = 1024 * 1024;
+/// How much of a denied request's body the proxy reads and discards so the
+/// stream ends cleanly. h2 resets a stream whose request body is dropped
+/// unread with `CANCEL`, and clients report that (curl: "Stream error in the
+/// HTTP/2 framing layer") instead of the denial.
+const DENIAL_DISCARD_BUDGET: usize = 1024 * 1024;
+const DENIAL_DISCARD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
-async fn drain_h2_body(body: &mut h2::RecvStream) {
-    let _ = read_h2_body(body, DENIAL_DRAIN_BUDGET).await;
-}
-
+/// Send the complete denial at once; the request body cannot delay it.
 fn deny_h2(
     respond: &mut h2::server::SendResponse<bytes::Bytes>,
     status: http::StatusCode,
     message: &str,
-) -> Result<(), InterceptError> {
+) -> Result<h2::SendStream<bytes::Bytes>, InterceptError> {
     let body = denial_body(message);
     let response = http::Response::builder()
         .status(status)
@@ -1050,14 +1064,48 @@ fn deny_h2(
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
     let mut stream = respond.send_response(response, false)?;
     stream.send_data(body, true)?;
-    Ok(())
+    Ok(stream)
 }
 
-/// Answer a policy denial on an HTTP/1 connection, which then closes. Best
-/// effort: the caller returns the denial whether or not the write lands.
-async fn write_h1_denial<S>(client: &mut S, status: http::StatusCode, error: &InterceptError)
-where
-    S: tokio::io::AsyncWrite + Unpin,
+/// After a denial, discard the rest of the request body without keeping it.
+/// A body that does not end within the budget and the deadline gets
+/// `RST_STREAM(NO_ERROR)`, which RFC 9113 §8.1 allows after a complete
+/// response.
+async fn finish_denied_h2(mut stream: h2::SendStream<bytes::Bytes>, mut body: h2::RecvStream) {
+    if body.is_end_stream() {
+        return;
+    }
+    let discarded = tokio::time::timeout(DENIAL_DISCARD_DEADLINE, async {
+        let mut seen = 0usize;
+        while let Some(data) = body.data().await {
+            let Ok(data) = data else { return false };
+            seen = seen.saturating_add(data.len());
+            let _ = body.flow_control().release_capacity(data.len());
+            if seen > DENIAL_DISCARD_BUDGET {
+                return false;
+            }
+        }
+        true
+    })
+    .await
+    .unwrap_or(false);
+    if !discarded {
+        stream.send_reset(h2::Reason::NO_ERROR);
+    }
+}
+
+/// Answer a policy denial on an HTTP/1 connection, which then closes. The
+/// unread part of a declared body is discarded first (within the same budget
+/// and deadline as HTTP/2): closing a socket with unread bytes sends a TCP RST
+/// that can reach the client before the answer. Best effort: the caller
+/// returns the denial whether or not the write lands.
+async fn write_h1_denial<S>(
+    client: &mut S,
+    status: http::StatusCode,
+    error: &InterceptError,
+    unread_body: usize,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     let body = denial_body(&denial_message(error));
     let head = format!(
@@ -1069,7 +1117,25 @@ where
     let _ = client.write_all(head.as_bytes()).await;
     let _ = client.write_all(&body).await;
     let _ = client.flush().await;
+    let discard = unread_body.min(DENIAL_DISCARD_BUDGET) as u64;
+    let _ = tokio::time::timeout(
+        DENIAL_DISCARD_DEADLINE,
+        tokio::io::copy(&mut (&mut *client).take(discard), &mut tokio::io::sink()),
+    )
+    .await;
     let _ = client.shutdown().await;
+}
+
+/// The `Content-Length` an HTTP/1 request head declares, if any.
+fn declared_content_length(head: &[u8]) -> Option<usize> {
+    let head = std::str::from_utf8(head).ok()?;
+    head.split("\r\n").skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    })
 }
 
 async fn read_h2_body(
@@ -2726,6 +2792,42 @@ mod hardening_tests {
         output.extend(transformer.push(b"placeholder-after", false).unwrap());
         output.extend(transformer.push(&[], true).unwrap());
         assert_eq!(output, b"before-host-secret-after");
+    }
+
+    #[test]
+    fn only_a_grant_gap_tells_the_guest_to_ask_for_a_grant() {
+        let grantable = [
+            InterceptError::RequestRejected {
+                method: "GET".into(),
+                path: "/x".into(),
+            },
+            InterceptError::GraphqlRejected {
+                reason: GRAPHQL_NOT_PERMITTED,
+            },
+        ];
+        for error in &grantable {
+            assert!(denial_message(error).contains("can grant the matching power"));
+        }
+        let not_grantable = [
+            InterceptError::GraphqlRejected {
+                reason: "truncated graphql body",
+            },
+            InterceptError::CredentialRequestRejected {
+                method: "POST".into(),
+                path: "/v1/keys".into(),
+            },
+        ];
+        for error in &not_grantable {
+            assert!(denial_message(error).contains("No integration grant permits"));
+        }
+        assert_eq!(
+            declared_content_length(b"POST / HTTP/1.1\r\ncontent-length: 42\r\n"),
+            Some(42)
+        );
+        assert_eq!(
+            declared_content_length(b"GET / HTTP/1.1\r\nHost: a\r\n"),
+            None
+        );
     }
 
     #[tokio::test]

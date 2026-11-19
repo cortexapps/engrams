@@ -856,7 +856,7 @@ async fn reject_answers_the_guest_with_a_403_that_names_the_request() {
     let mut tls_client = tls_client_to(&ca, client_to_proxy).await;
     tls_client
         .write_all(
-            b"DELETE /repos/o/r/git/refs/heads/x HTTP/1.1\r\nHost: fake-upstream\r\nContent-Length: 0\r\n\r\n",
+            b"DELETE /repos/o/r/git/refs/heads/x HTTP/1.1\r\nHost: fake-upstream\r\nContent-Length: 11\r\n\r\n{\"sha\":\"x\"}",
         )
         .await
         .unwrap();
