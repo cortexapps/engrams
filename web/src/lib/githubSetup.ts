@@ -41,9 +41,12 @@ export const MINIMUM_PERMISSIONS: GithubPermission[] = [
 
 const RANK: Record<string, number> = { read: 1, write: 2, admin: 3 };
 
-/** Resource namespace → App permission key (only `pulls` diverges). */
+/** Resource namespace → App permission key. Must agree with the coordinator's
+ * minter (`permissions_for_caps` in engram-git-github). */
 function permKeyFor(resource: string): string {
-  return resource === "pulls" ? "pull_requests" : resource;
+  if (resource === "pulls") return "pull_requests";
+  if (resource === "variables") return "actions_variables";
+  return resource;
 }
 
 /**

@@ -342,11 +342,10 @@ impl RequestPolicy {
     }
 
     /// Glob path match over the whole path; empty `path_globs` = any path.
-    /// An internal `segment:` prefix makes each `*` stop at `/`.
-    /// `segment-path:` also excludes the query string from matching. Google
-    /// Cloud policies use the latter form because API clients add transport
-    /// parameters such as `alt=json`, while the permission boundary is the
-    /// resource path.
+    /// A `segment:` prefix makes each `*` stop at `/`. `segment-path:` also
+    /// excludes the query string from matching; Google Cloud policies and
+    /// connector operations that gate one resource path use it, because
+    /// clients add query parameters such as `alt=json` or `per_page`.
     pub fn path_matches(&self, path: &str) -> bool {
         self.path_globs.is_empty()
             || self.path_globs.iter().any(|pattern| {
@@ -1146,5 +1145,15 @@ mod tests {
         assert!(
             !google.path_matches("/v3/projects/example-project/metricDescriptors/delete?alt=json")
         );
+
+        // The GitHub repository-root operation: the repository, never a path below it.
+        let repository = RequestPolicy {
+            path_globs: vec!["segment-path:/repos/*/*".into()],
+            ..RequestPolicy::default()
+        };
+        assert!(repository.path_matches("/repos/acme/app"));
+        assert!(repository.path_matches("/repos/acme/app?per_page=1"));
+        assert!(!repository.path_matches("/repos/acme/app/dependabot/alerts"));
+        assert!(!repository.path_matches("/repos/acme/app/actions/secrets"));
     }
 }

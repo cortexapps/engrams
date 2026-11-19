@@ -126,24 +126,22 @@ request() {
 fetch() {
     p="$1"
     shift
-    flags=$(for kv in "$@"; do
+    nargs=$#
+    for kv in "$@"; do
         k="${kv%%=*}"
-        v="${kv#*=}"
         case "$k" in
         *MatchesAny)
-            printf '%s\n' "$v" | tr ',' '\n' | while IFS= read -r item; do
-                [ -n "$item" ] && printf '%s\n%s\n' '--data-urlencode' "$k=$item"
+            rest="${kv#*=},"
+            while [ -n "$rest" ]; do
+                item="${rest%%,*}"
+                rest="${rest#*,}"
+                if [ -n "$item" ]; then set -- "$@" --data-urlencode "$k=$item"; fi
             done
             ;;
-        *) printf '%s\n%s\n' '--data-urlencode' "$kv" ;;
+        *) set -- "$@" --data-urlencode "$kv" ;;
         esac
-    done)
-    OLD_IFS=$IFS
-    IFS='
-'
-    # shellcheck disable=SC2086
-    set -- $flags
-    IFS=$OLD_IFS
+    done
+    shift "$nargs"
     request GET "$p" -G "$@"
 }
 

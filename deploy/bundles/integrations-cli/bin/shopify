@@ -91,13 +91,9 @@ rest() {
 
 # Build --data-urlencode flag pairs from field=value args (POSIX-safe, no arrays).
 encode_query() {
-    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
-    OLD_IFS=$IFS
-    IFS='
-'
-    # shellcheck disable=SC2086
-    set -- $flags
-    IFS=$OLD_IFS
+    nargs=$#
+    for kv in "$@"; do set -- "$@" --data-urlencode "$kv"; done
+    shift "$nargs"
     # A GET with --data-urlencode sends the query string in the URL via -G.
     rest GET "$RESOURCE" -G "$@"
 }

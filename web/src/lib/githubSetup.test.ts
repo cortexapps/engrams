@@ -30,6 +30,12 @@ describe("permissionsForCapabilities", () => {
     expect(perms.some((p) => p.key === "pulls")).toBe(false);
   });
 
+  test("maps `variables` → `actions_variables` (mirrors the coordinator)", () => {
+    const perms = permissionsForCapabilities([cap("variables:read", "read")]);
+    expect(perms.find((p) => p.key === "actions_variables")?.level).toBe("read");
+    expect(perms.some((p) => p.key === "variables")).toBe(false);
+  });
+
   test("adds a permission per granted power at the highest level needed", () => {
     const perms = permissionsForCapabilities([
       cap("actions:read", "read"),

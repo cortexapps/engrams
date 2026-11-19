@@ -10,6 +10,52 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **The GitHub `metadata:read` power covers less.** It gave every `GET` under
+  `/repos/<owner>/<repo>/`. It now gives the repository itself and the metadata endpoints
+  (events, forks, license, stargazers, subscribers, stats, rules, rulesets, topics,
+  languages). Other paths moved to the power GitHub requires for them:
+  - `contents:read`: the root `contents` listing, `compare`, `tarball`, `zipball`, the
+    dependency graph, `activity`, commit `comments`, `codeowners/errors` and
+    `community/profile`;
+  - `issues:read`: `assignees`;
+  - `actions:read`: `environments`.
+
+  A `GET` that only the old rule let through, such as code scanning or `teams`, is now
+  refused. Dependabot alerts need the new `vulnerability_alerts:read`. ([#1822])
+- **The Slack `users:read` and `usergroups:read` powers name their methods.** They gave every
+  `users.*` and `usergroups.*` method, including writes such as `users.setPresence` and
+  `usergroups.create`. They now give the read methods only. ([#1822])
+- **To use the new GitHub powers,** the GitHub App needs the matching permission:
+  Dependabot alerts (`vulnerability_alerts`) for `vulnerability_alerts:read` and `:write`.
+  ([#1822])
+
+### Added
+
+- The GitHub powers `vulnerability_alerts:read` (list Dependabot alerts) and
+  `vulnerability_alerts:write` (dismiss one). ([#1822])
+
+### Fixed
+
+- A request that a session's grants do not permit now gets a `403` with a JSON body that
+  names the request. Before, HTTP/1 closed the connection and HTTP/2 sent an empty `403`
+  or reset the stream, so clients printed nothing or a framing error. ([#1822])
+- The bundled integration CLIs split a `field=value` that held a newline into two curl
+  arguments, so a multiline Slack message lost all but its first line. ([#1822])
+- Every Slack power showed as "write" in the catalog and the profile editor, and so did
+  some Datadog and Notion read powers, because their APIs read over `POST`. A power's
+  access now comes from the level in its name. ([#1822])
+- `slack upload` used `files.upload`, which Slack retired. It now uses the two-step upload
+  (`files.getUploadURLExternal`, an upload to `files.slack.com`, then
+  `files.completeUploadExternal`). `files:read` can also download a file's `url_private`.
+  ([#1822])
+- The GitHub power `variables:read` and `:write` minted no permission, because the GitHub
+  App permission is `actions_variables`. ([#1822])
+- A session on a routed model recorded zero tokens for every model call, and its run cost
+  used Anthropic prices. Tokens now come from the stream's final usage, and the cost uses
+  the router's catalog prices. ([#1822])
+
 ## [0.13.0] - 2026-11-11
 
 ### Upgrade notes
@@ -389,3 +435,4 @@ The first tagged release. See the
 [#1784]: https://github.com/cortexapps/engrams/pull/1784
 [#1788]: https://github.com/cortexapps/engrams/pull/1788
 [#1789]: https://github.com/cortexapps/engrams/pull/1789
+[#1822]: https://github.com/cortexapps/engrams/pull/1822

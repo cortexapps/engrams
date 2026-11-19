@@ -34,10 +34,10 @@ const API_VERSION: &str = "2022-11-28";
 /// ADR 0056 (Plane A): compute the GitHub App `permissions` object from the
 /// session's bound `github:` capabilities. A capability action is
 /// `<resource>:<level>` (e.g. `contents:write`, `pulls:write`); the App
-/// permission key is the resource with `pulls` → `pull_requests`, and the
-/// level is the highest granted (read < write < admin). Returns an empty map
-/// when no `github:` cap is bound — the caller then falls back to the default
-/// scopes (today's behavior), so a capability-less profile is unaffected.
+/// permission key is the resource, except `pulls` → `pull_requests` and
+/// `variables` → `actions_variables`, and the level is the highest granted
+/// (read < write < admin). Returns an empty map when no `github:` cap is
+/// bound; the caller then requests the default scopes.
 fn permissions_for_caps(caps: &[Capability]) -> BTreeMap<String, String> {
     let rank = |l: &str| match l {
         "admin" => 3,
@@ -55,6 +55,7 @@ fn permissions_for_caps(caps: &[Capability]) -> BTreeMap<String, String> {
         };
         let key = match resource {
             "pulls" => "pull_requests",
+            "variables" => "actions_variables",
             other => other,
         }
         .to_string();
@@ -606,10 +607,20 @@ mod tests {
 
     #[test]
     fn permissions_map_action_to_github_key_and_level() {
-        let p = permissions_for_caps(&caps(&["github:contents:read", "github:pulls:write"]));
+        let p = permissions_for_caps(&caps(&[
+            "github:contents:read",
+            "github:pulls:write",
+            "github:variables:read",
+            "github:vulnerability_alerts:read",
+        ]));
         assert_eq!(p.get("contents").map(String::as_str), Some("read"));
-        // `pulls` action → GitHub's `pull_requests` permission key.
         assert_eq!(p.get("pull_requests").map(String::as_str), Some("write"));
+        assert_eq!(p.get("actions_variables").map(String::as_str), Some("read"));
+        assert_eq!(
+            p.get("vulnerability_alerts").map(String::as_str),
+            Some("read")
+        );
+        assert!(!p.contains_key("variables"));
     }
 
     #[test]

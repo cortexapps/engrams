@@ -62,21 +62,14 @@ request() {
 }
 
 # get <full-url> [Key=Value ...] — GET, mapping each Key=Value into the query string
-# via `-G --data-urlencode` (POSIX-safe newline re-split, no arrays).
+# via `-G --data-urlencode`.
 get() {
     url="$1"
     shift
-    flags="-G"
-    for kv in "$@"; do flags="$flags
---data-urlencode
-$kv"; done
-    OLD_IFS=$IFS
-    IFS='
-'
-    # shellcheck disable=SC2086
-    set -- $flags
-    IFS=$OLD_IFS
-    request GET "$url" "$@"
+    nargs=$#
+    for kv in "$@"; do set -- "$@" --data-urlencode "$kv"; done
+    shift "$nargs"
+    request GET "$url" -G "$@"
 }
 
 # post_form <full-url> [Key=Value ...] — POST/PUT/etc, form-encoding each Key=Value.
@@ -84,16 +77,9 @@ post_form() {
     method="$1"
     url="$2"
     shift 2
-    flags=""
-    for kv in "$@"; do flags="$flags--data-urlencode
-$kv
-"; done
-    OLD_IFS=$IFS
-    IFS='
-'
-    # shellcheck disable=SC2086
-    set -- $flags
-    IFS=$OLD_IFS
+    nargs=$#
+    for kv in "$@"; do set -- "$@" --data-urlencode "$kv"; done
+    shift "$nargs"
     request "$method" "$url" "$@"
 }
 

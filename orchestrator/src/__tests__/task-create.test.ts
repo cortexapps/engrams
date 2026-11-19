@@ -699,6 +699,33 @@ describe("compileSessionCreateInput", () => {
     expect(inp.harnessEnv?.ANTHROPIC_MODEL).toBe("claude-sonnet-4-6");
   });
 
+  test("a routed launch passes the model's catalog prices to the harness", async () => {
+    const pricing = { prompt: "0.00000024", completion: "0.0000084", input_cache_read: "0.0000002" };
+    const priced: SessionCompileDeps = {
+      ...deps(),
+      harnessCatalog: providerHarnessCatalog(),
+      orgSecret: { listSecrets: async () => ({ secrets: [{ name: "openrouter.api_key" }] }) },
+      modelRouters: fakeModelRouters(routedModel({ upstream: { pricing } })),
+    };
+    const inp = await compileSessionCreateInput(
+      profile({ modelRouter: "openrouter", model: "z-ai/glm-5.2" }),
+      priced,
+      { programmatic: true },
+    );
+    expect(JSON.parse(inp.harnessEnv!.ENGRAM_MODEL_ROUTER_PRICING!)).toEqual(pricing);
+
+    const unpriced = await compileSessionCreateInput(
+      profile({
+        modelRouter: "openrouter",
+        model: "z-ai/glm-5.2",
+        envVars: { ENGRAM_MODEL_ROUTER_PRICING: '{"prompt":"0","completion":"0"}' },
+      }),
+      { ...priced, modelRouters: fakeModelRouters() },
+      { programmatic: true },
+    );
+    expect(unpriced.harnessEnv?.ENGRAM_MODEL_ROUTER_PRICING).toBeUndefined();
+  });
+
   test("routed models replace native auth and native egress for human and programmatic principals", async () => {
     const providerDeps: SessionCompileDeps = {
       ...deps(),

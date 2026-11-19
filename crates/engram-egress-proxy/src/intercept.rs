@@ -61,6 +61,10 @@ const REQUEST_BODY_BUDGET: usize = 1024 * 1024;
 /// GraphQL endpoint pay this — REST/bypass hosts keep the header-only early stop.
 const GRAPHQL_REQUEST_BODY_BUDGET: usize = 256 * 1024;
 
+/// The `GraphqlRejected` reason for an operation the grants do not cover (the
+/// other reasons are request shapes no grant can fix).
+const GRAPHQL_NOT_PERMITTED: &str = "operation not permitted by integration policy";
+
 #[derive(Debug)]
 pub enum InterceptError {
     Io(std::io::Error),
@@ -396,43 +400,58 @@ where
     if !request_target_is_origin_form(&path) {
         return Err(InterceptError::InvalidRequestTarget);
     }
-    deny_credential_operation(sni, &method, &path)?;
     let head_request = method.eq_ignore_ascii_case("HEAD");
 
-    // ADR 0059: for a GraphQL endpoint, read the FULL request body (bounded) and
-    // parse it into its top-level operation/fields. Fail-closed: anything we can't
-    // read or parse cleanly rejects the request before a byte reaches upstream.
-    // `gh` (and standard GraphQL clients) send a Content-Length'd, identity-encoded
-    // JSON body — chunked/compressed bodies are denied.
-    let parsed_graphql: Option<ParsedGraphql> = if is_graphql_endpoint(injects, observes, &path) {
-        let head = std::str::from_utf8(&prefix[..head_end]).map_err(|_| {
-            InterceptError::GraphqlRejected {
-                reason: "non-utf8 headers",
+    let gated = async {
+        deny_credential_operation(sni, &method, &path)?;
+        // ADR 0059: for a GraphQL endpoint, read the FULL request body (bounded)
+        // and parse it into its top-level operation/fields. Fail-closed: anything
+        // we can't read or parse cleanly rejects the request before a byte
+        // reaches upstream. `gh` (and standard GraphQL clients) send a
+        // Content-Length'd, identity-encoded JSON body — chunked/compressed
+        // bodies are denied.
+        let parsed_graphql = if is_graphql_endpoint(injects, observes, &path) {
+            let head = std::str::from_utf8(&prefix[..head_end]).map_err(|_| {
+                InterceptError::GraphqlRejected {
+                    reason: "non-utf8 headers",
+                }
+            })?;
+            let content_length = graphql_content_length(head)?;
+            let body_start = head_end;
+            let body_end = body_start + content_length;
+            read_to_content_length(
+                &mut client_tls,
+                &mut prefix,
+                body_end,
+                InterceptError::GraphqlRejected {
+                    reason: "truncated graphql body",
+                },
+            )
+            .await?;
+            let body = &prefix[body_start..body_end];
+            Some(
+                graphql::parse_request_body(body).ok_or(InterceptError::GraphqlRejected {
+                    reason: "unparseable or unsupported graphql operation",
+                })?,
+            )
+        } else {
+            None
+        };
+        let plan = evaluate_stream(&context, &method, &path, parsed_graphql.as_ref()).await?;
+        Ok::<_, InterceptError>((parsed_graphql, plan))
+    }
+    .await;
+    let (parsed_graphql, plan) = match gated {
+        Ok(gated) => gated,
+        Err(error) => {
+            if let Some(status) = policy_denial_status(&error) {
+                let unread_body = declared_content_length(&prefix[..head_end])
+                    .map_or(0, |len| len.saturating_sub(prefix.len() - head_end));
+                write_h1_denial(&mut client_tls, status, &error, unread_body).await;
             }
-        })?;
-        let content_length = graphql_content_length(head)?;
-        let body_start = head_end;
-        let body_end = body_start + content_length;
-        read_to_content_length(
-            &mut client_tls,
-            &mut prefix,
-            body_end,
-            InterceptError::GraphqlRejected {
-                reason: "truncated graphql body",
-            },
-        )
-        .await?;
-        let body = &prefix[body_start..body_end];
-        Some(
-            graphql::parse_request_body(body).ok_or(InterceptError::GraphqlRejected {
-                reason: "unparseable or unsupported graphql operation",
-            })?,
-        )
-    } else {
-        None
+            return Err(error);
+        }
     };
-
-    let plan = evaluate_stream(&context, &method, &path, parsed_graphql.as_ref()).await?;
     let StreamPlan {
         matched,
         firing,
@@ -613,7 +632,12 @@ async fn process_h2_stream(
         .path_and_query()
         .map_or_else(|| "/".to_string(), ToString::to_string);
     if let Err(error) = deny_credential_operation(context.sni, &method, &path) {
-        deny_h2(&mut respond, http::StatusCode::FORBIDDEN)?;
+        let stream = deny_h2(
+            &mut respond,
+            http::StatusCode::FORBIDDEN,
+            &denial_message(&error),
+        )?;
+        finish_denied_h2(stream, request.into_body()).await;
         return Err(error);
     }
 
@@ -625,14 +649,23 @@ async fn process_h2_stream(
                     let parsed = match graphql::parse_request_body(&body) {
                         Some(parsed) => parsed,
                         None => {
-                            deny_h2(&mut respond, http::StatusCode::BAD_REQUEST)?;
+                            deny_h2(
+                                &mut respond,
+                                http::StatusCode::BAD_REQUEST,
+                                "The GraphQL request could not be parsed.",
+                            )?;
                             return Ok(());
                         }
                     };
                     (Some(body), trailers, Some(parsed))
                 }
                 Err(_) => {
-                    deny_h2(&mut respond, http::StatusCode::PAYLOAD_TOO_LARGE)?;
+                    let stream = deny_h2(
+                        &mut respond,
+                        http::StatusCode::PAYLOAD_TOO_LARGE,
+                        "The GraphQL request body exceeds the inspection limit.",
+                    )?;
+                    finish_denied_h2(stream, request_body).await;
                     return Ok(());
                 }
             }
@@ -645,7 +678,9 @@ async fn process_h2_stream(
     let plan = match evaluate_stream(context, &method, &path, parsed_graphql.as_ref()).await {
         Ok(plan) => plan,
         Err(error) => {
-            deny_h2(&mut respond, denial_status(&error))?;
+            let status = policy_denial_status(&error).unwrap_or(http::StatusCode::FORBIDDEN);
+            let stream = deny_h2(&mut respond, status, &denial_message(&error))?;
+            finish_denied_h2(stream, request_body).await;
             return Err(error);
         }
     };
@@ -752,7 +787,11 @@ async fn process_h2_stream(
         if (!response_redactions.is_empty() || !firing.is_empty())
             && !h2_response_is_inspectable(&response_parts.headers)
         {
-            deny_h2(&mut respond, http::StatusCode::BAD_GATEWAY)?;
+            deny_h2(
+                &mut respond,
+                http::StatusCode::BAD_GATEWAY,
+                "The upstream response cannot be inspected.",
+            )?;
             return Ok(());
         }
         redact_h2_headers(&mut response_parts.headers, &response_redactions);
@@ -871,7 +910,7 @@ async fn evaluate_stream<'a>(
     } else if let Some(document) = parsed_graphql {
         gate_graphql_injects(context.injects, method, path, document).ok_or(
             InterceptError::GraphqlRejected {
-                reason: "operation not permitted by integration policy",
+                reason: GRAPHQL_NOT_PERMITTED,
             },
         )?
     } else {
@@ -961,30 +1000,142 @@ async fn evaluate_stream<'a>(
     })
 }
 
-/// The status an HTTP/2 stream answers a policy denial with. HTTP/1 never
-/// synthesizes a response — it closes the connection, so the guest's client
-/// reports a transport error and can never read a denial as a 2xx. HTTP/2 has
-/// no such option: a stream is one frame sequence inside a multiplexed
-/// connection, so closing it needs an explicit status. A 4xx is safe here for
-/// the same reason the HTTP/1 close is: it is a REFUSAL, never a synthesized
-/// success, and the guest's client surfaces it as an error.
-fn denial_status(error: &InterceptError) -> http::StatusCode {
+/// The status a policy denial answers with, or `None` for an error that only
+/// closes the connection (a malformed or smuggling-shaped request). A denial is
+/// always a 4xx REFUSAL, never a synthesized success, so a client cannot read
+/// it as a 2xx.
+fn policy_denial_status(error: &InterceptError) -> Option<http::StatusCode> {
     match error {
-        InterceptError::GraphqlRejected { .. } => http::StatusCode::BAD_REQUEST,
-        _ => http::StatusCode::FORBIDDEN,
+        InterceptError::RequestRejected { .. }
+        | InterceptError::CredentialRequestRejected { .. } => Some(http::StatusCode::FORBIDDEN),
+        InterceptError::GraphqlRejected { .. } => Some(http::StatusCode::BAD_REQUEST),
+        _ => None,
     }
 }
 
+/// What the guest reads when the policy refuses a request. Only a request the
+/// grants do not cover can be fixed by granting a power.
+fn denial_message(error: &InterceptError) -> String {
+    let grantable = match error {
+        InterceptError::RequestRejected { .. } => true,
+        InterceptError::GraphqlRejected { reason } => *reason == GRAPHQL_NOT_PERMITTED,
+        _ => false,
+    };
+    if grantable {
+        format!(
+            "{error}. This session's integration grants do not permit this request; \
+             an administrator can grant the matching power on the session's profile."
+        )
+    } else {
+        format!("{error}. No integration grant permits this request.")
+    }
+}
+
+/// The denial body. Its shape suits the common API clients: Slack clients read
+/// `ok` and `error`, GitHub clients read `message`.
+fn denial_body(message: &str) -> bytes::Bytes {
+    let body = serde_json::json!({
+        "ok": false,
+        "error": "egress_policy_denied",
+        "message": message,
+    });
+    bytes::Bytes::from(body.to_string())
+}
+
+/// How much of a denied request's body the proxy reads and discards so the
+/// stream ends cleanly. h2 resets a stream whose request body is dropped
+/// unread with `CANCEL`, and clients report that (curl: "Stream error in the
+/// HTTP/2 framing layer") instead of the denial.
+const DENIAL_DISCARD_BUDGET: usize = 1024 * 1024;
+const DENIAL_DISCARD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Send the complete denial at once; the request body cannot delay it.
 fn deny_h2(
     respond: &mut h2::server::SendResponse<bytes::Bytes>,
     status: http::StatusCode,
-) -> Result<(), InterceptError> {
+    message: &str,
+) -> Result<h2::SendStream<bytes::Bytes>, InterceptError> {
+    let body = denial_body(message);
     let response = http::Response::builder()
         .status(status)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::CONTENT_LENGTH, body.len())
         .body(())
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
-    respond.send_response(response, true)?;
-    Ok(())
+    let mut stream = respond.send_response(response, false)?;
+    stream.send_data(body, true)?;
+    Ok(stream)
+}
+
+/// After a denial, discard the rest of the request body without keeping it.
+/// A body that does not end within the budget and the deadline gets
+/// `RST_STREAM(NO_ERROR)`, which RFC 9113 §8.1 allows after a complete
+/// response.
+async fn finish_denied_h2(mut stream: h2::SendStream<bytes::Bytes>, mut body: h2::RecvStream) {
+    if body.is_end_stream() {
+        return;
+    }
+    let discarded = tokio::time::timeout(DENIAL_DISCARD_DEADLINE, async {
+        let mut seen = 0usize;
+        while let Some(data) = body.data().await {
+            let Ok(data) = data else { return false };
+            seen = seen.saturating_add(data.len());
+            let _ = body.flow_control().release_capacity(data.len());
+            if seen > DENIAL_DISCARD_BUDGET {
+                return false;
+            }
+        }
+        true
+    })
+    .await
+    .unwrap_or(false);
+    if !discarded {
+        stream.send_reset(h2::Reason::NO_ERROR);
+    }
+}
+
+/// Answer a policy denial on an HTTP/1 connection, which then closes. The
+/// unread part of a declared body is discarded first (within the same budget
+/// and deadline as HTTP/2): closing a socket with unread bytes sends a TCP RST
+/// that can reach the client before the answer. Best effort: the caller
+/// returns the denial whether or not the write lands.
+async fn write_h1_denial<S>(
+    client: &mut S,
+    status: http::StatusCode,
+    error: &InterceptError,
+    unread_body: usize,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let body = denial_body(&denial_message(error));
+    let head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or(""),
+        body.len(),
+    );
+    let _ = client.write_all(head.as_bytes()).await;
+    let _ = client.write_all(&body).await;
+    let _ = client.flush().await;
+    let discard = unread_body.min(DENIAL_DISCARD_BUDGET) as u64;
+    let _ = tokio::time::timeout(
+        DENIAL_DISCARD_DEADLINE,
+        tokio::io::copy(&mut (&mut *client).take(discard), &mut tokio::io::sink()),
+    )
+    .await;
+    let _ = client.shutdown().await;
+}
+
+/// The `Content-Length` an HTTP/1 request head declares, if any.
+fn declared_content_length(head: &[u8]) -> Option<usize> {
+    let head = std::str::from_utf8(head).ok()?;
+    head.split("\r\n").skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    })
 }
 
 async fn read_h2_body(
@@ -2643,6 +2794,42 @@ mod hardening_tests {
         assert_eq!(output, b"before-host-secret-after");
     }
 
+    #[test]
+    fn only_a_grant_gap_tells_the_guest_to_ask_for_a_grant() {
+        let grantable = [
+            InterceptError::RequestRejected {
+                method: "GET".into(),
+                path: "/x".into(),
+            },
+            InterceptError::GraphqlRejected {
+                reason: GRAPHQL_NOT_PERMITTED,
+            },
+        ];
+        for error in &grantable {
+            assert!(denial_message(error).contains("can grant the matching power"));
+        }
+        let not_grantable = [
+            InterceptError::GraphqlRejected {
+                reason: "truncated graphql body",
+            },
+            InterceptError::CredentialRequestRejected {
+                method: "POST".into(),
+                path: "/v1/keys".into(),
+            },
+        ];
+        for error in &not_grantable {
+            assert!(denial_message(error).contains("No integration grant permits"));
+        }
+        assert_eq!(
+            declared_content_length(b"POST / HTTP/1.1\r\ncontent-length: 42\r\n"),
+            Some(42)
+        );
+        assert_eq!(
+            declared_content_length(b"GET / HTTP/1.1\r\nHost: a\r\n"),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn h2_denial_and_slow_stream_do_not_block_an_allowed_stream() {
         let (guest_io, proxy_guest_io) = tokio::io::duplex(64 * 1024);
@@ -2743,8 +2930,23 @@ mod hardening_tests {
             .uri("https://attacker.example/denied")
             .body(())
             .unwrap();
-        let (denied_response, _) = guest.send_request(denied, true).unwrap();
-        assert_eq!(denied_response.await.unwrap().status(), 403);
+        // A denied request with a body still gets a readable denial, not a
+        // stream reset.
+        let (denied_response, mut denied_body) = guest.send_request(denied, false).unwrap();
+        denied_body
+            .send_data(bytes::Bytes::from_static(b"channel=C1"), true)
+            .unwrap();
+        let denied_response = denied_response.await.unwrap();
+        assert_eq!(denied_response.status(), 403);
+        let mut denial = denied_response.into_body();
+        let mut denial_bytes = Vec::new();
+        while let Some(data) = denial.data().await {
+            denial_bytes.extend_from_slice(&data.expect("the denial body arrives without a reset"));
+        }
+        let denial: serde_json::Value = serde_json::from_slice(&denial_bytes).unwrap();
+        assert_eq!(denial["ok"], false);
+        assert_eq!(denial["error"], "egress_policy_denied");
+        assert!(denial["message"].as_str().unwrap().contains("POST /denied"));
 
         guest = guest.ready().await.unwrap();
         let fast = http::Request::builder()

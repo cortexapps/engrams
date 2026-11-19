@@ -24,6 +24,7 @@ import {
   invalidateRegistry,
   connectorStatus,
   buildProviderCatalog,
+  powerAccess,
   defaultDisplayName,
   defaultIconMono,
   effectiveHosts,
@@ -780,6 +781,25 @@ describe("on-disk registry", () => {
     expect(reg.get("datadog")!.userCredential).toBeUndefined();
   });
 
+  test("the shipped github metadata:read power reaches the repository, not every path below it", () => {
+    const globs = (capability: string) =>
+      compileIntegrationPolicy([capability]).injects
+        .filter((i) => i.methods.includes("GET"))
+        .flatMap((i) => i.path_globs);
+    const metadata = globs("github:metadata:read");
+    expect(metadata).toContain("segment-path:/repos/*/*");
+    expect(metadata).not.toContain("/repos/*");
+    // Every metadata glob is one exact path below the owner/name prefix.
+    for (const glob of metadata.filter((g) => g.startsWith("/repos/"))) {
+      expect(["/repos/*/languages", "/repos/*/topics", "/repos/*/contributors*", "/repos/*/collaborators*"]).toContain(glob);
+    }
+    expect(metadata.some((glob) => glob.includes("dependabot"))).toBe(false);
+    expect(globs("github:vulnerability_alerts:read")).toEqual([
+      "segment-path:/repos/*/*/dependabot/alerts",
+      "segment-path:/repos/*/*/dependabot/alerts/*",
+    ]);
+  });
+
   test("the shipped datadog connector scopes REST and MCP header spellings to their hosts", () => {
     const policy = compileIntegrationPolicy(["datadog:metrics:read"]);
     // metrics:read activates several ops (query, metric metadata, v2 query); each
@@ -1129,6 +1149,17 @@ describe("buildProviderCatalog", () => {
     expect(gh.capabilities).toEqual([{ action: "issues:write", access: "write" }]);
     // No secret material (mint kind, secretRef, header, template) leaks to members.
     expect(JSON.stringify(cat)).not.toMatch(/secretRef|header|template|github_app|datadog-api-key/);
+  });
+
+  test("a power's declared level decides its access, so POST-only APIs read", () => {
+    const cat = buildProviderCatalog(connectorRegistry(), new Map());
+    const slack = cat.find((e) => e.provider === "slack")!;
+    const access = Object.fromEntries(slack.capabilities.map((c) => [c.action, c.access]));
+    expect(access["channels:read"]).toBe("read");
+    expect(access["users:read"]).toBe("read");
+    expect(access["chat:write"]).toBe("write");
+    expect(access["channels:manage"]).toBe("write");
+    expect(powerAccess("cloudsql.postgres.connect", "read")).toBe("read");
   });
 
   test("carries the asset kind for an asset-bearing op (from the on-disk seeds)", () => {
