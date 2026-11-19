@@ -645,6 +645,9 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
                 sessionId,
                 runId: spawnerBinding[0].runId,
                 blockId: "spawn_session",
+                // A child is never the workstream's kept session: events for
+                // the workstream reach the agent that spawned it.
+                role: "child",
                 keep: true,
               })
               .onConflictDoNothing();

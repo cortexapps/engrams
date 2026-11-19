@@ -489,7 +489,7 @@ describe("automation engine store (live PG)", () => {
     expect((await engine.findSessionBinding(sessionId))?.relay).toBe(false);
   });
 
-  test.skipIf(!dbReachable)("latestKeptInstanceSession: the newest KEPT session of the workstream's other runs", async () => {
+  test.skipIf(!dbReachable)("latestKeptInstanceSession: the newest KEPT primary session of the workstream's other runs", async () => {
     const id = `${AUTO_ID}-instance-session`;
     await seedAutomation(id);
     const store = makeAutomationStore(getDb());
@@ -516,6 +516,8 @@ describe("automation engine store (live PG)", () => {
       { sessionId: `sess-${UNIQ}-r1`, runId: `autorun:${id}:slack:r1`, blockId: "session", keep: true, createdAt: new Date("2026-10-01T01:00:00Z") },
       { sessionId: `sess-${UNIQ}-r2`, runId: `autorun:${id}:slack:r2`, blockId: "session", keep: true, createdAt: new Date("2026-10-01T02:00:00Z") },
       { sessionId: `sess-${UNIQ}-r2w`, runId: `autorun:${id}:slack:r2`, blockId: "worker", keep: false, createdAt: new Date("2026-10-01T03:00:00Z") },
+      // A child the agent spawned is kept and newer, but never the workstream's session.
+      { sessionId: `sess-${UNIQ}-r2c`, runId: `autorun:${id}:slack:r2`, blockId: "spawn_session", role: "child", keep: true, createdAt: new Date("2026-10-01T03:30:00Z") },
       // The asking run's own session never counts, nor another workstream's.
       { sessionId: `sess-${UNIQ}-me`, runId: `autorun:${id}:slack:me`, blockId: "session", keep: true, createdAt: new Date("2026-10-01T04:00:00Z") },
       { sessionId: `sess-${UNIQ}-other`, runId: `autorun:${id}:slack:other`, blockId: "session", keep: true, createdAt: new Date("2026-10-01T05:00:00Z") },

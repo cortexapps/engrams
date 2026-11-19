@@ -1548,6 +1548,9 @@ export const automationSession = pgTable(
       .notNull()
       .references(() => automationRun.id, { onDelete: "cascade" }),
     blockId: text("block_id").notNull(),
+    /** "primary" = a session the run's own blocks started; "child" = a
+     * session an automation's agent spawned. Only a primary is the
+     * workstream's kept session. */
     role: text("role").notNull().default("primary"),
     /** ADR 0119 D8: finalize ends only keep=false sessions. */
     keep: boolean("keep").notNull().default(true),
