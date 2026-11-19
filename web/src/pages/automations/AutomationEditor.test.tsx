@@ -39,10 +39,6 @@ vi.mock("@/hooks/useAutomationRuns", () => ({
 vi.mock("@/hooks/useAutomationCode", () => ({
   useDryRun: () => ({ mutate: vi.fn(), isPending: false }),
 }));
-vi.mock("@/hooks/useTags", () => ({
-  useTags: () => ({ data: { tags: [] }, isPending: false, error: null }),
-  useCreateTag: () => ({ mutateAsync: vi.fn(), isPending: false }),
-}));
 vi.mock("@/hooks/useAutomationEditor", () => ({
   useEditorAutomation: () => ({ data: automationHolder.value, isPending: false, error: null }),
   useCreateAutomationV2: () => ({ mutateAsync: createAutomation, isPending: false }),
@@ -55,8 +51,6 @@ vi.mock("@/hooks/useAutomationEditor", () => ({
   useAutomationVersions: () => ({ data: undefined }),
   useActionCatalog: () => ({ data: undefined }),
   useEditorWebhookRegistrations: () => ({ data: { registrations: [] } }),
-  useAddAutomationTag: () => ({ mutateAsync: vi.fn(), isPending: false }),
-  useRemoveAutomationTag: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
 // 3.4: the shell instantiates the test-with-sample state; the shell tests
 // exercise save paths, not rendering, so the hook is inert here.
@@ -432,13 +426,13 @@ describe("AutomationEditor", () => {
     expect(sent.entrypoints[0].blocks[0].config.promptTemplate).toBe("review feedback arrived");
   });
 
-  it("a saved automation shows its tag chips and the tag picker", () => {
+  it("the header shows no tags; they live in the Settings tab", () => {
     const saved = automation("user");
     saved.tags = [{ id: "t-ops", name: "Ops", color: "#1f6feb", description: "" }];
     automationHolder.value = { automation: saved };
     render(<AutomationEditor mode="edit" />);
-    expect(screen.getByText("Ops").classList.contains("tag-chip")).toBe(true);
-    expect(screen.getByRole("button", { name: "Edit tags" })).toBeTruthy();
+    expect(screen.queryByText("Ops")).toBeNull();
+    expect(screen.queryByRole("button", { name: /^(Add tag|Edit tags)$/ })).toBeNull();
   });
 
   it("selects the tab from the search param and navigates on tab change", async () => {

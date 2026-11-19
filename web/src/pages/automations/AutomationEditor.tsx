@@ -16,8 +16,6 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 
 import { EmptyState } from "@/components/empty-state";
-import { TagChip } from "@/components/tags/TagChip";
-import { TagPicker } from "@/components/tags/TagPicker";
 import { SkeletonRows } from "@/components/skeleton-rows";
 import {
   AlertDialog,
@@ -511,7 +509,7 @@ export function AutomationEditor({
                 className="w-full min-w-0 rounded-sm bg-transparent text-sm text-muted-foreground outline-none placeholder:text-muted-foreground/60 focus-visible:ring-2 focus-visible:ring-ring/60"
               />
             )}
-            <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <div className="flex min-w-0 items-center gap-2">
               {builtin && (
                 <Badge
                   variant="secondary"
@@ -527,14 +525,6 @@ export function AutomationEditor({
                 <span className="truncate rounded-full bg-secondary px-2 py-0.5 font-mono text-xs tabular-nums text-muted-foreground">
                   v{automation.currentVersion} · saved {relativeTime(automation.updatedAt)}
                 </span>
-              )}
-              {automation && (
-                <>
-                  {automation.tags.map((tag) => (
-                    <TagChip key={tag.id} tag={tag} />
-                  ))}
-                  <TagPicker automationId={automation.id} tags={automation.tags} />
-                </>
               )}
             </div>
           </div>

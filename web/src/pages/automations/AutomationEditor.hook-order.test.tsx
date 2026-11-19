@@ -14,10 +14,6 @@ const editorState = vi.hoisted(() => ({
   listeners: new Set<() => void>(),
 }));
 
-vi.mock("@/hooks/useTags", () => ({
-  useTags: () => ({ data: { tags: [] }, isPending: false, error: null }),
-  useCreateTag: () => ({ mutateAsync: vi.fn(), isPending: false }),
-}));
 vi.mock("@/hooks/useAutomationEditor", async (orig) => {
   const real = await orig<typeof import("@/hooks/useAutomationEditor")>();
   const { useSyncExternalStore } = await import("react");
@@ -43,8 +39,6 @@ vi.mock("@/hooks/useAutomationEditor", async (orig) => {
     useAutomationVersions: () => ({ data: undefined }),
     useActionCatalog: () => ({ data: undefined }),
     useEditorWebhookRegistrations: () => ({ data: { registrations: [] } }),
-    useAddAutomationTag: () => ({ mutateAsync: vi.fn(), isPending: false }),
-    useRemoveAutomationTag: () => ({ mutateAsync: vi.fn(), isPending: false }),
   };
 });
 // The hooks BELOW the early returns are the ones whose placement this test
