@@ -65,6 +65,7 @@ function summary(
     failedToday?: number;
     scoped?: boolean;
     tags?: string[];
+    description?: string;
   } = {},
 ): AutomationSummary {
   return create(AutomationSummarySchema, {
@@ -75,6 +76,7 @@ function summary(
       enabled: opts.enabled ?? true,
       currentVersion: 1,
       tags: (opts.tags ?? []).map(tagOf),
+      description: opts.description ?? "",
       ...(opts.scoped
         ? {
             version: create(AutomationVersionSchema, {
@@ -165,6 +167,7 @@ describe("AutomationsList", () => {
     expect(await screen.findByRole("table")).toBeTruthy();
     expect(screen.getAllByRole("columnheader").map((cell) => cell.textContent)).toEqual([
       "Automation",
+      "Tags",
       "Trigger",
       "Last run",
       "7 days",
@@ -242,6 +245,20 @@ describe("AutomationsList tag filter", () => {
     const rows = await screen.findAllByTestId("automation-row");
     expect(within(rows[0]!).getByText("Ops")).toBeTruthy();
     expect(within(rows[1]!).queryByText("Ops")).toBeNull();
+  });
+
+  it("puts the tags in their own column and keeps the description in the name link", async () => {
+    state.automations = [
+      summary("a-one", "One", { tags: ["Ops"], description: "Runs every night" }),
+    ];
+    renderWithProviders(<AutomationsList />, { initialPath: "/automations" });
+    const [row] = await screen.findAllByTestId("automation-row");
+    const [nameCell, tagsCell] = within(row!).getAllByRole("cell");
+    expect(nameCell!.querySelector(".tag-chip")).toBeNull();
+    expect(within(nameCell!).getByRole("link").textContent).toContain("Runs every night");
+    expect([...tagsCell!.querySelectorAll(".tag-chip")].map((chip) => chip.textContent)).toEqual([
+      "Ops",
+    ]);
   });
 
   it("filters by a tag from the URL and shows the count as shown of total", async () => {

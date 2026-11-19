@@ -30,7 +30,14 @@ export const PR_REVIEW_BUILTIN_KEY = "pr_review";
 
 // One set of tracks for the header, the rows and the loading skeleton, applied
 // as an inline template so the three cannot drift.
-const TABLE_COLUMNS = ["minmax(0,1.5fr)", "minmax(0,1fr)", "minmax(200px,0.9fr)", "64px", "90px"];
+const TABLE_COLUMNS = [
+  "minmax(0,1.4fr)",
+  "minmax(0,1fr)",
+  "minmax(0,1fr)",
+  "minmax(200px,0.9fr)",
+  "64px",
+  "90px",
+];
 const TABLE_TEMPLATE = { gridTemplateColumns: TABLE_COLUMNS.join(" ") };
 const TABLE_GRID = "grid items-center gap-x-4 px-4";
 
@@ -60,6 +67,7 @@ function AutomationTableHeader() {
       style={TABLE_TEMPLATE}
     >
       <span role="columnheader">Automation</span>
+      <span role="columnheader">Tags</span>
       <span role="columnheader">Trigger</span>
       <span role="columnheader">Last run</span>
       <span role="columnheader">7 days</span>
@@ -119,49 +127,43 @@ function AutomationRow({
           : TABLE_TEMPLATE
       }
     >
-      {/* The second line sits outside the link: it holds the "+N" tags
-          button, and a button cannot be inside a link. */}
-      <div
-        role="cell"
-        className={cn("grid min-w-0 grid-cols-[8px_minmax(0,1fr)] items-center gap-x-2", fadedCell)}
-      >
-        <StatusDot tone={tone} size={8} />
-        <span className="min-w-0">
-          <Link
-            to="/automations/$id"
-            params={{ id: automation.id }}
-            search={{ tab: "build" }}
-            className="group flex min-w-0 items-center gap-1.5 rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-          >
-            <span className="truncate text-sm font-semibold group-hover:underline">
-              {automation.name}
-            </span>
-            {builtin && (
-              <Badge variant="secondary" className="shrink-0 gap-1 rounded-sm">
-                <LockIcon className="size-3" aria-hidden />
-                built-in
-              </Badge>
-            )}
-            {scope && (
-              <Badge variant="secondary" className="shrink-0 rounded-sm">
-                {scope}
-              </Badge>
-            )}
-          </Link>
-          {(automation.tags.length > 0 || automation.description) && (
+      <div role="cell" className={cn("min-w-0", fadedCell)}>
+        <Link
+          to="/automations/$id"
+          params={{ id: automation.id }}
+          search={{ tab: "build" }}
+          className="group grid min-w-0 grid-cols-[8px_minmax(0,1fr)] items-center gap-x-2 rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+        >
+          <StatusDot tone={tone} size={8} />
+          <span className="min-w-0">
             <span className="flex min-w-0 items-center gap-1.5">
-              <TagChipRow tags={automation.tags} selected={selectedTags} />
-              {automation.description && (
-                // Zero basis: the description takes only the space the tags
-                // leave, so it truncates before they do.
-                <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-                  {automation.description}
-                </span>
+              <span className="truncate text-sm font-semibold group-hover:underline">
+                {automation.name}
+              </span>
+              {builtin && (
+                <Badge variant="secondary" className="shrink-0 gap-1 rounded-sm">
+                  <LockIcon className="size-3" aria-hidden />
+                  built-in
+                </Badge>
+              )}
+              {scope && (
+                <Badge variant="secondary" className="shrink-0 rounded-sm">
+                  {scope}
+                </Badge>
               )}
             </span>
-          )}
-        </span>
+            {automation.description && (
+              <span className="block truncate text-xs text-muted-foreground">
+                {automation.description}
+              </span>
+            )}
+          </span>
+        </Link>
       </div>
+
+      <span role="cell" className={cn("min-w-0", fadedCell)}>
+        <TagChipRow tags={automation.tags} selected={selectedTags} />
+      </span>
 
       <span
         role="cell"
@@ -292,7 +294,7 @@ export function AutomationsList() {
         </h2>
         {automations.isPending && (
           <div role="table" className="overflow-x-auto rounded-lg border bg-card">
-            <div className="min-w-[860px]">
+            <div className="min-w-[980px]">
               <AutomationTableHeader />
               <SkeletonRows
                 rows={3}
@@ -344,7 +346,7 @@ export function AutomationsList() {
         )}
         {loaded && visible.length > 0 && (
           <div role="table" className="overflow-x-auto rounded-lg border bg-card">
-            <div className="min-w-[860px]">
+            <div className="min-w-[980px]">
               <AutomationTableHeader />
               <div role="rowgroup" className="divide-y">
                 {visible.map((summary) => (
