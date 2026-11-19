@@ -66,12 +66,9 @@ whoami)
 file)
     key="${1:?usage: figma file <file-key> [field=value ...]}"
     shift
-    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
-    OLD_IFS=$IFS; IFS='
-'
-    # shellcheck disable=SC2086
-    set -- $flags
-    IFS=$OLD_IFS
+    nargs=$#
+    for kv in "$@"; do set -- "$@" --data-urlencode "$kv"; done
+    shift "$nargs"
     get "/v1/files/$key" "$@"
     ;;
 meta)
@@ -81,12 +78,9 @@ meta)
 nodes)
     key="${1:?usage: figma nodes <file-key> ids=1:2,1:3}"
     shift
-    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
-    OLD_IFS=$IFS; IFS='
-'
-    # shellcheck disable=SC2086
-    set -- $flags
-    IFS=$OLD_IFS
+    nargs=$#
+    for kv in "$@"; do set -- "$@" --data-urlencode "$kv"; done
+    shift "$nargs"
     get "/v1/files/$key/nodes" "$@"
     ;;
 versions)
@@ -96,12 +90,9 @@ versions)
 images)
     key="${1:?usage: figma images <file-key> ids=1:2 [field=value ...]}"
     shift
-    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
-    OLD_IFS=$IFS; IFS='
-'
-    # shellcheck disable=SC2086
-    set -- $flags
-    IFS=$OLD_IFS
+    nargs=$#
+    for kv in "$@"; do set -- "$@" --data-urlencode "$kv"; done
+    shift "$nargs"
     get "/v1/images/$key" "$@"
     ;;
 comments)
@@ -145,12 +136,9 @@ style)
 get)
     path="${1:?usage: figma get <path> [field=value ...]}"
     shift
-    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
-    OLD_IFS=$IFS; IFS='
-'
-    # shellcheck disable=SC2086
-    set -- $flags
-    IFS=$OLD_IFS
+    nargs=$#
+    for kv in "$@"; do set -- "$@" --data-urlencode "$kv"; done
+    shift "$nargs"
     get "$path" "$@"
     ;;
 "" | -h | --help | help)
