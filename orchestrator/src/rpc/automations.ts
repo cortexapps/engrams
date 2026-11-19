@@ -1335,13 +1335,10 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
     async duplicateAutomation(req, ctx) {
       const userId = (await requireAdmin(ctx, getSession)).id;
       const row = await requireAutomation(req.automationId);
-      // The copy folds overrides into the graph and is fully editable.
+      // The copy folds overrides into the graph and is fully editable. It
+      // starts disabled, so it has no next fire time until it is turned on.
       const definition = effectiveDefinition(row.version, row.blockOverrides);
       const name = req.name?.trim() || `${row.name} (copy)`;
-      const nextFireAt =
-        definition.trigger.kind === "cron"
-          ? nextCronFire(definition.trigger.schedule, definition.trigger.timezone, now())
-          : null;
       const sourceTags = (await tags.tagsForAutomations([row.id])).get(row.id) ?? [];
       const copy = await store.create(
         {
@@ -1355,7 +1352,6 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         },
         userId,
       );
-      void nextFireAt;
       return { automation: await protoAutomation(copy) };
     },
 
