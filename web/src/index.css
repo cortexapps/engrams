@@ -259,15 +259,21 @@
     border-top-color: oklch(1 0 0 / 0.09);
   }
 
-  /* A tag drawn from `--tag-color` (the stored hex). The neutral declarations
-     come first: a browser without relative colors keeps them. */
+  /* A tag drawn from `--tag-color` (the stored hex). A declaration with
+     var() always parses, so an unsupported relative color would not fall
+     back to an earlier value; the tint therefore sits behind @supports, and
+     other browsers keep the neutral chip. */
   .tag-chip {
     border: 1px solid var(--border);
     background-color: var(--secondary);
     color: var(--secondary-foreground);
-    border-color: oklch(from var(--tag-color) var(--tag-border-l) min(c, var(--tag-border-c)) h);
-    background-color: oklch(from var(--tag-color) var(--tag-bg-l) min(c, var(--tag-bg-c)) h);
-    color: oklch(from var(--tag-color) var(--tag-fg-l) min(c, var(--tag-fg-c)) h);
+  }
+  @supports (color: oklch(from red l min(c, 0.1) h)) {
+    .tag-chip {
+      border-color: oklch(from var(--tag-color) var(--tag-border-l) min(c, var(--tag-border-c)) h);
+      background-color: oklch(from var(--tag-color) var(--tag-bg-l) min(c, var(--tag-bg-c)) h);
+      color: oklch(from var(--tag-color) var(--tag-fg-l) min(c, var(--tag-fg-c)) h);
+    }
   }
 }
 
