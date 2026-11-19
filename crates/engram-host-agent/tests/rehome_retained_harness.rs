@@ -27,6 +27,8 @@ use tokio::time::timeout;
 const BUDGET: Duration = Duration::from_secs(30);
 const NOOP: &str = "/opt/noop/harness";
 const PID: &str = "/run/engram/harness.pid";
+/// The test creates this file to let the noop's tool call finish.
+const RELEASE: &str = "/run/engram/release-tool";
 type Record = (SessionId, SandboxId, HarnessEvent, Option<EventDelivery>);
 
 async fn until(mut ready: impl FnMut() -> bool) {
@@ -184,8 +186,8 @@ async fn non_drained_resume_reattaches_the_live_harness_and_finishes_its_run() {
             "--no-autorun".into(),
             "--tool-calls".into(),
             "1".into(),
-            "--tool-sleep-secs".into(),
-            "10".into(),
+            "--tool-release-file".into(),
+            RELEASE.into(),
             "--send-run-completed".into(),
             "--pid-file".into(),
             PID.into(),
@@ -258,6 +260,8 @@ async fn non_drained_resume_reattaches_the_live_harness_and_finishes_its_run() {
         pid_before.trim(),
         "the harness must not respawn"
     );
+    // The tool call stayed open through the capture; let it finish now.
+    exec(&pooled, restored, &format!("touch {RELEASE}")).await;
     until(|| {
         let events = records.lock();
         let tail = &events[before_restore..];
