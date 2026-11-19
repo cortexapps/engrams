@@ -506,7 +506,7 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
   registry.register({
     name: "spawn_session",
     description:
-      "Spawn a named child session. Optional file_paths may name files anywhere in this session and are copied to the same absolute paths before the message is sent.",
+      "Spawn a named child session. Optional file_paths may name files anywhere in this session and are copied to the same absolute paths before the message is sent. When the child finishes a turn, its final message arrives in this session as a new prompt, so you do not have to poll with wait_sessions.",
     input: SpawnInput,
     output: z.object({ session_id: z.string(), canonical_task_name: z.string() }),
     handling: "handled",

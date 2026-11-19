@@ -35,6 +35,9 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 
 - The GitHub powers `vulnerability_alerts:read` (list Dependabot alerts) and
   `vulnerability_alerts:write` (dismiss one). ([#1822])
+- A session that spawns a child session gets a new prompt when the child finishes a turn.
+  The prompt carries the child's outcome and its last message, so the parent does not have
+  to poll for it. ([#1825])
 
 ### Fixed
 
@@ -436,3 +439,4 @@ The first tagged release. See the
 [#1788]: https://github.com/cortexapps/engrams/pull/1788
 [#1789]: https://github.com/cortexapps/engrams/pull/1789
 [#1822]: https://github.com/cortexapps/engrams/pull/1822
+[#1825]: https://github.com/cortexapps/engrams/pull/1825
