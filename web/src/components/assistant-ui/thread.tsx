@@ -150,6 +150,12 @@ const ThreadMessage: FC = () => {
   // ADR 0108: a durable user echo whose consuming run_started has not landed
   // yet (delivery gap) — pending grey plus a "delivering…" caption.
   const delivering = useAuiState((s) => s.message.metadata.custom?.delivering === true);
+  // The coordinator gave up delivering this prompt: it will never run.
+  const undeliverable = useAuiState((s) => s.message.metadata.custom?.undeliverable === true);
+  const undeliverableReason = useAuiState((s) => {
+    const reason = s.message.metadata.custom?.undeliverableReason;
+    return typeof reason === "string" ? reason : "";
+  });
   const inner =
     role === "system" ? (
       <SystemMessage />
@@ -173,14 +179,22 @@ const ThreadMessage: FC = () => {
       <div
         className="opacity-50 transition-opacity"
         title={
-          delivering
-            ? "Delivering — the run has not started yet"
-            : "Pending — not yet in the conversation log"
+          undeliverable
+            ? `Not delivered${undeliverableReason ? ` — ${undeliverableReason}` : ""}`
+            : delivering
+              ? "Delivering — the run has not started yet"
+              : "Pending — not yet in the conversation log"
         }
       >
         {inner}
-        {delivering && (
-          <p className="mt-1 text-right text-xs text-muted-foreground italic">Delivering…</p>
+        {undeliverable ? (
+          <p className="mt-1 text-right text-xs text-destructive">
+            Not delivered. Send it again to retry.
+          </p>
+        ) : (
+          delivering && (
+            <p className="mt-1 text-right text-xs text-muted-foreground italic">Delivering…</p>
+          )
         )}
       </div>
     );

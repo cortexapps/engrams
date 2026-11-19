@@ -59,6 +59,7 @@ export const SESSION_EVENT_KINDS: readonly SessionEventKind[] = [
   "prompt_edited",
   "prompt_dequeued",
   "prompt_steered",
+  "prompt_undeliverable",
   "integration_asset",
   "file_shared",
   "recovered_from_checkpoint",
