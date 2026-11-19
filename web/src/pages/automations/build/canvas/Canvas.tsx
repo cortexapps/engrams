@@ -3,10 +3,11 @@
  * tail. Layout is `layoutCanvas`'s pure geometry; everything render-only
  * (selection, lock, errors, ghosts, run status) resolves by node id here.
  *
- * The canvas scales to fit its column unless the Build tab hands it a zoom. */
+ * The canvas draws at its natural size; the Build tab's `ZoomFrame` scales
+ * every way in together. */
 
 import { Lock, Plus } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useRef } from "react";
 
 import { DropdownMenu, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import type { BlockDef, ListPath, TriggerSpec } from "@/lib/automation-blocks";
@@ -16,7 +17,7 @@ import { BlockKindMenu } from "./BlockKindMenu";
 import { CanvasNode, type CanvasNodeStatus } from "./CanvasNode";
 import { EdgeLayer } from "./EdgeLayer";
 import { InsertMenu } from "./InsertMenu";
-import { layoutCanvas, MAX_SCALE, MIN_SCALE, NODE_W, TRIGGER_ROW_ID } from "./layout";
+import { layoutCanvas, NODE_W, TRIGGER_ROW_ID } from "./layout";
 
 export { TRIGGER_ROW_ID };
 export type { CanvasNodeStatus };
@@ -45,16 +46,10 @@ export interface CanvasProps {
    * did, the rest fade, and the edges it travelled thicken. `onPath` says
    * whether this way in carried the run at all. Editing is off. */
   replay?: { map: ReplayMap; onPath: boolean };
-  /** "fit" (default) scales down to the column; a number is an explicit zoom. */
-  zoom?: number | "fit";
   /** A node's second line, when the owner can resolve it (profile names). */
   summaryFor?: (block: BlockDef) => string | undefined;
   /** The automation has an agent: the insert menus offer no wait blocks. */
   withAgent?: boolean;
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
 }
 
 export function Canvas({
@@ -72,7 +67,6 @@ export function Canvas({
   ghostIds,
   nodeStatus,
   replay,
-  zoom = "fit",
   summaryFor,
   withAgent,
 }: CanvasProps) {
@@ -101,22 +95,6 @@ export function Canvas({
     return map;
   }, [blocks]);
 
-  // Scale-to-fit: the canvas shrinks (never grows) to the column width.
-  const scrollRef = useRef<HTMLDivElement | null>(null);
-  const [containerWidth, setContainerWidth] = useState(0);
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const update = () => setContainerWidth(el.clientWidth);
-    update();
-    const observer = new ResizeObserver(update);
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
-  // jsdom (stubbed observer) lands on width 0 → scale 1, untransformed.
-  const fit = containerWidth > 0 ? clamp(containerWidth / layout.width, MIN_SCALE, MAX_SCALE) : 1;
-  const scale = zoom === "fit" ? fit : clamp(zoom, MIN_SCALE, MAX_SCALE);
-
   // Roving arrow-key focus in document order (nodes render in that order).
   const nodeRefs = useRef(new Map<string, HTMLDivElement>());
   const focusStep = (fromId: string, delta: 1 | -1) => {
@@ -129,105 +107,91 @@ export function Canvas({
 
   return (
     <div
-      className="flex min-h-0 min-w-0 shrink flex-col"
+      className="flex flex-col"
       data-testid={entrypointId ? `entrypoint-canvas-${entrypointId}` : "block-canvas"}
+      role="group"
+      aria-label={entrypointId ? `Steps for ${entrypointId}` : "Automation blocks"}
     >
-      <div
-        ref={scrollRef}
-        className="min-h-0 flex-1 overflow-auto"
-        aria-label={entrypointId ? `Steps for ${entrypointId}` : "Automation blocks"}
-      >
-        <div style={{ width: layout.width * scale, height: layout.height * scale }}>
-          <div
-            className="relative"
-            style={{
-              width: layout.width,
-              height: layout.height,
-              transform: `scale(${scale})`,
-              transformOrigin: "top left",
-            }}
-          >
-            <EdgeLayer layout={layout} {...(replay ? { taken: edgeTaken } : {})} />
-            {layout.nodes.map((node) => {
-              const block = node.id === TRIGGER_ROW_ID ? undefined : blocksById.get(node.id);
-              const replayed = block ? replay?.map.get(node.id) : undefined;
-              return (
-                <CanvasNode
-                  key={node.id}
-                  node={node}
-                  block={block}
-                  triggerSummary={triggerSummary}
-                  triggerDetail={entrypointId}
-                  selected={selectedId === (block ? node.id : TRIGGER_ROW_ID)}
-                  errored={erroredIds.has(block ? node.id : TRIGGER_ROW_ID)}
-                  locked={locked || !!replay}
-                  ghost={block ? ghostIds?.has(node.id) : false}
-                  status={
-                    replay
-                      ? block
-                        ? replayed?.status
-                        : replay.onPath
-                          ? "ok"
-                          : undefined
-                      : block
-                        ? nodeStatus?.[node.id]
-                        : undefined
-                  }
-                  summary={replayed ? replayed.sentence : block ? summaryFor?.(block) : undefined}
-                  dimmed={replay ? (block ? !replayed : !replay.onPath) : false}
-                  count={replayed?.frames.length}
-                  canMoveUp={node.index !== undefined && node.index > 0}
-                  canMoveDown={
-                    node.index !== undefined &&
-                    node.listLength !== undefined &&
-                    node.index < node.listLength - 1
-                  }
-                  onSelect={() => onSelect(block ? node.id : TRIGGER_ROW_ID)}
-                  onMoveUp={() => {
-                    if (node.at && node.index !== undefined) {
-                      onMove(node.at, node.index, node.index - 1);
-                    }
-                  }}
-                  onMoveDown={() => {
-                    if (node.at && node.index !== undefined) {
-                      onMove(node.at, node.index, node.index + 1);
-                    }
-                  }}
-                  onRemove={() => onRemove(node.id)}
-                  onFocusStep={(delta) => focusStep(node.id, delta)}
-                  nodeRef={(el) => {
-                    if (el) nodeRefs.current.set(node.id, el);
-                    else nodeRefs.current.delete(node.id);
-                  }}
-                />
-              );
-            })}
-            {editable &&
-              layout.edges
-                .filter((edge) => edge.insert && edge.kind !== "tail")
-                .map((edge) => (
-                  <InsertMenu
-                    key={`insert-${edge.id}`}
-                    x={edge.insert!.x}
-                    y={edge.insert!.y}
-                    at={edge.insert!.at}
-                    index={edge.insert!.index}
-                    onInsert={onInsert}
-                    withAgent={withAgent}
-                  />
-                ))}
-            {editable && tail?.insert && (
-              <AddStepNode
-                x={tail.points.at(-1)!.x}
-                y={tail.points.at(-1)!.y}
-                at={tail.insert.at}
-                index={tail.insert.index}
+      <div className="relative" style={{ width: layout.width, height: layout.height }}>
+        <EdgeLayer layout={layout} {...(replay ? { taken: edgeTaken } : {})} />
+        {layout.nodes.map((node) => {
+          const block = node.id === TRIGGER_ROW_ID ? undefined : blocksById.get(node.id);
+          const replayed = block ? replay?.map.get(node.id) : undefined;
+          return (
+            <CanvasNode
+              key={node.id}
+              node={node}
+              block={block}
+              triggerSummary={triggerSummary}
+              triggerDetail={entrypointId}
+              selected={selectedId === (block ? node.id : TRIGGER_ROW_ID)}
+              errored={erroredIds.has(block ? node.id : TRIGGER_ROW_ID)}
+              locked={locked || !!replay}
+              ghost={block ? ghostIds?.has(node.id) : false}
+              status={
+                replay
+                  ? block
+                    ? replayed?.status
+                    : replay.onPath
+                      ? "ok"
+                      : undefined
+                  : block
+                    ? nodeStatus?.[node.id]
+                    : undefined
+              }
+              summary={replayed ? replayed.sentence : block ? summaryFor?.(block) : undefined}
+              dimmed={replay ? (block ? !replayed : !replay.onPath) : false}
+              count={replayed?.frames.length}
+              canMoveUp={node.index !== undefined && node.index > 0}
+              canMoveDown={
+                node.index !== undefined &&
+                node.listLength !== undefined &&
+                node.index < node.listLength - 1
+              }
+              onSelect={() => onSelect(block ? node.id : TRIGGER_ROW_ID)}
+              onMoveUp={() => {
+                if (node.at && node.index !== undefined) {
+                  onMove(node.at, node.index, node.index - 1);
+                }
+              }}
+              onMoveDown={() => {
+                if (node.at && node.index !== undefined) {
+                  onMove(node.at, node.index, node.index + 1);
+                }
+              }}
+              onRemove={() => onRemove(node.id)}
+              onFocusStep={(delta) => focusStep(node.id, delta)}
+              nodeRef={(el) => {
+                if (el) nodeRefs.current.set(node.id, el);
+                else nodeRefs.current.delete(node.id);
+              }}
+            />
+          );
+        })}
+        {editable &&
+          layout.edges
+            .filter((edge) => edge.insert && edge.kind !== "tail")
+            .map((edge) => (
+              <InsertMenu
+                key={`insert-${edge.id}`}
+                x={edge.insert!.x}
+                y={edge.insert!.y}
+                at={edge.insert!.at}
+                index={edge.insert!.index}
                 onInsert={onInsert}
                 withAgent={withAgent}
               />
-            )}
-          </div>
-        </div>
+            ))}
+        {editable && tail?.insert && (
+          <AddStepNode
+            x={tail.points.at(-1)!.x}
+            y={tail.points.at(-1)!.y}
+            at={tail.insert.at}
+            index={tail.insert.index}
+            onInsert={onInsert}
+            withAgent={withAgent}
+          />
+        )}
       </div>
       {locked && (
         <div className="flex shrink-0 items-center gap-1 px-3 py-1.5 text-2xs text-muted-foreground">
