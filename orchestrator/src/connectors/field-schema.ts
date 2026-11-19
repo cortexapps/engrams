@@ -119,7 +119,8 @@ export function coerceFieldValue(schema: FieldSchema, value: unknown): unknown {
     case "boolean":
       return value === "true" ? true : value === "false" ? false : value;
     case "string":
-      return value;
+      // An id that an earlier step gave as a number.
+      return typeof value === "number" && Number.isFinite(value) ? String(value) : value;
   }
 }
 

@@ -187,6 +187,8 @@ const SENTENCES: Record<string, Sentence> = {
         : undefined,
   relay_close: ({ outputs }) =>
     outputs["posted"] === true ? "Posted the closing message" : "Nothing to post",
+  review_facts: ({ outputs }) =>
+    outputs["value"] == null ? "This event starts no review" : "This event starts a review",
   review_open_pass: ({ outputs }) =>
     outputs["deduplicated"] === true
       ? "This head was already reviewed"

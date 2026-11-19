@@ -3,14 +3,50 @@ import { describe, expect, test } from "bun:test";
 
 import type { UpsertReviewTargetInput } from "../db/reviews.ts";
 import { dispatchIntegrationEvent, type DispatchWebhookInput } from "../automations/dispatch.ts";
-import type { IntegrationEventDispatchInput } from "../automations/integration-ingress.ts";
+import type {
+  HandleDeliveryDeps,
+  IntegrationEventDispatchInput,
+} from "../automations/integration-ingress.ts";
 import type {
   IntegrationEventStore,
   RecordIntegrationEventInput,
 } from "../db/integration-events.ts";
-import { makeGithubEventsRoute } from "../routes/github-events.ts";
+import { makeIntegrationEventsRoute } from "../routes/integration-events.ts";
+import { githubEventSource } from "../providers/github/events.ts";
+import type { ReviewCoordinate } from "../reviews/automation-review.ts";
+import { makeForgeDeliveryHandler, type ForgeDeliveryDeps } from "../reviews/forge-deliveries.ts";
 
 const SECRET = "github-route-secret";
+
+function makeGithubEventsRoute({
+  webhookSecret,
+  ingress,
+  now,
+  mentionHandle,
+  ...forge
+}: Omit<ForgeDeliveryDeps, "mentionHandle"> & {
+  webhookSecret: () => Promise<string>;
+  ingress: HandleDeliveryDeps;
+  mentionHandle?: string;
+  now?: () => Date;
+}) {
+  return makeIntegrationEventsRoute({
+    sources: [githubEventSource],
+    secrets: { resolve: webhookSecret },
+    ingress,
+    forgeDelivery: makeForgeDeliveryHandler({
+      stopAutomationReview: async () => {
+        throw new Error("no stop is expected");
+      },
+      refreshTarget: async () => {
+        throw new Error("no refresh is expected");
+      },
+      ...forge,
+      mentionHandle: async () => mentionHandle ?? "",
+    }),
+    ...(now ? { now } : {}),
+  });
+}
 const PATH = "/api/v1/integrations/github/events";
 const enrollment = { repo: "openai/engrams" };
 
@@ -76,7 +112,7 @@ function commentBody(
     action: "created",
     repository: { full_name: enrollment.repo },
     issue: { number: 100, pull_request: { url: "https://api.github.test/pr/100" } },
-    comment: { id: 42, body, author_association: authorAssociation },
+    comment: { id: 42, body, author_association: authorAssociation, user: { login: "octo" } },
     sender: { type: senderType },
   });
 }
@@ -132,7 +168,7 @@ export function fakeIngress() {
 
 function app() {
   const refreshes: UpsertReviewTargetInput[] = [];
-  const stops: Array<{ repo: string; prNumber: number }> = [];
+  const stops: ReviewCoordinate[] = [];
   const ingress = fakeIngress();
   return {
     refreshes,
@@ -381,7 +417,7 @@ describe("POST /api/v1/integrations/github/events", () => {
       headers: headers(body, "issue_comment"),
     });
     expect(res.status).toBe(200);
-    expect(fixture.stops).toEqual([{ repo: enrollment.repo, prNumber: 100 }]);
+    expect(fixture.stops).toEqual([{ provider: "github", repo: enrollment.repo, prNumber: 100 }]);
   });
 
   test("closed refreshes an existing target without starting a pass", async () => {

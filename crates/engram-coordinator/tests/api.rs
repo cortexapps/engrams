@@ -88,12 +88,31 @@ fn build_app_with_tokens(meta: Arc<SimMetadataStore>, tokens: Vec<String>) -> ax
 /// ADR 0023: build a router with a configured (mock) git forge + a
 /// seeded session whose credential-broker token is `broker-tok-123`.
 /// Returns the router, the session id, and the forge handle (so tests
-/// can assert recorded change requests).
+/// can assert recorded mints).
 async fn build_forge_app() -> (
     axum::Router,
     SessionId,
     Arc<engram_git_dev::StaticGitHubIntegration>,
 ) {
+    let forge = Arc::new(engram_git_dev::StaticGitHubIntegration::github(
+        "ghs_test_xyz",
+    ));
+    let (app, sid) = build_forge_app_with(
+        &["github:contents:read@acme/app"],
+        Arc::new(InMemorySecretStore::new()),
+        engram_coordinator::integrations::IntegrationBroker::with(forge.clone()),
+    )
+    .await;
+    (app, sid, forge)
+}
+
+/// [`build_forge_app`] over a chosen capability set, secret store and
+/// integration broker.
+async fn build_forge_app_with(
+    caps: &[&str],
+    secrets: Arc<dyn engram_core::traits::SecretStore>,
+    integrations: engram_coordinator::integrations::IntegrationBroker,
+) -> (axum::Router, SessionId) {
     let meta = sim_meta();
     let session_id = meta
         .create_session(engram_core::types::session::SessionSpec {
@@ -102,16 +121,20 @@ async fn build_forge_app() -> (
         })
         .await
         .expect("seed session");
+    let caps: Vec<engram_core::types::Capability> = caps
+        .iter()
+        .map(|cap| engram_core::types::Capability::parse(cap).unwrap())
+        .collect();
+    meta.bind_session_capabilities(session_id, &caps)
+        .await
+        .expect("bind capabilities");
     let sandbox_dir = tempfile::tempdir().expect("sandbox tempdir").keep();
-    let forge = Arc::new(engram_git_dev::StaticGitHubIntegration::github(
-        "ghs_test_xyz",
-    ));
     let services = Services {
         meta,
         host: Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(Arc::new(
             ProcessBackend::new(sandbox_dir),
         ))),
-        secrets: Arc::new(InMemorySecretStore::new()),
+        secrets,
         kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
             [0u8; 32], "test:v1",
         )),
@@ -137,12 +160,107 @@ async fn build_forge_app() -> (
         ..CoordinatorConfig::default()
     };
     let mut app = AppState::new(cfg, services);
-    app.integrations = engram_coordinator::integrations::IntegrationBroker::with(forge.clone());
+    app.integrations = integrations;
     let state = Arc::new(app);
     state
         .git_broker_tokens
         .insert(session_id, "broker-tok-123".to_string());
-    (api::router(state), session_id, forge)
+    (api::router(state), session_id)
+}
+
+/// Ask for a git credential, naming no host, over both guest paths: the HTTP
+/// endpoint and the `/hosts/forge` forward of a vsock request. Returns the
+/// HTTP status and the forward's `ForgeResponse` JSON.
+async fn ask_git_credential(app: &axum::Router, sid: SessionId) -> (StatusCode, Value) {
+    let http = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/sessions/{sid}/git-credential"))
+                .header("authorization", "Bearer broker-tok-123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let req = engram_harness_proto::ForgeRequest {
+        session_id: sid,
+        broker_token: "broker-tok-123".to_string(),
+        op: engram_harness_proto::ForgeOp::FetchCredential {
+            host: String::new(),
+            owner: None,
+        },
+    };
+    let forward = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/hosts/forge")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forward.status(), StatusCode::OK);
+    (http.status(), body_json(forward.into_body()).await)
+}
+
+#[tokio::test]
+async fn a_session_with_no_forge_capability_gets_no_git_credential() {
+    let no_caps: &[&str] = &[];
+    for caps in [no_caps, &["linear:issues:read"]] {
+        let forge = Arc::new(engram_git_dev::StaticGitHubIntegration::github(
+            "ghs_test_xyz",
+        ));
+        let (app, sid) = build_forge_app_with(
+            caps,
+            Arc::new(InMemorySecretStore::new()),
+            engram_coordinator::integrations::IntegrationBroker::with(forge.clone()),
+        )
+        .await;
+        let (status, forward) = ask_git_credential(&app, sid).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "caps {caps:?}");
+        assert_eq!(
+            forward["Error"]["message"], "this session has no git forge for that host",
+            "caps {caps:?}: {forward:?}"
+        );
+        assert!(
+            forge.recorded_mint_caps().is_empty(),
+            "caps {caps:?} minted"
+        );
+    }
+}
+
+/// A secret store whose backend is down.
+struct UnreachableSecrets;
+
+#[async_trait::async_trait]
+impl engram_core::traits::SecretStore for UnreachableSecrets {
+    async fn get(
+        &self,
+        _ctx: &engram_core::traits::SecretContext<'_>,
+        _name: &str,
+        _schema: &engram_core::types::SecretSchema,
+    ) -> Result<Option<String>, engram_core::error::SecretError> {
+        Err(engram_core::error::SecretError::Backend(
+            "store unreachable".into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn a_forge_whose_secrets_cannot_be_read_is_an_error_not_an_absent_forge() {
+    let (app, sid) = build_forge_app_with(
+        &["github:contents:read@acme/app"],
+        Arc::new(UnreachableSecrets),
+        engram_coordinator::integrations::IntegrationBroker::new(),
+    )
+    .await;
+    let (status, forward) = ask_git_credential(&app, sid).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let message = forward["Error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("store unreachable"), "{forward:?}");
 }
 
 #[tokio::test]
@@ -185,6 +303,31 @@ async fn forge_git_credential_gated_by_broker_token() {
     let v = body_json(resp.into_body()).await;
     assert_eq!(v["username"], "x-access-token");
     assert_eq!(v["password"], "ghs_test_xyz");
+}
+
+#[tokio::test]
+async fn forge_git_credential_needs_a_capability_for_the_host() {
+    let (app, sid, forge) = build_forge_app().await;
+    let get = |uri: String| {
+        app.clone().oneshot(
+            Request::get(uri)
+                .header("authorization", "Bearer broker-tok-123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+    };
+    let uri = format!("/api/v1/sessions/{sid}/git-credential");
+
+    // The session's forge serves github.com: a named host must match it.
+    let resp = get(format!("{uri}?host=GitHub.com")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = get(format!("{uri}?host=gitlab.com")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // The mint is clamped to the session's own capabilities.
+    let minted = forge.recorded_mint_caps();
+    assert_eq!(minted.len(), 1);
+    assert_eq!(minted[0][0].action, "contents:read");
 }
 
 #[tokio::test]

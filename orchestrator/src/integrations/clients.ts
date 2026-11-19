@@ -6,7 +6,7 @@
  * for a ready client by provider; this resolves the credential coordinator-side
  * (./run-op.ts) and hands it to the adapter, caching the instance until the
  * credential nears expiry. Adding a new client later = one `registerIntegrationClient`
- * line (see ../integrations/slack.ts for the first one, in PR2).
+ * line (see `providers/slack/client.ts`).
  */
 
 import { resolveIntegrationCredential, resolveIntegrationHost, type RunOpDeps } from "./run-op.ts";

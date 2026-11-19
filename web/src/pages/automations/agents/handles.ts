@@ -1,21 +1,22 @@
 export interface ParsedHandle {
-  provider: "slack" | "github" | string;
+  provider: string;
   label: string;
   href?: string;
 }
 
-const GITHUB_HANDLE = /^github:([^#]+)#(\d+)$/;
+/** A forge's handle for a pull request: `<provider>:<repository>#<number>`. */
+const PULL_REQUEST_HANDLE = /^([a-z]+):([^#:]+)#(\d+)$/;
 const SLACK_HANDLE = /^slack:([^:]+)(?::(.+))?$/;
 
 export function parseHandle(handle: string): ParsedHandle {
-  const github = GITHUB_HANDLE.exec(handle);
-  if (github) {
-    const repository = github[1]!;
-    const number = github[2]!;
+  const pullRequest = PULL_REQUEST_HANDLE.exec(handle);
+  if (pullRequest) {
+    const [, provider, repository, number] = pullRequest;
     return {
-      provider: "github",
+      provider: provider!,
       label: `${repository}#${number}`,
-      href: `https://github.com/${repository}/pull/${number}`,
+      // The handle has no host. Only GitHub's is known without one.
+      ...(provider === "github" ? { href: `https://github.com/${repository}/pull/${number}` } : {}),
     };
   }
 

@@ -1,4 +1,4 @@
-/** Webhook verification strategies and sealed-secret resolution (ADR 0102). */
+/** Webhook signature schemes and sealed-secret resolution. */
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 
@@ -63,7 +63,7 @@ export function makeVerificationSecretResolver(
   };
 }
 
-/** Test seam and rotation hook: clear all cached registration secrets. */
+/** Test seam: clear every cached secret. */
 export function resetVerificationSecretCache(): void {
   secretCache.clear();
 }
@@ -75,7 +75,8 @@ export interface VerifyWebhookInput {
   rawBody: Uint8Array;
 }
 
-function timingSafeHeader(expected: string, actual: string | null): boolean {
+/** Compare an ASCII header value with the expected one in constant time. */
+export function timingSafeHeader(expected: string, actual: string | null): boolean {
   if (actual === null) return false;
   const expectedBytes = Buffer.from(expected, "ascii");
   const actualBytes = Buffer.from(actual, "ascii");
@@ -87,17 +88,52 @@ function sha256Signature(secret: string, body: Uint8Array): string {
   return createHmac("sha256", secret).update(body).digest("hex");
 }
 
-/** Bare hex-encoded HMAC-SHA256 of the raw body (no scheme prefix) — the
- * Linear-Signature format (ADR 0119 D5). Timing-safe with a length pre-check. */
-export function verifyHexHmacSha256(
-  secret: string,
-  rawBody: Uint8Array,
-  actual: string | null,
-): boolean {
-  return timingSafeHeader(sha256Signature(secret, rawBody), actual);
+/** The replay window Svix and Standard Webhooks document. */
+const SVIX_TOLERANCE_MS = 5 * 60_000;
+
+/** A delivery on a provider's event route, as its event source verifies it. */
+export interface IngressDelivery {
+  headers: Headers;
+  rawBody: Uint8Array;
+  now: Date;
+  /** The sealed signing secret that the connector's ingress names. It
+   * rejects when the secret cannot be read. */
+  secret(): Promise<string>;
 }
 
-export interface SvixSignatureInput {
+/** HMAC-SHA256 of the raw body in hex, compared with a header in constant
+ * time. `prefix` is what the provider puts before the digest. */
+export async function verifyHmacSha256Header(
+  delivery: IngressDelivery,
+  header: string,
+  prefix = "",
+): Promise<boolean> {
+  const secret = await delivery.secret();
+  return timingSafeHeader(
+    `${prefix}${sha256Signature(secret, delivery.rawBody)}`,
+    delivery.headers.get(header),
+  );
+}
+
+/** A Svix or Standard Webhooks signature under the three headers that start
+ * with `headerPrefix`. */
+export function verifySvixHeaders(
+  delivery: Pick<IngressDelivery, "headers" | "rawBody" | "now">,
+  secret: string,
+  headerPrefix: "svix" | "webhook",
+): boolean {
+  return verifySvixSignature({
+    secret,
+    rawBody: delivery.rawBody,
+    id: delivery.headers.get(`${headerPrefix}-id`),
+    timestamp: delivery.headers.get(`${headerPrefix}-timestamp`),
+    signature: delivery.headers.get(`${headerPrefix}-signature`),
+    now: delivery.now.getTime(),
+    toleranceMs: SVIX_TOLERANCE_MS,
+  });
+}
+
+interface SvixSignatureInput {
   /** The endpoint secret as the dashboard shows it (`whsec_<base64>`); a bare
    * base64 secret is accepted too. */
   secret: string;
@@ -112,12 +148,11 @@ export interface SvixSignatureInput {
   toleranceMs: number;
 }
 
-/** The Svix webhook signature (Vanta): HMAC-SHA256 over
- * `${id}.${timestamp}.${body}` under the base64-decoded secret, base64
- * encoded, compared against every `v1,` entry of the header (a rotation
- * sends the old and the new). A timestamp outside the tolerance is a
- * replay. Timing-safe per entry. */
-export function verifySvixSignature(input: SvixSignatureInput): boolean {
+/** The Svix webhook signature: HMAC-SHA256 over `${id}.${timestamp}.${body}`
+ * under the base64-decoded secret, base64 encoded, compared against every
+ * `v1,` entry of the header (a rotation sends the old and the new). A
+ * timestamp outside the tolerance is a replay. */
+function verifySvixSignature(input: SvixSignatureInput): boolean {
   if (!input.id || !input.timestamp || !input.signature) return false;
   if (!/^\d{1,12}$/.test(input.timestamp)) return false;
   const sentMs = Number(input.timestamp) * 1000;
@@ -137,9 +172,8 @@ export function verifySvixSignature(input: SvixSignatureInput): boolean {
   return false;
 }
 
-/** Custom-registration verification: the generic scheme only. Provider
- * schemes retired with ADR 0119 D5 — GitHub/Slack/Linear deliveries arrive on
- * the integration ingress routes and verify with the connection's secret. */
+/** Verify a delivery to a custom webhook registration. Provider deliveries
+ * are verified by their event source. */
 export function verifyWebhook(input: VerifyWebhookInput): boolean {
   switch (input.verification.scheme) {
     case "generic_hmac_sha256":

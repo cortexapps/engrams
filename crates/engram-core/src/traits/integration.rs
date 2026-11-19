@@ -117,13 +117,12 @@ pub trait Integration: Send + Sync {
         default_inject_header(cred)
     }
 
-    /// ADR 0056 P2: if this provider is a **git forge**, the host its remotes
-    /// live at (e.g. `github.com`). git clone/push speaks a credential-*helper*
-    /// protocol, not a header-injectable HTTP API — the one delivery the egress
-    /// interceptor can't do — so a git-forge provider keeps the askpass seam. This
-    /// declaration is what makes that seam GENERIC: the guest's askpass helper and
-    /// the coordinator's forge-env injection key off this host, not a literal
-    /// `"github"`. `None` for non-git providers (the default).
+    /// The host this provider's git remotes live at (e.g. `github.com`), when
+    /// it is a forge whose integration mints a short-lived git credential. The
+    /// guest's askpass asks the coordinator for that credential, and the
+    /// coordinator picks the forge by this host. `None` for every other
+    /// provider (the default), including a forge whose static token the egress
+    /// proxy adds to git requests.
     fn git_forge_host(&self) -> Option<String> {
         None
     }
@@ -161,8 +160,42 @@ pub fn default_inject_header(cred: &ScopedCredential) -> Option<InjectHeader> {
     }
 }
 
-/// Minimal standard base64 (RFC 4648, `+/`, `=` padding) — avoids a crate dep for
-/// the one place engram-core needs it (the Basic `inject_header` default).
+/// Render a connector's header template with the resolved secret. `{}` is the
+/// secret itself. `{basic:USER}` is the HTTP Basic credential
+/// base64(`USER:secret`), for a server that takes a token only as a Basic
+/// password (git over HTTPS). The secret's own text is never scanned for a
+/// placeholder.
+pub fn render_header_template(template: &str, secret: &str) -> String {
+    const BASIC: &str = "{basic:";
+    let mut out = String::with_capacity(template.len() + secret.len() * 2);
+    let mut rest = template;
+    loop {
+        let raw = rest.find("{}");
+        let basic = rest
+            .find(BASIC)
+            .and_then(|at| Some((at, at + rest[at..].find('}')?)));
+        match (raw, basic) {
+            (Some(raw), basic) if basic.is_none_or(|(at, _)| raw < at) => {
+                out.push_str(&rest[..raw]);
+                out.push_str(secret);
+                rest = &rest[raw + 2..];
+            }
+            (_, Some((at, end))) => {
+                let user = &rest[at + BASIC.len()..end];
+                out.push_str(&rest[..at]);
+                out.push_str(&base64_std(format!("{user}:{secret}").as_bytes()));
+                rest = &rest[end + 1..];
+            }
+            _ => {
+                out.push_str(rest);
+                return out;
+            }
+        }
+    }
+}
+
+/// Standard base64 (RFC 4648, `+/`, `=` padding), so engram-core needs no
+/// crate for the Basic credential.
 fn base64_std(input: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
@@ -241,6 +274,35 @@ pub struct MintKindDescriptor {
 mod inject_header_tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn header_template_substitutes_the_secret() {
+        assert_eq!(render_header_template("Bearer {}", "tok"), "Bearer tok");
+        assert_eq!(render_header_template("{}", "tok"), "tok");
+        assert_eq!(render_header_template("static", "tok"), "static");
+    }
+
+    #[test]
+    fn header_template_renders_http_basic() {
+        // base64("oauth2:tok") and base64(":tok").
+        assert_eq!(
+            render_header_template("Basic {basic:oauth2}", "tok"),
+            "Basic b2F1dGgyOnRvaw=="
+        );
+        assert_eq!(
+            render_header_template("Basic {basic:}", "tok"),
+            "Basic OnRvaw=="
+        );
+    }
+
+    #[test]
+    fn header_template_never_scans_the_secret() {
+        assert_eq!(
+            render_header_template("{} {}", "{basic:x}"),
+            "{basic:x} {basic:x}"
+        );
+        assert_eq!(render_header_template("{basic:u", "tok"), "{basic:u");
+    }
 
     #[test]
     fn base64_std_matches_rfc4648() {

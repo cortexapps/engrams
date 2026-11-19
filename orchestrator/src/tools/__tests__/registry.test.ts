@@ -21,18 +21,17 @@ describe("tool registry", () => {
     expect(() => registry.register(definition)).toThrow("tool already registered: save_memory");
   });
 
-  test("handled tools require a handler instead of presenters alone", () => {
+  test("handled tools require a handler", () => {
     const registry = createToolRegistry();
 
     expect(() =>
       registry.register({
         name: "broken_handled",
-        description: "Has presentation but no implementation.",
+        description: "Has no implementation.",
         input: z.object({}),
         output: z.object({ ok: z.boolean() }),
         handling: "handled",
         execution: "sync",
-        presenters: { web: "BrokenCard" },
       } as never),
     ).toThrow("handled tool broken_handled requires a handler");
   });
@@ -59,7 +58,6 @@ describe("tool registry", () => {
         output: z.object({ ok: z.boolean() }),
         handling: "session",
         execution: "sync",
-        presenters: { web: "QuestionCard" },
       } as never),
     ).toThrow("session tool sync_session must use deferred execution");
 
@@ -69,7 +67,6 @@ describe("tool registry", () => {
       input: z.object({ question: z.string() }),
       output: z.object({ answer: z.string() }),
       handling: "session",
-      presenters: { web: "QuestionCard" },
     });
     expect(registered.execution).toBe("deferred");
   });

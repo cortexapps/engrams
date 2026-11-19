@@ -149,6 +149,8 @@ const fakeModelRouters = (row = routedModel()): ModelRouterStore => ({
   updatePolicy: async () => row,
   getSyncState: async () => null,
   recordFailure: async () => {},
+  getSettings: async () => null,
+  setSettings: async () => {},
 });
 
 const fakeConnections = (): IntegrationConnectionStore => {
@@ -783,6 +785,55 @@ describe("compileSessionCreateInput", () => {
           expect(policy.network.allow_hosts).not.toContain("openrouter.ai");
         }
       }
+    }
+  });
+
+  test("a second router launches on its own host and base paths", async () => {
+    const connections = fakeConnections();
+    const row = (await connections.getDefault("litellm"))!;
+    connections.getDefault = async () => ({
+      ...row,
+      config: { settings: { api_host: "llm.example.com" } },
+    });
+    const launch = (protocol: string, model: string | null) =>
+      compileSessionCreateInput(profile({ modelRouter: "litellm", model }), {
+        ...deps(),
+        connections,
+        harnessCatalog: {
+          listHarnesses: async () => ({
+            harnesses: [{ name: "claude", descriptor: { models: [], effort: [], routerProtocols: [protocol] } }],
+          }),
+        },
+        orgSecret: { listSecrets: async () => ({ secrets: [{ name: "litellm.api_key" }] }) },
+        modelRouters: fakeModelRouters(routedModel({ routerId: "litellm", modelId: "claude-sonnet" })),
+      });
+
+    for (const [protocol, baseUrl] of [
+      ["anthropic_messages", "https://llm.example.com"],
+      ["openai_responses", "https://llm.example.com/v1"],
+    ] as const) {
+      const inp = await launch(protocol, "claude-sonnet");
+      expect(inp.harnessEnv).toMatchObject({
+        ENGRAM_MODEL_ROUTER_ID: "litellm",
+        ENGRAM_MODEL_ROUTER_BASE_URL: baseUrl,
+        ENGRAM_MODEL_ROUTER_MODEL: "claude-sonnet",
+      });
+      const policy = JSON.parse(inp.integrationPolicyJson!);
+      expect(policy.secrets[0]).toMatchObject({
+        secret_ref: "litellm.api_key",
+        allow_hosts: ["llm.example.com"],
+      });
+    }
+
+    // The router has no built-in default model and the admin chose none.
+    try {
+      await launch("anthropic_messages", null);
+      throw new Error("expected a missing-model failure");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConnectError);
+      if (!(error instanceof ConnectError)) throw error;
+      expect(error.code).toBe(Code.FailedPrecondition);
+      expect(error.message).toContain("no default model");
     }
   });
 

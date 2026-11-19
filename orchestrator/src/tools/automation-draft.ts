@@ -11,7 +11,7 @@
  * reject the WHOLE tools/list.
  */
 
-import { isRouterConnected } from "../model-routers/connected.ts";
+import { canDecide } from "../model-routers/client.ts";
 import { z } from "zod";
 
 import { definitionOf, effectiveDefinition, SaveVersionConflictError } from "../db/automations.ts";
@@ -47,9 +47,9 @@ export interface AutomationDraftToolDeps {
   >;
   profiles: Pick<ProfileStore, "getActive" | "list">;
   events: DraftEventCatalogDeps;
-  /** Whether a model router has a key (default: isRouterConnected). The
-   * catalog offers router-backed blocks only when it does. */
-  routerConnected?: (routerId: string) => Promise<boolean>;
+  /** Whether a connected model router can answer a decision. The catalog
+   * offers the decide block only when one can. */
+  decisionsAvailable?: () => Promise<boolean>;
   now?: () => Date;
 }
 
@@ -190,7 +190,7 @@ export function registerAutomationDraftTools(
           return {
             part: args.part,
             content: draftBlockCatalog(
-              new Set((await (deps.routerConnected ?? isRouterConnected)("openrouter")) ? ["openrouter"] : []),
+              await (deps.decisionsAvailable ?? canDecide)(),
             ),
           };
         case "patterns":

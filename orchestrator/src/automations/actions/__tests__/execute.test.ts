@@ -2,9 +2,11 @@ import { beforeEach, describe, expect, test } from "bun:test";
 
 import { invalidateRegistry } from "../../../connectors/registry.ts";
 import type { IntegrationOpRequest, IntegrationOpResult } from "../../../integrations/run-op.ts";
-import { makeGithubReviewPoster } from "../../../reviews/github-review.ts";
+import { requireForge } from "../../../forges/registry.ts";
 import { actionClientId } from "../client-id.ts";
-import { defaultBuiltinActionDeps, type BuiltinActionDeps } from "../builtin.ts";
+import type { LinearIssueClient } from "../../../providers/linear/issues.ts";
+import type { SlackChatClient } from "../../../providers/slack/actions.ts";
+import type { BuiltinActionDeps } from "../builtin.ts";
 import { IntegrationActionError } from "../errors.ts";
 import { executeIntegrationAction, type ExecuteIntegrationActionDeps } from "../execute.ts";
 
@@ -37,6 +39,28 @@ function deps(
   extra: Partial<ExecuteIntegrationActionDeps> = {},
 ): ExecuteIntegrationActionDeps {
   return { runOp, connectors: emptySource, ...extra };
+}
+
+// The forges send through the fake op; a test names any other client it
+// reaches.
+function builtinDeps(
+  runOp: (provider: string, req: IntegrationOpRequest) => Promise<IntegrationOpResult>,
+  clients: Record<string, unknown> = {},
+): BuiltinActionDeps {
+  return {
+    clients: {
+      github: requireForge("github", { runIntegrationOp: runOp }),
+      gitlab: requireForge("gitlab", { runIntegrationOp: runOp }),
+      ...clients,
+    },
+  };
+}
+
+/** `deps` with the forges over the same fake op. */
+function forgeDeps(
+  runOp: (provider: string, req: IntegrationOpRequest) => Promise<IntegrationOpResult>,
+): ExecuteIntegrationActionDeps {
+  return deps(runOp, { builtinDeps: builtinDeps(runOp) });
 }
 
 async function expectActionError(
@@ -121,18 +145,24 @@ describe("executeIntegrationAction — http", () => {
         params: { repo: "acme/repo", number: 5, body: "hello" },
       },
       CTX,
-      deps(fresh.runOp),
+      forgeDeps(fresh.runOp),
     );
     expect(fresh.calls).toHaveLength(2);
     expect(fresh.calls[0]!.req.method).toBe("GET");
     const posted = JSON.parse(fresh.calls[1]!.req.body as string) as { body: string };
     expect(posted.body).toContain("hello");
     expect(posted.body).toContain(`<!-- engrams-automation:${CTX.runId}:${CTX.stepPath} -->`);
-    expect(outputs).toEqual({ commentId: 42 });
+    expect(outputs).toEqual({ commentId: "42" });
 
-    // Replay: the scan finds the marker; no second create.
+    // Replay: the scan finds the marker on the app's comment; no second create.
     const replay = fakeRunOp([
-      json(200, [{ id: 42, body: `hi\n\n<!-- engrams-automation:${CTX.runId}:${CTX.stepPath} -->` }]),
+      json(200, [
+        {
+          id: 42,
+          user: { type: "Bot" },
+          body: `hi\n\n<!-- engrams-automation:${CTX.runId}:${CTX.stepPath} -->`,
+        },
+      ]),
     ]);
     const replayed = await executeIntegrationAction(
       {
@@ -141,10 +171,10 @@ describe("executeIntegrationAction — http", () => {
         params: { repo: "acme/repo", number: 5, body: "hello" },
       },
       CTX,
-      deps(replay.runOp),
+      forgeDeps(replay.runOp),
     );
     expect(replay.calls).toHaveLength(1);
-    expect(replayed).toEqual({ commentId: 42 });
+    expect(replayed).toEqual({ commentId: "42" });
   });
 
   test("marker_comment with an {input.key} marker pins one comment per key across runs", async () => {
@@ -153,22 +183,28 @@ describe("executeIntegrationAction — http", () => {
     const created = await executeIntegrationAction(
       {
         provider: "github",
-        actionId: "upsert_issue_comment",
+        actionId: "upsert_pr_comment",
         params: { repo: "acme/repo", number: 5, key: "review-status", body: "reviewing abc1234" },
       },
       CTX,
-      deps(first.runOp),
+      forgeDeps(first.runOp),
     );
-    expect(created).toEqual({ commentId: 51 });
+    expect(created).toEqual({ commentId: "51" });
     const posted = JSON.parse(first.calls[1]!.req.body as string) as { body: string };
     expect(posted.body).toContain("<!-- engrams-pinned:review-status -->");
     expect(posted.body).not.toContain(CTX.runId);
 
-    // A LATER run (different run id) finds it by the key and gets its id back.
+    // A LATER run (different run id) finds it by the key and gets its id
+    // back. It names the action by its earlier id, as a stored automation
+    // does. A person's comment that quotes the marker is not the app's.
     const later = fakeRunOp([
       json(200, [
-        { id: 60, body: "someone else" },
-        { id: 51, body: "reviewing abc1234\n\n<!-- engrams-pinned:review-status -->" },
+        { id: 60, user: { type: "User" }, body: "<!-- engrams-pinned:review-status -->" },
+        {
+          id: 51,
+          user: { type: "Bot" },
+          body: "reviewing abc1234\n\n<!-- engrams-pinned:review-status -->",
+        },
       ]),
     ]);
     const found = await executeIntegrationAction(
@@ -178,70 +214,84 @@ describe("executeIntegrationAction — http", () => {
         params: { repo: "acme/repo", number: 5, key: "review-status", body: "reviewing def5678" },
       },
       { ...CTX, runId: "autorun:auto-1:main:i-2:github:d2" },
-      deps(later.runOp),
+      forgeDeps(later.runOp),
     );
     expect(later.calls).toHaveLength(1);
-    expect(found).toEqual({ commentId: 51 });
+    expect(found).toEqual({ commentId: "51" });
 
     // An EDIT of the pinned comment re-appends the marker (the plain update
     // action would drop it, and the next run's scan would miss the comment).
+    // A stored automation can give the id as a number.
     const edit = fakeRunOp([json(200, { id: 51 })]);
-    await executeIntegrationAction(
+    const edited = await executeIntegrationAction(
       {
         provider: "github",
         actionId: "update_pinned_comment",
         params: { repo: "acme/repo", commentId: 51, key: "review-status", body: "no findings for def5678" },
       },
       { ...CTX, runId: "autorun:auto-1:main:i-2:github:d2" },
-      deps(edit.runOp),
+      forgeDeps(edit.runOp),
     );
+    expect(edited).toEqual({ commentId: "51" });
     expect(edit.calls).toHaveLength(1);
-    expect(edit.calls[0]!.req.method).toBe("PATCH");
-    const edited = JSON.parse(edit.calls[0]!.req.body as string) as { body: string };
-    expect(edited.body).toBe("no findings for def5678\n\n<!-- engrams-pinned:review-status -->");
+    expect(edit.calls[0]!.req).toMatchObject({
+      method: "PATCH",
+      path: "/repos/acme/repo/issues/comments/51",
+    });
+    const editedBody = (JSON.parse(edit.calls[0]!.req.body as string) as { body: string }).body;
+    expect(editedBody).toBe("no findings for def5678\n\n<!-- engrams-pinned:review-status -->");
 
     // And a THIRD run scanning the body that edit left behind still finds it.
-    const third = fakeRunOp([json(200, [{ id: 51, body: edited.body }])]);
+    const third = fakeRunOp([json(200, [{ id: 51, user: { type: "Bot" }, body: editedBody }])]);
     expect(
       await executeIntegrationAction(
         {
           provider: "github",
-          actionId: "upsert_issue_comment",
+          actionId: "upsert_pr_comment",
           params: { repo: "acme/repo", number: 5, key: "review-status", body: "reviewing 0123abc" },
         },
         { ...CTX, runId: "autorun:auto-1:main:i-3:github:d3" },
-        deps(third.runOp),
+        forgeDeps(third.runOp),
       ),
-    ).toEqual({ commentId: 51 });
+    ).toEqual({ commentId: "51" });
 
     // The key is part of an HTML comment and of the next scan: a token only.
     await expect(
       executeIntegrationAction(
         {
           provider: "github",
-          actionId: "upsert_issue_comment",
+          actionId: "upsert_pr_comment",
           params: { repo: "acme/repo", number: 5, key: "-->oops", body: "x" },
         },
         CTX,
-        deps(fakeRunOp([]).runOp),
+        forgeDeps(fakeRunOp([]).runOp),
       ),
     ).rejects.toThrow(/short token/);
   });
 
   test("caps oversized mapped outputs with a truncation flag", async () => {
     const huge = "x".repeat(300 * 1024);
-    const f = fakeRunOp([json(200, []), json(201, { id: huge })]);
+    const f = fakeRunOp([]);
     const outputs = await executeIntegrationAction(
-      {
-        provider: "github",
-        actionId: "create_issue_comment",
-        params: { repo: "acme/repo", number: 5, body: "hello" },
-      },
+      { provider: "slack", actionId: "post_message", params: { channel: "C1", text: "hi" } },
       CTX,
-      deps(f.runOp),
+      deps(f.runOp, {
+        builtinDeps: builtinDeps(f.runOp, {
+          slack: {
+            chat: {
+              postMessage: async () => ({ ts: huge, channel: "C1" }),
+              update: async () => ({}),
+            },
+            conversations: {
+              join: async () => ({}),
+              replies: async () => ({ messages: [] }),
+            },
+          } satisfies SlackChatClient,
+        }),
+      }),
     );
     expect(outputs["truncated"]).toBe(true);
-    expect((outputs["commentId"] as string).length).toBeLessThanOrEqual(4096);
+    expect((outputs["ts"] as string).length).toBeLessThanOrEqual(4096);
   });
 });
 
@@ -286,25 +336,6 @@ describe("executeIntegrationAction — graphql", () => {
 });
 
 describe("executeIntegrationAction — builtins", () => {
-  // Built from scratch (never spread from production defaults) so a test can
-  // only ever reach the seams it explicitly provides.
-  function builtinDeps(
-    runOp: (provider: string, req: IntegrationOpRequest) => Promise<IntegrationOpResult>,
-    overrides: Partial<BuiltinActionDeps> = {},
-  ): BuiltinActionDeps {
-    return {
-      runOp,
-      githubPoster: () => makeGithubReviewPoster({ runIntegrationOp: runOp }),
-      slackClient: async () => {
-        throw new Error("slack client not provided in this test");
-      },
-      linearClient: () => {
-        throw new Error("linear client not provided in this test");
-      },
-      ...overrides,
-    };
-  }
-
   test("github.post_pr_review rides the real poster incl. the 422 summary-only fallback", async () => {
     const f = fakeRunOp([
       json(200, []), // marker scan
@@ -379,6 +410,51 @@ describe("executeIntegrationAction — builtins", () => {
     expect(outputs).toMatchObject({ posted: false, already_posted: true });
   });
 
+  const NOTES = "/api/v4/projects/acme%2Fplatform%2Fapi/merge_requests/7/notes";
+
+  test("gitlab.upsert_pr_comment posts once per key and reuses the comment after", async () => {
+    const upsert = (f: ReturnType<typeof fakeRunOp>) =>
+      executeIntegrationAction(
+        {
+          provider: "gitlab",
+          actionId: "upsert_pr_comment",
+          params: { repo: "acme/platform/api", number: 7, key: "status", body: "Reviewing." },
+        },
+        CTX,
+        deps(f.runOp, { builtinDeps: builtinDeps(f.runOp) }),
+      );
+
+    // The lookup asks who the token's user is: only that user's comment counts.
+    const self = { id: 5 };
+    const first = fakeRunOp([json(200, self), json(200, []), json(201, { id: 8 })]);
+    expect(await upsert(first)).toMatchObject({ commentId: "7:8" });
+    expect(first.calls[2]!.req).toMatchObject({ method: "POST", path: NOTES });
+    const posted = String((JSON.parse(first.calls[2]!.req.body as string) as { body: string }).body);
+    const marker = posted.slice(posted.indexOf("<!--"));
+    expect(posted).toBe(`Reviewing.\n\n${marker}`);
+
+    const again = fakeRunOp([json(200, self), json(200, [{ id: 8, author: self, body: posted }])]);
+    expect(await upsert(again)).toMatchObject({ commentId: "7:8" });
+    expect(again.calls).toHaveLength(2);
+  });
+
+  test("gitlab.update_pr_comment rewrites the comment and keeps its marker", async () => {
+    const f = fakeRunOp([json(200, { id: 8 })]);
+    const outputs = await executeIntegrationAction(
+      {
+        provider: "gitlab",
+        actionId: "update_pr_comment",
+        params: { repo: "acme/platform/api", commentId: "7:8", key: "status", body: "Done." },
+      },
+      CTX,
+      deps(f.runOp, { builtinDeps: builtinDeps(f.runOp) }),
+    );
+    expect(outputs).toMatchObject({ commentId: "7:8" });
+    expect(f.calls[0]!.req).toMatchObject({ method: "PUT", path: `${NOTES}/8` });
+    const body = String((JSON.parse(f.calls[0]!.req.body as string) as { body: string }).body);
+    expect(body).toMatch(/^Done\.\n\n<!-- .+ -->$/);
+  });
+
   test("slack.post_message maps ts/channel through the declared outputs", async () => {
     const sent: Array<Record<string, unknown>> = [];
     const f = fakeRunOp([]);
@@ -391,7 +467,7 @@ describe("executeIntegrationAction — builtins", () => {
       CTX,
       deps(f.runOp, {
         builtinDeps: builtinDeps(f.runOp, {
-          slackClient: async () => ({
+          slack: {
             chat: {
               postMessage: async (args) => {
                 sent.push(args);
@@ -403,7 +479,7 @@ describe("executeIntegrationAction — builtins", () => {
               join: async () => ({}),
               replies: async () => ({ messages: [] }),
             },
-          }),
+          } satisfies SlackChatClient,
         }),
       }),
     );
@@ -423,7 +499,7 @@ describe("executeIntegrationAction — builtins", () => {
       CTX,
       deps(f.runOp, {
         builtinDeps: builtinDeps(f.runOp, {
-          slackClient: async () => ({
+          slack: {
             chat: { postMessage: async () => ({}), update: async () => ({}) },
             conversations: {
               join: async () => ({}),
@@ -443,7 +519,7 @@ describe("executeIntegrationAction — builtins", () => {
                 };
               },
             },
-          }),
+          } satisfies SlackChatClient,
         }),
       }),
     );
@@ -469,7 +545,7 @@ describe("executeIntegrationAction — builtins", () => {
       CTX,
       deps(f.runOp, {
         builtinDeps: builtinDeps(f.runOp, {
-          slackClient: async () => ({
+          slack: {
             chat: {
               postMessage: async () => ({}),
               update: async () => ({}),
@@ -481,7 +557,7 @@ describe("executeIntegrationAction — builtins", () => {
               },
               replies: async () => ({ messages: [] }),
             },
-          }),
+          } satisfies SlackChatClient,
         }),
       }),
     );
@@ -501,15 +577,15 @@ describe("executeIntegrationAction — builtins", () => {
       CTX,
       deps(f.runOp, {
         builtinDeps: builtinDeps(f.runOp, {
-          linearClient: () => ({
+          linear: {
             findIssue: async () => null,
             createIssue: async (input) => {
-              created.push(input as unknown as Record<string, unknown>);
+              created.push({ ...input });
               return { id: input.id, identifier: "ENG-1", url: "https://linear.app/i/ENG-1" };
             },
             createBlockingRelation: async () => {},
             readWorkspace: async () => ({ teams: [], projects: [], labels: [] }),
-          }),
+          } satisfies LinearIssueClient,
         }),
       }),
     );
@@ -534,9 +610,9 @@ describe("executeIntegrationAction — templated scalars", () => {
         params: { repo: "acme/repo", number: "1539", body: "hello" },
       },
       CTX,
-      deps(f.runOp),
+      forgeDeps(f.runOp),
     );
-    expect(outputs).toEqual({ commentId: 42 });
+    expect(outputs).toEqual({ commentId: "42" });
     expect(f.calls[1]!.req.path).toContain("/issues/1539/comments");
   });
 

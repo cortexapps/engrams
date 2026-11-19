@@ -20,7 +20,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import { useActionCatalog } from "@/hooks/useAutomationEditor";
+import { useActionCatalog, useAutomationProviders } from "@/hooks/useAutomationEditor";
 import { useHarnessCatalog } from "@/hooks/useHarnessCatalog";
 import { useProfiles } from "@/hooks/useProfiles";
 import {
@@ -344,14 +344,16 @@ interface FieldSchema {
   enum?: string[];
 }
 
-const PROVIDERS = ["github", "slack", "linear"] as const;
-
 function IntegrationActionInspector(props: BlockInspectorProps) {
   const { block, onChange, builtin, errors, variablePaths } = props;
   const provider = typeof block.config["provider"] === "string" ? block.config["provider"] : "";
   const actionId = typeof block.config["actionId"] === "string" ? block.config["actionId"] : "";
+  const providers = useAutomationProviders("actions", provider);
   const catalog = useActionCatalog(provider || undefined);
-  const action = catalog.data?.actions.find((a) => a.id === actionId);
+  // A stored block can name an action by an earlier id.
+  const action = catalog.data?.actions.find(
+    (a) => a.id === actionId || a.aliases.includes(actionId),
+  );
   const schema = useMemo<FieldSchema | undefined>(() => {
     if (!action?.inputSchemaJson) return undefined;
     try {
@@ -392,7 +394,7 @@ function IntegrationActionInspector(props: BlockInspectorProps) {
             <SelectValue placeholder="Choose…" />
           </SelectTrigger>
           <SelectContent>
-            {PROVIDERS.map((p) => (
+            {providers.map((p) => (
               <SelectItem key={p} value={p}>
                 {p}
               </SelectItem>
@@ -406,7 +408,7 @@ function IntegrationActionInspector(props: BlockInspectorProps) {
       >
         <FieldLabel>Action</FieldLabel>
         <Select
-          value={actionId}
+          value={action?.id ?? actionId}
           onValueChange={(next) =>
             onChange({ ...block, config: { ...block.config, actionId: next, params: {} } })
           }

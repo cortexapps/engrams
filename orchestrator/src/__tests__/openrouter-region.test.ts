@@ -1,9 +1,8 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { create } from "@bufbuild/protobuf";
-import type { OpenRouterProvider } from "@openrouter/ai-sdk-provider";
-import type { DecisionsClient } from "../integrations/openrouter-decisions.ts";
-import "../integrations/openrouter.ts";
-import { getIntegrationClient, invalidateIntegrationClient } from "../integrations/clients.ts";
+import { routerClient } from "../model-routers/client.ts";
+import { getModelRouterDefinition } from "../model-routers/registry.ts";
+import { invalidateIntegrationClient } from "../integrations/clients.ts";
 import { runIntegrationOp, type RunOpDeps } from "../integrations/run-op.ts";
 import { compileIntegrationPolicy, connectorRegistry } from "../connectors/registry.ts";
 import {
@@ -63,14 +62,17 @@ test("SDK and Decisions requests follow a region change while the credential is 
       }),
     },
   };
+  const router = getModelRouterDefinition("openrouter")!;
   try {
     for (const configured of [undefined, "us.openrouter.ai", "eu.openrouter.ai"]) {
       host = configured;
-      const clients = await getIntegrationClient<{ sdk: OpenRouterProvider; decisions: DecisionsClient }>("openrouter", deps);
-      await clients.sdk.chat("test-model").doGenerate({
+      const clients = await routerClient(router, deps);
+      const model = clients.chat("test-model");
+      if (typeof model === "string") throw new Error("expected a model object");
+      await model.doGenerate({
         prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
       });
-      await clients.decisions.decide({ model: "test-model", state: "hello", questions: {} });
+      await clients.decisions!.decide({ model: "test-model", state: "hello", questions: {} });
       expect(urls.splice(0)).toEqual([
         `https://${host ?? "openrouter.ai"}/api/v1/chat/completions`,
         `https://${host ?? "openrouter.ai"}/api/alpha/decisions`,

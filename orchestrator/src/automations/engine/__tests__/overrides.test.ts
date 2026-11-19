@@ -140,7 +140,10 @@ describe("previewDefinition", () => {
 });
 
 import { makeCodeBlockRuntime } from "../../code/runtime.ts";
-import { SLACK_BRAIN_BUILTIN } from "../../builtins/slack-brain.ts";
+import { chatThreadsBuiltin } from "../../builtins/chat-threads.ts";
+import { SLACK_THREADS } from "../../../providers/slack/threads-variant.ts";
+
+const SLACK_BRAIN_BUILTIN = chatThreadsBuiltin(SLACK_THREADS);
 
 describe("previewDefinition — code blocks run (the editor's Test with sample)", () => {
   const base = {

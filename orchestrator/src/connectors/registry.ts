@@ -31,7 +31,6 @@
 import { readdirSync, readFileSync } from "node:fs";
 
 import type { ConnectionProvider } from "../integrations/providers/provider.ts";
-import { BUILTIN_ACTION_IDS } from "./builtin-actions-allowlist.ts";
 import { join } from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -39,7 +38,8 @@ import { join } from "node:path";
 // ---------------------------------------------------------------------------
 
 /** One injected auth header. `{}` in `template` is replaced by the resolved
- * secret value host-side (e.g. `"Bearer {}"`, default `"{}"`). `secretRef` names
+ * secret value host-side (e.g. `"Bearer {}"`, default `"{}"`); `{basic:USER}`
+ * by the HTTP Basic credential base64(`USER:secret`). `secretRef` names
  * the org secret for a static connector; on an oauth-facet connector it is
  * ABSENT — the value is the connector's OAuth access token, resolved and
  * refreshed from the coordinator's sealed credential store (ADR 0106 addendum). */
@@ -69,6 +69,94 @@ export type Credential = InjectCredential | MintCredential;
 export interface HttpMatch {
   method?: string;
   path?: string;
+  /** The path for one resource of a grant that names resources:
+   * `{resource}` is the resource, `{resource:encoded}` is its URL-encoded
+   * form. A path with neither is the same for every resource. A connector
+   * that has one on an operation is resource-aware: a grant with resources
+   * then reaches only the operations that have one. */
+  resourcePath?: string;
+}
+
+const RESOURCE_PLACEHOLDER = /\{resource(:encoded)?\}/;
+
+/** A resource of a grant goes into a path glob, so it is `/`-separated names
+ * of letters, digits, `.`, `_` and `-`. No name is `.` or `..`, and none
+ * starts with `-`. */
+const SAFE_RESOURCE =
+  /^(?!-|\.{1,2}(?:\/|$))[A-Za-z0-9._-]+(?:\/(?!-|\.{1,2}(?:\/|$))[A-Za-z0-9._-]+)*$/;
+
+function restMatch(op: Operation): HttpMatch | undefined {
+  return op.match !== undefined && !isGraphqlMatch(op.match) ? op.match : undefined;
+}
+
+function holdsResource(op: Operation): boolean {
+  const template = restMatch(op)?.resourcePath;
+  return template !== undefined && RESOURCE_PLACEHOLDER.test(template);
+}
+
+/** Whether the connector's paths can hold a grant to a resource. */
+function isResourceAware(connector: Connector): boolean {
+  return connector.operations.some(holdsResource);
+}
+
+/** A grant as the resource check reads it. `userScoped`: the session uses
+ * the person's own credential. */
+export interface ResourceScopedGrant {
+  provider: string;
+  operation: string;
+  resourceConstraints: readonly string[];
+  userScoped?: boolean;
+}
+
+/** Why the egress policy cannot hold `grant` to its resources; null when it
+ * can, and when the grant names none. Profile save refuses a grant with an
+ * error, and the policy compile gives it no credential.
+ *
+ * A resource-aware connector holds the resource in the path. Any other
+ * connector holds it only in a credential that the coordinator mints for the
+ * session: a static key and a person's own token reach all that they can
+ * reach. */
+export function resourceScopeError(
+  grant: ResourceScopedGrant,
+  registry: Map<string, Connector>,
+): string | null {
+  if (grant.resourceConstraints.length === 0) return null;
+  const connector = registry.get(grant.provider);
+  const unlimited = `"${grant.provider}" grants cannot be limited to a resource`;
+  if (!connector) return unlimited;
+  if (!isResourceAware(connector)) {
+    if (connector.credential.source === "inject") return unlimited;
+    return grant.userScoped === true && connector.userCredential !== undefined
+      ? `a "${grant.provider}" grant that uses the person's own credential cannot be limited to a resource`
+      : null;
+  }
+  if (!connector.operations.some((op) => op.grants.includes(grant.operation) && holdsResource(op))) {
+    return `"${grant.provider}:${grant.operation}" cannot be limited to a resource`;
+  }
+  const pattern =
+    connector.resourcePattern !== undefined ? new RegExp(connector.resourcePattern) : undefined;
+  const invalid = grant.resourceConstraints.find(
+    (resource) => !SAFE_RESOURCE.test(resource) || pattern?.test(resource) === false,
+  );
+  return invalid !== undefined ? `"${invalid}" is not a resource of "${grant.provider}"` : null;
+}
+
+/** The path globs of `match` for a grant that passes {@link resourceScopeError}.
+ * Null when the grant names resources and this operation has no path for one. */
+function grantPathGlobs(
+  match: HttpMatch | undefined,
+  resources: readonly string[],
+  resourceAware: boolean,
+): string[] | null {
+  if (!resourceAware || resources.length === 0) return match?.path ? [match.path] : [];
+  const template = match?.resourcePath;
+  if (template === undefined) return null;
+  const globs = resources.map((resource) =>
+    template.replace(new RegExp(RESOURCE_PLACEHOLDER, "g"), (_all, encoded) =>
+      encoded ? encodeURIComponent(resource) : resource,
+    ),
+  );
+  return [...new Set(globs)];
 }
 
 /**
@@ -123,6 +211,10 @@ export interface Operation {
   grants: string[];
   /** Either an HTTP match (`method`/`path`) or a GraphQL match (`operation`/`field`). */
   match?: HttpMatch | GraphqlMatch;
+  /** Replaces the credential's header template on this operation, for a path
+   * that takes the same secret in another form (git over HTTPS takes a token
+   * as a Basic password). */
+  template?: string;
   asset?: AssetSpec;
 }
 
@@ -406,11 +498,6 @@ export interface ConnectorSetting {
   hint?: string;
 }
 
-export type WebhookVerificationScheme =
-  | "github_hmac_sha256"
-  | "slack_v0"
-  | "generic_hmac_sha256";
-
 /** Bounded JSON-Schema subset for typed event fields and action inputs
  * (ADR 0119 D5). Deliberately tiny: enough to type a field picker and
  * validate action params, nothing more. */
@@ -455,11 +542,15 @@ export interface WebhookEventSpec {
   handleCandidates?: HandleTemplateSpec[];
 }
 
-/** Provider-owned ingress (ADR 0119 D5): how the integration event route
- * verifies deliveries and which sealed org secret signs them. */
+/** Provider-owned ingress (ADR 0119 D5): the sealed org secret that signs
+ * deliveries on the provider's event route. The provider's event source
+ * holds the signature scheme. */
 export interface WebhookIngressSpec {
-  scheme: "github_hmac_sha256" | "slack_v0" | "linear_hmac_sha256" | "svix_hmac_sha256";
   secretRef: string;
+  /** The provider also sends card clicks, signed the same way, to
+   * `interactivityPath(provider)`. The path takes
+   * requests with no login. */
+  interactivity?: true;
 }
 
 /** Provider-specific coarse scope: one payload path whose value a trigger can
@@ -479,10 +570,6 @@ export interface WebhookAliasSpec {
 }
 
 export interface WebhookFacet {
-  /** Custom webhook-REGISTRATION scheme hint (ADR 0102). Still read by the
-   * `/api/v1/hooks/:id` path; retires with the provider schemes in the HMAC
-   * retirement stack item. New code reads `ingress`. */
-  verificationScheme: WebhookVerificationScheme;
   events: WebhookEventSpec[];
   aliases: WebhookAliasSpec[];
   /** ADR 0119 D5: the provider-owned integration event route. */
@@ -516,6 +603,9 @@ export type ActionIdempotency =
 
 export interface ActionSpec {
   id: string;
+  /** Earlier ids of this action. A stored automation that names one runs
+   * this action. */
+  aliases?: string[];
   label: string;
   description?: string;
   /** Object-root FieldSchema; `required[]` enforced before execute. */
@@ -546,6 +636,9 @@ export interface Connector {
    * Defaulted to `/graphql` when any operation has a GraphQL match; absent for a
    * pure-REST connector. */
   graphqlEndpoint?: string;
+  /** A regular expression that each resource of a grant must match (GitLab:
+   * a project path of two or more names). */
+  resourcePattern?: string;
   operations: Operation[];
   /** Always defaulted from `provider` when absent (see {@link parseConnector}). */
   display: ConnectorDisplay;
@@ -1508,17 +1601,6 @@ const WEBHOOK_EVENT_KEY_RE = /^[a-z0-9_-]+(?:\.[a-z0-9_-]+)*$/;
 const WEBHOOK_ALIAS_RE = /^[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)*$/;
 const WEBHOOK_PATH_RE = /^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/;
 const UNSAFE_OBJECT_PATH_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
-const WEBHOOK_SCHEMES: ReadonlySet<WebhookVerificationScheme> = new Set([
-  "github_hmac_sha256",
-  "slack_v0",
-  "generic_hmac_sha256",
-]);
-const INGRESS_SCHEMES: ReadonlySet<WebhookIngressSpec["scheme"]> = new Set([
-  "github_hmac_sha256",
-  "slack_v0",
-  "linear_hmac_sha256",
-  "svix_hmac_sha256",
-]);
 const MAX_EVENT_DESCRIPTION_LENGTH = 300;
 const FIELD_SCHEMA_MAX_DEPTH = 8;
 const FIELD_SCHEMA_MAX_PROPERTIES = 250;
@@ -1679,16 +1761,6 @@ function checkPayloadPath(path: string): string | null {
 export function parseWebhookFacet(where: string, raw: unknown): WebhookFacet {
   if (typeof raw !== "object" || raw === null) fail(where, '"webhook" must be an object');
   const o = raw as Record<string, unknown>;
-  if (
-    typeof o.verificationScheme !== "string" ||
-    !WEBHOOK_SCHEMES.has(o.verificationScheme as WebhookVerificationScheme)
-  ) {
-    fail(
-      where,
-      '"webhook.verificationScheme" must be "github_hmac_sha256", "slack_v0", or "generic_hmac_sha256"',
-    );
-  }
-
   if (!Array.isArray(o.events)) fail(where, '"webhook.events" must be an array');
   if (o.events.length > MAX_WEBHOOK_EVENTS) {
     fail(where, `"webhook.events" has ${o.events.length} entries (max ${MAX_WEBHOOK_EVENTS})`);
@@ -1779,19 +1851,16 @@ export function parseWebhookFacet(where: string, raw: unknown): WebhookFacet {
       fail(where, '"webhook.ingress" must be an object');
     }
     const i = o.ingress as Record<string, unknown>;
-    if (
-      typeof i.scheme !== "string" ||
-      !INGRESS_SCHEMES.has(i.scheme as WebhookIngressSpec["scheme"])
-    ) {
-      fail(
-        where,
-        '"webhook.ingress.scheme" must be "github_hmac_sha256", "slack_v0", "linear_hmac_sha256", or "svix_hmac_sha256"',
-      );
-    }
     if (typeof i.secretRef !== "string" || !/^\S+$/.test(i.secretRef)) {
       fail(where, '"webhook.ingress.secretRef" must be a non-empty org-secret name');
     }
-    ingress = { scheme: i.scheme as WebhookIngressSpec["scheme"], secretRef: i.secretRef };
+    if (i.interactivity !== undefined && i.interactivity !== true) {
+      fail(where, '"webhook.ingress.interactivity" must be true when present');
+    }
+    ingress = {
+      secretRef: i.secretRef,
+      ...(i.interactivity === true ? { interactivity: true as const } : {}),
+    };
   }
 
   let scope: WebhookScopeSpec | undefined;
@@ -1816,7 +1885,6 @@ export function parseWebhookFacet(where: string, raw: unknown): WebhookFacet {
   }
 
   return {
-    verificationScheme: o.verificationScheme as WebhookVerificationScheme,
     events,
     aliases,
     ...(ingress !== undefined ? { ingress } : {}),
@@ -1845,6 +1913,18 @@ export function parseActionsFacet(
     }
     if (ids.has(a.id)) fail(actionWhere, `duplicate action id "${a.id}"`);
     ids.add(a.id);
+    let aliases: string[] | undefined;
+    if (a.aliases !== undefined) {
+      if (!Array.isArray(a.aliases)) fail(actionWhere, '"aliases" must be an array');
+      aliases = a.aliases.map((alias) => {
+        if (typeof alias !== "string" || !ACTION_ID_RE.test(alias) || alias.length > 64) {
+          fail(actionWhere, 'each alias must be a lowercase identifier');
+        }
+        if (ids.has(alias)) fail(actionWhere, `duplicate action id "${alias}"`);
+        ids.add(alias);
+        return alias;
+      });
+    }
     if (typeof a.label !== "string" || !a.label.trim() || a.label.length > 120) {
       fail(actionWhere, '"label" must be a non-empty string of at most 120 characters');
     }
@@ -1879,6 +1959,10 @@ export function parseActionsFacet(
     }
 
     const idempotency = parseActionIdempotency(actionWhere, a.idempotency);
+    // Only a builtin action can search for its marker before it posts.
+    if (idempotency.kind === "marker_comment" && execute.kind !== "builtin") {
+      fail(actionWhere, '"idempotency.kind" marker_comment needs a builtin action');
+    }
 
     let successStatus: number[] | undefined;
     if (a.successStatus !== undefined) {
@@ -1913,6 +1997,7 @@ export function parseActionsFacet(
 
     return {
       id: a.id,
+      ...(aliases !== undefined ? { aliases } : {}),
       label: a.label,
       ...(a.description !== undefined ? { description: a.description as string } : {}),
       inputSchema,
@@ -1992,8 +2077,10 @@ function parseActionExecution(
       return { kind: "graphql", document: e.document };
     }
     case "builtin": {
-      if (typeof e.id !== "string" || !BUILTIN_ACTION_IDS.has(e.id)) {
-        fail(where, `"execute.id" must be one of the registered builtin actions`);
+      // `<provider>.<name>`. A test checks that each id has an implementation;
+      // this module does not load provider code.
+      if (typeof e.id !== "string" || !/^[a-z0-9_]+\.[a-z0-9_]+$/.test(e.id)) {
+        fail(where, '"execute.id" must be "<provider>.<name>"');
       }
       return { kind: "builtin", id: e.id };
     }
@@ -2024,6 +2111,20 @@ function parseActionIdempotency(where: string, raw: unknown): ActionIdempotency 
     }
     default:
       fail(where, '"idempotency.kind" must be natural/marker_comment/client_id/none');
+  }
+}
+
+/** A header template names the secret as `{}` or as `{basic:USER}`. The
+ * renderer reads a `{basic:` up to the next `}`, so one that is not a whole
+ * placeholder is refused. */
+const TEMPLATE_PLACEHOLDER_RE = /\{\}|\{basic:[A-Za-z0-9_.-]*\}/;
+const MALFORMED_BASIC_RE = /\{basic:(?![A-Za-z0-9_.-]*\})/;
+
+function assertHeaderTemplate(where: string, field: string, value: unknown): asserts value is string {
+  if (typeof value !== "string") fail(where, `"${field}" must be a string`);
+  if (/[\r\n]/.test(value)) fail(where, `"${field}" must not contain newlines`);
+  if (!TEMPLATE_PLACEHOLDER_RE.test(value) || MALFORMED_BASIC_RE.test(value)) {
+    fail(where, `"${field}" must contain the "{}" or "{basic:USER}" value placeholder`);
   }
 }
 
@@ -2060,11 +2161,7 @@ export function parseConnector(
         if (typeof inj.secretRef !== "string" || !inj.secretRef) fail(iw, '"secretRef" must be a non-empty string');
         if (/\s/.test(inj.secretRef)) fail(iw, '"secretRef" must not contain whitespace');
       }
-      if (inj.template !== undefined) {
-        if (typeof inj.template !== "string") fail(iw, '"template" must be a string');
-        if (/[\r\n]/.test(inj.template)) fail(iw, '"template" must not contain newlines');
-        if (!inj.template.includes("{}")) fail(iw, '"template" must contain the "{}" value placeholder');
-      }
+      if (inj.template !== undefined) assertHeaderTemplate(iw, "template", inj.template);
       let injectHosts: string[] | undefined;
       if (inj.hosts !== undefined) {
         injectHosts = asStringArray(iw, "hosts", inj.hosts);
@@ -2145,7 +2242,21 @@ export function parseConnector(
       } else {
         if (m.method !== undefined && typeof m.method !== "string") fail(opWhere, '"match.method" must be a string');
         if (m.path !== undefined && typeof m.path !== "string") fail(opWhere, '"match.path" must be a string');
-        match = { ...(typeof m.method === "string" ? { method: m.method } : {}), ...(typeof m.path === "string" ? { path: m.path } : {}) };
+        if (m.resourcePath !== undefined && typeof m.resourcePath !== "string") {
+          fail(opWhere, '"match.resourcePath" must be a string');
+        }
+        match = {
+          ...(typeof m.method === "string" ? { method: m.method } : {}),
+          ...(typeof m.path === "string" ? { path: m.path } : {}),
+          ...(typeof m.resourcePath === "string" ? { resourcePath: m.resourcePath } : {}),
+        };
+      }
+    }
+    if (op.template !== undefined) {
+      assertHeaderTemplate(opWhere, "template", op.template);
+      // One template cannot render two different headers.
+      if (credential.source !== "inject" || credential.injects.length !== 1 || !match || isGraphqlMatch(match)) {
+        fail(opWhere, '"template" needs an inject credential with one header and an HTTP match');
       }
     }
     let asset: AssetSpec | undefined;
@@ -2204,7 +2315,12 @@ export function parseConnector(
         ...(urlFallback ? { urlFallback } : {}),
       };
     }
-    return { grants, ...(match ? { match } : {}), ...(asset ? { asset } : {}) };
+    return {
+      grants,
+      ...(match ? { match } : {}),
+      ...(typeof op.template === "string" ? { template: op.template } : {}),
+      ...(asset ? { asset } : {}),
+    };
   });
 
   const display = parseDisplay(where, o.display, o.provider, opts.builtin === true);
@@ -2413,9 +2529,7 @@ export function parseConnector(
       if (typeof inj.header !== "string" || !HEADER_NAME_RE.test(inj.header)) {
         fail(uw, '"inject.header" must be a valid HTTP header name');
       }
-      if (typeof inj.template !== "string" || !inj.template.includes("{}") || /[\r\n]/.test(inj.template)) {
-        fail(uw, '"inject.template" must be a string containing the "{}" placeholder and no newlines');
-      }
+      assertHeaderTemplate(uw, "inject.template", inj.template);
       userInject = { header: inj.header, template: inj.template };
     }
     if (credential.source === "inject") {
@@ -2462,6 +2576,17 @@ export function parseConnector(
     graphqlEndpoint = "/graphql";
   }
 
+  let resourcePattern: string | undefined;
+  if (o.resourcePattern !== undefined) {
+    if (typeof o.resourcePattern !== "string") fail(where, '"resourcePattern" must be a string');
+    try {
+      new RegExp(o.resourcePattern);
+    } catch {
+      fail(where, '"resourcePattern" must be a regular expression');
+    }
+    resourcePattern = o.resourcePattern;
+  }
+
   const actions =
     o.actions !== undefined
       ? parseActionsFacet(where, o.actions, {
@@ -2483,6 +2608,7 @@ export function parseConnector(
     credential,
     hosts,
     ...(graphqlEndpoint ? { graphqlEndpoint } : {}),
+    ...(resourcePattern !== undefined ? { resourcePattern } : {}),
     operations,
     display,
     ...(cli ? { cli } : {}),
@@ -2533,6 +2659,21 @@ function loadFromDisk(): Map<string, Connector> {
 export function connectorRegistry(): Map<string, Connector> {
   if (cachedRegistry === null) cachedRegistry = loadFromDisk();
   return cachedRegistry;
+}
+
+/** Where a chat provider's card clicks arrive. The route mount and the
+ * public-path rule both read it. */
+export function interactivityPath(provider: string): string {
+  return `/api/v1/integrations/${provider}/interactivity`;
+}
+
+/** The ingress a built-in connector declares, if any. */
+export function declaredIngress(
+  provider: string,
+): { displayName: string; ingress: WebhookIngressSpec } | undefined {
+  const connector = connectorRegistry().get(provider);
+  const ingress = connector?.webhook?.ingress;
+  return connector && ingress ? { displayName: connector.display.name, ingress } : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -2647,8 +2788,27 @@ export function compileIntegrationPolicy(
     // a regional or self-hosted host is opened + injected onto, never a
     // hard-coded default the deployment does not use.
     const hosts = effectiveHosts(connector, resolveSettings(connector, grant.settings));
+    // ADR 0115: a user-scoped grant on a human compile (userSubjectId set)
+    // swaps the VALUE SOURCE to the launching user's sealed credential; the
+    // gating and the header shape are unchanged. Programmatic sessions never
+    // supply a subject, so they compile the org credential below.
+    const userScoped =
+      grant.userScoped === true &&
+      inputs?.userSubjectId !== undefined &&
+      connector.userCredential !== undefined;
+    if (resourceScopeError({ ...grant, userScoped }, registry) !== null) continue;
+    const resourceAware = isResourceAware(connector);
     for (const op of connector.operations) {
       if (!op.grants.includes(grant.operation)) continue;
+      const graphql = op.match !== undefined && isGraphqlMatch(op.match);
+      // A GraphQL operation has no path to hold to a resource.
+      const restGlobs =
+        graphql && resourceAware && grant.resourceConstraints.length > 0
+          ? null
+          : graphql
+            ? []
+            : grantPathGlobs(op.match as HttpMatch | undefined, grant.resourceConstraints, resourceAware);
+      if (restGlobs === null) continue;
       for (const h of hosts) grantedHosts.add(h);
       // ADR 0059: a GraphQL op gates `POST <graphqlEndpoint>` and is body-matched
       // by (operation, field); a REST op gates by (method, path glob). The path
@@ -2666,17 +2826,9 @@ export function compileIntegrationPolicy(
         graphql_field = op.match.field;
       } else {
         methods = op.match?.method ? [op.match.method.toUpperCase()] : [];
-        path_globs = op.match?.path ? [op.match.path] : [];
+        path_globs = restGlobs;
       }
 
-      // ADR 0115: a user-scoped grant on a human compile (userSubjectId set)
-      // swaps the VALUE SOURCE to the launching user's sealed credential; the
-      // gating and the header shape are unchanged. Programmatic sessions never
-      // supply a subject, so they compile the org credential below.
-      const userScoped =
-        grant.userScoped === true &&
-        inputs?.userSubjectId !== undefined &&
-        connector.userCredential !== undefined;
       const userMintSource = (): CredentialMintSourceJson => ({
         oauth_user: {
           user_id: inputs?.userSubjectId ?? "",
@@ -2695,7 +2847,7 @@ export function compileIntegrationPolicy(
           const entry: IntegrationInjectJson = {
             hosts: inj.hosts ?? hosts,
             header_name: inj.header,
-            header_template: inj.template ?? "{}",
+            header_template: op.template ?? inj.template ?? "{}",
             secret_ref: userScoped ? "" : (inj.secretRef ?? ""),
             mint_source: userScoped
               ? userMintSource()
@@ -2989,6 +3141,9 @@ export interface ProviderCatalogEntry {
    * decide this by hard-coding the one provider it knew was named.
    */
   connectionModel: "singleton" | "named";
+  /** Whether the connector declares webhook events, and actions. */
+  hasEvents: boolean;
+  hasActions: boolean;
   /** ADR 0115: user-scoped credential support, when declared. `tokenHint` is
    * the member-facing setup line for PAT mode. Drives the profile editor's
    * per-integration toggle and the Settings → Credentials cards. */
@@ -3040,6 +3195,8 @@ export function buildProviderCatalog(
       hosts: effectiveHosts(connector, resolveSettings(connector, settingsByProvider[connector.provider])),
       capabilities: [...byAction.values()],
       connectionModel: "singleton",
+      hasEvents: (connector.webhook?.events.length ?? 0) > 0,
+      hasActions: (connector.actions?.length ?? 0) > 0,
       ...(connector.userCredential
         ? {
             userCredential: {
@@ -3082,6 +3239,8 @@ export function buildProviderCatalog(
         ...(operation.endpointRule ? { endpointRule: operation.endpointRule } : {}),
       })),
       connectionModel: "named",
+      hasEvents: false,
+      hasActions: false,
     });
   }
   entries.sort((a, b) => a.provider.localeCompare(b.provider));

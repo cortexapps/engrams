@@ -1,32 +1,33 @@
-/** `relay_session` — mirror a session into a place (a Slack thread).
+/** `relay_session` — mirror a session into a place (a chat thread).
  *
  * Since contract 5 the relay is bound to the SESSION (`automations/
  * session-relay.ts`): this block installs it, or re-points an installed one
  * at the mention that starts a new turn, inside one checkpointed step, and
  * the run goes on (or ends). The automation consumer renders the session's
- * events into the thread from then on, with no run live. Slack is the only
- * provider so far; the config's `provider` enum is where the next one lands.
+ * events into the thread from then on, with no run live.
  */
 
 import { z } from "zod";
 
-import { makeSlackPolicy } from "../../../integrations/slack-policy.ts";
-import type { CommunicationPolicy, SourceMention } from "../../../workflows/communication-policy.ts";
-import { canonicalHandle } from "../../handles.ts";
+import { chatFor, defaultChatProvider, requireChat } from "../../../chat/registry.ts";
+import type { SourceMention } from "../../../workflows/communication-policy.ts";
 import { installSessionRelay } from "../../session-relay.ts";
 import { sessionRefSchema } from "../definition.ts";
 import type { RunContext } from "../context.ts";
 import { registerBlock, type BlockOutcome } from "./registry.ts";
 
-export { CHOICE_ID_PREFIX, SLACK_ANSWER_SIGNAL } from "../../session-relay.ts";
-
 export const RELAY_SESSION_TYPE = "relay_session";
 
-export const slackRelayConfigSchema = z.object({
+/** A registered chat provider. A config with none means the legacy default. */
+export const chatProviderSchema = z
+  .string()
+  .min(1)
+  .default(defaultChatProvider)
+  .refine((provider) => chatFor(provider) !== null, "not a chat provider");
+
+export const relayConfigSchema = z.object({
   session: sessionRefSchema,
-  /** The place the session is mirrored into. Slack is the only provider so
-   * far; the thread coordinates below are Slack's. */
-  provider: z.enum(["slack"]).default("slack"),
+  provider: chatProviderSchema,
   team: z.string().min(1),
   channel: z.string().min(1),
   /** The thread root ts (the mention that opened the thread). */
@@ -36,9 +37,9 @@ export const slackRelayConfigSchema = z.object({
   userId: z.string().min(1).optional(),
   eventId: z.string().min(1).optional(),
 });
-export type SlackRelayConfig = z.infer<typeof slackRelayConfigSchema>;
+export type RelayConfig = z.infer<typeof relayConfigSchema>;
 
-export function mentionFromRelayConfig(config: Omit<SlackRelayConfig, "session">): SourceMention {
+export function mentionFromRelayConfig(config: Omit<RelayConfig, "session">): SourceMention {
   return {
     team: config.team,
     channel: config.channel,
@@ -53,7 +54,7 @@ export function mentionFromRelayConfig(config: Omit<SlackRelayConfig, "session">
  * `run_agent`. */
 export async function installRelayForSession(
   sessionId: string,
-  config: Omit<SlackRelayConfig, "session">,
+  config: Omit<RelayConfig, "session">,
   ctx: RunContext,
 ): Promise<BlockOutcome> {
   const mention = mentionFromRelayConfig(config);
@@ -68,7 +69,7 @@ export async function installRelayForSession(
     return { kind: "error", code: "relay_store_unavailable", message: "the session relay store is not installed", retryable: false };
   }
   const { created, previous } = await installSessionRelay(
-    { sessionId, automationId: ctx.automationId, target: mention },
+    { sessionId, automationId: ctx.automationId, provider: config.provider, target: mention },
     { store },
   );
   // The place the session talks into is the workstream's: the handle
@@ -79,7 +80,7 @@ export async function installRelayForSession(
   // rebind and never a failed turn.
   let handle: string | undefined;
   if (ctx.instanceId !== "" && ctx.deps.instances?.recordInstanceHandle) {
-    handle = canonicalHandle("slack", `slack:${mention.channel}:${mention.threadRoot}`);
+    handle = requireChat(config.provider).threadHandle(mention);
     const result = await ctx.deps.instances.recordInstanceHandle({
       automationId: ctx.automationId,
       handle,
@@ -103,18 +104,11 @@ export async function installRelayForSession(
   };
 }
 
-/** A run-addressed Slack policy for the `slack_choice` card: its click is
- * the RUN's answer (the choice block waits for it), so `runId` rides the
- * route instead of a session id. */
-export function slackRelayPolicy(runId: string): CommunicationPolicy {
-  return makeSlackPolicy({ routeExtras: { runId } });
-}
-
-export function registerSlackRelayBlock(): void {
-  registerBlock<SlackRelayConfig>({
+export function registerRelayBlock(): void {
+  registerBlock<RelayConfig>({
     type: RELAY_SESSION_TYPE,
     outputs: ["session_id", "installed", "created", "mention_ts"],
-    configSchema: slackRelayConfigSchema,
+    configSchema: relayConfigSchema,
     async execute(config, ctx) {
       const sessionId = await ctx.resolveSession(config.session);
       return installRelayForSession(sessionId, config, ctx);

@@ -17,15 +17,9 @@ import {
   type IntegrationOpResult,
   type RunOpDeps,
 } from "../../integrations/run-op.ts";
-import { LinearError } from "../../integrations/linear-issues.ts";
 import { ownPath } from "../paths.ts";
 import { actionClientId } from "./client-id.ts";
-import {
-  BUILTIN_ACTIONS,
-  defaultBuiltinActionDeps,
-  type BuiltinActionDeps,
-  type BuiltinActionTable,
-} from "./builtin.ts";
+import { builtinActions, type BuiltinAction, type BuiltinActionDeps } from "./builtin.ts";
 import { IntegrationActionError, statusIsTransient } from "./errors.ts";
 
 type RunIntegrationOp = typeof defaultRunIntegrationOp;
@@ -48,7 +42,7 @@ export interface IntegrationActionCallContext {
 
 export interface ExecuteIntegrationActionDeps {
   runOp?: RunIntegrationOp;
-  builtins?: BuiltinActionTable;
+  builtins?: Map<string, BuiltinAction>;
   builtinDeps?: BuiltinActionDeps;
   connectors?: RunOpDeps["connectors"];
 }
@@ -213,7 +207,7 @@ export async function findAction(
   const registry = await loadRegistry(source);
   const connector = registry.get(provider);
   if (!connector) throw new IntegrationActionError(`unknown provider "${provider}"`, true);
-  const action = connector.actions?.find((a) => a.id === actionId);
+  const action = connector.actions?.find((a) => a.id === actionId || a.aliases?.includes(actionId));
   if (!action) {
     throw new IntegrationActionError(`provider "${provider}" has no action "${actionId}"`, true);
   }
@@ -252,12 +246,7 @@ export async function executeIntegrationAction(
 
   switch (action.execute.kind) {
     case "http": {
-      let params = config.params;
-      if (marker !== null) {
-        const guard = await commentMarkerGuard(runOp, config, action, marker);
-        if (guard.kind === "exists") return guard.outputs;
-        params = guard.params;
-      }
+      const params = config.params;
       const path = renderPathTemplate(action.execute.pathTemplate, params);
       const body =
         action.execute.bodyTemplate !== undefined
@@ -318,86 +307,25 @@ export async function executeIntegrationAction(
       return mapOutputs(action, parsed, { status: result.status });
     }
     case "builtin": {
-      const table = deps.builtins ?? BUILTIN_ACTIONS;
-      const fn = table[action.execute.id];
-      if (fn === undefined) {
+      const run = (deps.builtins ?? builtinActions()).get(action.execute.id);
+      if (run === undefined) {
         throw new IntegrationActionError(`builtin action "${action.execute.id}" is not implemented`, true);
       }
-      const builtinDeps =
-        deps.builtinDeps ?? defaultBuiltinActionDeps(deps.connectors ? { connectors: deps.connectors } : undefined);
+      const builtinDeps: BuiltinActionDeps =
+        deps.builtinDeps ?? (deps.connectors ? { runOpDeps: { connectors: deps.connectors } } : {});
       let result: Record<string, unknown>;
       try {
-        result = await fn(config.params, { runId: ctx.runId, stepPath: ctx.stepPath, marker }, builtinDeps);
+        result = await run(config.params, { runId: ctx.runId, stepPath: ctx.stepPath, marker }, builtinDeps);
       } catch (error) {
         if (error instanceof IntegrationActionError) throw error;
-        if (error instanceof LinearError) {
-          throw new IntegrationActionError(error.message, !error.retryable, error.status);
-        }
         throw new IntegrationActionError(
           error instanceof Error ? error.message : String(error),
-          // Unknown SDK failures default to permanent: a retry storm against a
-          // provider is worse than one failed run a person can re-run.
+          // An unknown client failure is permanent: a retry storm against a
+          // provider is worse than one failed run that a person can run again.
           true,
         );
       }
       return mapOutputs(action, result, result);
     }
   }
-}
-
-const SAFE_REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
-
-type MarkerGuardOutcome =
-  | { kind: "exists"; outputs: Record<string, unknown> }
-  | { kind: "proceed"; params: Record<string, unknown> };
-
-/** marker_comment for HTTP comment creators: pre-scan the newest 100 issue
- * comments for the marker; found → short-circuit with the existing comment's
- * mapped outputs; else append the marker to the body param. Actions without
- * comment-shaped params (repo + number + body) just get the marker appended —
- * the pre-scan is a crash-window optimization, not a correctness gate. That
- * second shape is also how a pinned comment survives an EDIT: an update
- * action carrying the same key marker rewrites the body with the marker
- * re-appended, so the next run's scan still finds the comment. */
-async function commentMarkerGuard(
-  runOp: RunIntegrationOp,
-  config: IntegrationActionConfigInput,
-  action: ActionSpec,
-  marker: string,
-): Promise<MarkerGuardOutcome> {
-  const repo = config.params["repo"];
-  const number = config.params["number"];
-  const body = config.params["body"];
-  const proceed = (): MarkerGuardOutcome => ({
-    kind: "proceed",
-    params: {
-      ...config.params,
-      ...(typeof body === "string" ? { body: `${body}\n\n${marker}` } : {}),
-    },
-  });
-  if (typeof repo !== "string" || !SAFE_REPO_RE.test(repo) || typeof number !== "number") {
-    return proceed();
-  }
-  const result = await runOp(config.provider, {
-    method: "GET",
-    path: `/repos/${repo}/issues/${number}/comments?per_page=100&sort=created&direction=desc`,
-    contentType: "application/json",
-  });
-  if (result.status >= 200 && result.status < 300) {
-    const parsed = decodeJson(result, `${config.provider}.${config.actionId} marker scan`);
-    if (Array.isArray(parsed)) {
-      for (const comment of parsed) {
-        const record = comment as { body?: unknown };
-        if (typeof record.body === "string" && record.body.includes(marker)) {
-          return {
-            kind: "exists",
-            outputs: mapOutputs(action, comment as Record<string, unknown>, {
-              status: result.status,
-            }),
-          };
-        }
-      }
-    }
-  }
-  return proceed();
 }

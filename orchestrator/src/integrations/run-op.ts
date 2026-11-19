@@ -106,6 +106,14 @@ async function credentialSpec(
   };
 }
 
+/** The connector's host comes from a setting that no admin has set. */
+export class ConnectorHostUnsetError extends Error {
+  constructor(provider: string) {
+    super(`connector "${provider}" has no host`);
+    this.name = "ConnectorHostUnsetError";
+  }
+}
+
 async function resolveConnector(provider: string, deps?: RunOpDeps): Promise<Connector> {
   const source = deps?.connectors ?? makeConnectorStore(getDb());
   const registry = await loadRegistry(source);
@@ -121,7 +129,7 @@ async function connectorHost(c: Connector, deps?: RunOpDeps): Promise<string> {
   const settingsFor = deps?.settingsFor ?? defaultSettingsFor;
   const stored = (c.settings ?? []).length > 0 ? await settingsFor(c.provider) : {};
   const host = effectiveHosts(c, resolveSettings(c, stored))[0];
-  if (!host) throw new Error(`connector "${c.provider}" has no host`);
+  if (!host) throw new ConnectorHostUnsetError(c.provider);
   return host;
 }
 

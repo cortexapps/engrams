@@ -27,8 +27,8 @@ pub use clock::{Clock, Entropy, OsEntropy, SystemClock};
 pub use cloud::CloudBackend;
 pub use host_client::{HostClient, SessionFence};
 pub use integration::{
-    default_inject_header, CredentialHint, InjectHeader, Integration, MintFieldKind,
-    MintFieldSchema, MintKindDescriptor, ResolvedFields, ScopedCredential,
+    default_inject_header, render_header_template, CredentialHint, InjectHeader, Integration,
+    MintFieldKind, MintFieldSchema, MintKindDescriptor, ResolvedFields, ScopedCredential,
 };
 pub use metadata::{
     CreateDisposition, DisableEnabledImageOutcome, ExecLifecycleEventKind, ExecOutputStream,

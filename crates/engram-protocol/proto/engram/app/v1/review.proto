@@ -76,8 +76,7 @@ message Review {
   // rename can move out from under a client, and a reused repo name can even
   // point two different pull requests at it.
   string target_id = 24;
-  // PR: which forge this came from. "github" today. Named for the concept rather
-  // than the vendor, so a second forge needs no field rename here.
+  // PR: the provider name of the forge this came from.
   string provider = 25;
   // PR: the forge's own stable id — the identity, and the only field a rename or
   // a transfer cannot move. Unset on a record that predates the change table, and
@@ -97,6 +96,11 @@ message Review {
   // graph drove). The product links here to the platform: Automations →
   // PR review → Activity opens the run's trace.
   optional string automation_run_id = 30;
+  // The review as the forge shows it, when one was posted and the pull
+  // request has a URL.
+  optional string posted_review_url = 31;
+  // The automation that `automation_run_id` is a run of. GetReview only.
+  optional string automation_id = 32;
 }
 
 // Per-severity finding counts for the list page.
@@ -114,7 +118,7 @@ message ReviewFinding {
   string path = 3;
   optional int32 start_line = 4;
   optional int32 end_line = 5;
-  // "LEFT" | "RIGHT" (GitHub diff side), when line-anchored.
+  // "LEFT" | "RIGHT": the side of the diff, when the finding has a line.
   optional string side = 6;
   // security-privacy | stability-availability | data-integrity-integration |
   // functional-correctness | performance-scalability | maintainability-quality
@@ -137,6 +141,9 @@ message ReviewFinding {
   optional string resolution = 17;
   string session_id = 18;
   google.protobuf.Timestamp created_at = 19;
+  // The finding's file on the forge at the commit the pass read, at the
+  // finding's lines. Absent when the pull request has no URL.
+  optional string file_url = 20;
 }
 
 // The verifier's judgment on one finding.

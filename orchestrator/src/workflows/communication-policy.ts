@@ -1,26 +1,23 @@
 /**
- * The per-source communication seam (ADR 0060 §Communication policy, P1.4;
- * since ADR 0119 phase 4.8 the relay block is its only driver).
+ * How a session is rendered into a chat thread (ADR 0060, ADR 0119).
  *
- * "Where does this go" is CODE, not config. The relay block (the framework)
- * owns event classification, the per-turn ⏳/✅ ledger, and outbound
- * replay-dedupe (DBOS step checkpoints). A `CommunicationPolicy` owns ONLY
- * the provider mechanics — how an ack, a question, an asset, a summary, or a
- * failure is rendered on the source. Slack is the only impl; Linear/Jira are
- * designed-for. The thread's prompt (the fold of its new messages) is the
- * built-in's own `list_replies` + Code block, not a policy method.
+ * The session relay owns event classification, the per-turn reaction
+ * ledger and the render state. A `CommunicationPolicy` owns only the
+ * provider mechanics: how an ack, a question, an asset, a summary or a
+ * failure appears in the thread. Each chat provider (`chat/chat.ts`) has one.
  *
- * This module is framework-side and DBOS-free: the interface, the pure
- * event-routing decision the relay makes per event, and the source types.
+ * This module is DBOS-free: the interface, the pure routing decision the
+ * relay makes for each event, and the source types.
  */
 
 import type { CuratedEvent } from "../control-plane/session-events.ts";
 import { AnswersSchema, QuestionsSchema } from "../tools/builtin.ts";
 
 /**
- * An `@mention` — the turn's anchor on the source. The provider-shaped
- * fields are opaque to the framework; only the source's `CommunicationPolicy`
- * interprets them. Shape matches the Slack events handler (ADR 0060 §handler).
+ * The message a turn answers: its workspace, channel and thread, and the
+ * message itself. The values are the provider's own ids; only its
+ * `CommunicationPolicy` reads them. The field names are stored in
+ * `automation_session_relay.target`.
  */
 export interface SourceMention {
   team: string;
@@ -62,12 +59,9 @@ export interface ClosingSummary {
   assets: AssetSummary[];
 }
 
-/**
- * The provider seam. Every method is invoked by the framework as a checkpointed
- * DBOS step, so a completed effect is never re-run on replay. `onUserQuestion`
- * returns a provider message ref (e.g. a Slack `ts`) the framework holds in
- * workflow-local state to later update via `onAnswered`.
- */
+/** What a chat provider renders for a relayed session. `onUserQuestion`
+ * returns the provider's message ref; the relay keeps it and passes it to
+ * `onAnswered`. */
 export interface CommunicationPolicy {
   /** The session started (Slack: a link message into the thread). */
   onStarted(m: SourceMention, session: StartedSession): Promise<void>;
@@ -175,7 +169,7 @@ export function routeSessionEvent(
   }
 }
 
-/** Match and validate the one session-handled generic tool Slack presents. */
+/** Match and validate the one session-handled generic tool a chat provider presents. */
 function parseGenericQuestionRequest(payloadJson: string): string | undefined {
   try {
     const payload = JSON.parse(payloadJson) as {

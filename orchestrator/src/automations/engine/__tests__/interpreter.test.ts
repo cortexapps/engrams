@@ -328,8 +328,8 @@ function makeHarness(
   if (options.prRefs) {
     const refs = options.prRefs;
     deps.prRefs = {
-      async getByPr(repo, prNumber) {
-        return refs[`${repo}#${prNumber}`] ?? null;
+      async getByPr(provider, repo, prNumber) {
+        return provider === "github" ? (refs[`${repo}#${prNumber}`] ?? null) : null;
       },
     };
   }

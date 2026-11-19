@@ -81,7 +81,8 @@ function harness(run: AutomationRunRow | null) {
   const admitted: Array<{ runId: string; deliveryKey: string; trigger: unknown }> = [];
   const started: string[] = [];
   const store = {
-    getByBuiltinKey: async () => (run ? (builtin() as never) : (builtin() as never)),
+    get: async () => builtin() as never,
+    getByBuiltinKey: async () => builtin() as never,
     getRun: async () => run,
     insertRun: async (input: { id: string; deliveryKey: string | null; trigger: unknown }) => {
       admitted.push({ runId: input.id, deliveryKey: input.deliveryKey ?? "", trigger: input.trigger });
@@ -115,7 +116,7 @@ function harness(run: AutomationRunRow | null) {
 describe("retryAutomationReview", () => {
   test("admits a fresh built-in run with a retry: delivery key and the original trigger payload", async () => {
     const h = harness(originalRun());
-    const runId = await retryAutomationReview("autorun:b1:github:d1", h.deps);
+    const runId = await retryAutomationReview("autorun:b1:github:d1", "github", h.deps);
     // Bound to the PR's workstream (ADR 0120), opened by the key template.
     expect(runId).toBe("autorun:b1:main:i-ai_pr:retry:uuid-1");
     expect(h.opened).toEqual([{ key: "engrams/engrams#7", openedBy: "review:retry:uuid-1" }]);
@@ -129,16 +130,24 @@ describe("retryAutomationReview", () => {
     expect(h.started).toEqual([runId]);
   });
 
+  test("refuses a review that another automation wrote", async () => {
+    const h = harness({ ...originalRun(), automationId: "user-automation" });
+    await expect(retryAutomationReview("autorun:b1:github:d1", "github", h.deps)).rejects.toThrow(
+      /another automation wrote this review/,
+    );
+    expect(h.admitted).toEqual([]);
+  });
+
   test("throws when the original run no longer exists", async () => {
     const h = harness(null);
-    await expect(retryAutomationReview("gone", h.deps)).rejects.toBeInstanceOf(RetryAutomationError);
+    await expect(retryAutomationReview("gone", "github", h.deps)).rejects.toBeInstanceOf(RetryAutomationError);
   });
 });
 
 describe("dispatchAutomationReview", () => {
   test("admits a built-in run under review.dispatch with a coordinate-only payload", async () => {
     const h = harness(null);
-    const runId = await dispatchAutomationReview({ repo: "engrams/engrams", prNumber: 42 }, h.deps);
+    const runId = await dispatchAutomationReview({ provider: "github", repo: "engrams/engrams", prNumber: 42 }, h.deps);
     expect(runId).toBe("autorun:b1:main:i-ai_pr:dispatch:uuid-1");
     expect(h.opened).toEqual([{ key: "engrams/engrams#42", openedBy: "review:dispatch:uuid-1" }]);
     expect(h.admitted).toHaveLength(1);
@@ -158,7 +167,7 @@ describe("dispatchAutomationReview", () => {
 });
 
 describe("stopAutomationReview", () => {
-  const coordinate = { repo: "engrams/engrams", prNumber: 7 };
+  const coordinate = { provider: "github", repo: "engrams/engrams", prNumber: 7 };
   function stopHarness(options: { active?: { automationRunId: string | null } | null; runStatus?: string }) {
     const sent: Array<{ runId: string; message: unknown; key: string }> = [];
     const deps = {

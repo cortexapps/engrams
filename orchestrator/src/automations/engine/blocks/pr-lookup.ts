@@ -11,9 +11,12 @@
 
 import { z } from "zod";
 
+import { defaultForgeProvider } from "../../../forges/registry.ts";
 import { registerBlock } from "./registry.ts";
 
 export const lookupPrSessionConfigSchema = z.object({
+  /** The forge's connector provider. */
+  provider: z.string().min(1).default(defaultForgeProvider),
   /** owner/name, templated (e.g. `${{ event.raw.repository.full_name }}`). */
   repo: z.string().min(1).max(300),
   /** Usually a `$ref` to the event's PR number. */
@@ -36,7 +39,7 @@ export function registerPrLookupBlock(): void {
           retryable: false,
         };
       }
-      const ref = await prRefs.getByPr(config.repo, config.prNumber);
+      const ref = await prRefs.getByPr(config.provider, config.repo, config.prNumber);
       if (!ref) {
         return {
           kind: "ok",

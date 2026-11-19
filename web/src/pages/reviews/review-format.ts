@@ -12,7 +12,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 
-import type { Review, ReviewEvent, ReviewFinding } from "../../gen/engram/app/v1/review_pb";
+import type { Review, ReviewEvent } from "../../gen/engram/app/v1/review_pb";
 
 /**
  * Review vocabulary — the same grammar the session glyphs use (shape carries the
@@ -149,50 +149,6 @@ export function isHumanTrigger(review: Pick<Review, "humanTrigger">): boolean {
  */
 export function prTitleOf(review: Review): string | undefined {
   return review.prTitle && review.prTitle.trim() !== "" ? review.prTitle : undefined;
-}
-
-/**
- * GitHub's own URL when we have it, and the coordinate otherwise.
- *
- * The stored URL is preferred because `repo` is a mutable name: after a rename
- * the reconstructed link only works while GitHub still redirects, and the stored
- * one is what GitHub itself last handed us.
- */
-export function prUrl(review: Review): string {
-  return review.prUrl || `https://github.com/${review.repo}/pull/${review.prNumber}`;
-}
-
-/** Deep link to the formal review engrams posted, when it posted one. */
-export function postedReviewUrl(review: Review): string | undefined {
-  if (!review.githubReviewId) return undefined;
-  return `${prUrl(review)}#pullrequestreview-${review.githubReviewId}`;
-}
-
-/**
- * The code a finding is about, at the commit the pass actually read.
- *
- * Pinned to `headSha` rather than the branch: the branch has almost certainly
- * moved on, and a finding pointing at lines that have since shifted is worse than
- * no link at all. Deciding whether a finding is real means looking at the code, so
- * this is the one link the surface cannot do without.
- */
-export function blobUrl(review: Review, finding: ReviewFinding): string {
-  // Escape each segment but keep the separators: `src/foo#bar.ts` is a valid git
-  // path, and unescaped it turns `#bar.ts` into the URL fragment — so the link
-  // opens the wrong file AND loses the line anchor. `?` does the same.
-  const path = finding.path.split("/").map(encodeURIComponent).join("/");
-  const base = `https://github.com/${review.repo}/blob/${review.headSha}/${path}`;
-  const start = finding.startLine;
-  const end = finding.endLine;
-  if (start && end && start !== end) return `${base}#L${start}-L${end}`;
-  const line = end ?? start;
-  return line ? `${base}#L${line}` : base;
-}
-
-/** The inline conversation a posted finding became, when it reached the PR. */
-export function threadUrl(review: Review, finding: ReviewFinding): string | undefined {
-  if (!finding.githubThreadId) return undefined;
-  return `${prUrl(review)}#discussion_r${finding.githubThreadId}`;
 }
 
 /**

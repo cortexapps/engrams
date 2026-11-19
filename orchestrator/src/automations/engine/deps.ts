@@ -10,7 +10,7 @@ import type { AutomationInbox } from "./inbox.ts";
 import type { RunSnapshot } from "./context.ts";
 import type { SessionRelayStore } from "../../db/session-relays.ts";
 import type { SourceMention } from "../../workflows/communication-policy.ts";
-import type { DecisionsRequest, DecisionsResponse } from "../../integrations/openrouter-decisions.ts";
+import type { DecisionsRequest, DecisionsResponse } from "../../model-routers/decisions.ts";
 import type { ProfileCard } from "../profile-cards.ts";
 
 /** DBOS.runStep, injected. Retries are an ENGINE loop (attempt-scoped step
@@ -252,7 +252,7 @@ export interface EngineInstanceOps {
 /** PR → authoring-session lookup (the pr_ref ledger the link consumer
  * maintains). Read-only; the `lookup_pr_session` block's seam. */
 export interface EnginePrRefLookup {
-  getByPr(repo: string, prNumber: number): Promise<{
+  getByPr(provider: string, repo: string, prNumber: number): Promise<{
     sessionId: string;
     taskId: string | null;
     headBranch: string;
@@ -261,12 +261,11 @@ export interface EnginePrRefLookup {
   } | null>;
 }
 
-/** The decide block's seam: the OpenRouter Decisions API in production, a
- * fake in tests and the simulator. */
+/** The decide block's seam: a connected model router in production, a fake
+ * in tests and the simulator. */
 export interface DecisionsRuntime {
-  /** Whether the org has an OpenRouter key (isRouterConnected). */
-  connected(): Promise<boolean>;
-  decide(request: DecisionsRequest): Promise<DecisionsResponse>;
+  /** Null when no connected model router has a decision model. */
+  decide(request: DecisionsRequest): Promise<DecisionsResponse | null>;
 }
 
 export interface EngineDeps {
@@ -288,7 +287,7 @@ export interface EngineDeps {
   /** Tell the relayed place a NEW session started (the link into the
    * thread). The agent step calls it once per session it starts. Absent =
    * silent. */
-  announceStarted?(sessionId: string, target: SourceMention): Promise<void>;
+  announceStarted?(sessionId: string, provider: string, target: SourceMention): Promise<void>;
   prRefs?: EnginePrRefLookup;
   code?: CodeBlockRuntime;
   integrationActions?: IntegrationActionRuntime;

@@ -2477,13 +2477,15 @@ fn thread_params() -> Value {
 }
 
 async fn write_router_config(runtime_home: &Path) -> Result<(), String> {
+    let router = std::env::var("ENGRAM_MODEL_ROUTER_ID")
+        .map_err(|_| "routed Codex launch is missing ENGRAM_MODEL_ROUTER_ID".to_string())?;
     let model = std::env::var("ENGRAM_MODEL_ROUTER_MODEL")
         .map_err(|_| "routed Codex launch is missing ENGRAM_MODEL_ROUTER_MODEL".to_string())?;
     let base_url = std::env::var("ENGRAM_MODEL_ROUTER_BASE_URL")
         .map_err(|_| "routed Codex launch is missing ENGRAM_MODEL_ROUTER_BASE_URL".to_string())?;
     let helper =
         std::env::current_exe().map_err(|e| format!("resolve router credential helper: {e}"))?;
-    let config = router_config(&model, &base_url, &helper.to_string_lossy());
+    let config = router_config(&router, &model, &base_url, &helper.to_string_lossy())?;
     let path = runtime_home.join("config.toml");
     tokio::fs::write(&path, config)
         .await
@@ -2498,14 +2500,29 @@ async fn write_router_config(runtime_home: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn router_config(model: &str, base_url: &str, helper: &str) -> String {
+/// The Codex config for a routed session. The provider id is the router's
+/// own id (`openrouter`, `litellm`): Codex records it in each thread's
+/// rollout, and a resumed thread keeps the id it started with.
+fn router_config(
+    router: &str,
+    model: &str,
+    base_url: &str,
+    helper: &str,
+) -> Result<String, String> {
+    let valid_id = !router.is_empty()
+        && router
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+    if !valid_id {
+        return Err(format!("invalid model router id {router:?}"));
+    }
     let quote = |value: &str| serde_json::to_string(value).expect("string JSON cannot fail");
-    format!(
-        "model = {}\nmodel_provider = \"openrouter\"\n\n[model_providers.openrouter]\nname = \"OpenRouter\"\nbase_url = {}\nwire_api = \"responses\"\n\n[model_providers.openrouter.auth]\ncommand = {}\nargs = [\"__model-router-token\"]\ntimeout_ms = 5000\nrefresh_interval_ms = 0\n",
-        quote(model),
-        quote(base_url),
-        quote(helper),
-    )
+    Ok(format!(
+        "model = {model}\nmodel_provider = \"{router}\"\n\n[model_providers.{router}]\nname = \"Model router\"\nbase_url = {base_url}\nwire_api = \"responses\"\n\n[model_providers.{router}.auth]\ncommand = {helper}\nargs = [\"__model-router-token\"]\ntimeout_ms = 5000\nrefresh_interval_ms = 0\n",
+        model = quote(model),
+        base_url = quote(base_url),
+        helper = quote(helper),
+    ))
 }
 
 async fn persist_thread_id(path: &Path, id: &str) -> Result<(), String> {
@@ -2533,19 +2550,30 @@ mod tests {
 
     #[test]
     fn routed_provider_config_uses_responses_and_command_auth() {
-        for host in ["openrouter.ai", "us.openrouter.ai", "eu.openrouter.ai"] {
-            let base_url = format!("https://{host}/api/v1");
+        for (router, base_url) in [
+            ("openrouter", "https://openrouter.ai/api/v1"),
+            ("litellm", "https://llm.example.com/v1"),
+        ] {
             let config = router_config(
+                router,
                 "deepseek/deepseek-v4-pro-0813",
-                &base_url,
+                base_url,
                 "/sbin/engram-harness-codex",
-            );
-            assert!(config.contains("model_provider = \"openrouter\""));
+            )
+            .unwrap();
+            // The provider id is the router's own, so a thread a previous
+            // harness started under `openrouter` resumes under the same id.
+            assert!(config.contains(&format!("model_provider = \"{router}\"")));
+            assert!(config.contains(&format!("[model_providers.{router}]")));
+            assert!(config.contains(&format!("[model_providers.{router}.auth]")));
             assert!(config.contains("wire_api = \"responses\""));
             assert!(config.contains("command = \"/sbin/engram-harness-codex\""));
             assert!(config.contains("args = [\"__model-router-token\"]"));
             assert!(!config.contains("router-secret"));
             assert!(config.contains(&format!("base_url = \"{base_url}\"")));
+        }
+        for router in ["", "Open Router", "a]b", "x.y"] {
+            assert!(router_config(router, "m", "https://r.example/v1", "/h").is_err());
         }
     }
 

@@ -132,7 +132,6 @@ describe("parseConnector", () => {
       {
         ...githubRaw,
         webhook: {
-          verificationScheme: "github_hmac_sha256",
           events: [{ key: "issues.opened", label: "Issue opened" }],
           aliases: [
             { path: "issue.title", alias: "issue.title" },
@@ -143,7 +142,6 @@ describe("parseConnector", () => {
       "github",
     );
     expect(c.webhook).toEqual({
-      verificationScheme: "github_hmac_sha256",
       events: [{ key: "issues.opened", label: "Issue opened" }],
       aliases: [
         { path: "issue.title", alias: "issue.title" },
@@ -158,21 +156,19 @@ describe("parseConnector", () => {
         {
           ...githubRaw,
           webhook: {
-            verificationScheme: "module_ref",
-            events: [],
+            events: "issues.opened",
             aliases: [],
             mapper: "./mapper.ts",
           },
         },
         "custom",
       ),
-    ).toThrow(/verificationScheme/);
+    ).toThrow(/webhook.events/);
 
     const withModuleReference = parseConnector(
       {
         ...githubRaw,
         webhook: {
-          verificationScheme: "github_hmac_sha256",
           events: [],
           aliases: [],
           mapper: "./mapper.ts",
@@ -180,18 +176,13 @@ describe("parseConnector", () => {
       },
       "custom",
     );
-    expect(Object.keys(withModuleReference.webhook ?? {}).sort()).toEqual([
-      "aliases",
-      "events",
-      "verificationScheme",
-    ]);
+    expect(Object.keys(withModuleReference.webhook ?? {}).sort()).toEqual(["aliases", "events"]);
 
     expect(() =>
       parseConnector(
         {
           ...githubRaw,
           webhook: {
-            verificationScheme: "github_hmac_sha256",
             events: [],
             aliases: [{ path: "issue.title", alias: "raw.issue" }],
           },
@@ -206,7 +197,6 @@ describe("parseConnector", () => {
           {
             ...githubRaw,
             webhook: {
-              verificationScheme: "github_hmac_sha256",
               events: [],
               aliases: [{ path: "issue.title", alias }],
             },
@@ -221,7 +211,6 @@ describe("parseConnector", () => {
         {
           ...githubRaw,
           webhook: {
-            verificationScheme: "github_hmac_sha256",
             events: [{ key: `issue.${"x".repeat(200)}`, label: "Too long" }],
             aliases: [],
           },
@@ -235,7 +224,6 @@ describe("parseConnector", () => {
         {
           ...githubRaw,
           webhook: {
-            verificationScheme: "github_hmac_sha256",
             events: [],
             aliases: [
               { path: "issue", alias: "issue" },
@@ -457,6 +445,68 @@ describe("compileIntegrationPolicy", () => {
     ]);
   });
 
+  test("an operation's own template replaces the credential's on its path", () => {
+    const policy = compileIntegrationPolicy(
+      ["gitlab:repository:read", "gitlab:repository:write"],
+      connectorRegistry(),
+    );
+    const templateFor = (method: string, path: string) =>
+      policy.injects.find((i) => i.methods.includes(method) && i.path_globs.includes(path))
+        ?.header_template;
+    // Git over HTTPS takes the token as a Basic password; the REST API as a bearer.
+    expect(templateFor("GET", "path-query:/*.git/info/refs?service=git-upload-pack")).toBe("Basic {basic:oauth2}");
+    expect(templateFor("POST", "path-query:/*.git/git-receive-pack")).toBe("Basic {basic:oauth2}");
+    expect(templateFor("GET", "segment-id:/api/v4/projects/*/repository/**")).toBe("Bearer {}");
+    expect(policy.injects.every((i) => i.secret_ref === "gitlab.api_token")).toBe(true);
+
+    // A read grant alone opens fetch and not push.
+    const readOnly = compileIntegrationPolicy(["gitlab:repository:read"], connectorRegistry());
+    expect(readOnly.injects.some((i) => i.path_globs.includes("path-query:/*.git/git-upload-pack"))).toBe(true);
+    expect(readOnly.injects.some((i) => i.path_globs.some((p) => p.includes("receive-pack")))).toBe(false);
+  });
+
+  test("Azure DevOps sends its token as a Basic password on the API and on git", () => {
+    const policy = compileIntegrationPolicy(["azure_devops:code:read"], connectorRegistry());
+    expect(policy.injects.map((i) => [i.methods[0], i.path_globs[0]])).toEqual([
+      ["GET", "/*/_apis/git/*"],
+      ["GET", "path-query:/*/_git/*/info/refs?service=git-upload-pack"],
+      ["POST", "path-query:/*/_git/*/git-upload-pack"],
+      ["GET", "/*/_apis/projects*"],
+    ]);
+    for (const inject of policy.injects) {
+      expect(inject).toMatchObject({
+        hosts: ["dev.azure.com"],
+        header_name: "Authorization",
+        header_template: "Basic {basic:}",
+        secret_ref: "azure_devops.pat",
+      });
+    }
+  });
+
+  test("a template names the secret as {} or {basic:USER}, and only on an inject connector's HTTP match", () => {
+    const withOp = (operation: Record<string, unknown>, raw: Record<string, unknown> = datadogRaw) =>
+      parseConnector({ ...raw, operations: [operation] }, "t");
+    const op = { grants: ["x"], match: { method: "GET", path: "/x" } };
+    const oneHeader = datadogRaw;
+    const twoHeaders = {
+      ...datadogRaw,
+      credential: {
+        source: "inject",
+        injects: [...datadogRaw.credential.injects, { header: "DD-APPLICATION-KEY", secretRef: "datadog-app-key" }],
+      },
+    };
+    expect(() => withOp({ ...op, template: "Basic {basic:}" }, oneHeader)).not.toThrow();
+    // One template cannot render two headers.
+    expect(() => withOp({ ...op, template: "Basic {basic:}" }, twoHeaders)).toThrow(/one header/);
+    expect(() => withOp({ ...op, template: "Basic token" }, oneHeader)).toThrow(/value placeholder/);
+    expect(() => withOp({ ...op, template: "{basic:a:b}" }, oneHeader)).toThrow(/value placeholder/);
+    expect(() => withOp({ ...op, template: "{basic:a:b} {}" }, oneHeader)).toThrow(/value placeholder/);
+    expect(() => withOp({ ...op, template: "{basic:u {}" }, oneHeader)).toThrow(/value placeholder/);
+    expect(() => withOp({ ...op, template: "{}\r\nX: y" }, oneHeader)).toThrow(/newlines/);
+    expect(() => withOp({ grants: ["x"], template: "{}" }, oneHeader)).toThrow(/HTTP match/);
+    expect(() => withOp({ ...op, template: "{}" }, githubRaw)).toThrow(/inject credential/);
+  });
+
   test("an oauth-facet connector compiles to a brokered-source inject (ADR 0106 addendum)", () => {
     const linearRaw = {
       provider: "linear",
@@ -492,10 +542,10 @@ describe("compileIntegrationPolicy", () => {
     expect(policy.network.allow_hosts).toEqual(["api.linear.app"]);
   });
 
-  test("the resource suffix is ignored for inject gating", () => {
-    const a = compileIntegrationPolicy(["datadog:logs:read"], reg);
-    const b = compileIntegrationPolicy(["datadog:logs:read@idx-1"], reg);
-    expect(b).toEqual(a);
+  test("a resource that a static key cannot be held to compiles no inject", () => {
+    const policy = compileIntegrationPolicy(["datadog:logs:read@idx-1"], reg);
+    expect(policy.injects).toEqual([]);
+    expect(policy.network.allow_hosts).toEqual([]);
   });
 
   test("a mint capability compiles to a minted inject (ADR 0056 amendment)", () => {
@@ -729,7 +779,7 @@ describe("on-disk registry", () => {
     expect(reg.get("datadog")!.credential.source).toBe("inject");
     expect(reg.get("github")!.credential.source).toBe("mint");
     expect(reg.get("github")!.webhook?.events.some((event) => event.key === "issues.opened")).toBe(true);
-    expect(reg.get("slack")!.webhook?.verificationScheme).toBe("slack_v0");
+    expect(reg.get("slack")!.webhook?.ingress?.secretRef).toBe("slack.signing_secret");
   });
 
   // ADR 0115: the shipped user-scoped facets survive the parse invariants —
@@ -1942,9 +1992,9 @@ describe("the shipped vanta connector", () => {
     expect(c.test?.path).toBe("/v1/organization");
   });
 
-  test("webhooks verify with the Svix scheme and every event has a fixture", () => {
+  test("webhooks name the signing secret and every event has a fixture", () => {
     const c = connectorRegistry().get("vanta")!;
-    expect(c.webhook?.ingress).toEqual({ scheme: "svix_hmac_sha256", secretRef: "vanta.webhook_secret" });
+    expect(c.webhook?.ingress).toEqual({ secretRef: "vanta.webhook_secret" });
     const keys = c.webhook!.events.map((e) => e.key);
     expect(keys).toContain("questionnaire.status-changed");
     expect(keys).toContain("trust-center.access-request.received");

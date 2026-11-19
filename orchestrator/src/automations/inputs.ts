@@ -15,6 +15,7 @@
  *     schema rejects fail the run BEFORE the walk, never inside it.
  */
 
+import { SAFE_REPO_PATH } from "../forges/forge.ts";
 import type { InputFieldSpec } from "./engine/definition.ts";
 
 export interface InputValueError {
@@ -48,7 +49,7 @@ export function rangeMessage(value: number, min?: number, max?: number): string 
 }
 
 /** A map whose rows are one scalar each (`valueShape: {type: "string"}` —
- * the Slack threads built-in's channel → profile map), as the row's field
+ * the chat-threads built-in's channel → profile map), as the row's field
  * spec; null for an object-shaped map. Same projection as the web's
  * mapScalarField. */
 export function mapScalarField(spec: InputFieldSpec): ValueFieldSpec | null {
@@ -93,26 +94,29 @@ export function listElementField(spec: InputFieldSpec): ValueFieldSpec {
 }
 
 const MAP_KEY_RE: Record<NonNullable<InputFieldSpec["keyNoun"]>, RegExp> = {
-  // owner/repo, GitHub's own character set.
-  repository: /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/,
-  // Slack channel ids (C…/G…/D…) or a #name.
-  channel: /^(?:[CGD][A-Z0-9]{8,}|#[a-z0-9_-]+)$/,
+  // A path of two or more names: every forge's repository has one.
+  repository: SAFE_REPO_PATH,
+  // A chat provider's own id or name for a channel.
+  channel: /^\S+$/,
   // Linear team keys are short uppercase identifiers.
   team: /^[A-Z][A-Z0-9]{1,9}$/,
 };
 
-export function isValidMapKey(noun: InputFieldSpec["keyNoun"], key: string): boolean {
+type KeySpec = Pick<InputFieldSpec, "keyNoun" | "keyHint">;
+
+export function isValidMapKey(spec: KeySpec, key: string): boolean {
   if (!key.trim()) return false;
-  if (!noun) return true;
-  return MAP_KEY_RE[noun].test(key.trim());
+  if (!spec.keyNoun) return true;
+  return MAP_KEY_RE[spec.keyNoun].test(key.trim());
 }
 
-export function mapKeyHint(noun: InputFieldSpec["keyNoun"]): string {
-  switch (noun) {
+export function mapKeyHint(spec: KeySpec): string {
+  if (spec.keyHint) return spec.keyHint;
+  switch (spec.keyNoun) {
     case "repository":
-      return "owner/repo";
+      return "repository path (owner/repo)";
     case "channel":
-      return "channel id (C…) or #name";
+      return "channel";
     case "team":
       return "team key (e.g. ENG)";
     default:
@@ -227,12 +231,12 @@ export function validateInputValues(
         const fields = mapValueFields(spec);
         const scalar = mapScalarField(spec);
         for (const [rowKey, row] of Object.entries(value)) {
-          if (!isValidMapKey(spec.keyNoun, rowKey)) {
+          if (!isValidMapKey(spec, rowKey)) {
             errors.push({
               key: spec.key,
               path: rowKey,
               code: "map_key",
-              message: `not a valid ${mapKeyHint(spec.keyNoun)}`,
+              message: `not a valid ${mapKeyHint(spec)}`,
             });
             continue;
           }

@@ -8,6 +8,7 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 
 import { invalidateRegistry } from "../../../connectors/registry.ts";
+import type { SlackChatClient } from "../../../providers/slack/actions.ts";
 import type { BuiltinActionDeps } from "../builtin.ts";
 import { IntegrationActionError } from "../errors.ts";
 import { makeIntegrationActionRuntime } from "../runtime.ts";
@@ -43,36 +44,25 @@ function fakeLedger(preOwned: Record<string, string> = {}) {
 function slackPostDeps(ledger: ReturnType<typeof fakeLedger>) {
   const posts: Array<{ channel: string; text: string; thread_ts?: string }> = [];
   // slack.post_message is a builtin execution: it talks through the bot-token
-  // slack client seam, not the generic HTTP op. Built from scratch (the
-  // execute.test.ts precedent) so a test only reaches seams it provides.
-  const builtinDeps: BuiltinActionDeps = {
-    runOp: async () => {
-      throw new Error("not used by slack.post_message");
-    },
-    githubPoster: () => {
-      throw new Error("not used");
-    },
-    linearClient: () => {
-      throw new Error("not used");
-    },
-    slackClient: async () => ({
-      chat: {
-        postMessage: async (args) => {
-          posts.push(args);
-          return { ts: "1724.200", channel: "C1" };
-        },
-        update: async () => {
-          throw new Error("not used");
-        },
+  // slack client seam, not the generic HTTP op.
+  const slack: SlackChatClient = {
+    chat: {
+      postMessage: async (args) => {
+        posts.push(args);
+        return { ts: "1724.200", channel: "C1" };
       },
-      conversations: {
-        join: async () => {
-          throw new Error("not used");
-        },
-        replies: async () => ({ messages: [] }),
+      update: async () => {
+        throw new Error("not used");
       },
-    }),
+    },
+    conversations: {
+      join: async () => {
+        throw new Error("not used");
+      },
+      replies: async () => ({ messages: [] }),
+    },
   };
+  const builtinDeps: BuiltinActionDeps = { clients: { slack } };
   return {
     posts,
     deps: {

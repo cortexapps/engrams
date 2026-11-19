@@ -14,7 +14,6 @@ import {
 
 import type { Review } from "../../gen/engram/app/v1/review_pb";
 import { useRetryReview, useReview } from "../../hooks/useReviews";
-import { useBuiltinAutomation } from "../../hooks/useAutomations";
 import { useNow } from "../../hooks/useNow";
 import { useAbility } from "../../auth/AuthProvider";
 import type { SessionSubject } from "../../lib/ability";
@@ -46,9 +45,7 @@ import {
   isActive,
   isHumanTrigger,
   passDuration,
-  postedReviewUrl,
   prTitleOf,
-  prUrl,
   reviewCreatedAt,
   shortSha,
   triggerOf,
@@ -166,9 +163,8 @@ function BackToLedger() {
  * recorded before that landed, so the coordinate carries the heading when there
  * is no title rather than a placeholder standing in for one.
  *
- * One GitHub affordance, not two: it lands on the review engrams posted when there
- * is one and on the PR itself otherwise. Both are the same page over there, so a
- * second link would only make a reader choose between them.
+ * One link to the forge: to the review engrams posted when there is one, else
+ * to the pull request.
  */
 function PrHeader({
   pass,
@@ -183,11 +179,8 @@ function PrHeader({
   // borrow identity from the newest sibling.
   const title = prTitleOf(pass);
   const retry = useRetryReview();
-  const builtin = useBuiltinAutomation("pr_review");
-  const runAutomationId = builtin.data?.automation?.id;
   const navigate = useNavigate();
-  // One GitHub affordance, but never a label that lies about where it lands.
-  const reviewUrl = postedReviewUrl(pass);
+  const forgeUrl = pass.postedReviewUrl ?? pass.prUrl;
 
   // A re-run cannot tell you the new pass's id: the RPC starts durable ingress
   // and returns only its workflow id. Ingress writes the row shortly afterward,
@@ -208,13 +201,12 @@ function PrHeader({
           {title ?? `Pull request #${pass.prNumber}`}
         </Text>
         <div className="flex shrink-0 items-center gap-1">
-          {pass.automationRunId && runAutomationId && (
-            // The platform behind the product: this pass is one run of the
-            // PR-review automation, and the run's trace is the ground truth.
+          {pass.automationRunId && pass.automationId && (
+            // This pass is one run of the review automation; the run has its trace.
             <Button variant="ghost" size="sm" asChild>
               <Link
                 to="/automations/$id"
-                params={{ id: runAutomationId }}
+                params={{ id: pass.automationId }}
                 search={{ tab: "activity", run: pass.automationRunId }}
               >
                 <Workflow className="size-3.5" aria-hidden />
@@ -222,12 +214,14 @@ function PrHeader({
               </Link>
             </Button>
           )}
-          <Button variant="ghost" size="sm" asChild>
-            <a href={reviewUrl ?? prUrl(pass)} target="_blank" rel="noreferrer">
-              <ExternalLink className="size-3.5" aria-hidden />
-              {reviewUrl ? "Review on GitHub" : "Pull request on GitHub"}
-            </a>
-          </Button>
+          {forgeUrl && (
+            <Button variant="ghost" size="sm" asChild>
+              <a href={forgeUrl} target="_blank" rel="noreferrer">
+                <ExternalLink className="size-3.5" aria-hidden />
+                {pass.postedReviewUrl ? "Open the review" : "Open the pull request"}
+              </a>
+            </Button>
+          )}
           {!isActive(pass) && (
             <Button
               variant="outline"

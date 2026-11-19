@@ -33,8 +33,8 @@ sandboxBackend: firecracker
 # Blob storage backend selection (ADR 0007 / ADR 0122). Production
 # reads chunks from the same bucket the image-builder writes to.
 blob:
-  # `local` (dev), `gcs`, or `s3`.
-  backend: gcs
+  # Required: `local` (dev), `gcs`, or `s3`.
+  backend: ""
   # Required when backend=gcs.
   gcs:
     bucket: ""
@@ -42,8 +42,8 @@ blob:
   # at an S3-compatible store (MinIO, R2 — flips path-style addressing
   # in the client); `region` overrides the SDK chain (AWS_REGION →
   # profile → IMDS). Credentials ride the ambient chain (IRSA on EKS).
-  # Key names match the engram-host-fleet chart so coord and hosts
-  # agree.
+  # The engram-host-fleet chart names these keys differently
+  # (`blob.s3Bucket`, `blob.gcsBucket`); set the same bucket in both.
   s3:
     bucket: ""
     endpointUrl: ""
@@ -51,9 +51,9 @@ blob:
 
 # KEK provider for envelope-encrypted creds + cold-tier blob seals.
 kek:
-  # `env-var` (dev/CI, and GCP production today — gcp-kms wrap/unwrap
-  # is a stub), `gcp-kms`, or `aws-kms` (real, ADR 0122).
-  provider: gcp-kms
+  # Required: `env-var` (dev/CI, and GCP production today — gcp-kms
+  # wrap/unwrap is a stub), `gcp-kms`, or `aws-kms` (real, ADR 0122).
+  provider: ""
   # env-var only — name of the env var carrying the base64 master key.
   envVarName: ENGRAM_KEK_MASTER_KEY
   # gcp-kms only — full resource path.
@@ -64,10 +64,10 @@ kek:
 
 # Secrets backend for image manifest's `[secrets.*]` references.
 secrets:
-  # `env` (dev), `gcp` (Secret Manager via Workload Identity), or
-  # `aws` (AWS Secrets Manager via IRSA — ADR 0122; needs no extra
+  # Required: `env` (dev), `gcp` (Secret Manager via Workload Identity),
+  # or `aws` (AWS Secrets Manager via IRSA — ADR 0122; needs no extra
   # keys here: region + credentials ride the SDK chain).
-  backend: gcp
+  backend: ""
   # Required when backend=gcp.
   gcpProjectId: ""
 
@@ -122,14 +122,14 @@ upgradeDrain:
   timeoutSeconds: 3600
 
 # Git forge (ADR 0023). Lets in-session agents fetch short-lived git
-# credentials and open pull/merge requests through the platform — no
-# durable token ever lives in the sandbox. Off by default.
+# credentials from the platform — no durable token ever lives in the
+# sandbox. Off by default.
 #
 # This block is the coordinator-side authority (the App credential).
-# WHICH repos a session may act on is set per image in the manifest's
-# `[git]` block (`provider` + `owner`); the seam only activates for a
-# session whose image declares one. An installation token works across
-# every repo the App can reach, so one App serves all of an org's images.
+# WHICH repos a session may act on comes from the session's capabilities
+# (the profile's grants, for example `github:contents:write@owner/repo`);
+# a session gets a git credential only when it holds a capability for the
+# forge, and the mint is clamped to those capabilities.
 forge:
   # `none` (off) or `github`.
   provider: none

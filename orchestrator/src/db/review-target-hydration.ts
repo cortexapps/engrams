@@ -2,7 +2,7 @@
 
 import { and, asc, eq, isNull } from "drizzle-orm";
 
-import type { PrContext } from "../reviews/pr-context.ts";
+import type { PrContext } from "../forges/pr-context.ts";
 import { getDb } from "./client.ts";
 import { reviewTarget as targetTable } from "./schema.ts";
 

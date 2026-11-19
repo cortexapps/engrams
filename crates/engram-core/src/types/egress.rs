@@ -120,7 +120,7 @@ pub struct EgressSecretEntry {
 /// `secret` (its real value, host-side) before shipping; on an outbound
 /// request matching `allow_hosts`/`allow_host_patterns` (SNI) AND the
 /// request policy (`methods` + `path_globs`), the proxy adds
-/// `header_name: <header_template with "{}" → secret>`. The guest never
+/// `header_name: <header_template rendered with the secret>`. The guest never
 /// holds the secret. Empty `methods`/`path_globs` = any.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgressInjectEntry {

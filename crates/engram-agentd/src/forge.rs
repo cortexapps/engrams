@@ -1,17 +1,16 @@
 //! ADR 0023 in-guest forge client.
 //!
 //! Invoked as a subcommand of the baked `engram-agentd` binary — the
-//! dogfood image's `GIT_ASKPASS` helper runs `engram-agentd
-//! forge-credential`. We dial the host on `FORGE_VSOCK_PORT`, send a
+//! `GIT_ASKPASS` helper runs `engram-agentd forge-credential [--host H]
+//! [--username]`. We dial the host on `FORGE_VSOCK_PORT`, send a
 //! [`ForgeRequest`] authenticated by the per-session broker token
 //! (`ENGRAM_FORGE_TOKEN`), read one [`ForgeResponse`], and print the
-//! result. The real credential never persists in the guest — it's
-//! fetched fresh per git op, so token expiry is invisible here.
+//! credential's password, or its username with `--username`. The real
+//! credential never persists in the guest — it's fetched fresh per git op,
+//! so token expiry is invisible here.
 //!
-//! ADR 0056 P3 retired the `engram-pr` / `forge-pull-request` op: PRs open
-//! over the egress inject+observe plane (`gh pr create`) now, so the only
-//! op left here is the git-clone/push credential the interceptor can't
-//! deliver.
+//! With no `--host`, the request names no host and the coordinator mints
+//! for the session's only forge.
 
 use std::process::ExitCode;
 
@@ -50,13 +49,7 @@ async fn run_inner(sub: &str, rest: &[String]) -> Result<String, String> {
     let session_id = env_session_id()?;
     let broker_token = std::env::var("ENGRAM_FORGE_TOKEN")
         .map_err(|_| "ENGRAM_FORGE_TOKEN not set in the guest env".to_string())?;
-    let op = match sub {
-        "forge-credential" => ForgeOp::FetchCredential {
-            host: flag(rest, "--host").unwrap_or_else(|| "github.com".to_string()),
-            owner: flag(rest, "--owner").or_else(|| non_empty_env("ENGRAM_FORGE_OWNER")),
-        },
-        other => return Err(format!("unknown forge subcommand: {other}")),
-    };
+    let (op, want_username) = credential_request(sub, rest, non_empty_env("ENGRAM_FORGE_OWNER"))?;
 
     let req = ForgeRequest {
         session_id,
@@ -75,13 +68,31 @@ async fn run_inner(sub: &str, rest: &[String]) -> Result<String, String> {
         .await
         .map_err(|e| format!("read forge response: {e}"))?;
     match resp {
-        // GIT_ASKPASS prints the password; the username comes from git
-        // config (`credential.<host>.username = x-access-token`).
+        ForgeResponse::Credential { username, .. } if want_username => Ok(username),
         ForgeResponse::Credential { password, .. } => Ok(password),
         ForgeResponse::OAuthCredential { .. } | ForgeResponse::OAuthCredentialBroken => {
             Err("host returned OAuth credential to git helper".into())
         }
         ForgeResponse::Error { message } => Err(message),
+    }
+}
+
+/// The forge op for `sub` and its argv, and whether to print the username
+/// rather than the password. An empty host names no host.
+fn credential_request(
+    sub: &str,
+    rest: &[String],
+    env_owner: Option<String>,
+) -> Result<(ForgeOp, bool), String> {
+    match sub {
+        "forge-credential" => Ok((
+            ForgeOp::FetchCredential {
+                host: flag(rest, "--host").unwrap_or_default(),
+                owner: flag(rest, "--owner").or(env_owner),
+            },
+            rest.iter().any(|arg| arg == "--username"),
+        )),
+        other => Err(format!("unknown forge subcommand: {other}")),
     }
 }
 
@@ -117,5 +128,35 @@ mod tests {
         assert_eq!(flag(&argv, "--host").as_deref(), Some("github.com"));
         assert_eq!(flag(&argv, "--owner").as_deref(), Some("cortexapps"));
         assert!(flag(&argv, "--missing").is_none());
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_credential_request_names_no_host_unless_asked() {
+        let (op, want_username) = credential_request("forge-credential", &argv(&[]), None).unwrap();
+        assert!(!want_username);
+        let ForgeOp::FetchCredential { host, owner } = op else {
+            panic!("expected FetchCredential");
+        };
+        assert_eq!(host, "");
+        assert_eq!(owner, None);
+
+        let (op, want_username) = credential_request(
+            "forge-credential",
+            &argv(&["--username", "--host", "gitlab.example.com"]),
+            Some("acme".into()),
+        )
+        .unwrap();
+        assert!(want_username);
+        let ForgeOp::FetchCredential { host, owner } = op else {
+            panic!("expected FetchCredential");
+        };
+        assert_eq!(host, "gitlab.example.com");
+        assert_eq!(owner.as_deref(), Some("acme"));
+
+        assert!(credential_request("forge-pull-request", &argv(&[]), None).is_err());
     }
 }

@@ -1658,12 +1658,6 @@ pub(crate) async fn delete_session_core(
     .await
 }
 
-/// ADR 0023: when a forge is configured and the image declares `[git]`,
-/// mint a per-session credential-broker token (stored in
-/// `state.git_broker_tokens`) and inject the forge env so the in-session
-/// `GIT_ASKPASS` helper can fetch credentials + open PRs. No-op when no
-/// forge is configured or the image has no `[git]` block. Re-minting on
-/// resume is fine — the latest token wins.
 /// Mint-or-reuse the session's broker token (stored in
 /// `state.git_broker_tokens`). Idempotent: a later call from the
 /// `/exec` path returns the SAME token rather than orphaning a fresh
@@ -1804,38 +1798,29 @@ pub(crate) async fn inject_harness_env(
     Ok(())
 }
 
+/// Inject the forge env for a session that holds a capability for a forge
+/// whose integration mints git credentials: the broker token the in-guest
+/// `GIT_ASKPASS` helper authenticates with, the owner hint and, on the
+/// loopback path, the endpoint. No-op for any other session. A forge whose
+/// configuration cannot be read is an error.
 pub(crate) async fn inject_forge_env(
     state: &SharedState,
     session_id: SessionId,
     env: &mut HashMap<String, String>,
 ) -> Result<(), ApiError> {
-    // ADR 0056 P2: forge env is injected when the session holds a capability for a
-    // provider that (a) resolves a mint engine AND (b) declares a git-forge host
-    // (`Integration::git_forge_host`). De-hardcodes the old `"github"` literal — any
-    // git-forge integration (github today; gitlab/gitea later) gets the askpass env.
-    // The manifest `[git]` block is retired — git binding rides the profile's caps.
+    // The askpass env goes to a session that holds a capability for a git forge.
     let caps = state
         .services
         .meta
         .get_session_capabilities(session_id)
         .await?;
-    // The session's bound caps that belong to a git-forge provider.
-    let mut git_caps: Vec<&engram_core::types::Capability> = Vec::new();
-    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for provider in caps.iter().map(|c| c.provider.as_str()) {
-        if !seen.insert(provider) {
-            continue;
-        }
-        let is_git_forge = state
-            .integrations
-            .resolve(provider, &state.services.secrets)
-            .await
-            .and_then(|e| e.git_forge_host())
-            .is_some();
-        if is_git_forge {
-            git_caps.extend(caps.iter().filter(|c| c.provider == provider));
-        }
-    }
+    let forges = crate::api::forge::session_forges(state, &caps)
+        .await
+        .map_err(|e| ApiError::Internal(format!("resolve the session's git forges: {e}")))?;
+    let git_caps: Vec<&engram_core::types::Capability> = caps
+        .iter()
+        .filter(|c| forges.iter().any(|f| f.provider == c.provider))
+        .collect();
     if git_caps.is_empty() {
         return Ok(());
     }

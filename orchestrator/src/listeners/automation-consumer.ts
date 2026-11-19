@@ -100,7 +100,7 @@ export function makeAutomationConsumer(deps: AutomationConsumerDeps): SessionCon
     }
   };
 
-  // The relay renders into Slack; a failure there is logged inside the
+  // The relay renders into the chat thread; a failure there is logged inside the
   // relay and must never pin the listener's cursor on the event.
   const render = async (sessionId: string, event: CuratedEvent): Promise<void> => {
     if (!deps.relay) return;

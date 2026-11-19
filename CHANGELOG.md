@@ -10,6 +10,80 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Set the backend selectors in your Helm values before you upgrade.** They have no
+  default now, and `helm upgrade` fails at render, before it changes the release, when one
+  is unset. An install that relied on the old defaults sets `blob.backend: gcs`,
+  `kek.provider: gcp-kms` and `secrets.backend: gcp` (`engram`), and `blob.backend: gcs`
+  and `egress.caSource: gcp-secret-manager` (`engram-host-fleet`). The example overlays
+  set all of them. ([#1793])
+- **Upgrade the hosts before the control plane to use GitLab or Azure DevOps git.** A
+  session clones and pushes to them through the egress proxy of the new host agent.
+  ([#1793])
+- **A rollback past this release** makes a profile routed to LiteLLM, and the GitLab
+  review, fail until you upgrade again. A custom connector with a `webhook` section that
+  was saved on this release does not load on the earlier one, because the earlier one
+  requires `webhook.verificationScheme`. Nothing else changes back. ([#1793])
+- **The upgrade stops the pull request reviews and the Slack thread runs that are active
+  when it deploys.** Both built-ins have a new definition. A push or a `review` comment
+  starts the review again, and the next mention continues a thread. ([#1793])
+- **A capability that names a resource is refused when nothing can enforce the resource.**
+  GitHub and GitLab hold a session to a resource. A profile that has a resource on a
+  capability of another connector (for example `datadog:metrics:read@name`) does not save,
+  and a task on it does not start, until you remove the resource. Before, the resource was
+  accepted and ignored. The same rule refuses a resource on a GitHub capability that uses
+  a person's own credential, and a GitLab resource that is not a project path
+  (`group/project`). ([#1793])
+- **A connector path rule refuses a path that two servers can read differently.** A rule
+  no longer matches a path with `;`, `\`, a `.` or `..` segment, or a percent sign that
+  is itself escaped. A path with an escaped `?` or `#` matches only when the part before
+  it also matches. A custom connector whose requests depend on such a path is refused
+  until its rule changes. ([#1793])
+
+### Added
+
+- **LiteLLM is a model router.** Point engrams at your own LiteLLM proxy and route Claude
+  Code and Codex sessions, titles and decisions through it. An admin picks the model for
+  each of those roles on Settings → Model routers. ([#1793])
+- **GitLab merge request review.** GitLab is a git forge: sessions clone and push with the
+  organization's token, which stays out of the VM, and a second review built-in reviews
+  merge requests. It needs GitLab 17.4 or later. An organization can use GitHub and GitLab
+  together. ([#1793])
+- An Azure DevOps connector: git over HTTPS, pull requests, work items and pipelines. It
+  has no review built-in. ([#1793])
+
+### Changed
+
+- **Git forges, chat services and model routers are roles.** GitHub, Slack and OpenRouter
+  are implementations of them, and a new provider that fills a role gets the features built
+  on it. The site's "Add a provider" page says what a provider implements. ([#1793])
+- A pull request comment gives a command when the mention of the review app starts a line
+  or follows a space, on every forge. The `stop` command follows the same rule as `review`.
+  A quoted line (`> ...`) is not a command. ([#1793])
+- A GitLab capability that names a project (`gitlab:repository:read@group/project`) limits
+  the session to that project. ([#1793])
+- GitLab `projects:read` reaches the project list and one project. It no longer reaches a
+  project's merge requests, issues, pipelines or files; each of those has its own power.
+  ([#1793])
+- The review edits only a status comment that an app wrote. With `GITHUB_APP_LOGIN` set
+  it prefers the comment of that app. ([#1793])
+- A review step fails when the forge cannot list the comments of a pull request. Before,
+  the step read that as "no comment" and could post a second status comment. ([#1793])
+- A segment rule of a connector (`segment-path:`, `segment-id:`) can end in `**`, which
+  matches the rest of the path. ([#1793])
+- The line a Slack thread shows for a routed profile says "smart routing". When the
+  decision model gives one answer, the "which profile?" card offers that answer and the
+  other candidates. ([#1793])
+- With more than one model router connected, a role uses the router whose model an admin
+  chose. ([#1793])
+- A Decide block and smart routing work with any connected router that has a decision
+  model. A router with no decisions endpoint answers with a structured chat completion.
+  ([#1793])
+- A session gets git credentials only for a forge that its profile grants. ([#1793])
+- Every provider's webhooks arrive at `/api/v1/integrations/<provider>/events`. The URLs of
+  the existing providers are the same. ([#1793])
+
 ## [0.13.0] - 2026-11-11
 
 ### Upgrade notes
@@ -389,3 +463,4 @@ The first tagged release. See the
 [#1784]: https://github.com/cortexapps/engrams/pull/1784
 [#1788]: https://github.com/cortexapps/engrams/pull/1788
 [#1789]: https://github.com/cortexapps/engrams/pull/1789
+[#1793]: https://github.com/cortexapps/engrams/pull/1793

@@ -5,8 +5,9 @@ import type {
   ReviewTargetHydrationStore,
   UnhydratedReviewTarget,
 } from "../../db/review-target-hydration.ts";
-import { GithubRequestError } from "../github-review.ts";
-import type { PrContext } from "../pr-context.ts";
+import { ForgeRequestError } from "../../forges/forge.ts";
+import { makeGithubForge } from "../../providers/github/forge.ts";
+import type { PrContext } from "../../forges/pr-context.ts";
 import {
   runTargetHydration,
   type TargetHydrationReader,
@@ -65,24 +66,25 @@ describe("review target hydrator", () => {
       },
     };
     const github: TargetHydrationReader = {
-      async fetchPrContext(repo) {
+      isPermanentError: makeGithubForge().isPermanentError,
+      async fetchPullRequest(repo) {
         const id = repo.split("/")[1];
         if (id === "gone") {
-          throw new GithubRequestError(
+          throw new ForgeRequestError(
             404,
             "pull request not found",
             JSON.stringify({ message: "Not Found" }),
           );
         }
         if (id === "rate-limited") {
-          throw new GithubRequestError(
+          throw new ForgeRequestError(
             403,
             "rate limited",
             JSON.stringify({ message: "You have exceeded a secondary rate limit" }),
           );
         }
         if (id === "server-error") {
-          throw new GithubRequestError(
+          throw new ForgeRequestError(
             502,
             "GitHub unavailable",
             JSON.stringify({ message: "Bad Gateway" }),
@@ -95,7 +97,7 @@ describe("review target hydrator", () => {
     const result = await runTargetHydration({
       config: { intervalMs: 1_000, batchSize: 5 },
       store,
-      github,
+      forge: () => github,
       now: () => NOW,
       log,
     });
@@ -131,11 +133,12 @@ describe("review target hydrator", () => {
           failed.push(id);
         },
       },
-      github: {
-        async fetchPrContext() {
+      forge: () => ({
+        isPermanentError: () => false,
+        async fetchPullRequest() {
           return { headSha: "head", baseSha: "base", pr: pr(null) };
         },
-      },
+      }),
       now: () => NOW,
       log,
     });

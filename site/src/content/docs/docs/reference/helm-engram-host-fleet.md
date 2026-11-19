@@ -39,10 +39,10 @@ by hand and drain each host first.
 | `image`, `imagePullSecrets`, `serviceAccount` | The host-agent image and its ServiceAccount, annotated for Workload Identity or IRSA. |
 | `nodeSelector`, `tolerations` | Pin the fleet to the KVM pool. The default selector is `engram.io/kvm: "true"`. |
 | `coordinator` | `endpoint`, the in-cluster coordinator Service, and the Secret that holds the bearer token. |
-| `blob` | The chunk store, matching the control-plane chart. |
+| `blob` | The chunk store, matching the control-plane chart. `backend` is required. |
 | `nodeAssets` | The image that carries Firecracker, the guest kernel, and the bundles. Pin it to a digest in production. |
 | `firecracker` | Restore modes, the canonical-memory tmpfs and its size, the density knobs, and `vmCgroupParent`, the node-level cgroup VMs move into so a pod restart does not kill them. |
-| `egress` | The proxy's ports and `caSource`, which is `env` on GKE and `aws-secrets-manager` on EKS. The [configuration reference](../configuration/) explains why. |
+| `egress` | The proxy's ports and `caSource` (required), which is `env` on GKE and `aws-secrets-manager` on EKS. The [configuration reference](../configuration/) explains why. |
 | `storage` | The host's working directory on the node, the chunk cache budget, and any dedicated devices. The working directory must be a host path so it survives pod restarts. |
 | `thinPool` | The session-disk pool every host needs: its `name` and `dir`, `dataSize` (absolute, or a percentage of the filesystem that holds `dir`), `metadataSize`, `blockSizeSectors`, and `lowWaterMarkBlocks`. Every image and session volume on the node lives in it. |
 | `nodePrep` | The node-prep image and the sysctls it sets. |

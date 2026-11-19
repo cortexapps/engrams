@@ -1,5 +1,7 @@
-import { PR_REVIEW_DEFINITION } from "../automations/builtins/pr-review.ts";
-import { SLACK_BRAIN_DEFINITION } from "../automations/builtins/slack-brain.ts";
+import { reviewDefinition } from "../automations/builtins/review.ts";
+import { GITHUB_REVIEW } from "../providers/github/review-variant.ts";
+import { chatThreadsDefinition } from "../automations/builtins/chat-threads.ts";
+import { SLACK_THREADS } from "../providers/slack/threads-variant.ts";
 import { beforeEach, describe, expect, test } from "bun:test";
 import { Code, ConnectError, createClient, createRouterTransport } from "@connectrpc/connect";
 
@@ -788,7 +790,7 @@ describe("AutomationService v2", () => {
       Code.InvalidArgument,
     );
     expect(err.rawMessage).toBe(
-      "inputs.repos.acme/x.mode: must be one of auto, on_request; inputs.repos.bad: not a valid owner/repo",
+      "inputs.repos.acme/x.mode: must be one of auto, on_request; inputs.repos.bad: not a valid repository path (owner/repo)",
     );
   });
 
@@ -1274,6 +1276,7 @@ describe("integration triggers + catalogs", () => {
     const { automations } = clients(
       adminDeps({
         connections: {
+          get: async () => null,
           getDefault: async () => ({
             id: "conn-github", alias: "default", provider: "github", displayName: "GitHub (default)",
             isDefault: true, config: {}, enabled: true, testedAt: null, createdAt: NOW, updatedAt: NOW,
@@ -1378,6 +1381,10 @@ import type {
   AutomationInstanceRow,
   AutomationInstanceStore,
 } from "../db/automation-instances.ts";
+
+const SLACK_BRAIN_DEFINITION = chatThreadsDefinition(SLACK_THREADS);
+
+const PR_REVIEW_DEFINITION = reviewDefinition(GITHUB_REVIEW);
 
 function fakeInstanceStore() {
   const rows = new Map<string, AutomationInstanceRow>();

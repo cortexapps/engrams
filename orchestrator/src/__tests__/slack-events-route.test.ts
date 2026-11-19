@@ -9,12 +9,14 @@
 
 import { expect, test, describe } from "bun:test";
 import { createHmac } from "node:crypto";
-import { makeSlackEventsRoute } from "../routes/slack-events.ts";
+import { makeIntegrationEventsRoute } from "../routes/integration-events.ts";
+import { slackEventSource } from "../providers/slack/events.ts";
 import { fakeIngress } from "./github-events-route.test.ts";
 
 const SECRET = "test-signing-secret";
 const PATH = "/api/v1/integrations/slack/events";
-const app = makeSlackEventsRoute({ signingSecret: async () => SECRET });
+const secrets = { resolve: async () => SECRET };
+const app = makeIntegrationEventsRoute({ sources: [slackEventSource], secrets });
 
 function signed(body: string, ts = String(Math.floor(Date.now() / 1000))) {
   const sig = "v0=" + createHmac("sha256", SECRET).update(`v0:${ts}:${body}`).digest("hex");
@@ -63,14 +65,14 @@ describe("the ingress spine", () => {
     });
   }
 
-  async function post(app: ReturnType<typeof makeSlackEventsRoute>, channel: string) {
+  async function post(app: ReturnType<typeof makeIntegrationEventsRoute>, channel: string) {
     const body = mentionBody(channel);
     return app.request(PATH, { method: "POST", body, headers: signed(body) });
   }
 
   test("an app_mention is ledgered, handed to the dispatch seam, and acked 200", async () => {
     const ingress = fakeIngress();
-    const app = makeSlackEventsRoute({ signingSecret: async () => SECRET, ingress: ingress.deps });
+    const app = makeIntegrationEventsRoute({ sources: [slackEventSource], secrets, ingress: ingress.deps });
     const res = await post(app, "C1");
     expect(res.status).toBe(200);
     expect(ingress.dispatched.map((d) => [d.eventKey, d.scopeValue])).toEqual([["app_mention", "C1"]]);
@@ -78,7 +80,7 @@ describe("the ingress spine", () => {
 
   test("a message in a group direct message is ledgered with its conversation as the scope", async () => {
     const ingress = fakeIngress();
-    const app = makeSlackEventsRoute({ signingSecret: async () => SECRET, ingress: ingress.deps });
+    const app = makeIntegrationEventsRoute({ sources: [slackEventSource], secrets, ingress: ingress.deps });
     const body = JSON.stringify({
       type: "event_callback",
       team_id: "T1",
@@ -92,7 +94,7 @@ describe("the ingress spine", () => {
 
   test("a bot message subtype is skipped by the spine and still acked 200", async () => {
     const ingress = fakeIngress();
-    const app = makeSlackEventsRoute({ signingSecret: async () => SECRET, ingress: ingress.deps });
+    const app = makeIntegrationEventsRoute({ sources: [slackEventSource], secrets, ingress: ingress.deps });
     const body = JSON.stringify({
       type: "event_callback",
       team_id: "T1",

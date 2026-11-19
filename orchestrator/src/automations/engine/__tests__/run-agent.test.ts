@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { setSlackPolicyFactoryForTest } from "../../../integrations/slack-policy.ts";
+import { setSlackPolicyFactoryForTest } from "../../../providers/slack/policy.ts";
 import type { CommunicationPolicy } from "../../../workflows/communication-policy.ts";
 import { registerEngineBlocks } from "../blocks/index.ts";
 import { CLOSE_AGENT_TYPE, RUN_AGENT_TYPE, closeAgentConfigSchema, runAgentConfigSchema } from "../blocks/agent.ts";
@@ -80,7 +80,7 @@ function harness(options: {
     sessions,
     clock: { nowMs: () => 0 },
     relays: store,
-    announceStarted: async (sessionId, target) => {
+    announceStarted: async (sessionId, _provider, target) => {
       announced.push({ sessionId, ts: target.ts });
     },
     instances: {
@@ -114,11 +114,12 @@ function harness(options: {
   return { store, created, prompts, adopted, announced, ended, closed, ctx, run, close };
 }
 
-/** A Slack policy that records its closing messages. */
-function recordingPolicy() {
+/** A Slack policy that records its closing messages, or refuses them. */
+function recordingPolicy(refuse = false) {
   const neutral: Array<{ ts: string; message: string }> = [];
   const pol = {
     onNeutralClose: async (m: { ts: string }, message: string) => {
+      if (refuse) throw new Error("is_archived");
       neutral.push({ ts: m.ts, message });
     },
   } as unknown as CommunicationPolicy;
@@ -314,6 +315,25 @@ describe("run_agent", () => {
     expect(h.store.rows.size).toBe(0);
     expect(h.ended).toEqual(["s-old"]);
     expect(h.closed).toEqual([{ instanceId: "ai_thread1", reason: 'closed by the "done" way in' }]);
+  });
+
+  test("close_agent ends the session and closes the workstream when the closing message cannot be posted", async () => {
+    const h = harness({ instanceId: "ai_thread1", previous: { sessionId: "s-old", alive: true } });
+    await h.store.install({
+      sessionId: "s-old",
+      automationId: "auto-1",
+      provider: "slack",
+      target: { ...RELAY, threadRoot: "100.0", ts: "100.0" },
+      state: { bubble: null, lastAssistantText: "", assets: [], questionTs: {}, questionProtocols: {} },
+    });
+    setSlackPolicyFactoryForTest(() => recordingPolicy(true).pol);
+    try {
+      expect(await h.close()).toMatchObject({ kind: "ok", outputs: { closed: true, ended: true } });
+    } finally {
+      setSlackPolicyFactoryForTest(null);
+    }
+    expect(h.ended).toEqual(["s-old"]);
+    expect(h.closed).toHaveLength(1);
   });
 
   test("close_agent with no live session only closes the workstream; unbound it closes nothing", async () => {

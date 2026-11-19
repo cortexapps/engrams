@@ -87,3 +87,16 @@ app.kubernetes.io/name: {{ .Chart.Name }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: orchestrator
 {{- end -}}
+
+{{/*
+A backend selector with no default: the value, or a render failure that names
+the choices. Call with (list VALUE "values.key" (list CHOICES...)).
+*/}}
+{{- define "engram.choice" -}}
+{{- $value := index . 0 -}}
+{{- $choices := index . 2 -}}
+{{- if not (has $value $choices) -}}
+{{- fail (printf "%s is required: set it to one of %s (got %q)" (index . 1) (join ", " $choices) (toString $value)) -}}
+{{- end -}}
+{{- $value -}}
+{{- end -}}

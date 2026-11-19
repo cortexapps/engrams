@@ -3,10 +3,12 @@ import { z } from "zod";
 
 import type { CuratedEvent } from "../control-plane/session-events.ts";
 import { getDb } from "../db/client.ts";
+import { isUniqueViolation } from "../db/pg-errors.ts";
 import { makePrRefStore, type PrRefStore } from "../db/pr-refs.ts";
 import { makeAutomationEngineStore } from "../db/automations.ts";
 import { makeAutomationInstanceStore } from "../db/automation-instances.ts";
-import { canonicalHandle } from "../automations/handles.ts";
+import { canonicalIdentifier } from "../automations/handles.ts";
+import { forgeFor } from "../forges/registry.ts";
 import { taskSession } from "../db/schema.ts";
 import { log as rootLog } from "../log.ts";
 import type { SessionConsumer } from "./consumer.ts";
@@ -21,6 +23,7 @@ const log = rootLog.child({ component: "pr-link-consumer" });
 // decorative degrades to "" rather than classifying the event as malformed
 // and silently dropping the task→PR link.
 const pullRequestAssetSchema = z.object({
+  provider: z.string().min(1),
   asset_kind: z.literal("pull_request"),
   data: z.object({
     repo: z.string().min(1).optional(),
@@ -49,28 +52,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Derive the PR identity ("owner/repo" + number) from a forge PR URL like
- * `https://github.com/owner/repo/pull/97`. Returns null when the URL doesn't
- * carry that shape (or isn't a URL at all); `number` is null when the segment
- * after `pull` isn't a positive integer. */
-export function prIdentityFromUrl(
-  url: string,
-): { repo: string; number: number | null } | null {
-  if (!url) return null;
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    return null;
-  }
-  const segments = parsed.pathname.split("/").filter(Boolean);
-  if (segments.length >= 4 && (segments[2] === "pull" || segments[2] === "pulls")) {
-    const number = /^[1-9]\d*$/.test(segments[3] ?? "") ? Number(segments[3]) : null;
-    return { repo: `${segments[0]}/${segments[1]}`, number };
-  }
-  return null;
-}
-
 export function parsePullRequestAsset(event: CuratedEvent): ParseResult {
   if (event.kind !== "integration_asset") return { kind: "ignore" };
 
@@ -94,7 +75,7 @@ export interface PrLinkConsumerDeps {
   findTaskId(sessionId: string): Promise<string | null>;
   /** ADR 0120: the session's automation binding (engine store). A session an
    * instance-bound run created routes review feedback back through the
-   * handle ledger — the consumer writes github:<repo>#<n> on PR open. */
+   * handle ledger — the consumer writes <provider>:<repo>#<n> on PR open. */
   findAutomationBinding?(sessionId: string): Promise<{
     automationId: string;
     instanceId: string;
@@ -130,9 +111,17 @@ export function makePrLinkConsumer(deps: PrLinkConsumerDeps): SessionConsumer {
         return;
       }
 
-      const { data, fetchable, at } = parsed.asset;
+      const { provider, data, fetchable, at } = parsed.asset;
+      const forge = forgeFor(provider);
+      if (!forge) {
+        log.warn(
+          { sessionId: ctx.sessionId, eventIdx: event.idx.toString(), provider },
+          "pull-request asset is from a provider that is not a git forge; skipping",
+        );
+        return;
+      }
       const url = fetchable?.kind === "external" ? fetchable.url : "";
-      const fromUrl = prIdentityFromUrl(url);
+      const fromUrl = forge.parsePullRequestUrl(url);
       const repo = data.repo ?? fromUrl?.repo;
       const prNumber = data.number ?? fromUrl?.number;
       if (!repo || !prNumber) {
@@ -144,17 +133,37 @@ export function makePrLinkConsumer(deps: PrLinkConsumerDeps): SessionConsumer {
       }
 
       const taskId = await deps.findTaskId(ctx.sessionId);
-      await deps.prRefs.upsert({
-        repo,
-        prNumber,
-        authoringTaskId: taskId,
-        sessionId: ctx.sessionId,
-        title: data.title ?? "",
-        url,
-        headBranch: data.head_branch ?? "",
-        baseBranch: data.base_branch ?? "",
-        observedAt: new Date(at),
-      });
+      const upsert = () =>
+        deps.prRefs.upsert({
+          provider,
+          repo,
+          prNumber,
+          authoringTaskId: taskId,
+          sessionId: ctx.sessionId,
+          title: data.title ?? "",
+          url,
+          headBranch: data.head_branch ?? "",
+          baseBranch: data.base_branch ?? "",
+          observedAt: new Date(at),
+        });
+      try {
+        // The upsert resolves its own key, so a unique violation is the
+        // (repo, number) index the previous build still needs. A concurrent
+        // first insert of the same pull request also trips it; the second
+        // attempt then finds that row and updates it.
+        await upsert().catch((error: unknown) => {
+          if (!isUniqueViolation(error)) throw error;
+          return upsert();
+        });
+      } catch (error) {
+        // Two conflicts in a row: another forge holds this repository name
+        // and number, and no later attempt can take it.
+        if (!isUniqueViolation(error)) throw error;
+        log.warn(
+          { sessionId: ctx.sessionId, provider, repo, prNumber },
+          "another forge holds this repository name and pull-request number; PR reference not recorded",
+        );
+      }
 
       // ADR 0120: bind the PR to the session's workstream so review events
       // route back (handle admission). Best-effort AND loud: a conflict
@@ -163,7 +172,7 @@ export function makePrLinkConsumer(deps: PrLinkConsumerDeps): SessionConsumer {
       if (deps.findAutomationBinding && deps.recordInstanceHandle) {
         const binding = await deps.findAutomationBinding(ctx.sessionId);
         if (binding !== null && binding.instanceId !== "") {
-          const handle = canonicalHandle("github", `github:${repo}#${prNumber}`);
+          const handle = canonicalIdentifier(provider, `${provider}:${repo}#${prNumber}`);
           const result = await deps.recordInstanceHandle({
             automationId: binding.automationId,
             handle,

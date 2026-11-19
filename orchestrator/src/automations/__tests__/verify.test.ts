@@ -7,6 +7,12 @@ import {
   ResolvedCredentialSchema,
   ResolveIntegrationCredentialResponseSchema,
 } from "../../gen/engram/app/v1/integration_op_pb.ts";
+import type { IntegrationEventSource } from "../integration-ingress.ts";
+import { githubEventSource } from "../../providers/github/events.ts";
+import { gitlabEventSource } from "../../providers/gitlab/events.ts";
+import { linearEventSource } from "../../providers/linear/events.ts";
+import { slackEventSource } from "../../providers/slack/events.ts";
+import { vantaEventSource } from "../../providers/vanta/events.ts";
 import {
   makeVerificationSecretResolver,
   resetVerificationSecretCache,
@@ -30,9 +36,6 @@ function digest(value: string | Uint8Array): string {
 }
 
 describe("webhook verification strategies", () => {
-  // Only the generic scheme survives ADR 0119 D5; the provider schemes
-  // (github_hmac_sha256, slack_v0) are verified on the integration ingress
-  // routes and can no longer be stored on a registration.
   test("generic_hmac_sha256 accepts a valid signature", () => {
     expect(verify("generic_hmac_sha256", {
       "x-engrams-signature-256": `sha256=${digest(BODY)}`,
@@ -50,6 +53,104 @@ describe("webhook verification strategies", () => {
     expect(verify("generic_hmac_sha256", {
       "x-hub-signature-256": `sha256=${digest(BODY)}`,
     })).toBe(false);
+  });
+});
+
+describe("provider event source verification", () => {
+  const NOW = new Date("2026-08-21T12:00:00Z");
+  const seconds = String(Math.floor(NOW.getTime() / 1000));
+
+  function ingress(
+    source: IntegrationEventSource,
+    headers: Record<string, string>,
+    secret = SECRET,
+  ): Promise<boolean> {
+    return source.verify({
+      headers: new Headers(headers),
+      rawBody: BODY,
+      now: NOW,
+      secret: async () => secret,
+    });
+  }
+
+  test("a secret that cannot be read rejects the verify", async () => {
+    const unreadable = githubEventSource.verify({
+      headers: new Headers({ "x-hub-signature-256": `sha256=${digest(BODY)}` }),
+      rawBody: BODY,
+      now: NOW,
+      secret: async () => {
+        throw new Error("not sealed");
+      },
+    });
+    await expect(unreadable).rejects.toThrow("not sealed");
+  });
+
+  test("GitHub reads the prefixed X-Hub-Signature-256", async () => {
+    const header = "x-hub-signature-256";
+    expect(await ingress(githubEventSource, { [header]: `sha256=${digest(BODY)}` })).toBe(true);
+    expect(await ingress(githubEventSource, { [header]: `sha256=${digest("other")}` })).toBe(false);
+    expect(await ingress(githubEventSource, { [header]: "sha256=short" })).toBe(false);
+    expect(await ingress(githubEventSource, { [header]: encodeURI("💥") })).toBe(false);
+    expect(await ingress(githubEventSource, {})).toBe(false);
+  });
+
+  test("Linear reads the bare hex Linear-Signature", async () => {
+    expect(await ingress(linearEventSource, { "linear-signature": digest(BODY) })).toBe(true);
+    expect(await ingress(linearEventSource, { "linear-signature": `sha256=${digest(BODY)}` }))
+      .toBe(false);
+    expect(await ingress(linearEventSource, {})).toBe(false);
+  });
+
+  test("Slack signs the timestamp with the body and refuses a stale one", async () => {
+    const sign = (ts: string) => ({
+      "x-slack-request-timestamp": ts,
+      "x-slack-signature": `v0=${digest(Buffer.concat([Buffer.from(`v0:${ts}:`), BODY]))}`,
+    });
+    expect(await ingress(slackEventSource, sign(seconds))).toBe(true);
+    expect(await ingress(slackEventSource, sign(String(Number(seconds) - 3600)))).toBe(false);
+    expect(await ingress(slackEventSource, {})).toBe(false);
+  });
+
+  test("Vanta (Svix) signs id, timestamp, and body under the decoded secret", async () => {
+    const key = Buffer.from("svix-test-key");
+    const secret = `whsec_${key.toString("base64")}`;
+    const sign = (ts: string) => ({
+      "svix-id": "msg_1",
+      "svix-timestamp": ts,
+      "svix-signature": `v1,${createHmac("sha256", key)
+        .update(`msg_1.${ts}.`)
+        .update(BODY)
+        .digest("base64")}`,
+    });
+    expect(await ingress(vantaEventSource, sign(seconds), secret)).toBe(true);
+    expect(await ingress(vantaEventSource, sign(String(Number(seconds) - 3600)), secret))
+      .toBe(false);
+    expect(await ingress(vantaEventSource, {}, secret)).toBe(false);
+  });
+
+  test("GitLab compares the secret token header", async () => {
+    expect(await ingress(gitlabEventSource, { "x-gitlab-token": SECRET })).toBe(true);
+    expect(await ingress(gitlabEventSource, { "x-gitlab-token": "other" })).toBe(false);
+    expect(await ingress(gitlabEventSource, {})).toBe(false);
+    expect(await ingress(gitlabEventSource, { "x-gitlab-token": "" }, "")).toBe(false);
+  });
+
+  test("GitLab with a signing token takes only a signature", async () => {
+    const key = Buffer.from("gitlab-test-key");
+    const secret = `whsec_${key.toString("base64")}`;
+    const signed = (ts: string) => ({
+      "webhook-id": "msg_1",
+      "webhook-timestamp": ts,
+      "webhook-signature": `v1,${createHmac("sha256", key)
+        .update(`msg_1.${ts}.`)
+        .update(BODY)
+        .digest("base64")}`,
+    });
+    expect(await ingress(gitlabEventSource, signed(seconds), secret)).toBe(true);
+    expect(await ingress(gitlabEventSource, signed(String(Number(seconds) - 3600)), secret))
+      .toBe(false);
+    // The secret in the token header does not pass in place of a signature.
+    expect(await ingress(gitlabEventSource, { "x-gitlab-token": secret }, secret)).toBe(false);
   });
 });
 

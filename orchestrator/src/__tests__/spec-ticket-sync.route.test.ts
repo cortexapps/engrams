@@ -8,7 +8,7 @@
 import { describe, expect, test } from "bun:test";
 import { Hono } from "hono";
 
-import type { LinearIssue, LinearIssueClient } from "../integrations/linear-issues.ts";
+import type { LinearIssue, LinearIssueClient } from "../providers/linear/issues.ts";
 import {
   makeSpecTicketSyncRoute,
   type SpecTicketSyncPayload,

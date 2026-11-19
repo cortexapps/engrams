@@ -13,17 +13,20 @@ import { makeCodeBlockRuntime } from "../../code/runtime.ts";
 import { makeFakeRelayStore, type FakeRelayStore } from "../../engine/__tests__/fake-relay-store.ts";
 import { registerEngineBlocks } from "../../engine/blocks/index.ts";
 import { setResolveUserDeps } from "../../engine/blocks/resolve-user.ts";
-import { NO_USER_MSG } from "../../../integrations/slack-identity.ts";
-import { setSlackPolicyFactoryForTest } from "../../../integrations/slack-policy.ts";
+import { NO_USER_MSG } from "../../../chat/identity.ts";
+import { setSlackPolicyFactoryForTest } from "../../../providers/slack/policy.ts";
 import type { RunSnapshot } from "../../engine/context.ts";
 import type { EngineDeps, EngineSessionOps, EngineStepRecord } from "../../engine/deps.ts";
 import type { AutomationInbox } from "../../engine/inbox.ts";
 import { interpretAutomation } from "../../engine/interpreter.ts";
 import type { CommunicationPolicy } from "../../../workflows/communication-policy.ts";
 import { config } from "../../../config.ts";
-import { SLACK_BRAIN_DEFINITION } from "../slack-brain.ts";
-import type { DecisionsRequest, DecisionsResponse } from "../../../integrations/openrouter-decisions.ts";
+import { chatThreadsDefinition } from "../chat-threads.ts";
+import { SLACK_THREADS } from "../../../providers/slack/threads-variant.ts";
+import type { DecisionsRequest, DecisionsResponse } from "../../../model-routers/decisions.ts";
 import type { ProfileCard } from "../../profile-cards.ts";
+
+const SLACK_BRAIN_DEFINITION = chatThreadsDefinition(SLACK_THREADS);
 
 const card = (id: string, name: string, description: string): ProfileCard => ({
   id,
@@ -274,13 +277,13 @@ function harness(options: {
     },
     sessions: sessionOps,
     relays,
-    announceStarted: async (sessionId, target) =>
+    announceStarted: async (sessionId, _provider, target) =>
       policy.onStarted(target, { id: sessionId, webUrl: `${config.baseUrl}/sessions/${sessionId}` }),
     clock: { nowMs: () => (clock += options.clockStepMs ?? 1000) },
     code: makeCodeBlockRuntime(),
     decisions: {
-      connected: async () => options.decisions?.connected ?? true,
       async decide(request) {
+        if (options.decisions?.connected === false) return null;
         decisionRequests.push(request);
         const next = decisionReplies.shift();
         if (!next) throw new Error("fake decisions exhausted");
@@ -688,7 +691,7 @@ describe("Slack thread brain — smart routing", () => {
     expect(h.choices).toEqual([]);
     expect(h.sessions).toEqual([expect.objectContaining({ profileId: "p-infra" })]);
     // The verdict is a line in the thread, then the session's link.
-    expect(posts(h)).toEqual(["Profile: *Infra* (routed by Jev, 91% confident)"]);
+    expect(posts(h)).toEqual(["Profile: *Infra* (smart routing, 91% confident)"]);
     expect(h.policyCalls).toEqual(["started:s-1"]);
   });
 
@@ -738,7 +741,7 @@ describe("Slack thread brain — smart routing", () => {
     expect(result.status).toBe("completed");
     expect(h.sessions).toEqual([expect.objectContaining({ profileId: "p-infra" })]);
     expect(h.actions.find((a) => a.actionId === "update_message")!.params["text"]).toBe(
-      "Profile: *Infra* (no answer, so routed by Jev, 41% confident)",
+      "Profile: *Infra* (no answer, so smart routing, 41% confident)",
     );
   });
 

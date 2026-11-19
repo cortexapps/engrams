@@ -92,6 +92,8 @@ export const inputFieldSchema = z.object({
   multiline: z.boolean().optional(),
   /** map: the integration noun that populates the key picker. */
   keyNoun: z.enum(["repository", "channel", "team"]).optional(),
+  /** map: what a key looks like, for the editor's prompt. */
+  keyHint: z.string().max(80).optional(),
   /** map: field specs for the value object; list: the element type. */
   valueShape: z.record(z.string(), z.unknown()).optional(),
 });

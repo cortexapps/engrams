@@ -17,7 +17,11 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import { useEditorWebhookRegistrations, useEventCatalog } from "@/hooks/useAutomationEditor";
+import {
+  useAutomationProviders,
+  useEditorWebhookRegistrations,
+  useEventCatalog,
+} from "@/hooks/useAutomationEditor";
 import { TemplateField } from "./fields/TemplateField";
 import type {
   AgentScope,
@@ -26,12 +30,11 @@ import type {
   TriggerSpec,
 } from "@/lib/automation-blocks";
 
-const PROVIDERS = ["github", "slack", "linear"] as const;
 const KINDS: ReadonlyArray<{ kind: TriggerSpec["kind"]; label: string; help: string }> = [
   {
     kind: "integration",
     label: "Integration event",
-    help: "An event from a connected integration (GitHub, Slack, Linear).",
+    help: "An event from a connected integration.",
   },
   {
     kind: "cron",
@@ -129,7 +132,7 @@ export function TriggerInspector({
   const defaultFor = (kind: TriggerSpec["kind"]): TriggerSpec => {
     switch (kind) {
       case "integration":
-        return { kind, provider: "github", connectionId: "", eventKeys: [] };
+        return { kind, provider: "", connectionId: "", eventKeys: [] };
       case "cron":
         return { kind, schedule: "0 9 * * 1-5", timezone: "UTC" };
       case "webhook":
@@ -265,6 +268,7 @@ function IntegrationTrigger({ trigger, onChange, builtin, errors }: TriggerInspe
   const provider = typeof trigger["provider"] === "string" ? trigger["provider"] : "";
   const eventKeys = Array.isArray(trigger["eventKeys"]) ? (trigger["eventKeys"] as string[]) : [];
   const scope = trigger["scope"] as { values?: string[]; fromInput?: string } | undefined;
+  const providers = useAutomationProviders("events", provider);
   const catalog = useEventCatalog(provider || undefined);
   const visible = (catalog.data?.events ?? []).filter((e) => !e.hidden);
 
@@ -304,7 +308,7 @@ function IntegrationTrigger({ trigger, onChange, builtin, errors }: TriggerInspe
             <SelectValue placeholder="Choose…" />
           </SelectTrigger>
           <SelectContent>
-            {PROVIDERS.map((p) => (
+            {providers.map((p) => (
               <SelectItem key={p} value={p}>
                 {p}
               </SelectItem>

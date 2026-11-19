@@ -23,3 +23,8 @@ export const refreshRouterModels = ModelRouterService.method.refreshRouterModels
  * @generated from rpc engram.app.v1.ModelRouterService.UpdateRouterModelPolicy
  */
 export const updateRouterModelPolicy = ModelRouterService.method.updateRouterModelPolicy;
+
+/**
+ * @generated from rpc engram.app.v1.ModelRouterService.UpdateModelRouterSettings
+ */
+export const updateModelRouterSettings = ModelRouterService.method.updateModelRouterSettings;

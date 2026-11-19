@@ -8,11 +8,11 @@
  * comment on a PR under review — "LGTM", `@engrams stop` — killed the
  * review, and the stop path could never end a run `halted`.
  *
- * The prelude (`admissionPrelude`: the entrypoint's leading `code` +
- * `filter` blocks) is pure, so dispatch evaluates it here against the same
- * scope the run would see. A rejection records a `filtered` run row with
+ * The prelude (`admissionPrelude`: the entrypoint's leading `code`,
+ * `filter` and `admission` blocks) has no side effect, so dispatch evaluates
+ * it here against the same scope the run would see. A rejection records a `filtered` run row with
  * no workflow and no claim; an admission proceeds to the claim. A prelude
- * that throws (a code error) admits — the run then fails visibly on the
+ * that throws (a code error, a forge that does not answer) admits — the run then fails visibly on the
  * same block instead of a delivery vanishing.
  *
  * Instance-bound runs (ADR 0120) evaluate it too, against the workstream's

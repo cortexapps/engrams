@@ -134,14 +134,14 @@ pub fn credential_mint_source() -> impl Strategy<Value = CredentialMintSource> {
     ]
 }
 
-/// Path globs cover all three matcher forms the proxy understands, including
-/// the `segment-path:` form Google Cloud policies use (a `*` stops at `/`, and
-/// the query string is excluded).
+/// Path globs cover the matcher forms the proxy understands: plain,
+/// `segment-path:` (a `*` stops at `/`) and `path-query:` (the query must
+/// equal the pattern's).
 fn path_globs() -> impl Strategy<Value = Vec<String>> {
     proptest::collection::vec(
         prop_oneof![
             s(),
-            s().prop_map(|value| format!("segment:{value}")),
+            s().prop_map(|value| format!("path-query:{value}")),
             s().prop_map(|value| format!("segment-path:{value}")),
         ],
         0..3,

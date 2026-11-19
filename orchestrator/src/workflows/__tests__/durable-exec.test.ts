@@ -8,8 +8,6 @@ import {
   type RunExecRuntime,
 } from "../../exec/durable-exec.ts";
 import {
-  makeReviewControlPlane,
-  ReviewSetupError,
   type ReviewControlPlane,
   type ReviewControlPlaneDeps,
   type ReviewSessionsClient,
@@ -233,26 +231,6 @@ class JournalExecServer implements ReviewSessionsClient {
     return {};
   }
 }
-
-function bootstrapInput() {
-  return {
-    reviewId: review.id,
-    repo: review.repo,
-    prNumber: review.prNumber,
-    headSha: review.headSha,
-  };
-}
-
-function bootstrapControlPlane(
-  sessions: ReviewSessionsClient,
-): ReviewControlPlane {
-  return makeReviewControlPlane({
-    sessions,
-    execRuntime: instantRuntime(),
-    reviews: reviewStore(),
-  });
-}
-
 
 describe("durable orchestrator exec caller", () => {
   test("re-attaches from byte offsets without gaps, duplicates, or a second spawn", async () => {
@@ -739,42 +717,4 @@ describe("durable orchestrator exec caller", () => {
     }
   });
 
-  test("finder and verifier reject both absent and null exit statuses with guest stderr", async () => {
-    for (const phase of ["finder", "verifier"] as const) {
-      for (const terminal of ["missing-exit", "null-exit"] as const) {
-        const server = new JournalExecServer(
-          new Uint8Array(),
-          encoder.encode("guest journal unavailable"),
-          [],
-          terminal,
-        );
-        const cp = bootstrapControlPlane(server);
-        const promise = phase === "finder"
-          ? cp.bootstrapFinderSession("finder-stage-1", bootstrapInput())
-          : cp.bootstrapVerifierSession("verifier-stage-1", bootstrapInput());
-
-        await expect(promise).rejects.toBeInstanceOf(ReviewSetupError);
-        await expect(promise).rejects.toThrow("guest journal unavailable");
-        expect(server.writeCalls).toHaveLength(0);
-      }
-    }
-  });
-
-  test("replaying the whole bootstrap method attaches and returns the original result", async () => {
-    const execId = "exec:finder-replay:bootstrap-clone";
-    const server = new JournalExecServer(
-      encoder.encode("original clone output"),
-      new Uint8Array(),
-    );
-    const cp = bootstrapControlPlane(server);
-
-    await cp.bootstrapFinderSession("finder-replay", bootstrapInput());
-    await cp.bootstrapFinderSession("finder-replay", bootstrapInput());
-
-    expect(server.spawnCounts.get(execId)).toBe(1);
-    expect(server.execCalls).toHaveLength(2);
-    expect(server.execCalls.every((call) => call.execId === execId)).toBe(true);
-    expect(server.execCalls.every((call) => call.stdoutOffset === 0n)).toBe(true);
-    expect(server.writeCalls).toHaveLength(14);
-  });
 });

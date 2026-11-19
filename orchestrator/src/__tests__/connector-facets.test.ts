@@ -28,7 +28,6 @@ const BUILTIN = { builtin: true } as const;
 
 function webhook(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    verificationScheme: "github_hmac_sha256",
     events: [{ key: "issues.opened", label: "Issue opened" }],
     aliases: [],
     ...overrides,
@@ -59,7 +58,7 @@ describe("grown webhook facet", () => {
             },
             { key: "installation.created", label: "App installed", hidden: true },
           ],
-          ingress: { scheme: "github_hmac_sha256", secretRef: "github.webhook_secret" },
+          ingress: { secretRef: "github.webhook_secret" },
           scope: { key: "repositories", label: "Repositories", path: "repository.full_name" },
         }),
       },
@@ -68,21 +67,14 @@ describe("grown webhook facet", () => {
     );
     expect(c.webhook?.events[0]?.label).toBe("Pull request opened");
     expect(c.webhook?.events[1]?.hidden).toBe(true);
-    expect(c.webhook?.ingress).toEqual({
-      scheme: "github_hmac_sha256",
-      secretRef: "github.webhook_secret",
-    });
+    expect(c.webhook?.ingress).toEqual({ secretRef: "github.webhook_secret" });
     expect(c.webhook?.scope?.path).toBe("repository.full_name");
   });
 
-  test("rejects unknown ingress schemes and bad scope paths", () => {
+  test("rejects an ingress with no secret and bad scope paths", () => {
     expect(() =>
-      parseConnector(
-        { ...base, webhook: webhook({ ingress: { scheme: "md5", secretRef: "x" } }) },
-        "x",
-        BUILTIN,
-      ),
-    ).toThrow(/ingress.scheme/);
+      parseConnector({ ...base, webhook: webhook({ ingress: { secretRef: "" } }) }, "x", BUILTIN),
+    ).toThrow(/ingress.secretRef/);
     expect(() =>
       parseConnector(
         {
@@ -146,7 +138,7 @@ describe("actions facet", () => {
       pathTemplate: "/repos/{input.repo}/issues/{input.number}/comments",
       bodyTemplate: { body: "{input.body}" },
     },
-    idempotency: { kind: "marker_comment" },
+    idempotency: { kind: "none" },
     ...overrides,
   });
 
@@ -155,13 +147,23 @@ describe("actions facet", () => {
     expect(c.actions?.[0]?.id).toBe("create_issue_comment");
   });
 
+  test("rejects marker_comment idempotency on an action that is not builtin", () => {
+    expect(() =>
+      parseConnector(
+        { ...base, actions: [action({ idempotency: { kind: "marker_comment" } })] },
+        "x",
+        BUILTIN,
+      ),
+    ).toThrow(/marker_comment needs a builtin action/);
+  });
+
   test("rejects actions on custom (non-builtin) connectors", () => {
     expect(() => parseConnector({ ...base, actions: [action()] }, "db:x")).toThrow(
       /not allowed on custom connectors/,
     );
   });
 
-  test("rejects undeclared placeholders, traversal, graphql without endpoint, unknown builtins", () => {
+  test("rejects undeclared placeholders, traversal, graphql without endpoint, a malformed builtin id", () => {
     expect(() =>
       parseConnector(
         {
@@ -201,11 +203,11 @@ describe("actions facet", () => {
     ).toThrow(/graphqlEndpoint/);
     expect(() =>
       parseConnector(
-        { ...base, actions: [action({ execute: { kind: "builtin", id: "github.rm_rf" } })] },
+        { ...base, actions: [action({ execute: { kind: "builtin", id: "rm_rf" } })] },
         "x",
         BUILTIN,
       ),
-    ).toThrow(/registered builtin actions/);
+    ).toThrow(/<provider>\.<name>/);
   });
 
   test("rejects a body placeholder over an undeclared input", () => {

@@ -1,6 +1,6 @@
 /** Reviews reached from outside a webhook (ADR 0119 phase 4.4).
  *
- * The GitHub webhook spine admits the PR-review built-in on its own. Three
+ * The forge's webhook admits its code-review built-in on its own. Three
  * other doors into a review exist, and each one admits a built-in run the
  * same way:
  *
@@ -13,7 +13,7 @@
  *   coordinate. It admits a run under the synthetic `review.dispatch` event
  *   key with a minimal payload; the built-in's admission arm accepts it for
  *   any mapped repo (an explicit dispatch is a request, like a comment
- *   command), and `open_review_pass` resolves the heads from GitHub because
+ *   command), and `open_review_pass` resolves the heads from the forge because
  *   the payload carries no SHAs. The payload does carry the canonical PR
  *   url, because the built-in's supersede concurrency key is that url: a
  *   dispatch must supersede the same PR's in-flight pass exactly as a
@@ -26,7 +26,9 @@
  *   `report_halt` finalize hook posts the legacy halt comment.
  */
 
-import { PR_REVIEW_BUILTIN_KEY, REVIEW_DISPATCH_EVENT_KEY } from "../automations/builtins/pr-review.ts";
+import { REVIEW_DISPATCH_EVENT_KEY } from "../automations/builtins/review-variant.ts";
+import type { ReviewVariant } from "../automations/builtins/review-variant.ts";
+import { reviewVariantFor } from "../forges/registry.ts";
 import {
   admitAutomationRun,
   automationRunId,
@@ -48,6 +50,7 @@ import {
   type AutomationStore,
 } from "../db/automations.ts";
 import { makeReviewStore, type ReviewStore } from "../db/reviews.ts";
+import { requireForge } from "../forges/registry.ts";
 import { log as rootLog } from "../log.ts";
 
 const log = rootLog.child({ component: "automation-review" });
@@ -125,19 +128,22 @@ async function bindWorkstream(
 
 async function requireBuiltin(
   store: Pick<AutomationStore, "getByBuiltinKey">,
-): Promise<AutomationRow> {
-  const builtin = await store.getByBuiltinKey(PR_REVIEW_BUILTIN_KEY);
-  if (!builtin) {
-    throw new RetryAutomationError("the PR-review built-in is not seeded");
+  provider: string,
+): Promise<{ builtin: AutomationRow; variant: ReviewVariant }> {
+  const variant = reviewVariantFor(provider);
+  const builtin = variant === null ? null : await store.getByBuiltinKey(variant.key);
+  if (variant === null || !builtin) {
+    throw new RetryAutomationError(`the code-review built-in for "${provider}" is not seeded`);
   }
-  return builtin;
+  return { builtin, variant };
 }
 
-/** Admit a fresh built-in run mirroring the review's original trigger.
- * Returns the new run id. Throws if the review never ran on the engine, or
+/** Admit a fresh run of the forge's built-in with the review's original
+ * trigger. Returns the new run id. Throws if the original run is gone or
  * the built-in is not seeded. */
 export async function retryAutomationReview(
   automationRunId_: string,
+  provider: string,
   deps: AutomationReviewDeps = {},
 ): Promise<string> {
   const { store, starter, sender, instances, now, randomUUID } = resolveDeps(deps);
@@ -146,7 +152,14 @@ export async function retryAutomationReview(
   if (!original) {
     throw new RetryAutomationError("the review's automation run no longer exists");
   }
-  const builtin = await requireBuiltin(store);
+  // The built-in whose enrolment the caller checked.
+  const { builtin } = await requireBuiltin(store, provider);
+  // The trigger of another automation's run means nothing to the built-in.
+  if (original.automationId !== builtin.id) {
+    throw new RetryAutomationError(
+      "another automation wrote this review; start the review again from that automation",
+    );
+  }
   const definition = effectiveDefinition(builtin.version, builtin.blockOverrides);
 
   const deliveryKey = `retry:${randomUUID()}`;
@@ -173,6 +186,8 @@ export async function retryAutomationReview(
 }
 
 export interface ReviewCoordinate {
+  /** The forge's connector provider. */
+  provider: string;
   repo: string;
   prNumber: number;
 }
@@ -184,7 +199,7 @@ export async function dispatchAutomationReview(
   deps: AutomationReviewDeps = {},
 ): Promise<string> {
   const { store, starter, sender, instances, now, randomUUID } = resolveDeps(deps);
-  const builtin = await requireBuiltin(store);
+  const { builtin, variant } = await requireBuiltin(store, input.provider);
   const definition = effectiveDefinition(builtin.version, builtin.blockOverrides);
 
   const deliveryKey = `dispatch:${randomUUID()}`;
@@ -193,13 +208,7 @@ export async function dispatchAutomationReview(
     eventKey: REVIEW_DISPATCH_EVENT_KEY,
     receivedAt: now().toISOString(),
     scopeValue: input.repo,
-    payload: {
-      repository: { full_name: input.repo, name: input.repo.split("/")[1] ?? "" },
-      pull_request: {
-        number: input.prNumber,
-        html_url: `https://github.com/${input.repo}/pull/${input.prNumber}`,
-      },
-    },
+    payload: variant.dispatchPayload({ repo: input.repo, prNumber: input.prNumber }),
   };
   const bound = await bindWorkstream(builtin, definition, trigger, deliveryKey, instances);
   const runId = automationRunId(builtin.id, deliveryKey, MAIN_ENTRYPOINT_ID, bound.instanceId);
@@ -244,7 +253,7 @@ export async function stopAutomationReview(
   const sender = deps.sender ?? defaultAutomationSender;
   const randomUUID = deps.randomUUID ?? (() => crypto.randomUUID());
 
-  const active = await reviews.getActiveReviewByCoordinate("github", input.repo, input.prNumber);
+  const active = await reviews.getActiveReviewByCoordinate(input.provider, input.repo, input.prNumber);
   if (!active) return { stopped: false, reason: "no_active_review" };
   if (!active.automationRunId) return { stopped: false, reason: "not_on_engine" };
   const run: AutomationRunRow | null = await runs.getRun(active.automationRunId);
@@ -255,6 +264,6 @@ export async function stopAutomationReview(
     { kind: "stop", reason: "stopped by @mention command" },
     inboxKeys.stop(run.id, randomUUID()),
   );
-  log.info({ repo: input.repo, prNumber: input.prNumber, runId: run.id }, "github stop command halted the built-in review run");
+  log.info({ ...input, runId: run.id }, "stop command halted the built-in review run");
   return { stopped: true, runId: run.id };
 }

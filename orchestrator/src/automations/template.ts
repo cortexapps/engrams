@@ -1,5 +1,6 @@
 import { Liquid } from "liquidjs";
 
+import { defaultChatProvider, requireChat } from "../chat/registry.ts";
 import type { CreateTaskAutomationAction } from "../db/schema.ts";
 
 export const AUTOMATION_TEMPLATE_MAX_CHARS = 64 * 1024;
@@ -119,18 +120,12 @@ function makeEngine(): Liquid {
     return undefined;
   });
 
-  // `strip_mentions`: Slack message text as a human reads it — `<@U…>` user
-  // mentions removed, `<#C…|name>` channels and `<url|text>` links reduced
-  // to their visible part, whitespace collapsed. A workstream title for a
-  // thread opened by a mention.
-  engine.registerFilter("strip_mentions", (value: unknown) =>
-    String(value ?? "")
-      .replace(/<@[^>|]+(?:\|[^>]*)?>/g, " ")
-      .replace(/<#[^>|]+\|([^>]*)>/g, "#$1")
-      .replace(/<([^>|]+)\|([^>]*)>/g, "$2")
-      .replace(/<([^>]+)>/g, "$1")
-      .replace(/\s+/g, " ")
-      .trim(),
+  // `strip_mentions`: a chat message's text as a person reads it. The
+  // argument names the chat provider; with none it is the default one.
+  engine.registerFilter("strip_mentions", (value: unknown, provider?: unknown) =>
+    requireChat(typeof provider === "string" ? provider : defaultChatProvider()).plainText(
+      String(value ?? ""),
+    ),
   );
 
   // `strictFilters` only rejects unknown names; LiquidJS still installs every

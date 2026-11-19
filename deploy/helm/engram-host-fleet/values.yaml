@@ -35,7 +35,7 @@ coordinator:
   tokenSecretKey: coordinator-token
 
 blob:
-  backend: gcs        # local | gcs | s3 (s3 lands in ADR 0044 K5)
+  backend: ""         # Required: local | gcs | s3
   gcsBucket: ""
   s3Bucket: ""
   s3EndpointUrl: ""   # MinIO / R2 / Spaces
@@ -104,7 +104,7 @@ egress:
   # guest streams survive deploys. Path of the daemon binary inside the
   # host-agent image; override only for a custom image layout.
   # proxydBin: /usr/local/bin/engram-egress-proxyd
-  # Where the CA material loads from. One of:
+  # Required: where the CA material loads from. One of:
   #   env                 — read the PEMs from ENGRAM_EGRESS_CA_{CERT,KEY}_PEM,
   #                         injected by the DaemonSet from caEnvSecret (the
   #                         coord-token delivery pattern). RECOMMENDED on GKE:
@@ -123,7 +123,7 @@ egress:
   #   local-disk          — auto-generate a per-host self-signed CA. NOT for a
   #                         migrating fleet: a session teleported to another host
   #                         would no longer trust that host's distinct CA.
-  caSource: gcp-secret-manager
+  caSource: ""
   # caSource == env: the K8s secret holding the CA PEMs (mirrored from Secret
   # Manager by a properly-scoped component), and the keys within it. The
   # DaemonSet injects them as ENGRAM_EGRESS_CA_CERT_PEM / _KEY_PEM.

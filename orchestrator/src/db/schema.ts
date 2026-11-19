@@ -809,6 +809,8 @@ export const prRef = pgTable(
   "pr_ref",
   {
     id: text("id").primaryKey(), // uuid string (crypto.randomUUID())
+    /** The forge's connector provider. */
+    provider: text("provider").notNull().default("github"),
     repo: text("repo").notNull(),
     prNumber: integer("pr_number").notNull(),
     authoringTaskId: text("authoring_task_id").references(() => task.id, {
@@ -822,6 +824,9 @@ export const prRef = pgTable(
     observedAt: timestamp("observed_at", { withTimezone: true }).notNull(),
   },
   (t) => [
+    uniqueIndex("pr_ref_provider_repo_pr_number_unique").on(t.provider, t.repo, t.prNumber),
+    // The previous build's upsert targets this index. It goes once no deployed
+    // build names it; until then two forges cannot hold the same repo and number.
     uniqueIndex("pr_ref_repo_pr_number_unique").on(t.repo, t.prNumber),
     index("pr_ref_authoring_task_idx").on(t.authoringTaskId),
     index("pr_ref_session_idx").on(t.sessionId),
@@ -1325,6 +1330,16 @@ export const routerSyncState = pgTable("router_sync_state", {
   lastSuccessfulSyncAt: timestamp("last_successful_sync_at", { withTimezone: true }),
   lastAttemptAt: timestamp("last_attempt_at", { withTimezone: true }),
   lastError: text("last_error"),
+});
+
+/** The models an admin chose for a router's roles. A null column uses the
+ * router's built-in model for that role, when it has one. */
+export const routerSettings = pgTable("router_settings", {
+  routerId: text("router_id").primaryKey(),
+  defaultModel: text("default_model"),
+  titleModel: text("title_model"),
+  decisionModel: text("decision_model"),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
 /** Custom webhook registrations verify with the generic scheme only. The

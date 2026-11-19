@@ -44,10 +44,6 @@ function jsonSchemaOf(schema: z.ZodType): unknown {
   }
 }
 
-/** The block + definition catalog. Pure: derived from code, no I/O.
- * `connectedRouters` are the model routers with a key; a block that needs
- * another router is left out, so the agent never drafts one that cannot
- * decide anything. */
 /** The condition group a filter or a branch takes. Its zod schema is an
  * opaque refinement, so the JSON schema says nothing; this note does. */
 const CONDITIONS_NOTE =
@@ -55,15 +51,17 @@ const CONDITIONS_NOTE =
   'path is a scope path ("event.raw.pull_request.user.type", "steps.facts.value.ok"); op is one of equals, not_equals, contains, matches, in, is_empty, gt, lt, is_true, is_false. ' +
   'Example: {"mode":"all","conditions":[{"path":"event.raw.pull_request.user.type","op":"not_equals","value":"Bot"}]}.';
 
-export function draftBlockCatalog(connectedRouters: ReadonlySet<string> = new Set()): Record<string, unknown> {
+/** The block + definition catalog. Pure: derived from code, no I/O. Without
+ * `decisionsAvailable` the decide block is left out, so the agent never
+ * drafts one that cannot decide anything. */
+export function draftBlockCatalog(decisionsAvailable = false): Record<string, unknown> {
   registerEngineBlocks();
   const blocks = listBlockTypes()
     .filter((type) => {
       // The agent is a part of the definition, never a block in a list;
       // its close step comes from a way in's `close` role.
       if (type === AGENT_BLOCK_TYPE || type === AGENT_CLOSE_BLOCK_TYPE) return false;
-      const router = getBlock(type)!.requiresRouter;
-      return router === undefined || connectedRouters.has(router);
+      return decisionsAvailable || !getBlock(type)!.requiresDecisions;
     })
     .map((type) => {
       const executor = getBlock(type)!;
@@ -112,9 +110,9 @@ export function draftBlockCatalog(connectedRouters: ReadonlySet<string> = new Se
       'Prose fields render Liquid with ${{ }}; structured values use {"$ref": "steps.<id>.<output>"}.',
       'Missing variables are render errors. `x | default: y` tolerates a missing x but NOT a missing y (the argument is strict); to pick the first present of several paths use `${{ event.raw | coalesce: "pull_request.number", "issue.number" }}`.',
       "At most one cron trigger per automation; extra entrypoints take integration, cron, or manual triggers.",
-      ...(connectedRouters.has("openrouter")
+      ...(decisionsAvailable
         ? [
-            'decide asks a decision model typed questions in one call; gate on its answers with a branch (`steps.<id>.answers.<question>.confidence`, `.value`, `.yes`). It outputs decided: false when the org has no OpenRouter key, so give the graph a fallback. list_profiles.options feeds a choice question directly (value = profile id).',
+            'decide asks a decision model typed questions in one call; gate on its answers with a branch (`steps.<id>.answers.<question>.confidence`, `.value`, `.yes`). It outputs decided: false when no connected model router can answer, so give the graph a fallback. list_profiles.options feeds a choice question directly (value = profile id).',
           ]
         : []),
       'create_session.profileId takes a profile id. Profile ids differ per org, so a portable definition reads it from a string input (`${{ inputs.profile }}`) the org fills in; an empty value fails the block.',
@@ -151,6 +149,7 @@ export function draftPatterns(): Record<string, unknown> {
       "RunNow on an instanced automation takes instance_key + instance_inputs_json to open or join a workstream; the automation row's inputs are only defaults for new workstreams.",
     ],
     reviews: [
+      "review_facts (config: provider) reads the trigger event as that forge's pull request. Its output value is null when the event starts no review (project not enrolled, a draft, a comment that is no review command); otherwise it holds repo, pr_number, pr_url, head_sha, base_sha, trigger, and pr_context for review_open_pass.",
       "A code review that shows on the Reviews page is four blocks around ordinary sessions: review_open_pass (the pass row; outputs review_id, head_sha, base_sha) -> create_session + run_command clone + review_stage phase 'finder' (stages the reviewer brief into the session and outputs the prompt) -> send_prompt with waitFor a signal -> optionally the same for phase 'verifier' -> review_settle (outputs the github.post_pr_review params) -> integration_action github post_pr_review -> review_record_post (writes the posted review's id onto the pass so the Reviews page links to it).",
       "Put review_close_pass in settings.onFinalize hooks (outcome failed on failed|deadline, halted on halted, superseded on superseded) so a crashed or superseded pass leaves the ledger and the PR's status comment consistent. Set concurrency keyTemplate to the PR url with policy supersede: a force-push then supersedes the running pass.",
       "The PR review built-in is the worked example: Duplicate it for a variant (a security-only review on release branches, say) instead of composing from scratch.",

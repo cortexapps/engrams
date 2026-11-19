@@ -9,14 +9,26 @@ const setInput = vi.hoisted(() => vi.fn().mockResolvedValue({}));
 const state = vi.hoisted(() => ({
   profiles: [] as Array<{ id: string; name: string }>,
   inputs: {} as Record<string, unknown>,
+  forges: [] as Array<{ provider: string; name: string; builtinKey: string }>,
 }));
+const GITHUB = { provider: "github", name: "GitHub", builtinKey: "pr_review" };
+const GITLAB = { provider: "gitlab", name: "GitLab", builtinKey: "gitlab_review" };
 
 vi.mock("../../hooks/useProfiles", () => ({
   useProfiles: () => ({ data: { profiles: state.profiles } }),
 }));
+vi.mock("../../hooks/useIntegrations", () => ({
+  useReviewForges: () => ({ forges: state.forges, isPending: false, error: null }),
+}));
 vi.mock("../../hooks/useAutomations", () => ({
-  useBuiltinAutomation: () => ({
-    data: { automation: { id: "auto-pr", inputsJson: JSON.stringify(state.inputs) } },
+  // Each forge has its own automation; only GitHub's has the repos.
+  useBuiltinAutomation: (key: string) => ({
+    data: {
+      automation:
+        key === "pr_review"
+          ? { id: "auto-pr", inputsJson: JSON.stringify(state.inputs) }
+          : { id: `auto-${key}`, inputsJson: JSON.stringify({ repos: {}, profile: "p1" }) },
+    },
     isPending: false,
   }),
   useSetInputValue: () => ({ mutateAsync: setInput, isPending: false }),
@@ -28,6 +40,7 @@ beforeEach(() => {
   setEntry.mockClear();
   setInput.mockClear();
   state.profiles = [{ id: "p1", name: "Reviewer" }];
+  state.forges = [GITHUB];
   state.inputs = {
     repos: { "cortexapps/engrams": { mode: "on_request", autofix: false } },
     profile: "p1",
@@ -95,6 +108,42 @@ describe("ReviewRepositories", () => {
         enable: false,
       }),
     );
+  });
+
+  it("with one forge shows no forge picker", async () => {
+    renderWithProviders(<ReviewRepositories />);
+    await screen.findByText("cortexapps/engrams");
+    expect(screen.queryByRole("combobox", { name: /git forge/i })).toBeNull();
+  });
+
+  it("with two forges, picking one shows and writes that forge's automation", async () => {
+    state.forges = [GITHUB, GITLAB];
+    renderWithProviders(<ReviewRepositories />);
+    const user = userEvent.setup();
+    await screen.findByText("cortexapps/engrams");
+    await user.click(screen.getByRole("combobox", { name: /git forge/i }));
+    await user.click(await screen.findByRole("option", { name: "GitLab" }));
+    await waitFor(() => expect(screen.queryByText("cortexapps/engrams")).toBeNull());
+
+    // A GitLab project path can name subgroups.
+    await user.click(screen.getByRole("button", { name: /enroll repo/i }));
+    await user.type(await screen.findByLabelText("Repository"), "acme/platform/api");
+    await user.click(screen.getByRole("button", { name: /^enroll$/i }));
+    await waitFor(() =>
+      expect(setEntry).toHaveBeenCalledWith({
+        automationId: "auto-gitlab_review",
+        inputKey: "repos",
+        entryKey: "acme/platform/api",
+        valueJson: JSON.stringify({ mode: "on_request", autofix: false }),
+        enable: true,
+      }),
+    );
+  });
+
+  it("says so when no forge has a code review", async () => {
+    state.forges = [];
+    renderWithProviders(<ReviewRepositories />);
+    expect(await screen.findByText(/No git forge with a code review/)).toBeTruthy();
   });
 
   it("un-enrolls a repo by removing its map entry, via the confirm dialog", async () => {

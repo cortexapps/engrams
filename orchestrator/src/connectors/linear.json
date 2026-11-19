@@ -566,9 +566,7 @@
   },
   "graphqlEndpoint": "/graphql",
   "webhook": {
-    "verificationScheme": "generic_hmac_sha256",
     "ingress": {
-      "scheme": "linear_hmac_sha256",
       "secretRef": "linear.webhook_secret"
     },
     "scope": {

@@ -38,14 +38,24 @@ export interface MapInputEditorProps {
   onChange: (next: Record<string, unknown>) => void;
   errors?: InputFieldError[];
   disabled?: boolean;
+  /** The connection whose repositories, channels or teams the key picker
+   * offers. Absent: the default connection of the default provider. */
+  connectionId?: string;
 }
 
-export function MapInputEditor({ spec, value, onChange, errors, disabled }: MapInputEditorProps) {
+export function MapInputEditor({
+  spec,
+  value,
+  onChange,
+  errors,
+  disabled,
+  connectionId,
+}: MapInputEditorProps) {
   // A scalar-valued map (channel → profile id) edits as a one-field row
   // whose field IS the row; an object-valued map edits its fields.
   const scalar = useMemo(() => mapScalarField(spec), [spec]);
   const fields = useMemo(() => (scalar ? [scalar] : mapValueFields(spec)), [spec, scalar]);
-  const options = useInputKeyOptions(spec.keyNoun);
+  const options = useInputKeyOptions(spec.keyNoun, connectionId);
   const [draftKey, setDraftKey] = useState("");
   const [keyError, setKeyError] = useState<string | null>(null);
 
@@ -69,8 +79,8 @@ export function MapInputEditor({ spec, value, onChange, errors, disabled }: MapI
 
   const addKey = (raw: string) => {
     const key = normalizeMapKey(spec.keyNoun, raw);
-    if (!isValidMapKey(spec.keyNoun, key)) {
-      setKeyError(`Enter a ${mapKeyHint(spec.keyNoun)}`);
+    if (!isValidMapKey(spec, key)) {
+      setKeyError(`Enter a ${mapKeyHint(spec)}`);
       return;
     }
     if (existing.has(key)) {
@@ -142,7 +152,7 @@ export function MapInputEditor({ spec, value, onChange, errors, disabled }: MapI
         {unusedOptions.length > 0 && (
           <Select onValueChange={(key) => addKey(key)} disabled={disabled} value="">
             <SelectTrigger className="w-56" aria-label={`Add ${spec.label} from list`}>
-              <SelectValue placeholder={`Add ${mapKeyHint(spec.keyNoun)}…`} />
+              <SelectValue placeholder={`Add ${mapKeyHint(spec)}…`} />
             </SelectTrigger>
             <SelectContent>
               {unusedOptions.map((option) => (
@@ -167,7 +177,7 @@ export function MapInputEditor({ spec, value, onChange, errors, disabled }: MapI
                   addKey(draftKey);
                 }
               }}
-              placeholder={`Type a ${mapKeyHint(spec.keyNoun)}`}
+              placeholder={`Type a ${mapKeyHint(spec)}`}
               className="w-64"
               disabled={disabled}
               aria-label={`New ${spec.label} key`}

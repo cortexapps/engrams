@@ -246,6 +246,29 @@ jobs:
                 -f "$chart/ci/render-values.yaml" -f "$stub" > /dev/null
             done
           done
+      # A backend selector has no default, so an install states its cloud.
+      # The render must fail on that selector, not on something else.
+      - name: helm template (an unset backend selector fails)
+        run: |
+          set -euo pipefail
+          check() {
+            chart="deploy/helm/$1"
+            if stderr="$(helm template test-release "$chart" \
+              -f "$chart/ci/render-values.yaml" --set "$2=" 2>&1 > /dev/null)"; then
+              echo "$1 renders with $2 unset" >&2
+              exit 1
+            fi
+            if ! printf '%s\n' "$stderr" | grep -qF "$2 is required"; then
+              echo "$1 with $2 unset failed for another reason:" >&2
+              printf '%s\n' "$stderr" >&2
+              exit 1
+            fi
+          }
+          check engram blob.backend
+          check engram kek.provider
+          check engram secrets.backend
+          check engram-host-fleet blob.backend
+          check engram-host-fleet egress.caSource
       # Node prep's disk scheduler script against constructed sysfs trees,
       # and the chart default that turns it on.
       - name: host-fleet io scheduler

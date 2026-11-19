@@ -1,12 +1,13 @@
 import { describe, expect, test } from "bun:test";
 
 import { makeReviewsDispatchRoute } from "../routes/reviews-dispatch.ts";
+import type { ReviewCoordinate } from "../reviews/automation-review.ts";
 
 const PATH = "/api/v1/reviews/dispatch";
 const REPO = "openai/engrams";
 
 function app(options: { authenticated?: boolean; enrolled?: boolean } = {}) {
-  const automationDispatches: Array<{ repo: string; prNumber: number }> = [];
+  const automationDispatches: ReviewCoordinate[] = [];
   return {
     automationDispatches,
     app: makeReviewsDispatchRoute({
@@ -48,7 +49,7 @@ describe("POST /api/v1/reviews/dispatch", () => {
     const res = await request(fixture.app);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ workflow_id: "autorun:b1:dispatch:uuid-1" });
-    expect(fixture.automationDispatches).toEqual([{ repo: REPO, prNumber: 100 }]);
+    expect(fixture.automationDispatches).toEqual([{ provider: "github", repo: REPO, prNumber: 100 }]);
   });
 
   test("returns 404 without dispatch for an un-enrolled repo", async () => {

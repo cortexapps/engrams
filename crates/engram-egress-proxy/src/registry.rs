@@ -89,7 +89,7 @@ pub struct SecretEntry {
 /// ADR 0056 (Plane B): a credential the proxy injects host-side. The
 /// guest holds no placeholder; on an outbound request matching `allow`
 /// (SNI) AND `policy` (method + path), the proxy adds
-/// `header_name: <header_template with "{}" → secret>`. The secret lives
+/// `header_name: <header_template rendered with the secret>`. The secret lives
 /// only in this struct, on the host.
 ///
 /// The credential is refreshable. A minted entry (`mint_source` present)
@@ -307,13 +307,10 @@ impl GraphqlMatch {
 /// Layered on top of the SNI host match. `methods` empty = any method;
 /// `path_globs` empty = any path.
 ///
-/// `path_globs` are **glob patterns** — a `*` matches any run of characters
-/// (including `/`) — matched against the whole request path (the connector op's
-/// full `match.path`). So `POST /repos/o/r/pulls` matches `/repos/*/pulls` while
-/// `POST /repos/o/r/git/refs` does not. (These were once truncated at the first
-/// `*` and prefix-matched — a coarse over-match where `/repos/*/pulls` collapsed
-/// to `/repos/` and the gate fired on *any* `/repos/…` request; fixed in #413,
-/// renamed from `path_prefixes` to match.)
+/// `path_globs` are glob patterns over the request target; see
+/// [`target_matches`] for the forms. A `*` in the path part of a pattern
+/// never matches into the query, so `POST /repos/o/r/pulls` matches
+/// `/repos/*/pulls` while `POST /repos/o/r/git/refs?x=/pulls` does not.
 ///
 /// ADR 0059: when `graphql` is `Some`, this entry gates a GraphQL operation — the
 /// request must still satisfy `methods`/`path_globs` (the `POST /graphql`
@@ -328,10 +325,10 @@ pub struct RequestPolicy {
 
 impl RequestPolicy {
     /// Is `(method, path)` permitted by the REST gate? Method match is
-    /// case-insensitive; path match is a glob over the whole path (`*` = any
-    /// chars). Empty list = "any". This ignores `graphql` — GraphQL entries are
-    /// gated by [`Self::method_matches`] + [`Self::path_matches`] **plus** the
-    /// body parse (see `intercept`), not by `allows`.
+    /// case-insensitive; path match is [`Self::path_matches`]. Empty list =
+    /// "any". This ignores `graphql` — GraphQL entries are gated by
+    /// [`Self::method_matches`] + [`Self::path_matches`] **plus** the body
+    /// parse (see `intercept`), not by `allows`.
     pub fn allows(&self, method: &str, path: &str) -> bool {
         self.method_matches(method) && self.path_matches(path)
     }
@@ -341,40 +338,158 @@ impl RequestPolicy {
         self.methods.is_empty() || self.methods.iter().any(|m| m.eq_ignore_ascii_case(method))
     }
 
-    /// Glob path match over the whole path; empty `path_globs` = any path.
-    /// An internal `segment:` prefix makes each `*` stop at `/`.
-    /// `segment-path:` also excludes the query string from matching. Google
-    /// Cloud policies use the latter form because API clients add transport
-    /// parameters such as `alt=json`, while the permission boundary is the
-    /// resource path.
-    pub fn path_matches(&self, path: &str) -> bool {
+    /// Does the request target match one of `path_globs`? Empty
+    /// `path_globs` = any target. A GraphQL endpoint takes no query string:
+    /// the operation is gated from the body, and a server can also read an
+    /// operation from the query.
+    pub fn path_matches(&self, target: &str) -> bool {
+        if self.graphql.is_some() && target.contains('?') {
+            return false;
+        }
         self.path_globs.is_empty()
-            || self.path_globs.iter().any(|pattern| {
-                if let Some(pattern) = pattern.strip_prefix("segment-path:") {
-                    segment_glob_match(pattern, path.split_once('?').map_or(path, |(path, _)| path))
-                } else if let Some(pattern) = pattern.strip_prefix("segment:") {
-                    segment_glob_match(pattern, path)
-                } else {
-                    glob_match(pattern, path)
-                }
-            })
+            || self
+                .path_globs
+                .iter()
+                .any(|pattern| target_matches(pattern, target))
+    }
+}
+
+/// Match one pattern against a request target `PATH[?QUERY]`. The pattern's
+/// path part globs the request path only, and a path that another server
+/// could read as a different one never matches (see [`path_is_unambiguous`]).
+///
+/// - A plain pattern: a `*` matches any run of characters, `/` included. A
+///   pattern with a query part globs it against the request query, and a
+///   request with no query does not match. A pattern with no query part takes
+///   any query (API clients add paging and filter parameters).
+/// - `segment-path:` is the same, but a `*` stops at `/`, and the path holds no
+///   escaped `/`. Google Cloud policies use it: the permission boundary is the
+///   resource path.
+/// - `segment-id:` is `segment-path:` for an upstream that reads an escaped
+///   `/` as part of one segment (GitLab names a project `group%2Fproject`): a
+///   `*` stops at `/`, and an escaped `/` stays in its segment.
+/// - `path-query:` is for a request whose permission depends on the query
+///   (git smart HTTP: `info/refs?service=…` is a fetch or a push). The query
+///   must equal the pattern's exactly, a pattern with no query takes a request
+///   with none, and the path holds no escaped `/`.
+///
+/// In the two segment forms, a `**` at the end of the pattern matches any run
+/// of characters, `/` included.
+fn target_matches(pattern: &str, target: &str) -> bool {
+    let (path, query) = split_target(target);
+    if let Some(pattern) = pattern.strip_prefix("path-query:") {
+        let (pattern_path, pattern_query) = split_target(pattern);
+        return query == pattern_query && path_matches_glob(pattern_path, path, true, false);
+    }
+    let (pattern, segment, escaped_slash) =
+        if let Some(pattern) = pattern.strip_prefix("segment-path:") {
+            (pattern, true, false)
+        } else if let Some(pattern) = pattern.strip_prefix("segment-id:") {
+            (pattern, true, true)
+        } else {
+            (pattern, false, true)
+        };
+    let (pattern_path, pattern_query) = split_target(pattern);
+    path_matches_glob(pattern_path, path, !segment, escaped_slash)
+        && pattern_query
+            .is_none_or(|pattern_query| query.is_some_and(|query| glob_match(pattern_query, query)))
+}
+
+/// Does the request path match the pattern's path part, for every server
+/// that reads it? The path must pass [`path_is_unambiguous`]. A front server
+/// can also cut a path at a `#` or a `?`, plain or escaped, so the path up to
+/// each such character must match the pattern too: the request that the
+/// upstream routes is then one that the rule permits. A file path with an
+/// escaped `#` (`/repos/o/r/contents/C%23/x.cs`) matches `/repos/*/contents/*`.
+fn path_matches_glob(
+    pattern: &str,
+    path: &str,
+    star_matches_slash: bool,
+    escaped_slash: bool,
+) -> bool {
+    path_is_unambiguous(path, escaped_slash)
+        && glob_match_with(pattern, path, star_matches_slash)
+        && cut_points(path).all(|at| glob_match_with(pattern, &path[..at], star_matches_slash))
+}
+
+/// The offsets in `path` of each `#` and `?`, plain or escaped.
+fn cut_points(path: &str) -> impl Iterator<Item = usize> + '_ {
+    let bytes = path.as_bytes();
+    (0..bytes.len()).filter(move |&at| match bytes[at] {
+        b'#' | b'?' => true,
+        b'%' => bytes
+            .get(at + 1..at + 3)
+            .is_some_and(|hex| hex == b"23" || hex.eq_ignore_ascii_case(b"3f")),
+        _ => false,
+    })
+}
+
+/// Can no server read `path` as another path by a decode or a resolve? After
+/// one `%` decode the path must hold no `;`, `\`, `%` (a second decode) or
+/// ASCII control character, and no `.` or `..` segment; a malformed escape
+/// fails. An escaped `/` passes only with `escaped_slash`: a plain glob's `*`
+/// already crosses `/`, and GitLab names a project `group%2Fproject`.
+fn path_is_unambiguous(path: &str, escaped_slash: bool) -> bool {
+    let Some(decoded) = percent_decode(path) else {
+        return false;
+    };
+    let ambiguous_byte = |b: &u8| matches!(b, b';' | b'\\' | b'%') || b.is_ascii_control();
+    let escaped_slash_ok = escaped_slash || !path.to_ascii_lowercase().contains("%2f");
+    escaped_slash_ok
+        && !decoded.iter().any(ambiguous_byte)
+        && !decoded
+            .split(|&b| b == b'/')
+            .any(|segment| segment == b"." || segment == b"..")
+}
+
+/// Decode each `%XX` escape once. `None` for a `%` without two hex digits.
+fn percent_decode(path: &str) -> Option<Vec<u8>> {
+    fn hex(b: u8) -> Option<u8> {
+        char::from(b)
+            .to_digit(16)
+            .and_then(|d| u8::try_from(d).ok())
+    }
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let high = hex(*bytes.get(i + 1)?)?;
+            let low = hex(*bytes.get(i + 2)?)?;
+            out.push(high << 4 | low);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
+/// Split a request target (or a pattern) at its first `?`.
+fn split_target(target: &str) -> (&str, Option<&str>) {
+    match target.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (target, None),
     }
 }
 
 /// Glob match: `*` matches any run of characters (including `/`); the pattern
-/// must match the ENTIRE `text`. Iterative with backtracking (O(n·m), no
-/// recursion blow-up). `*` is the only metacharacter — connector match paths use
-/// nothing else.
+/// must match the ENTIRE `text`. `*` is the only metacharacter.
 fn glob_match(pattern: &str, text: &str) -> bool {
     glob_match_with(pattern, text, true)
 }
 
-/// Google resource-path glob: `*` matches within one `/`-delimited segment.
-fn segment_glob_match(pattern: &str, text: &str) -> bool {
-    glob_match_with(pattern, text, false)
-}
-
+/// Iterative glob with backtracking (O(n·m), no recursion). With
+/// `star_matches_slash` false, a `*` stops at `/` and a `**` at the end of
+/// the pattern does not.
 fn glob_match_with(pattern: &str, text: &str, star_matches_slash: bool) -> bool {
+    if let (false, Some(head)) = (star_matches_slash, pattern.strip_suffix("**")) {
+        // The head matches a prefix of the text; the `**` takes the rest.
+        return (0..=text.len())
+            .filter(|&at| text.is_char_boundary(at))
+            .any(|at| glob_match_with(head, &text[..at], false));
+    }
     let p = pattern.as_bytes();
     let t = text.as_bytes();
     let (mut pi, mut ti) = (0usize, 0usize);
@@ -648,6 +763,311 @@ mod tests {
 
     use super::*;
     use std::str::FromStr;
+
+    fn policy(glob: &str) -> RequestPolicy {
+        RequestPolicy {
+            methods: vec![],
+            path_globs: vec![glob.into()],
+            graphql: None,
+        }
+    }
+
+    #[test]
+    fn path_query_glob_keeps_the_query_out_of_the_path_match() {
+        let fetch_refs = policy("path-query:/*.git/info/refs?service=git-upload-pack");
+        let fetch = policy("path-query:/*.git/git-upload-pack");
+
+        assert!(fetch_refs.path_matches("/g/sub/p.git/info/refs?service=git-upload-pack"));
+        assert!(fetch.path_matches("/g/p.git/git-upload-pack"));
+
+        // A push dressed as a fetch: the fetch suffix sits in the query.
+        assert!(!fetch.path_matches("/g/p.git/git-receive-pack?x=/git-upload-pack"));
+        assert!(!fetch_refs.path_matches(
+            "/g/p.git/info/refs?service=git-receive-pack&x=/info/refs?service=git-upload-pack"
+        ));
+        // The query is exact: no extra parameter, none missing.
+        assert!(!fetch_refs.path_matches("/g/p.git/info/refs?service=git-upload-pack&x=1"));
+        assert!(!fetch_refs.path_matches("/g/p.git/info/refs"));
+        assert!(!fetch.path_matches("/g/p.git/git-upload-pack?x=1"));
+        // A path the server could resolve to another one.
+        assert!(!fetch.path_matches("/g/p.git/git-receive-pack/%2e%2e/git-upload-pack"));
+        assert!(!fetch.path_matches("/g/p.git/x/../git-upload-pack"));
+        // Not a repository path.
+        assert!(!fetch.path_matches("/api/v4/projects/1/git-upload-pack"));
+    }
+
+    #[test]
+    fn a_plain_path_glob_never_matches_into_the_query() {
+        let merge_requests = policy("/api/v4/projects/*/merge_requests");
+        assert!(merge_requests.path_matches("/api/v4/projects/7/merge_requests"));
+        assert!(merge_requests.path_matches("/api/v4/projects/7/merge_requests?page=2"));
+        assert!(merge_requests.path_matches("/api/v4/projects/group%2Fproject/merge_requests"));
+        // A commit dressed as a merge request: the rule suffix sits in the query.
+        assert!(
+            !merge_requests.path_matches("/api/v4/projects/1/repository/commits?x=/merge_requests")
+        );
+
+        // A trailing `*` reaches sub-paths and takes any query, but the
+        // literal before it is still read from the path.
+        let issues = policy("/repos/*/issues*");
+        assert!(issues.path_matches("/repos/o/r/issues?state=open"));
+        assert!(issues.path_matches("/repos/o/r/issues/42/comments"));
+        assert!(!issues.path_matches("/repos/o/r/git/refs?x=/issues"));
+        let pipeline = policy("/api/v4/projects/*/pipeline*");
+        assert!(!pipeline.path_matches("/api/v4/projects/1/repository/commits?pipeline"));
+        let leading = policy("*/rest/api/3/issue");
+        assert!(leading.path_matches("/ex/jira/c/rest/api/3/issue"));
+        assert!(!leading.path_matches("/ex/jira/c/rest/api/3/issue/1/comment?x=/rest/api/3/issue"));
+
+        // A pattern's query part globs the request query, and needs one.
+        let mcp = policy("/api/unstable/mcp-server/mcp?toolsets=profiling");
+        assert!(mcp.path_matches("/api/unstable/mcp-server/mcp?toolsets=profiling"));
+        assert!(!mcp.path_matches("/api/unstable/mcp-server/mcp"));
+        assert!(!mcp.path_matches("/api/unstable/mcp-server/mcp?toolsets=logs"));
+        assert!(!mcp.path_matches("/api/unstable/mcp-server/mcp?toolsets=profiling&toolsets=logs"));
+        let any_query = policy("/search?q=*");
+        assert!(any_query.path_matches("/search?q=engrams&page=2"));
+        assert!(!any_query.path_matches("/search?page=2"));
+        assert!(!any_query.path_matches("/search"));
+
+        // A GraphQL endpoint takes its operation from the body only.
+        let graphql = RequestPolicy {
+            graphql: Some(GraphqlMatch {
+                operation: GraphqlOperation::Query,
+                field: "viewer".into(),
+            }),
+            ..policy("/graphql")
+        };
+        assert!(graphql.path_matches("/graphql"));
+        assert!(!graphql.path_matches("/graphql?query=mutation%7BdeleteRepository%7D"));
+    }
+
+    #[test]
+    fn a_segment_id_rule_takes_one_segment_with_an_escaped_slash() {
+        let project = policy("segment-id:/api/v4/projects/*");
+        assert!(project.path_matches("/api/v4/projects/42"));
+        assert!(project.path_matches("/api/v4/projects/group%2Fproject"));
+        assert!(project.path_matches("/api/v4/projects/group%2Fproject?statistics=true"));
+        // A sub-resource of a project is another operation's.
+        assert!(!project.path_matches("/api/v4/projects/42/merge_requests"));
+        assert!(!project.path_matches("/api/v4/projects/group%2Fproject/repository/tree"));
+        assert!(!project.path_matches("/api/v4/projects/group%2F..%2Fother"));
+        // `segment-path:` refuses the escaped slash.
+        assert!(!policy("segment-path:/api/v4/projects/*")
+            .path_matches("/api/v4/projects/group%2Fproject"));
+    }
+
+    #[test]
+    fn a_path_another_server_could_read_differently_never_matches() {
+        for glob in [
+            "/api/v4/projects/*/merge_requests",
+            "segment-path:/api/v4/projects/*/merge_requests",
+        ] {
+            let rule = policy(glob);
+            for target in [
+                // A front server that cuts a fragment or a path parameter.
+                "/api/v4/projects/1/repository/commits#/merge_requests",
+                "/api/v4/projects/1/repository/commits;/merge_requests",
+                "/api/v4/projects/1%2Frepository%2Fcommits%23/merge_requests",
+                "/api/v4/projects/1%2Frepository%2Fcommits%3b/merge_requests",
+                // A front server that decodes `?`, or decodes twice.
+                "/api/v4/projects/1%2Frepository%2Fcommits%3F/merge_requests",
+                "/api/v4/projects/1%2Frepository%2Fcommits%253F/merge_requests",
+                // A backslash read as `/`, and control characters.
+                "/api/v4/projects/1\\x/merge_requests",
+                "/api/v4/projects/1%5Cx/merge_requests",
+                "/api/v4/projects/1%00/merge_requests",
+                "/api/v4/projects/1\tx/merge_requests",
+                // Dot segments, plain or escaped.
+                "/api/v4/projects/2/../1/merge_requests",
+                "/api/v4/projects/2%2F..%2F1/merge_requests",
+                "/api/v4/projects/2/%2e%2E/1/merge_requests",
+                "/api/v4/projects/./merge_requests",
+                // A malformed escape.
+                "/api/v4/projects/1%2/merge_requests",
+                "/api/v4/projects/1%zz/merge_requests",
+            ] {
+                assert!(!rule.path_matches(target), "{glob} matched {target:?}");
+            }
+        }
+
+        // An escaped `/` or `.` inside one id is a legitimate plain path.
+        let files = policy("/api/v4/projects/*/repository/files/*");
+        assert!(files.path_matches("/api/v4/projects/g%2Fp/repository/files/lib%2Fclass%2Erb"));
+        // A segment glob's `*` stops at `/`, so an escaped one could carry a
+        // nested action past it.
+        let instance = policy("segment-path:/compute/v1/projects/*/zones/*/instances/*");
+        assert!(instance.path_matches("/compute/v1/projects/p/zones/z/instances/vm-1"));
+        assert!(!instance.path_matches("/compute/v1/projects/p/zones/z/instances/vm-1%2Fstart"));
+
+        // The git rules take no escaped `/` and no ambiguous byte either.
+        let fetch = policy("path-query:/*.git/git-upload-pack");
+        for target in [
+            "/g/p.git/git-receive-pack;/git-upload-pack",
+            "/g/p.git/git-receive-pack#/git-upload-pack",
+            "/g/p.git/git-receive-pack%23/git-upload-pack",
+            "/g/p.git/git-receive-pack\\..\\git-upload-pack",
+            "/g/p.git/git-receive-pack\n/git-upload-pack",
+            "/g%2Fp.git/git-upload-pack",
+        ] {
+            assert!(!fetch.path_matches(target), "matched {target:?}");
+        }
+        // A name with a space is one path for every server.
+        let azure = policy("path-query:/*/_git/*/info/refs?service=git-upload-pack");
+        assert!(azure
+            .path_matches("/org/My%20Project/_git/my%20repo/info/refs?service=git-upload-pack"));
+    }
+
+    #[test]
+    fn an_escaped_cut_character_matches_when_the_cut_path_matches_too() {
+        // The path up to the `#` is a path of the same rule.
+        let contents = policy("/repos/*/contents/*");
+        assert!(contents.path_matches("/repos/o/r/contents/src/C%23/x.cs"));
+        assert!(contents.path_matches("/repos/o/r/contents/what%3F.md?ref=main"));
+        let refs = policy("/repos/*/git/ref*");
+        assert!(refs.path_matches("/repos/o/r/git/ref/heads/fix%23123"));
+        // The path up to the `#` is another operation's.
+        assert!(!contents.path_matches("/repos/o/r/git/refs%23/contents/x"));
+        assert!(!policy("/repos/*/pulls").path_matches("/repos/o/r/git/refs%3F/pulls"));
+    }
+
+    #[test]
+    fn a_double_star_at_the_end_of_a_segment_rule_crosses_slashes() {
+        let rule = policy("segment-id:/api/v4/projects/*/merge_requests**");
+        assert!(rule.path_matches("/api/v4/projects/7/merge_requests"));
+        assert!(rule.path_matches("/api/v4/projects/g%2Fp/merge_requests/3/notes?page=2"));
+        // The project is one segment, so the rule's text in a deeper path
+        // of another operation does not match.
+        assert!(!rule.path_matches("/api/v4/projects/7/repository/files/merge_requests"));
+        assert!(!rule.path_matches("/api/v4/projects/7/repository/merge_requests/1"));
+    }
+
+    /// A GitLab power reaches no path under another power's sub-resource:
+    /// the project id is one segment in every project rule.
+    #[test]
+    fn a_gitlab_rule_does_not_reach_into_the_repository_of_a_project() {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../orchestrator/src/connectors/gitlab.json"),
+        )
+        .expect("connector file");
+        let connector: serde_json::Value = serde_json::from_str(&text).expect("connector JSON");
+        let mut checked = 0usize;
+        for operation in connector["operations"].as_array().expect("operations") {
+            let grants = operation["grants"].as_array().expect("grants");
+            if grants
+                .iter()
+                .any(|g| g.as_str().is_some_and(|g| g.starts_with("repository:")))
+            {
+                continue;
+            }
+            for key in ["path", "resourcePath"] {
+                let Some(glob) = operation["match"][key].as_str() else {
+                    continue;
+                };
+                let Some((_, tail)) = glob.split_once("/projects/") else {
+                    continue;
+                };
+                let Some((_, name)) = tail.split_once('/') else {
+                    continue;
+                };
+                let name = name.trim_end_matches('*');
+                let rule = policy(&glob.replace("{resource:encoded}", "g%2Fp"));
+                for project in ["1", "g%2Fp"] {
+                    for target in [
+                        format!("/api/v4/projects/{project}/repository/files/{name}"),
+                        format!("/api/v4/projects/{project}/repository/files/{name}.yml/raw"),
+                        format!("/api/v4/projects/{project}/variables/{name}"),
+                    ] {
+                        assert!(!rule.path_matches(&target), "{glob:?} matched {target:?}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked >= 36, "only {checked} requests");
+    }
+
+    /// Every connector operation's path, with any other operation's path
+    /// text after it in the query, matches only the rules its path alone
+    /// matches. The connector definitions are the rules the proxy enforces.
+    #[test]
+    fn no_connector_rule_matches_text_in_the_query() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../orchestrator/src/connectors");
+        let mut rules: Vec<(String, String)> = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("connector directory") {
+            let path = entry.expect("connector entry").path();
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("connector file");
+            let connector: serde_json::Value = serde_json::from_str(&text).expect("connector JSON");
+            let provider = connector["provider"]
+                .as_str()
+                .expect("provider")
+                .to_string();
+            for operation in connector["operations"].as_array().into_iter().flatten() {
+                // `resourcePath` is the rule of a grant limited to a resource.
+                for key in ["path", "resourcePath"] {
+                    if let Some(glob) = operation["match"][key].as_str() {
+                        let glob = glob
+                            .replace("{resource:encoded}", "g%2Fp")
+                            .replace("{resource}", "g/p");
+                        rules.push((provider.clone(), glob));
+                    }
+                }
+            }
+        }
+        assert!(
+            rules.iter().any(|(provider, _)| provider == "gitlab"),
+            "connector rules not found under {}",
+            dir.display()
+        );
+
+        // A concrete path for a pattern: each `*` becomes one segment.
+        let concrete = |glob: &str| -> String {
+            let glob = ["path-query:", "segment-path:", "segment-id:"]
+                .iter()
+                .find_map(|prefix| glob.strip_prefix(prefix))
+                .unwrap_or(glob);
+            glob.replace('*', "x")
+        };
+        // For each rule, the request an attacker aims at it: another
+        // operation's path, with the rule's own text in the query. Every tail
+        // of that text that starts at a `/`, so the rule's literal suffix and
+        // its leading `*` both get a chance to match.
+        let mut checked = 0usize;
+        for (provider, glob) in &rules {
+            let rule = policy(glob);
+            let text = concrete(glob);
+            assert!(
+                rule.path_matches(&text),
+                "{provider}: {glob:?} rejects {text:?}"
+            );
+            let tails: Vec<&str> = text
+                .match_indices(['/', '?'])
+                .map(|(at, _)| &text[at..])
+                .chain([text.as_str()])
+                .collect();
+            for (_, other) in rules.iter().filter(|(other, _)| other == provider) {
+                let other = concrete(other);
+                let (path, _) = split_target(&other);
+                if rule.path_matches(path) {
+                    continue;
+                }
+                for tail in &tails {
+                    let crafted = format!("{path}?x={tail}");
+                    assert!(
+                        !rule.path_matches(&crafted),
+                        "{provider}: {glob:?} matched {crafted:?} but not {path:?}",
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 1000, "only {checked} crafted requests");
+    }
 
     fn state() -> SessionState {
         SessionState {
@@ -1011,7 +1431,7 @@ mod tests {
         assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(e.secret(), "fresh-token");
         assert_eq!(
-            e.header_template.replace("{}", &e.secret()),
+            engram_core::traits::render_header_template(&e.header_template, &e.secret()),
             "Bearer fresh-token"
         );
     }
@@ -1093,25 +1513,19 @@ mod tests {
 
     #[test]
     fn glob_match_semantics() {
-        // No metacharacter → exact, whole-string match (the granularity fix:
-        // `/repos/*/pulls` must NOT leak into `/repos/o/r/git/refs`).
+        // No metacharacter → exact, whole-string match.
         assert!(glob_match("/repos/o/r/pulls", "/repos/o/r/pulls"));
         assert!(!glob_match("/repos/o/r/pulls", "/repos/o/r/pulls/1"));
         assert!(!glob_match("/repos/o/r/pulls", "/repos/o/r"));
 
         // `*` swallows any run of chars, including `/`.
         assert!(glob_match("/repos/*/pulls", "/repos/octo/repo/pulls"));
-        assert!(glob_match("/repos/*/pulls", "/repos/a/b/c/pulls")); // owner segment can contain slashes
+        assert!(glob_match("/repos/*/pulls", "/repos/a/b/c/pulls"));
         assert!(!glob_match("/repos/*/pulls", "/repos/octo/repo/git/refs"));
 
-        // Trailing `*` matches the empty remainder AND query strings / sub-paths.
+        // A trailing `*` matches the empty remainder and sub-paths.
         assert!(glob_match("/api/v2/logs*", "/api/v2/logs"));
-        assert!(glob_match("/api/v2/logs*", "/api/v2/logs/events?query=x"));
-        assert!(glob_match(
-            "/repos/*/issues*",
-            "/repos/o/r/issues?state=open"
-        ));
-        assert!(glob_match("/repos/*/issues*", "/repos/o/r/issues/42")); // issue comments etc.
+        assert!(glob_match("/repos/*/issues*", "/repos/o/r/issues/42"));
 
         // Multiple `*` and leading `*`.
         assert!(glob_match(
@@ -1126,21 +1540,20 @@ mod tests {
         assert!(glob_match("/a/*/b", "/a/x/y/b"));
         assert!(!glob_match("/a/*/b", "/a/x/y/c"));
 
-        // Google resource patterns use segment globs. A resource wildcard must
-        // not authorize a nested action or subresource.
-        assert!(segment_glob_match(
+        // A segment glob: a resource wildcard does not authorize a nested
+        // action or subresource.
+        assert!(glob_match_with(
             "/compute/v1/projects/*/zones/*/instances/*",
-            "/compute/v1/projects/prod/zones/us-central1-a/instances/vm-1"
+            "/compute/v1/projects/prod/zones/us-central1-a/instances/vm-1",
+            false
         ));
-        assert!(!segment_glob_match(
+        assert!(!glob_match_with(
             "/compute/v1/projects/*/zones/*/instances/*",
-            "/compute/v1/projects/prod/zones/us-central1-a/instances/vm-1/start"
+            "/compute/v1/projects/prod/zones/us-central1-a/instances/vm-1/start",
+            false
         ));
 
-        let google = RequestPolicy {
-            path_globs: vec!["segment-path:/v3/projects/*/metricDescriptors".into()],
-            ..RequestPolicy::default()
-        };
+        let google = policy("segment-path:/v3/projects/*/metricDescriptors");
         assert!(google
             .path_matches("/v3/projects/example-project/metricDescriptors?alt=json&pageSize=1"));
         assert!(

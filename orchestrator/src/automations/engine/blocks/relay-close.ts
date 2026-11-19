@@ -1,8 +1,8 @@
 /** `relay_close` — the closing message of a relayed session, for a
- * `settings.onFinalize` hook (ADR 0119 phase 4.6; a catalog block since
- * 2026-09). Renders the run's terminal state into the relayed place exactly
- * the way the legacy Slack loop's terminal arms did, through the same policy,
- * then removes the session's relay (a later run re-installs it):
+ * `settings.onFinalize` hook (ADR 0119). Renders the run's terminal state
+ * into the relayed place through the chat provider's policy, then removes
+ * the session's relay (a later run re-installs it). A failed post keeps the
+ * relay until the session ends:
  *
  *   completed          → onComplete (✅, last message, asset recap)
  *   failed | deadline  → onFail (❌ + the run's error)
@@ -16,17 +16,15 @@
 
 import { z } from "zod";
 
-import { makeSlackPolicy } from "../../../integrations/slack-policy.ts";
-import { sessionWebUrl } from "../../../links.ts";
 import { registerBlock } from "./registry.ts";
 import { sessionRefSchema } from "../definition.ts";
 import type { RunContext } from "../context.ts";
 import { ownPath } from "../../paths.ts";
-import { relayFactsOf } from "../../session-relay.ts";
+import { closeRelay, SESSION_FAILED_MSG, type RelayClosing } from "../../session-relay.ts";
 
 export const RELAY_CLOSE_TYPE = "relay_close";
 
-export const slackRecapConfigSchema = z.object({
+export const relayCloseConfigSchema = z.object({
   /** The relayed session. Read without adoption: a finalize hook posts
    * about a session, it never takes routing over. */
   session: sessionRefSchema,
@@ -36,12 +34,12 @@ export const slackRecapConfigSchema = z.object({
    * error or a fixed sentence. Tunable on the built-in. */
   message: z.string().optional(),
 });
-export type SlackRecapConfig = z.infer<typeof slackRecapConfigSchema>;
+export type RelayCloseConfig = z.infer<typeof relayCloseConfigSchema>;
 
 /** The session id a hook names, without adoption (see the config doc). A
  * ref that does not resolve (the run was filtered before any session) is
  * no session: the hook has nothing to post to. */
-async function sessionIdOf(config: SlackRecapConfig, ctx: RunContext): Promise<string | null> {
+async function sessionIdOf(config: RelayCloseConfig, ctx: RunContext): Promise<string | null> {
   if ("blockId" in config.session) {
     const id = ownPath(ctx.steps, `${config.session.blockId}.session_id`);
     return typeof id === "string" && id !== "" ? id : null;
@@ -55,11 +53,11 @@ async function sessionIdOf(config: SlackRecapConfig, ctx: RunContext): Promise<s
 }
 
 export function registerRelayCloseBlock(): void {
-  registerBlock<SlackRecapConfig>({
+  registerBlock<RelayCloseConfig>({
     type: RELAY_CLOSE_TYPE,
     refusesDryRun: true,
     outputs: ["posted", "rendered_as"],
-    configSchema: slackRecapConfigSchema,
+    configSchema: relayCloseConfigSchema,
     async execute(config, ctx) {
       const store = ctx.deps.relays;
       if (!store) {
@@ -70,32 +68,24 @@ export function registerRelayCloseBlock(): void {
       if (row === null) {
         return { kind: "ok", outputs: { posted: false, rendered_as: "none" } };
       }
-      const facts = relayFactsOf(row, { sessionWebUrl });
-      const policy = makeSlackPolicy({ routeExtras: { sessionId: row.sessionId } });
       const runError = ctx.terminal?.error;
-      let renderedAs: "complete" | "fail" | "neutral";
+      let closing: RelayClosing;
       switch (config.status) {
         case "completed":
-          await policy.onComplete(facts.mention, facts.session, facts.summary);
-          renderedAs = "complete";
+          closing = { kind: "complete" };
           break;
         case "failed":
         case "deadline":
-          await policy.onFail(
-            facts.mention,
-            config.message ?? runError ?? "The session hit an error and the thread cannot continue.",
-          );
-          renderedAs = "fail";
+          closing = { kind: "fail", message: config.message ?? runError ?? SESSION_FAILED_MSG };
           break;
         default:
-          await policy.onNeutralClose(
-            facts.mention,
-            config.message ?? `This thread's run ended (${config.status}). The session is kept.`,
-          );
-          renderedAs = "neutral";
+          closing = {
+            kind: "neutral",
+            message: config.message ?? `This thread's run ended (${config.status}). The session is kept.`,
+          };
       }
-      await store.remove(row.sessionId);
-      return { kind: "ok", outputs: { posted: true, rendered_as: renderedAs } };
+      await closeRelay(row, closing, { store });
+      return { kind: "ok", outputs: { posted: true, rendered_as: closing.kind } };
     },
   });
 }

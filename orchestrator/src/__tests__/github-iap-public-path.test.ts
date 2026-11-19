@@ -22,6 +22,26 @@ describe("GitHub webhook IAP exemption", () => {
     expect(isIapPublicPath("/api/v1/integrations/linear")).toBe(false);
   });
 
+  test("an event path is public only for a connector that declares an ingress", () => {
+    expect(isIapPublicPath("/api/v1/integrations/vanta/events", "POST")).toBe(true);
+    expect(isIapPublicPath("/api/v1/integrations/gitlab/events", "POST")).toBe(true);
+    expect(isIapPublicPath("/api/v1/integrations/asana/events", "POST")).toBe(false);
+    expect(isIapPublicPath("/api/v1/integrations/unknown/events", "POST")).toBe(false);
+  });
+
+  test("an interactivity path is public only for a connector that declares it", () => {
+    const base = "/api/v1/integrations/slack/interactivity";
+    expect(isIapPublicPath(base, "POST")).toBe(true);
+    expect(isIapPublicPath(`${base}?x=1`, "POST")).toBe(true);
+    expect(isIapPublicPath(`${base}/`, "POST")).toBe(false);
+    expect(isIapPublicPath(`${base}/extra`, "POST")).toBe(false);
+    expect(isIapPublicPath(`/x${base}`, "POST")).toBe(false);
+    // These connectors take events and declare no interactivity.
+    expect(isIapPublicPath("/api/v1/integrations/github/interactivity", "POST")).toBe(false);
+    expect(isIapPublicPath("/api/v1/integrations/gitlab/interactivity", "POST")).toBe(false);
+    expect(isIapPublicPath("/api/v1/integrations/unknown/interactivity", "POST")).toBe(false);
+  });
+
   test("dynamic hooks require POST plus exactly one valid registration slug", () => {
     expect(isIapPublicPath("/api/v1/hooks/my-hook?delivery=1", "POST")).toBe(true);
     expect(isIapPublicPath("/api/v1/hooks/my-hook", "GET")).toBe(false);

@@ -1,5 +1,6 @@
 /** Connection-aware integration grant validation and policy projection (ADR 0109). */
 
+import { resourceScopeError, type Connector } from "../connectors/registry.ts";
 import { ConnectError, Code } from "@connectrpc/connect";
 import { createHash } from "node:crypto";
 
@@ -92,6 +93,8 @@ export function withConnectionMemo(store: IntegrationConnectionStore): Integrati
 export async function resolveIntegrationGrants(
   grants: readonly ProfileIntegrationGrant[],
   connections: IntegrationConnectionStore,
+  /** Every connector of the deployment, the custom ones included. */
+  registry: Map<string, Connector>,
 ): Promise<ResolvedIntegrationGrant[]> {
   const uniqueIds = [...new Set(grants.map((grant) => grant.connectionId))];
   // ONE query for the whole grant set — not one per connection id.
@@ -126,6 +129,20 @@ export async function resolveIntegrationGrants(
     if (grant.resourceConstraints.some((value) => value.trim() === "")) {
       throw new ConnectError("resource constraints must not be empty", Code.InvalidArgument);
     }
+    // A named-connection provider holds a resource by its own policy. For a
+    // connector, a resource that the egress policy cannot enforce is refused.
+    const unscoped = provider
+      ? null
+      : resourceScopeError(
+          {
+            provider: connection.provider,
+            operation: grant.operation,
+            resourceConstraints: grant.resourceConstraints,
+            userScoped: grant.credentialScope === "user",
+          },
+          registry,
+        );
+    if (unscoped) throw new ConnectError(unscoped, Code.InvalidArgument);
     return { grant, connection };
   });
 }

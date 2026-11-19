@@ -12,7 +12,7 @@ data:
   ENGRAM_KERNEL_IMAGE_PATH: "/opt/engram/vmlinux"
   ENGRAM_GRPC_LISTEN_ADDR: "0.0.0.0:{{ .Values.hostAgent.grpcPort }}"
   ENGRAM_HOST_METRICS_ADDR: "0.0.0.0:{{ .Values.hostAgent.metricsPort }}"
-  ENGRAM_BLOB_BACKEND: {{ .Values.blob.backend | quote }}
+  ENGRAM_BLOB_BACKEND: {{ include "hostfleet.choice" (list .Values.blob.backend "values.blob.backend" (list "local" "gcs" "s3")) | quote }}
   {{- if not (has .Values.hostAgent.idleEvictionHarness (list "keep" "drain")) }}
   {{- fail "hostAgent.idleEvictionHarness must be keep or drain" }}
   {{- end }}
@@ -21,9 +21,9 @@ data:
   ENGRAM_COORDINATOR_ENDPOINT: {{ .Values.coordinator.endpoint | quote }}
   {{- end }}
   {{- if eq .Values.blob.backend "gcs" }}
-  ENGRAM_GCS_BUCKET: {{ .Values.blob.gcsBucket | quote }}
+  ENGRAM_GCS_BUCKET: {{ required "values.blob.gcsBucket is required when blob.backend=gcs" .Values.blob.gcsBucket | quote }}
   {{- else if eq .Values.blob.backend "s3" }}
-  ENGRAM_S3_BUCKET: {{ .Values.blob.s3Bucket | quote }}
+  ENGRAM_S3_BUCKET: {{ required "values.blob.s3Bucket is required when blob.backend=s3" .Values.blob.s3Bucket | quote }}
   {{- with .Values.blob.s3EndpointUrl }}
   ENGRAM_S3_ENDPOINT_URL: {{ . | quote }}
   {{- end }}
@@ -89,7 +89,7 @@ data:
   # adopts across a pod roll). Ships in this image beside the
   # uffd-handler; the running daemon survives the pod on mapped text.
   ENGRAM_EGRESS_PROXYD_BIN: {{ .Values.egress.proxydBin | default "/usr/local/bin/engram-egress-proxyd" | quote }}
-  ENGRAM_EGRESS_CA_SOURCE: {{ .Values.egress.caSource | quote }}
+  ENGRAM_EGRESS_CA_SOURCE: {{ include "hostfleet.choice" (list .Values.egress.caSource "values.egress.caSource" (list "env" "gcp-secret-manager" "aws-secrets-manager" "local-disk")) | quote }}
   {{- if eq .Values.egress.caSource "gcp-secret-manager" }}
   {{- if not .Values.egress.caGcpCertSecret }}
   {{- fail "egress.caGcpCertSecret is required when egress.caSource == gcp-secret-manager (issue #240)" }}

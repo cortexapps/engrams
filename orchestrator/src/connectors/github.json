@@ -32,7 +32,6 @@
     }
   },
   "webhook": {
-    "verificationScheme": "github_hmac_sha256",
     "events": [
       {
         "key": "pull_request.opened",
@@ -1565,7 +1564,6 @@
       }
     ],
     "ingress": {
-      "scheme": "github_hmac_sha256",
       "secretRef": "github.webhook_secret"
     },
     "scope": {
@@ -2690,15 +2688,11 @@
         ]
       },
       "execute": {
-        "kind": "http",
-        "method": "POST",
-        "pathTemplate": "/repos/{input.repo}/issues/{input.number}/comments",
-        "bodyTemplate": {
-          "body": "{input.body}"
-        }
+        "kind": "builtin",
+        "id": "github.upsert_pr_comment"
       },
       "output": {
-        "commentId": "id"
+        "commentId": "commentId"
       },
       "idempotency": {
         "kind": "marker_comment"
@@ -2723,9 +2717,12 @@
       ]
     },
     {
-      "id": "upsert_issue_comment",
+      "id": "upsert_pr_comment",
+      "aliases": [
+        "upsert_issue_comment"
+      ],
       "label": "Create or reuse a pinned comment",
-      "description": "Post a comment on an issue or pull request once per key. A later call with the same key finds the comment an earlier call posted and returns its id instead of posting again; edit it with update_issue_comment. One status line per pull request, across runs.",
+      "description": "Post a comment on an issue or pull request once per key. A later call with the same key returns the id of the comment an earlier call posted; edit it with update_pr_comment.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2750,15 +2747,11 @@
         ]
       },
       "execute": {
-        "kind": "http",
-        "method": "POST",
-        "pathTemplate": "/repos/{input.repo}/issues/{input.number}/comments",
-        "bodyTemplate": {
-          "body": "{input.body}"
-        }
+        "kind": "builtin",
+        "id": "github.upsert_pr_comment"
       },
       "output": {
-        "commentId": "id"
+        "commentId": "commentId"
       },
       "idempotency": {
         "kind": "marker_comment",
@@ -2784,9 +2777,12 @@
       ]
     },
     {
-      "id": "update_pinned_comment",
+      "id": "update_pr_comment",
+      "aliases": [
+        "update_pinned_comment"
+      ],
       "label": "Rewrite a pinned comment",
-      "description": "Edit a comment posted by upsert_issue_comment, keeping it findable: the key's marker is re-appended to the new body, so a later upsert_issue_comment with the same key still finds this comment.",
+      "description": "Edit a comment that upsert_pr_comment posted. The key's marker goes back on the new body, so a later upsert_pr_comment with the same key still finds the comment.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2794,7 +2790,7 @@
             "type": "string"
           },
           "commentId": {
-            "type": "integer"
+            "type": "string"
           },
           "key": {
             "type": "string"
@@ -2811,12 +2807,8 @@
         ]
       },
       "execute": {
-        "kind": "http",
-        "method": "PATCH",
-        "pathTemplate": "/repos/{input.repo}/issues/comments/{input.commentId}",
-        "bodyTemplate": {
-          "body": "{input.body}"
-        }
+        "kind": "builtin",
+        "id": "github.update_pr_comment"
       },
       "idempotency": {
         "kind": "marker_comment",

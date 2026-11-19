@@ -8,7 +8,6 @@ import {
 
 export type ToolHandling = "handled" | "session";
 export type ToolExecution = "sync" | "deferred";
-export type ToolPresenters = Record<string, unknown>;
 export interface NativeBindings {
   claude?: string;
   codex?: string;
@@ -59,8 +58,6 @@ interface ToolDefinitionBase<
   description: string;
   input: TInput;
   output: TOutput;
-  presenters?: ToolPresenters;
-  presenterExempt?: string;
   nativeBindings?: NativeBindings;
   capability?: string;
   /** Task types for which the orchestrator can expose this tool. */

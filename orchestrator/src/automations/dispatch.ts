@@ -23,7 +23,7 @@ import {
 } from "../db/automations.ts";
 import type { AutomationRunTrigger, AutomationTrigger } from "../db/schema.ts";
 import type { IntegrationEventDispatchInput } from "./integration-ingress.ts";
-import { CASE_INSENSITIVE_HANDLE_PROVIDERS, extractHandleCandidates } from "./handles.ts";
+import { canonicalIdentifier, extractHandleCandidates } from "./handles.ts";
 import {
   instanceConcurrencyKey,
   resolveInstance,
@@ -33,6 +33,7 @@ import {
   makeAutomationInstanceStore,
   type AutomationInstanceStore,
 } from "../db/automation-instances.ts";
+import { threadsBuiltinKey } from "../chat/registry.ts";
 import { loadRegistry, type WebhookFacet } from "../connectors/registry.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import { getDb } from "../db/client.ts";
@@ -787,13 +788,6 @@ export interface IntegrationDispatchStore extends AutomationDispatchStore {
   ): Promise<DispatchTarget[]>;
 }
 
-/** The one catch-all built-in that rung-1 precedence stands down when
- * ANOTHER automation's handle-bound workstream owns the event's conversation
- * (ADR 0120). Deliberately a single constant, not a registry: suppression is
- * a cross-automation behavior change and each addition should be a reviewed
- * decision. */
-const SUPPRESSIBLE_CATCH_ALL = "slack_brain";
-
 export interface DispatchIntegrationDeps {
   store?: IntegrationDispatchStore;
   workflowStarter?: AutomationWebhookStarter;
@@ -817,7 +811,7 @@ export interface DispatchIntegrationResult {
   dropped: number;
   /** Built-in keys suppressed by instance precedence (rung 1): another
    * automation's handle-bound workstream owns this event's conversation, so
-   * the catch-all brain stood down for this delivery. */
+   * the provider's chat-threads built-in stood down for this delivery. */
   suppressed: string[];
   /** Targets whose admission threw; the dispatcher rethrows after the loop. */
   failed: number;
@@ -825,14 +819,6 @@ export interface DispatchIntegrationResult {
    * delivery's verdict, as the dispatcher made it — a built-in absent here
    * was not matched (not enabled, scope did not match). */
   builtins: Record<string, AdmitOutcome>;
-}
-
-/** Providers whose scope noun compares case-insensitively (GitHub owner/repo).
- * Slack channel ids and Linear team keys are exact. One shared rule with
- * instance handles (automations/handles.ts) so a write and a later match
- * never disagree by case. */
-function normalizeScope(provider: string, value: string): string {
-  return CASE_INSENSITIVE_HANDLE_PROVIDERS.has(provider) ? value.toLowerCase() : value;
 }
 
 /** Resolve a {fromInput} scope binding against the automation's input values
@@ -873,8 +859,8 @@ export function matchesIntegrationTrigger(
   // An unresolved input binding narrows to nothing: never fire on a scope the
   // author has not spelled out.
   if (values === undefined || event.scopeValue === undefined) return false;
-  const scoped = normalizeScope(event.provider, event.scopeValue);
-  return values.some((value) => normalizeScope(event.provider, value) === scoped);
+  const scoped = canonicalIdentifier(event.provider, event.scopeValue);
+  return values.some((value) => canonicalIdentifier(event.provider, value) === scoped);
 }
 
 /** Route one verified, ledgered integration delivery to every enabled
@@ -956,17 +942,13 @@ export async function dispatchIntegrationEvent(
     ...(input.scopeValue !== undefined ? { scopeValue: input.scopeValue } : {}),
   };
 
-  // Instance resolution runs BEFORE admission for every matched pair, so
-  // rung-1 precedence can see across targets: when an open workstream of
-  // ANOTHER automation owns the event's thread (a handle bound it), the
-  // catch-all slack brain stands down for this delivery — one thread, one
-  // responder. The brain's OWN workstream owning the thread is the normal
-  // case for a live thread (its "Started a session" post binds the thread
-  // handle to it) and routes the event to that workstream by key; it must
-  // never stand the brain down (prod 2026-10-01: every follow-up in every
-  // brain thread was suppressed by the brain's own binding). The verdict is
-  // computed over the PROVIDER's instanced automations even when no brain is
-  // a matched target, so `suppressed` is always this delivery's truth.
+  // Instance resolution runs before admission for every matched pair, so
+  // precedence can see across targets: when an open workstream of another
+  // automation owns the event's thread (a handle bound it), the provider's
+  // chat-threads built-in stands down for this delivery. One thread, one
+  // responder. The built-in's own workstream owning the thread is the
+  // normal case for a live thread, and must never stand it down.
+  const catchAll = threadsBuiltinKey(input.provider);
   const resolved: Array<{
     target: DispatchTarget;
     entrypoint: { id: string; trigger: TriggerSpec };
@@ -983,19 +965,14 @@ export async function dispatchIntegrationEvent(
     }
     resolved.push({ target, entrypoint, resolution });
   }
-  // Rung 2 completion: ownership is about the CONVERSATION, not the event
-  // subscription. A tagged message arrives as TWO deliveries (message +
-  // app_mention), and the owning workstream may subscribe to only one of
-  // them — but every brain must stand down for both (prod 2026-08-26: the
-  // legacy picker answered a mention in an owned channel because no MATCHED
-  // target was instanced, so no handle ever resolved). Ask the ledger
-  // which open workstreams — in any automation — own one of the event's
-  // candidate handles. Deliberately NOT gated on the suppressible built-in
-  // being a matched target: the verdict is this delivery's, whoever reads
-  // it (prod 2026-08-26, second finding: the built-in was disabled, the
-  // gate skipped the check, and a consumer of the verdict spawned a session
-  // in an owned channel with the fix fully deployed).
-  if (anyInstancedForProvider) {
+  // Ownership is about the conversation, not the event subscription. A
+  // tagged message arrives as two deliveries (message and mention), and the
+  // owning workstream may subscribe to only one of them, but the built-in
+  // must stand down for both. So the ledger is asked which open
+  // workstreams, in any automation, own one of the event's candidate
+  // handles. It is asked even when the built-in is not a matched target:
+  // the verdict is the delivery's.
+  if (catchAll !== null && anyInstancedForProvider) {
     const suppressFacet = facet ?? (await facets(input.provider));
     if (suppressFacet !== undefined) {
       const candidates = extractHandleCandidates({
@@ -1011,23 +988,22 @@ export async function dispatchIntegrationEvent(
       }
     }
   }
-  // The suppression VERDICT is a property of the delivery, not of which
-  // brains happen to be enabled: record it whenever ownership held, so the
-  // legacy route stands down even when the built-in is not a target (the
-  // owner may be the built-in brain's own thread — the legacy brain still
-  // has no business in it). The per-target loop below skips the matched
-  // built-in only when ANOTHER automation's workstream owns the thread.
+  // The suppression verdict is a property of the delivery: it is recorded
+  // whenever a workstream owns the thread, also when the built-in is not a
+  // target. The per-target loop below skips the matched built-in only when
+  // another automation's workstream owns the thread.
   const catchAllIds = new Set(
     targets
-      .filter(({ target }) => target.automation.builtinKey === SUPPRESSIBLE_CATCH_ALL)
+      .filter(({ target }) => target.automation.builtinKey === catchAll)
       .map(({ target }) => target.automation.id),
   );
-  const ownedByOther = [...owners.values()].some((automationId) => !catchAllIds.has(automationId));
-  if (ownedByOther && !result.suppressed.includes(SUPPRESSIBLE_CATCH_ALL)) {
-    result.suppressed.push(SUPPRESSIBLE_CATCH_ALL);
+  const ownedByOther =
+    catchAll !== null && [...owners.values()].some((automationId) => !catchAllIds.has(automationId));
+  if (ownedByOther && !result.suppressed.includes(catchAll)) {
+    result.suppressed.push(catchAll);
     log.info(
       { provider: input.provider, eventKey: input.eventKey },
-      "instance precedence: another automation's workstream owns this conversation; the brain stands down",
+      "instance precedence: another automation's workstream owns this conversation; the chat-threads built-in stands down",
     );
   }
 
@@ -1038,7 +1014,7 @@ export async function dispatchIntegrationEvent(
   // targets that already succeeded).
   const failures: Array<{ automationId: string; error: unknown }> = [];
   for (const { target, entrypoint, resolution } of resolved) {
-    if (ownedByOther && target.automation.builtinKey === SUPPRESSIBLE_CATCH_ALL) {
+    if (ownedByOther && target.automation.builtinKey === catchAll) {
       // The verdict (result.suppressed) and its log were recorded above,
       // once per delivery; here the matched built-in is only skipped.
       continue;

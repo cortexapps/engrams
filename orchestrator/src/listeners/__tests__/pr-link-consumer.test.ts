@@ -18,7 +18,7 @@ function integrationAsset(payload: unknown): CuratedEvent {
 
 function pullRequestAsset(): CuratedEvent {
   return integrationAsset({
-    provider: "forge",
+    provider: "github",
     asset_kind: "pull_request",
     surface: "asset",
     data: {
@@ -77,6 +77,7 @@ describe("PR-link consumer", () => {
 
     expect(recorder.upserts).toEqual([
       {
+        provider: "github",
         repo: "openai/engrams",
         prNumber: 97,
         authoringTaskId: "task-1",
@@ -121,6 +122,92 @@ describe("PR-link consumer", () => {
     expect(recorder.upserts[0]?.title).toBe("Record authored pull requests");
   });
 
+  test("links a GitLab merge request under its project path", async () => {
+    const recorder = prRefRecorder();
+    const consumer = makePrLinkConsumer({
+      prRefs: recorder.store,
+      findTaskId: async () => "task-1",
+    });
+
+    await consumer.handle(
+      integrationAsset({
+        provider: "gitlab",
+        asset_kind: "pull_request",
+        surface: "asset",
+        data: { number: 7, title: "Add the endpoint", head_branch: "feature", base_branch: "main" },
+        fetchable: {
+          kind: "external",
+          url: "https://gitlab.example.com/acme/platform/api/-/merge_requests/7",
+        },
+        at: "2026-07-16T18:19:20.123Z",
+      }),
+      { sessionId: "session-1" },
+    );
+
+    expect(recorder.upserts[0]).toMatchObject({
+      provider: "gitlab",
+      repo: "acme/platform/api",
+      prNumber: 7,
+      headBranch: "feature",
+    });
+  });
+
+  const duplicateKey = () => Object.assign(new Error("duplicate key"), { code: "23505" });
+
+  test("a repository name and number that another forge holds is skipped after one more attempt", async () => {
+    const recorder = prRefRecorder();
+    let attempts = 0;
+    const consumer = makePrLinkConsumer({
+      prRefs: {
+        ...recorder.store,
+        upsert: async () => {
+          attempts += 1;
+          throw duplicateKey();
+        },
+      },
+      findTaskId: async () => "task-1",
+    });
+
+    await consumer.handle(pullRequestAsset(), { sessionId: "session-1" });
+    expect(attempts).toBe(2);
+  });
+
+  test("a concurrent first insert of the same pull request is recorded on the second attempt", async () => {
+    const recorder = prRefRecorder();
+    let attempts = 0;
+    const consumer = makePrLinkConsumer({
+      prRefs: {
+        ...recorder.store,
+        upsert: async (input) => {
+          attempts += 1;
+          if (attempts === 1) throw duplicateKey();
+          return recorder.store.upsert(input);
+        },
+      },
+      findTaskId: async () => "task-1",
+    });
+
+    await consumer.handle(pullRequestAsset(), { sessionId: "session-1" });
+    expect(recorder.upserts).toHaveLength(1);
+  });
+
+  test("a store failure that is not a key conflict reaches the listener's retry", async () => {
+    const recorder = prRefRecorder();
+    const consumer = makePrLinkConsumer({
+      prRefs: {
+        ...recorder.store,
+        upsert: async () => {
+          throw new Error("connection lost");
+        },
+      },
+      findTaskId: async () => "task-1",
+    });
+
+    await expect(consumer.handle(pullRequestAsset(), { sessionId: "session-1" })).rejects.toThrow(
+      "connection lost",
+    );
+  });
+
   test("derives repo AND number from the PR URL for the `gh pr create` payload shape (empty data)", async () => {
     // `gh pr create` opens the PR via the GraphQL createPullRequest mutation
     // whose selection set carries only `id`+`url`, so every `data` extractor
@@ -149,6 +236,7 @@ describe("PR-link consumer", () => {
 
     expect(recorder.upserts).toEqual([
       {
+        provider: "github",
         repo: "openai/engrams",
         prNumber: 858,
         authoringTaskId: "task-1",
@@ -221,7 +309,7 @@ describe("PR-link consumer", () => {
 
     await consumer.handle(
       integrationAsset({
-        provider: "forge",
+        provider: "github",
         asset_kind: "pull_request",
         surface: "asset",
         data: { repo: "openai/engrams", number: 98 },
@@ -233,6 +321,7 @@ describe("PR-link consumer", () => {
 
     expect(recorder.upserts).toEqual([
       {
+        provider: "github",
         repo: "openai/engrams",
         prNumber: 98,
         authoringTaskId: "task-1",

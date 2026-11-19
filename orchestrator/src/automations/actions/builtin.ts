@@ -1,61 +1,14 @@
-/** The builtin action table (ADR 0119 D5).
+/** The built-in action table (ADR 0119 D5).
  *
- * Connector `actions[]` entries with `execute.kind: "builtin"` name an id
- * from connectors/builtin-actions-allowlist.ts; this module holds the TS
- * implementations. Every provider call rides an injected seam (runOp, the
- * Slack SDK client, the Linear GraphQL client) so tests never touch the
- * network or the coordinator.
+ * A connector `actions[]` entry with `execute.kind: "builtin"` names an id
+ * `<provider>.<name>`. The implementation is the provider's: its spec lists
+ * its actions, and a git forge gets the forge role's actions. Every provider
+ * call goes through a client that a test can replace.
  */
 
-import {
-  makeGithubReviewPoster,
-  type GithubReviewPoster,
-  type InlineComment,
-} from "../../reviews/github-review.ts";
-import {
-  runIntegrationOp as defaultRunIntegrationOp,
-  type RunOpDeps,
-} from "../../integrations/run-op.ts";
-import type { KnownBlock } from "@slack/types";
-
-import { getSlackClient } from "../../integrations/slack.ts";
-import { buildMessageBlocks } from "../../integrations/slack-blocks.ts";
-import { replyText, type SlackReply } from "../../integrations/slack-message-text.ts";
-import {
-  makeLinearIssueClient,
-  type LinearIssueClient,
-} from "../../integrations/linear-issues.ts";
-import { actionClientId } from "./client-id.ts";
-import { IntegrationActionError } from "./errors.ts";
-
-type RunIntegrationOp = typeof defaultRunIntegrationOp;
-
-/** The narrow Slack surface the builtins use (structural, fake-friendly;
- * WebClient satisfies it because these argument shapes inhabit its unions). */
-export interface SlackChatClient {
-  chat: {
-    postMessage(args: {
-      channel: string;
-      text: string;
-      thread_ts?: string;
-    }): Promise<{ ts?: string; channel?: string }>;
-    update(args: {
-      channel: string;
-      ts: string;
-      text: string;
-      blocks: KnownBlock[];
-    }): Promise<{ ts?: string; channel?: string }>;
-  };
-  conversations: {
-    join(args: { channel: string }): Promise<{ channel?: { id?: string } }>;
-    replies(args: {
-      channel: string;
-      ts: string;
-      oldest?: string;
-      limit?: number;
-    }): Promise<{ messages?: SlackReply[] }>;
-  };
-}
+import { forgeActions } from "../../forges/actions.ts";
+import type { RunOpDeps } from "../../integrations/run-op.ts";
+import { providerSpecs } from "../../providers/index.ts";
 
 export interface BuiltinActionContext {
   runId: string;
@@ -65,216 +18,64 @@ export interface BuiltinActionContext {
 }
 
 export interface BuiltinActionDeps {
-  runOp: RunIntegrationOp;
-  githubPoster(): GithubReviewPoster;
-  slackClient(): Promise<SlackChatClient>;
-  linearClient(): LinearIssueClient;
+  runOpDeps?: RunOpDeps;
+  /** Test seam: the client of a provider, in place of the one its actions
+   * make. */
+  clients?: Record<string, unknown>;
 }
 
-export type BuiltinActionFn = (
+export type BuiltinActionFn<Client> = (
+  params: Record<string, unknown>,
+  ctx: BuiltinActionContext,
+  client: Client,
+) => Promise<Record<string, unknown>>;
+
+/** A provider's built-in actions, by name, over the provider's client. */
+export interface ProviderActions {
+  names: string[];
+  run(
+    provider: string,
+    name: string,
+    params: Record<string, unknown>,
+    ctx: BuiltinActionContext,
+    deps: BuiltinActionDeps,
+  ): Promise<Record<string, unknown>>;
+}
+
+export function defineActions<Client>(spec: {
+  client(provider: string, runOpDeps?: RunOpDeps): Client | Promise<Client>;
+  actions: Record<string, BuiltinActionFn<Client>>;
+}): ProviderActions {
+  return {
+    names: Object.keys(spec.actions),
+    async run(provider, name, params, ctx, deps) {
+      const action = spec.actions[name];
+      if (!action) throw new Error(`"${provider}" has no built-in action "${name}"`);
+      // A test supplies the client of the provider it names, so the cast holds.
+      const injected = deps.clients?.[provider] as Client | undefined;
+      return action(params, ctx, injected ?? (await spec.client(provider, deps.runOpDeps)));
+    },
+  };
+}
+
+export type BuiltinAction = (
   params: Record<string, unknown>,
   ctx: BuiltinActionContext,
   deps: BuiltinActionDeps,
 ) => Promise<Record<string, unknown>>;
 
-export type BuiltinActionTable = Record<string, BuiltinActionFn>;
-
-export function defaultBuiltinActionDeps(runOpDeps?: RunOpDeps): BuiltinActionDeps {
-  const runOp: RunIntegrationOp = (provider, req) => defaultRunIntegrationOp(provider, req, runOpDeps);
-  return {
-    runOp,
-    githubPoster: () => makeGithubReviewPoster({ runIntegrationOp: runOp }),
-    slackClient: () => getSlackClient(runOpDeps),
-    linearClient: () => makeLinearIssueClient({ runIntegrationOp: runOp }),
-  };
-}
-
-function requireString(params: Record<string, unknown>, key: string): string {
-  const value = params[key];
-  if (typeof value !== "string" || value === "") {
-    throw new IntegrationActionError(`missing required string "${key}"`, true);
+/** Every built-in action, by id. */
+export function builtinActions(): Map<string, BuiltinAction> {
+  const table = new Map<string, BuiltinAction>();
+  for (const spec of providerSpecs()) {
+    for (const actions of [spec.actions, spec.forge ? forgeActions : undefined]) {
+      if (!actions) continue;
+      for (const name of actions.names) {
+        table.set(`${spec.provider}.${name}`, (params, ctx, deps) =>
+          actions.run(spec.provider, name, params, ctx, deps),
+        );
+      }
+    }
   }
-  return value;
+  return table;
 }
-
-function optionalString(params: Record<string, unknown>, key: string): string | undefined {
-  const value = params[key];
-  return typeof value === "string" && value !== "" ? value : undefined;
-}
-
-const REVIEW_SCAN_PAGES = 3;
-const REVIEW_SCAN_PER_PAGE = 50;
-
-/** Scan the PR's reviews for a marker string — the crash-window guard between
- * a posted review and its checkpoint (generalizes the review product's
- * alreadyPosted, which hardcodes its own marker shape). */
-async function markerAlreadyPosted(
-  runOp: RunIntegrationOp,
-  repo: string,
-  prNumber: number,
-  marker: string,
-): Promise<boolean> {
-  for (let page = 1; page <= REVIEW_SCAN_PAGES; page += 1) {
-    const response = await runOp("github", {
-      method: "GET",
-      path: `/repos/${repo}/pulls/${prNumber}/reviews?per_page=${REVIEW_SCAN_PER_PAGE}&page=${page}`,
-      contentType: "application/json",
-    });
-    if (response.status < 200 || response.status >= 300) {
-      throw new IntegrationActionError(
-        `list pull request reviews returned ${response.status}`,
-        response.status >= 400 && response.status < 500 && response.status !== 429,
-        response.status,
-      );
-    }
-    const value: unknown = JSON.parse(new TextDecoder().decode(response.body));
-    if (!Array.isArray(value)) return false;
-    for (const review of value) {
-      const body = (review as { body?: unknown }).body;
-      if (typeof body === "string" && body.includes(marker)) return true;
-    }
-    if (value.length < REVIEW_SCAN_PER_PAGE) return false;
-  }
-  return false;
-}
-
-function readComments(params: Record<string, unknown>): InlineComment[] {
-  const raw = params["comments"];
-  if (raw === undefined) return [];
-  if (!Array.isArray(raw)) {
-    throw new IntegrationActionError(`"comments" must be an array`, true);
-  }
-  return raw.map((item, i) => {
-    const record = item as Record<string, unknown>;
-    const path = record["path"];
-    const line = record["line"];
-    const body = record["body"];
-    if (typeof path !== "string" || typeof line !== "number" || typeof body !== "string") {
-      throw new IntegrationActionError(`comments[${i}] needs path, line, body`, true);
-    }
-    // A caller with a findings ledger (the PR-review built-in's review_settle
-    // output) names each comment's finding so the ledger row and the GitHub
-    // comment stay linked; a caller without one gets a positional id.
-    const findingId = typeof record["finding_id"] === "string" ? record["finding_id"] : `automation:${i}`;
-    const startLine = typeof record["start_line"] === "number" ? record["start_line"] : undefined;
-    return {
-      findingId,
-      path,
-      line,
-      ...(startLine !== undefined ? { startLine } : {}),
-      side: typeof record["side"] === "string" ? (record["side"] as string) : "RIGHT",
-      body,
-    };
-  });
-}
-
-export const BUILTIN_ACTIONS: BuiltinActionTable = {
-  "github.post_pr_review": async (params, ctx, deps) => {
-    const repo = requireString(params, "repo");
-    const prNumber = params["prNumber"];
-    if (typeof prNumber !== "number") {
-      throw new IntegrationActionError(`missing required integer "prNumber"`, true);
-    }
-    const summary = requireString(params, "summary");
-    // The body for the 422 fallback (GitHub refused an inline anchor): a
-    // caller with a findings ledger passes one that re-quotes every finding,
-    // so a summary-only review loses nothing. Without it the summary is the
-    // body either way.
-    const fallbackSummary = optionalString(params, "fallbackSummary") ?? summary;
-    const marker = ctx.marker ?? `<!-- engrams-automation:${ctx.runId}:${ctx.stepPath} -->`;
-    if (await markerAlreadyPosted(deps.runOp, repo, prNumber, marker)) {
-      return { posted: false, already_posted: true };
-    }
-    const poster = deps.githubPoster();
-    const commitId =
-      optionalString(params, "commitId") ?? (await poster.fetchPrContext(repo, prNumber)).headSha;
-    const result = await poster.postReview({
-      repo,
-      prNumber,
-      commitId,
-      buildSummary: (inlinePosted) => `${inlinePosted ? summary : fallbackSummary}\n\n${marker}`,
-      comments: readComments(params),
-    });
-    return {
-      posted: result.posted,
-      inline_posted: result.inlinePosted,
-      already_posted: false,
-      ...(result.githubReviewId !== undefined ? { github_review_id: result.githubReviewId } : {}),
-    };
-  },
-
-  "slack.post_message": async (params, _ctx, deps) => {
-    const client = await deps.slackClient();
-    const threadTs = optionalString(params, "threadTs");
-    const response = await client.chat.postMessage({
-      channel: requireString(params, "channel"),
-      text: requireString(params, "text"),
-      ...(threadTs !== undefined ? { thread_ts: threadTs } : {}),
-    });
-    return { ts: response.ts ?? null, channel: response.channel ?? null };
-  },
-
-  "slack.join_channel": async (params, _ctx, deps) => {
-    // Rung 2 companion: message events only flow where the bot is a channel
-    // MEMBER, so a flow that claims `slack:<channel>` joins first.
-    // conversations.join is idempotent for public channels (already-in →
-    // ok with a warning); private channels need a human /invite and fail
-    // here with Slack's typed error.
-    const client = await deps.slackClient();
-    const response = await client.conversations.join({
-      channel: requireString(params, "channel"),
-    });
-    return { channel: response.channel?.id ?? null };
-  },
-
-  "slack.list_replies": async (params, _ctx, deps) => {
-    // One page of a thread, every content surface of each message rendered
-    // to text (text, blocks, attachments, files — the legacy `replyText`).
-    // The caller folds it into a prompt; this action only reads.
-    const client = await deps.slackClient();
-    const oldest = optionalString(params, "oldest");
-    const response = await client.conversations.replies({
-      channel: requireString(params, "channel"),
-      ts: requireString(params, "threadTs"),
-      ...(oldest !== undefined ? { oldest } : {}),
-      limit: 500,
-    });
-    return {
-      // `subtype` is on every Slack message the API returns but not on the
-      // SDK's reply type; widen the one field honestly.
-      messages: (response.messages ?? []).map((m: SlackReply & { subtype?: string }) => ({
-        ts: m.ts ?? "",
-        user: m.user ?? "",
-        bot_id: m.bot_id ?? "",
-        subtype: m.subtype ?? "",
-        text: replyText(m),
-      })),
-    };
-  },
-
-  "slack.update_message": async (params, _ctx, deps) => {
-    const client = await deps.slackClient();
-    // The message becomes exactly this text: its blocks are replaced too, so
-    // updating an interactive card (a choice) removes its buttons.
-    const text = requireString(params, "text");
-    const response = await client.chat.update({
-      channel: requireString(params, "channel"),
-      ts: requireString(params, "ts"),
-      text,
-      blocks: buildMessageBlocks(text),
-    });
-    return { ts: response.ts ?? null, channel: response.channel ?? null };
-  },
-
-  "linear.create_issue": async (params, ctx, deps) => {
-    // CreateLinearIssueInput takes a caller-minted id (the in-repo spec-ticket
-    // precedent), so client_id idempotency is real: a retried create adopts.
-    const issue = await deps.linearClient().createIssue({
-      id: actionClientId(ctx.runId, ctx.stepPath),
-      teamId: requireString(params, "teamId"),
-      title: requireString(params, "title"),
-      description: optionalString(params, "description") ?? "",
-    });
-    return { id: issue.id, identifier: issue.identifier, url: issue.url };
-  },
-};

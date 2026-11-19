@@ -84,3 +84,16 @@ http://{{ (urlParse .Values.coordinator.endpoint).hostname }}:{{ .Values.upgrade
 {{- define "hostfleet.upgrade.fullname" -}}
 {{- printf "%s-upgrade" (include "hostfleet.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
+
+{{/*
+A backend selector with no default: the value, or a render failure that names
+the choices. Call with (list VALUE "values.key" (list CHOICES...)).
+*/}}
+{{- define "hostfleet.choice" -}}
+{{- $value := index . 0 -}}
+{{- $choices := index . 2 -}}
+{{- if not (has $value $choices) -}}
+{{- fail (printf "%s is required: set it to one of %s (got %q)" (index . 1) (join ", " $choices) (toString $value)) -}}
+{{- end -}}
+{{- $value -}}
+{{- end -}}

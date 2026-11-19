@@ -1,11 +1,13 @@
 /** Pull-request reference data-access seam (ADR 0100). */
 
-import { desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 
 import { getDb } from "./client.ts";
 import { prRef as prRefTable } from "./schema.ts";
 
 export interface PrRefInput {
+  /** The forge's connector provider. */
+  provider: string;
   repo: string;
   prNumber: number;
   authoringTaskId: string | null;
@@ -25,13 +27,14 @@ export interface PrRefStore {
   upsert(row: PrRefInput): Promise<string>;
   listByTaskId(taskId: string): Promise<PrRefRow[]>;
   listBySessionId(sessionId: string): Promise<PrRefRow[]>;
-  /** The authoring session for one PR — the (repo, pr_number) unique. */
-  getByPr(repo: string, prNumber: number): Promise<PrRefRow | null>;
+  /** The authoring session for one PR: the (provider, repo, pr_number) unique. */
+  getByPr(provider: string, repo: string, prNumber: number): Promise<PrRefRow | null>;
 }
 
 function toRow(row: typeof prRefTable.$inferSelect): PrRefRow {
   return {
     id: row.id,
+    provider: row.provider,
     repo: row.repo,
     prNumber: row.prNumber,
     authoringTaskId: row.authoringTaskId ?? null,
@@ -60,11 +63,17 @@ export function makePrRefStore(
   };
 
   return {
-    async getByPr(repo, prNumber) {
+    async getByPr(provider, repo, prNumber) {
       const rows = await db
         .select()
         .from(prRefTable)
-        .where(sql`${prRefTable.repo} = ${repo} and ${prRefTable.prNumber} = ${prNumber}`)
+        .where(
+          and(
+            eq(prRefTable.provider, provider),
+            eq(prRefTable.repo, repo),
+            eq(prRefTable.prNumber, prNumber),
+          ),
+        )
         .limit(1);
       return rows[0] ? toRow(rows[0]) : null;
     },
@@ -75,7 +84,7 @@ export function makePrRefStore(
         .insert(prRefTable)
         .values({ id, ...row })
         .onConflictDoUpdate({
-          target: [prRefTable.repo, prRefTable.prNumber],
+          target: [prRefTable.provider, prRefTable.repo, prRefTable.prNumber],
           set: {
             title: row.title,
             url: row.url,

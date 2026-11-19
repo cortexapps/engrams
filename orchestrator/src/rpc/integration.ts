@@ -3,7 +3,7 @@
  *
  * Orchestrator-native (like ProfileService), registered before the passthrough.
  * Connectors live in the orchestrator DB (the `connector` table, C1); the
- * built-ins (`github`/`datadog`) are read-only file seeds surfaced alongside
+ * built-in connectors are read-only file seeds surfaced alongside
  * custom ones. Admin-only. `config_json` is the raw connector JSON, validated by
  * `parseConnector` (the admin-trust boundary) on write; a successful write
  * invalidates the merged-registry cache so the next session-create sees it.
@@ -51,6 +51,8 @@ import {
   type IntegrationConnectionStore,
 } from "../db/integration-connections.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
+import { threadsBuiltinKey } from "../chat/registry.ts";
+import { reviewVariantFor } from "../forges/registry.ts";
 import { makeIntegrationOidcKeyStore } from "../db/integration-oidc-keys.ts";
 import { assertGoogleCloudConfig, makeGoogleWifBroker } from "../integrations/google-wif.ts";
 import {
@@ -532,6 +534,10 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
           })),
           defaultConnectionId: defaultConnection?.id ?? "",
           connectionModel: e.connectionModel,
+          hasEvents: e.hasEvents,
+          hasActions: e.hasActions,
+          reviewBuiltinKey: reviewVariantFor(e.provider)?.key ?? "",
+          threadsBuiltinKey: threadsBuiltinKey(e.provider) ?? "",
           // ADR 0115: absent when the connector is org-only.
           ...(e.userCredential
             ? {

@@ -26,21 +26,23 @@
  * `close_agent` — the step a `close` way in ends on: post the closing
  * message into the agent's relayed place and remove the relay, end the
  * kept session, then close the workstream (admission drops later events
- * for it).
+ * for it). A closing message that cannot be posted does not stop the rest.
  */
 
 import { z } from "zod";
 
 import { terminalOutcomeForStatus } from "../../../control-plane/session-events.ts";
-import { makeSlackPolicy } from "../../../integrations/slack-policy.ts";
 import { sessionWebUrl } from "../../../links.ts";
-import { installSessionRelay, relayFactsOf, type InstallSessionRelayInput } from "../../session-relay.ts";
+import { log as rootLog } from "../../../log.ts";
+import { closeRelay, installSessionRelay, type InstallSessionRelayInput } from "../../session-relay.ts";
 import { sessionRefSchema } from "../definition.ts";
 import type { RunContext } from "../context.ts";
 import { registerBlock, type BlockOutcome } from "./registry.ts";
-import { installRelayForSession, mentionFromRelayConfig, slackRelayConfigSchema } from "./relay.ts";
+import { installRelayForSession, mentionFromRelayConfig, relayConfigSchema } from "./relay.ts";
 import { createSessionConfigSchema, executeCreateSession, renderSessionPrompt } from "./session.ts";
 import { errorMessage } from "../errors.ts";
+
+const log = rootLog.child({ component: "agent-block" });
 
 export const RUN_AGENT_TYPE = "run_agent";
 export const CLOSE_AGENT_TYPE = "close_agent";
@@ -59,7 +61,7 @@ export const runAgentConfigSchema = createSessionConfigSchema.extend({
     // A relay whose place is blank (an editor form that left every field
     // empty) is no relay.
     (value) => (isBlankRelay(value) ? undefined : value),
-    slackRelayConfigSchema.omit({ session: true }).optional(),
+    relayConfigSchema.omit({ session: true }).optional(),
   ),
 });
 
@@ -182,7 +184,7 @@ async function execute(config: RunAgentConfig, ctx: RunContext): Promise<BlockOu
     // installed (same mention) and says nothing twice; a continued
     // session's place already carries its link.
     if (installed.outputs["created"] === true) {
-      await ctx.deps.announceStarted?.(sessionId, mentionFromRelayConfig(relay));
+      await ctx.deps.announceStarted?.(sessionId, relay.provider, mentionFromRelayConfig(relay));
     }
   }
 
@@ -197,9 +199,9 @@ async function execute(config: RunAgentConfig, ctx: RunContext): Promise<BlockOu
       // The turn did not reach the agent. The relay goes back to the
       // mention the session last heard, so the next turn's context starts
       // after what it really got, never after this mention.
-      if (repointedFrom !== undefined && ctx.deps.relays !== undefined) {
+      if (relay !== undefined && repointedFrom !== undefined && ctx.deps.relays !== undefined) {
         await installSessionRelay(
-          { sessionId, automationId: ctx.automationId, target: repointedFrom },
+          { sessionId, automationId: ctx.automationId, provider: relay.provider, target: repointedFrom },
           { store: ctx.deps.relays },
         );
       }
@@ -253,10 +255,13 @@ async function executeClose(config: CloseAgentConfig, ctx: RunContext): Promise<
     const relays = ctx.deps.relays;
     const row = relays ? await relays.get(previous.sessionId) : null;
     if (relays && row !== null) {
-      const facts = relayFactsOf(row, { sessionWebUrl });
-      const policy = makeSlackPolicy({ routeExtras: { sessionId: row.sessionId } });
-      await policy.onNeutralClose(facts.mention, reason ?? "This agent was closed.");
-      await relays.remove(row.sessionId);
+      try {
+        await closeRelay(row, { kind: "neutral", message: reason ?? "This agent was closed." }, { store: relays });
+      } catch (error) {
+        // The place can be gone for good (an archived channel). The session
+        // still ends, and its end removes the relay.
+        log.warn({ err: error, sessionId: previous.sessionId }, "the closing message of an agent was not posted");
+      }
     }
     await ctx.deps.sessions.endSession(previous.sessionId);
     ended = true;

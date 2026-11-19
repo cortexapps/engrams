@@ -7,15 +7,14 @@ import {
   closeSessionRelay,
   deliverSessionAnswer,
   installSessionRelay,
-  relayFactsOf,
   renderSessionEvent,
   type SessionRelayDeps,
 } from "../../session-relay.ts";
 import { registerEngineBlocks } from "../blocks/index.ts";
 import { getBlock } from "../blocks/registry.ts";
-import { RELAY_SESSION_TYPE, type SlackRelayConfig } from "../blocks/relay.ts";
+import { RELAY_SESSION_TYPE, type RelayConfig } from "../blocks/relay.ts";
 import { RELAY_CLOSE_TYPE } from "../blocks/relay-close.ts";
-import { setSlackPolicyFactoryForTest } from "../../../integrations/slack-policy.ts";
+import { setSlackPolicyFactoryForTest } from "../../../providers/slack/policy.ts";
 import { buildRunContext, type RunSnapshot } from "../context.ts";
 import type { EngineDeps, EngineRunStore, EngineSessionOps } from "../deps.ts";
 import { makeFakeRelayStore } from "./fake-relay-store.ts";
@@ -94,7 +93,7 @@ function harness() {
     sessionWebUrl: (id) => `https://x/sessions/${id}`,
   };
   const install = (target = MENTION) =>
-    installSessionRelay({ sessionId: SESSION, automationId: "auto-1", target }, deps);
+    installSessionRelay({ sessionId: SESSION, automationId: "auto-1", provider: "slack", target }, deps);
   const render = (event: CuratedEvent) => renderSessionEvent(SESSION, event, deps);
   return {
     policy,
@@ -241,10 +240,11 @@ describe("session relay (contract 5)", () => {
       ev("integration_asset", { provider: "github", kind: "pull_request", url: "https://github.com/a/b/pull/1", title: "Fix it" }),
     );
     expect(h.policy.calls.onAsset).toHaveLength(1);
-    const facts = relayFactsOf(h.store.rows.get(SESSION)!, h.deps);
-    expect(facts.summary.lastMessage).toBe("done");
-    expect(facts.summary.assets.length).toBe(1);
-    expect(facts.session.webUrl).toBe(`https://x/sessions/${SESSION}`);
+    await closeSessionRelay(SESSION, "completed", h.deps);
+    const [, session, summary] = h.policy.calls.onComplete[0]!;
+    expect(session).toEqual({ id: SESSION, webUrl: `https://x/sessions/${SESSION}` });
+    expect(summary).toMatchObject({ lastMessage: "done" });
+    expect((summary as { assets: unknown[] }).assets).toHaveLength(1);
   });
 
   test("a render failure is dropped, never thrown, and the event still counts as rendered", async () => {
@@ -284,7 +284,12 @@ describe("session relay (contract 5)", () => {
         // (the agent step of the next run): the bubble closes there.
         raced = true;
         await installSessionRelay(
-          { sessionId: SESSION, automationId: "auto-1", target: { ...MENTION, ts: "200.0", eventId: "E2" } },
+          {
+            sessionId: SESSION,
+            automationId: "auto-1",
+            provider: "slack",
+            target: { ...MENTION, ts: "200.0", eventId: "E2" },
+          },
           h.deps,
         );
       }
@@ -354,6 +359,33 @@ describe("session relay (contract 5)", () => {
     expect(h.policy.calls.onNeutralClose).toEqual([]);
     expect(h.store.rows.size).toBe(0);
   });
+
+  test("the session's end removes the relay when the closing post fails", async () => {
+    const h = harness();
+    await h.install();
+    const deps: SessionRelayDeps = {
+      ...h.deps,
+      policy: () => ({
+        ...h.policy.pol,
+        onComplete: async () => {
+          throw new Error("chat down");
+        },
+      }),
+    };
+    expect(await closeSessionRelay(SESSION, "completed", deps)).toBe("closed");
+    expect(h.store.rows.has(SESSION)).toBe(false);
+  });
+
+  test("a relay does not move to another chat provider", async () => {
+    const h = harness();
+    await h.install();
+    await expect(
+      installSessionRelay(
+        { sessionId: SESSION, automationId: "auto-1", provider: "other-chat", target: { ...MENTION, ts: "200.0" } },
+        h.deps,
+      ),
+    ).rejects.toThrow(/cannot move/);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -361,7 +393,7 @@ describe("session relay (contract 5)", () => {
 // ---------------------------------------------------------------------------
 
 const RUN_ID = "autorun:auto-1:slack:E1";
-const CONFIG: SlackRelayConfig = {
+const CONFIG: RelayConfig = {
   session: { blockId: "launch" },
   provider: "slack",
   team: "T1",
@@ -464,6 +496,34 @@ describe("relay_close block", () => {
       const none = await close.execute!({ session: { blockId: "launch" }, status: "failed" } as never, h.ctx);
       expect(none).toEqual({ kind: "ok", outputs: { posted: false, rendered_as: "none" } });
       expect(policy.calls.onFail).toHaveLength(0);
+    } finally {
+      setSlackPolicyFactoryForTest(null);
+    }
+  });
+
+  test("a failed closing post fails the step and keeps the relay for the next close", async () => {
+    const h = blockHarness();
+    const policy = recordingPolicy();
+    let down = true;
+    setSlackPolicyFactoryForTest(() => ({
+      ...policy.pol,
+      onComplete: async (...args) => {
+        if (down) throw new Error("chat down");
+        return policy.pol.onComplete(...args);
+      },
+    }));
+    try {
+      await getBlock(RELAY_SESSION_TYPE)!.execute!(CONFIG as never, h.ctx);
+      const close = getBlock(RELAY_CLOSE_TYPE)!;
+      const config = { session: { blockId: "launch" }, status: "completed" } as never;
+      await expect(close.execute!(config, h.ctx)).rejects.toThrow("chat down");
+      expect(h.store.rows.size).toBe(1);
+      down = false;
+      expect(await close.execute!(config, h.ctx)).toEqual({
+        kind: "ok",
+        outputs: { posted: true, rendered_as: "complete" },
+      });
+      expect(h.store.rows.size).toBe(0);
     } finally {
       setSlackPolicyFactoryForTest(null);
     }

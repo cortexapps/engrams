@@ -18,17 +18,17 @@ describe("makeEnrolledRepos", () => {
         return builtin({ repos: { "Acme/Widgets": { mode: "auto", autofix: true }, "acme/api": {} } });
       },
     });
-    expect(await repos.get("acme/widgets")).toEqual({ mode: "auto", autofix: true });
-    expect(await repos.get("ACME/API")).toEqual({ mode: "on_request", autofix: false });
-    expect(await repos.get("acme/other")).toBeNull();
+    expect(await repos.get("github", "acme/widgets")).toEqual({ mode: "auto", autofix: true });
+    expect(await repos.get("github", "ACME/API")).toEqual({ mode: "on_request", autofix: false });
+    expect(await repos.get("github", "acme/other")).toBeNull();
   });
 
   test("no built-in, an archived one, or a malformed map lists nothing", async () => {
-    expect(await makeEnrolledRepos({ async getByBuiltinKey() { return null; } }).get("a/b")).toBeNull();
+    expect(await makeEnrolledRepos({ async getByBuiltinKey() { return null; } }).get("github", "a/b")).toBeNull();
     expect(
-      await makeEnrolledRepos({ async getByBuiltinKey() { return builtin({ repos: { "a/b": {} } }, true); } }).get("a/b"),
+      await makeEnrolledRepos({ async getByBuiltinKey() { return builtin({ repos: { "a/b": {} } }, true); } }).get("github", "a/b"),
     ).toBeNull();
-    expect(await makeEnrolledRepos({ async getByBuiltinKey() { return builtin({ repos: ["a/b"] }); } }).get("a/b")).toBeNull();
+    expect(await makeEnrolledRepos({ async getByBuiltinKey() { return builtin({ repos: ["a/b"] }); } }).get("github", "a/b")).toBeNull();
   });
 
   test("policyOf tolerates a non-object entry", () => {

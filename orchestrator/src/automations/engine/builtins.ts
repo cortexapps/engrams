@@ -1,10 +1,11 @@
-/** Built-in automation registry seam (ADR 0119 D7).
- *
- * Phase 4 registers the PR-review and Slack-brain definitions here; the boot
- * hook seeds them with the seed-profile pattern. Empty in phase 1.
- */
+/** The built-in automation registry (ADR 0119 D7). The boot hook seeds
+ * what is registered here. */
 
 import type { AutomationDefinition } from "./definition.ts";
+
+/** The connection id a built-in's trigger carries until the seeder puts the
+ * org's default connection for the trigger's provider in its place. */
+export const DEFAULT_CONNECTION_PLACEHOLDER = "__default__";
 
 export interface BuiltinAutomation {
   key: string;

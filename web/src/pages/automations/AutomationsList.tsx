@@ -21,8 +21,6 @@ import { cn } from "@/lib/utils";
 import { formatDuration } from "./runs/run-format";
 import { Sparkline } from "./Sparkline";
 
-export const PR_REVIEW_BUILTIN_KEY = "pr_review";
-
 // One set of tracks for the header, the rows and the loading skeleton, applied
 // as an inline template so the three cannot drift.
 const TABLE_COLUMNS = ["minmax(0,1.5fr)", "minmax(0,1fr)", "minmax(200px,0.9fr)", "64px", "90px"];
