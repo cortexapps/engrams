@@ -155,12 +155,14 @@ export function makeTagStore(db: ReturnType<typeof getDb> = getDb()): TagStore {
       try {
         return await db.transaction(async (tx): Promise<AddToAutomationOutcome> => {
           // The row lock serializes adds to one automation, so the count
-          // below cannot go stale before the insert.
+          // below cannot go stale before the insert. NO KEY UPDATE does not
+          // conflict with the key-share lock a foreign-key check takes, so
+          // inserts that reference the automation (runs) do not wait.
           const [target] = await tx
             .select({ archivedAt: automationTable.archivedAt })
             .from(automationTable)
             .where(eq(automationTable.id, automationId))
-            .for("update");
+            .for("no key update");
           if (!isActive(target)) return "automation_missing";
           const linked = await tx
             .select({ tagId: automationTagTable.tagId })

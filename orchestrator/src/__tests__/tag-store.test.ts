@@ -7,7 +7,7 @@
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 
 import { ENGINE_VERSION } from "../automations/engine/definition.ts";
 import { checkDb, getDb } from "../db/client.ts";
@@ -160,6 +160,22 @@ describe.skipIf(!dbReachable)("tag store (live PG)", () => {
     expect(outcomes.filter((o) => o === "added")).toHaveLength(2);
     expect(outcomes.filter((o) => o === "full")).toHaveLength(1);
     expect((await tags.tagsForAutomations([a])).get(a)).toHaveLength(2);
+  });
+
+  test("a tag add does not block writes that only reference the automation", async () => {
+    const s = suffix();
+    const t = await newTag(`lock ${s}`);
+    const a = await seedAutomation();
+    // FOR KEY SHARE is the lock a foreign-key check takes, e.g. when a run for
+    // this automation is inserted. Hold it while the tag add runs.
+    await getDb().transaction(async (tx) => {
+      await tx.execute(sql`select 1 from automation where id = ${a} for key share`);
+      const outcome = await Promise.race([
+        tags.addToAutomation(a, t.id, 10),
+        new Promise((resolve) => setTimeout(() => resolve("blocked"), 2000)),
+      ]);
+      expect(outcome).toBe("added");
+    });
   });
 
   test("link writes refuse an archived or unknown automation and an unknown tag", async () => {
