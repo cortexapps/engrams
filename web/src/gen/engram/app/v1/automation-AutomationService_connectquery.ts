@@ -59,6 +59,18 @@ export const setAutomationEnabled = AutomationService.method.setAutomationEnable
 export const updateAutomationMeta = AutomationService.method.updateAutomationMeta;
 
 /**
+ * Add or remove ONE tag; no new version. Allowed on built-ins.
+ *
+ * @generated from rpc engram.app.v1.AutomationService.AddAutomationTag
+ */
+export const addAutomationTag = AutomationService.method.addAutomationTag;
+
+/**
+ * @generated from rpc engram.app.v1.AutomationService.RemoveAutomationTag
+ */
+export const removeAutomationTag = AutomationService.method.removeAutomationTag;
+
+/**
  * Per-automation input values (allowed on built-ins).
  *
  * @generated from rpc engram.app.v1.AutomationService.SetInputs

@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package engram.app.v1;
 
+import "engram/app/v1/tag.proto";
+
 // Automations v2 (ADR 0119): trigger + ordered block graph + inputs, run on
 // one durable interpreter workflow. ORCHESTRATOR-NATIVE: like task.proto /
 // profile.proto, this service is not compiled into the coordinator's Rust
@@ -29,6 +31,9 @@ service AutomationService {
   // Name / description / run settings. Settings are PermissionDenied on a
   // built-in.
   rpc UpdateAutomationMeta(UpdateAutomationMetaRequest) returns (UpdateAutomationMetaResponse);
+  // Add or remove ONE tag; no new version. Allowed on built-ins.
+  rpc AddAutomationTag(AddAutomationTagRequest) returns (AddAutomationTagResponse);
+  rpc RemoveAutomationTag(RemoveAutomationTagRequest) returns (RemoveAutomationTagResponse);
   // Per-automation input values (allowed on built-ins).
   rpc SetInputs(SetInputsRequest) returns (SetInputsResponse);
   // Set or remove ONE entry of a map input atomically (a JSONB patch, never
@@ -126,6 +131,8 @@ message Automation {
   string updated_at = 15;
   // The current version's definition, for the editor.
   AutomationVersion version = 16;
+  // Ordered by name without regard to case.
+  repeated Tag tags = 18;
 }
 
 message AutomationVersion {
@@ -275,6 +282,24 @@ message UpdateAutomationMetaRequest {
 }
 
 message UpdateAutomationMetaResponse {
+  Automation automation = 1;
+}
+
+message AddAutomationTagRequest {
+  string automation_id = 1;
+  string tag_id = 2;
+}
+
+message AddAutomationTagResponse {
+  Automation automation = 1;
+}
+
+message RemoveAutomationTagRequest {
+  string automation_id = 1;
+  string tag_id = 2;
+}
+
+message RemoveAutomationTagResponse {
   Automation automation = 1;
 }
 

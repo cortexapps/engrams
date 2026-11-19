@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+// Installation-wide tags, managed by admins. ORCHESTRATOR-NATIVE: not
+// compiled into the coordinator's Rust surface.
+service TagService {
+  rpc ListTags(ListTagsRequest) returns (ListTagsResponse);
+  rpc CreateTag(CreateTagRequest) returns (CreateTagResponse);
+  rpc UpdateTag(UpdateTagRequest) returns (UpdateTagResponse);
+  // Also removes the tag from every automation.
+  rpc DeleteTag(DeleteTagRequest) returns (DeleteTagResponse);
+}
+
+message Tag {
+  string id = 1;
+  string name = 2;
+  // #rrggbb
+  string color = 3;
+  string description = 4;
+}
+
+message TagSummary {
+  Tag tag = 1;
+  // Non-archived automations that have the tag.
+  int32 automation_count = 2;
+}
+
+message ListTagsRequest {}
+
+message ListTagsResponse {
+  // Ordered by name without regard to case.
+  repeated TagSummary tags = 1;
+}
+
+message CreateTagRequest {
+  string name = 1;
+  string color = 2;
+  string description = 3;
+}
+
+message CreateTagResponse {
+  Tag tag = 1;
+}
+
+message UpdateTagRequest {
+  string id = 1;
+  optional string name = 2;
+  optional string color = 3;
+  optional string description = 4;
+}
+
+message UpdateTagResponse {
+  Tag tag = 1;
+}
+
+message DeleteTagRequest {
+  string id = 1;
+}
+
+message DeleteTagResponse {}
