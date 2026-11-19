@@ -708,6 +708,13 @@
       "when": 1793241391817,
       "tag": "0100_profile_programmatic_only",
       "breakpoints": true
+    },
+    {
+      "idx": 101,
+      "version": "7",
+      "when": 1795115737039,
+      "tag": "0101_automation_session_child_role",
+      "breakpoints": true
     }
   ]
 }
