@@ -21,7 +21,7 @@ engram-harness-sdk.workspace = true
 engram-transport.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-nix = { version = "0.31", default-features = false, features = ["signal"] }
+nix = { version = "0.32", default-features = false, features = ["signal"] }
 # `io-std`: main.rs reads tokio::io::stdin() and writes tokio::io::stdout().
 tokio = { workspace = true, features = ["process", "io-util", "io-std", "rt", "macros", "time", "sync", "fs", "net"] }
 tracing.workspace = true
