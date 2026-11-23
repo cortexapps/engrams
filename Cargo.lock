@@ -9681,6 +9681,7 @@ dependencies = [
  "log",
  "memchr",
  "mio",
+ "nix 0.31.4",
  "nix 0.32.0",
  "nom",
  "num-bigint",
