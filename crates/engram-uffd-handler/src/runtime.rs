@@ -3769,7 +3769,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stalled_alt_source_does_not_block_stop_or_install_after_cancellation() {
         use crate::peer::{
-            tests::{fake_source, page_resp},
+            tests::{fake_source_geometry, page_resp},
             PeerSession,
         };
         use engram_substrate_proto::{read_frame, write_frame, FromWriter, ToWriter};
@@ -3844,7 +3844,7 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let addr = fake_source(vec![0, 1], move |req, offset| {
+            let addr = fake_source_geometry(vec![0, 1], 4096, 8192, move |req, offset| {
                 if offset == 4096 {
                     engram_migrate_proto::FromSource::AltSource {
                         req_id: req,

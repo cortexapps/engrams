@@ -304,10 +304,6 @@ tar = "0.4"
 # inflate throughput (~2x miniz_oxide) — the OCI layer gzip decode is on
 # the enable critical path.
 flate2 = { version = "1.1", features = ["zlib-rs"] }
-# ADR 0080: engram-rootfs-materializer's deterministic-pack mtime clamp
-# (regular files, dirs, AND symlinks — std can't lutimes) and its OCI
-# layer xattr application. Both are already transitive deps of `tar`.
-filetime = "0.2"
 xattr = "1"
 # ADR 0055 P2: read user-uploaded .zip skill archives. Lean: deflate + store
 # only (no bzip2/zstd/aes), and extraction is budgeted against zip bombs.

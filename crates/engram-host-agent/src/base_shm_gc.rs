@@ -208,15 +208,8 @@ mod tests {
         f.write_all(b"x").unwrap();
         drop(f);
         // Backdate mtime past the grace window.
-        let old = filetime::FileTime::from_unix_time(
-            (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                - 7200) as i64,
-            0,
-        );
-        filetime::set_file_mtime(&p, old).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::set_times(&p, std::fs::FileTimes::new().set_modified(old)).unwrap();
         p
     }
 
