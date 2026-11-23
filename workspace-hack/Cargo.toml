@@ -65,7 +65,7 @@ lazy_static = { version = "1", default-features = false, features = ["spin_no_st
 libc = { version = "0.2", features = ["extra_traits"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
-nix = { version = "0.31", default-features = false, features = ["fs", "mman", "sched", "signal", "uio"] }
+nix-51543b5218fc235c = { package = "nix", version = "0.32", default-features = false, features = ["fs", "mman", "sched", "signal", "uio"] }
 num-bigint = { version = "0.4" }
 num-bigint-dig = { version = "0.8", default-features = false, features = ["i128", "prime", "u64_digit", "zeroize"] }
 num-integer = { version = "0.1", default-features = false, features = ["i128", "std"] }
@@ -192,7 +192,8 @@ getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-f
 libc = { version = "0.2", default-features = false, features = ["use_std"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
 mio = { version = "1", features = ["net", "os-ext"] }
-nix = { version = "0.31", features = ["hostname", "ioctl", "mount", "socket"] }
+nix-51543b5218fc235c = { package = "nix", version = "0.32", features = ["hostname", "mount", "socket"] }
+nix-5f5a217a62ea0662 = { package = "nix", version = "0.31", features = ["fs", "ioctl", "mount", "sched", "signal", "socket"] }
 nom = { version = "7" }
 num-iter = { version = "0.1", default-features = false, features = ["i128", "std"] }
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
@@ -221,7 +222,8 @@ getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-f
 libc = { version = "0.2", default-features = false, features = ["use_std"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
 mio = { version = "1", features = ["net", "os-ext"] }
-nix = { version = "0.31", features = ["hostname", "ioctl", "mount", "socket"] }
+nix-51543b5218fc235c = { package = "nix", version = "0.32", features = ["hostname", "mount", "socket"] }
+nix-5f5a217a62ea0662 = { package = "nix", version = "0.31", features = ["fs", "ioctl", "mount", "sched", "signal", "socket"] }
 nom = { version = "7" }
 num-iter = { version = "0.1", default-features = false, features = ["i128", "std"] }
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
@@ -247,7 +249,7 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive", "s
 errno = { version = "0.3" }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 mio = { version = "1", features = ["net", "os-ext"] }
-nix = { version = "0.31", default-features = false, features = ["hostname", "socket"] }
+nix-51543b5218fc235c = { package = "nix", version = "0.32", default-features = false, features = ["hostname", "socket"] }
 rustix = { version = "1", features = ["event", "fs", "stdio", "termios"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
 
@@ -262,7 +264,7 @@ rustix = { version = "1", features = ["event", "fs", "stdio", "termios"] }
 errno = { version = "0.3" }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 mio = { version = "1", features = ["net", "os-ext"] }
-nix = { version = "0.31", default-features = false, features = ["hostname", "socket"] }
+nix-51543b5218fc235c = { package = "nix", version = "0.32", default-features = false, features = ["hostname", "socket"] }
 rustix = { version = "1", features = ["event", "fs", "stdio", "termios"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
 
