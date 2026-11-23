@@ -93,7 +93,7 @@ reqwest.workspace = true
 # memfd-backed self-test, no guest involved). The extra modules
 # compile to no-ops on non-Linux so the features are portable.
 # "signal": ADR 0121 — SIGKILL for a wedged egress daemon (identity-verified).
-nix = { version = "0.32", default-features = false, features = ["fs", "mman", "sched", "signal", "uio"] }
+nix = { version = "0.31", default-features = false, features = ["fs", "mman", "sched", "signal", "uio"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 engram-telemetry.workspace = true
@@ -132,8 +132,6 @@ engram-egress-proxyd.workspace = true
 engram-testkit.workspace = true
 # Paused-clock tests for the SIGTERM flush join.
 tokio = { workspace = true, features = ["test-util"] }
-# base_shm_gc tests backdate mtimes
-filetime = "0.2"
 engram-harness-noop.workspace = true
 engram-sandbox-process.workspace = true
 # item d (#530) deleted `ensure_stub_harness`, the only src/ consumer
