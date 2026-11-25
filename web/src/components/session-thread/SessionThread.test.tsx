@@ -569,4 +569,31 @@ describe("SessionThread", () => {
     await user.click(screen.getByText("nav-A"));
     await waitFor(() => expect(screen.getByText("bleed-probe-A")).toBeTruthy());
   });
+
+  test("an unsent draft stays with its session across a switch", async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<NavHarness />);
+
+    const input = await screen.findByLabelText("Message input");
+    await user.click(input);
+    await user.type(input, "draft-for-A");
+    expect(input.textContent).toBe("draft-for-A");
+
+    // Session B starts with an empty composer, not A's draft.
+    await user.click(screen.getByText("nav-B"));
+    await waitFor(() => expect(screen.getByText("B's own reply")).toBeTruthy());
+    expect(screen.getByLabelText("Message input").textContent).toBe("");
+    await user.click(screen.getByLabelText("Message input"));
+    await user.type(screen.getByLabelText("Message input"), "draft-for-B");
+
+    // Back to A: its own draft returns; then B's comes back on the next switch.
+    await user.click(screen.getByText("nav-A"));
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message input").textContent).toBe("draft-for-A"),
+    );
+    await user.click(screen.getByText("nav-B"));
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message input").textContent).toBe("draft-for-B"),
+    );
+  });
 });

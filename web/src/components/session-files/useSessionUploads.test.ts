@@ -80,4 +80,26 @@ describe("session upload composer tokens", () => {
 
     expect(result.current.tokens).toEqual([]);
   });
+
+  test("keeps a separate token list per draft key", () => {
+    const file = new File(["hello"], "notes.txt");
+    const { result, rerender } = renderHook(
+      ({ draftKey }) => useSessionUploads(undefined, draftKey),
+      {
+        initialProps: { draftKey: "session-A" },
+      },
+    );
+
+    act(() => {
+      result.current.addFiles([file]);
+    });
+    expect(result.current.tokens).toHaveLength(1);
+
+    rerender({ draftKey: "session-B" });
+    expect(result.current.tokens).toEqual([]);
+
+    rerender({ draftKey: "session-A" });
+    expect(result.current.tokens).toHaveLength(1);
+    expect(result.current.tokens[0]).toMatchObject({ name: "notes.txt", file });
+  });
 });
