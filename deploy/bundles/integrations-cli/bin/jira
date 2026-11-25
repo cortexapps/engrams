@@ -94,13 +94,9 @@ whoami)
 search)
     jql="${1:?usage: jira search <JQL> [field=value ...]}"
     shift
-    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
-    OLD_IFS=$IFS
-    IFS='
-'
-    # shellcheck disable=SC2086
-    set -- $flags
-    IFS=$OLD_IFS
+    nargs=$#
+    for kv in "$@"; do set -- "$@" --data-urlencode "$kv"; done
+    shift "$nargs"
     get "search/jql" -G --data-urlencode "jql=$jql" "$@"
     ;;
 issue)
@@ -140,35 +136,23 @@ transition)
     post "issue/$key/transitions" --data "{\"transition\":{\"id\":\"$id\"}}"
     ;;
 projects)
-    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
-    OLD_IFS=$IFS
-    IFS='
-'
-    # shellcheck disable=SC2086
-    set -- $flags
-    IFS=$OLD_IFS
+    nargs=$#
+    for kv in "$@"; do set -- "$@" --data-urlencode "$kv"; done
+    shift "$nargs"
     get "project/search" -G "$@"
     ;;
 users)
-    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
-    OLD_IFS=$IFS
-    IFS='
-'
-    # shellcheck disable=SC2086
-    set -- $flags
-    IFS=$OLD_IFS
+    nargs=$#
+    for kv in "$@"; do set -- "$@" --data-urlencode "$kv"; done
+    shift "$nargs"
     get "user/search" -G "$@"
     ;;
 get)
     p="${1:?usage: jira get <path> [field=value ...]}"
     shift
-    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
-    OLD_IFS=$IFS
-    IFS='
-'
-    # shellcheck disable=SC2086
-    set -- $flags
-    IFS=$OLD_IFS
+    nargs=$#
+    for kv in "$@"; do set -- "$@" --data-urlencode "$kv"; done
+    shift "$nargs"
     if [ "$#" -gt 0 ]; then get "$p" -G "$@"; else get "$p"; fi
     ;;
 post)

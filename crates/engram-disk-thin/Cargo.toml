@@ -11,6 +11,11 @@ description = "SessionDisk on a dm-thin pool: thin volumes, O(1) snapshots and t
 [lints.rust]
 unsafe_code = "deny"
 
+[lints.cargo]
+# `workspace-hack` is a dependency of every crate and no crate names it, and a
+# dependency that one platform uses reads as unused on the other.
+unused_dependencies = "allow"
+
 # Copied from the root Cargo.toml: `workspace = true` cannot coexist
 # with a crate-local lint.
 [lints.clippy]

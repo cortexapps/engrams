@@ -15,6 +15,11 @@ description = "Production SandboxBackend driving Firecracker microVMs over its H
 [lints.rust]
 unsafe_code = "allow"
 
+[lints.cargo]
+# `workspace-hack` is a dependency of every crate and no crate names it, and a
+# dependency that one platform uses reads as unused on the other.
+unused_dependencies = "allow"
+
 [dependencies]
 tempfile = "3"
 engram-chunk-store.workspace = true

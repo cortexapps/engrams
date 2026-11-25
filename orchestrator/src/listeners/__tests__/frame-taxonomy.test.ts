@@ -69,6 +69,7 @@ const WIRE_FRAME_KINDS: Readonly<Record<string, FrameClass>> = {
   prompt_edited: "durable",
   prompt_dequeued: "durable",
   prompt_steered: "durable",
+  prompt_undeliverable: "durable",
   integration_asset: "durable",
   file_shared: "durable",
   recovered_from_checkpoint: "durable",

@@ -9,6 +9,7 @@ import {
   allowlistIsEmpty,
   checkOAuthProfile,
   displayNameFromClaims,
+  isEntraIssuer,
   isGoogleIssuer,
   parseEmailAllowlist,
   profileFromClaims,
@@ -17,6 +18,9 @@ import {
 
 const GOOGLE = "https://accounts.google.com";
 const OKTA = "https://corp.okta.com";
+const TENANT = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+const ENTRA = `https://login.microsoftonline.com/${TENANT}/v2.0`;
+const ENTRA_V1 = `https://sts.windows.net/${TENANT}/`;
 
 const CORP: EmailAllowlist = { domains: ["corp.com"], emails: [] };
 
@@ -65,6 +69,58 @@ describe("checkOAuthProfile — the verified-email requirement", () => {
 
   test('the string "true" counts as verified', () => {
     expect(checkOAuthProfile({ email: "a@corp.com", email_verified: "true" }, OKTA, CORP)).toBeNull();
+  });
+});
+
+describe("isEntraIssuer", () => {
+  test("matches the tenant-specific v2 and v1 issuers, nothing else", () => {
+    expect(isEntraIssuer(ENTRA)).toBe(true);
+    expect(isEntraIssuer(`${ENTRA}/`)).toBe(true);
+    expect(isEntraIssuer(ENTRA_V1)).toBe(true);
+    expect(isEntraIssuer("https://login.microsoftonline.com/common/v2.0")).toBe(false);
+    expect(isEntraIssuer("https://sts.windows.net/common/")).toBe(false);
+    expect(isEntraIssuer(`https://login.microsoftonline.com/${TENANT}/`)).toBe(false);
+    expect(isEntraIssuer(`https://login.microsoftonline.us/${TENANT}/v2.0`)).toBe(false);
+    expect(isEntraIssuer(`${ENTRA}.evil.example`)).toBe(false);
+    expect(isEntraIssuer(OKTA)).toBe(false);
+  });
+});
+
+describe("checkOAuthProfile — Entra vouches by `xms_edov`", () => {
+  test.each([true, "true"])("xms_edov=%p from Entra → verified", (v) => {
+    expect(checkOAuthProfile({ email: "a@corp.com", xms_edov: v }, ENTRA, CORP)).toBeNull();
+  });
+
+  test.each([undefined, false, "false", 1])("xms_edov=%p from Entra → refused", (v) => {
+    expect(checkOAuthProfile({ email: "a@corp.com", xms_edov: v }, ENTRA, CORP)).toBe(
+      "email_not_verified",
+    );
+  });
+
+  test("xms_edov from another issuer is ignored", () => {
+    expect(checkOAuthProfile({ email: "a@corp.com", xms_edov: true }, OKTA, CORP)).toBe(
+      "email_not_verified",
+    );
+  });
+
+  test("xms_edov from the v1 Entra issuer → verified", () => {
+    expect(checkOAuthProfile({ email: "a@corp.com", xms_edov: true }, ENTRA_V1, CORP)).toBeNull();
+  });
+
+  test("an explicit email_verified wins over xms_edov", () => {
+    expect(
+      checkOAuthProfile({ email: "a@corp.com", email_verified: false, xms_edov: true }, ENTRA, CORP),
+    ).toBe("email_not_verified");
+  });
+
+  test("email_verified still counts for Entra", () => {
+    expect(checkOAuthProfile({ email: "a@corp.com", email_verified: true }, ENTRA, CORP)).toBeNull();
+  });
+
+  test("a verified Entra account still needs the allowlist", () => {
+    expect(checkOAuthProfile({ email: "a@other.io", xms_edov: true }, ENTRA, CORP)).toBe(
+      "account_not_allowed",
+    );
   });
 });
 

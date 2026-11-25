@@ -22,6 +22,8 @@ bytes.workspace = true
 # Guest clock discipline: step CLOCK_REALTIME to the host KVM PTP clock
 # (/dev/ptp0) after snapshot/restore (see `clock`). Safe API — no unsafe.
 clock-steering.workspace = true
+# Time types + `Clock` trait that clock-steering 0.3 re-exports from here.
+statime-base.workspace = true
 engram-transport.workspace = true
 # ADR 0023: forge wire types (ForgeRequest/Response, FORGE_VSOCK_PORT) +
 # SessionId for the in-guest `forge-*` client subcommands.
@@ -51,7 +53,7 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 # isn't available. On non-Linux (the supervisor's mount_harness is a
 # stub) nix is harmless.
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.31", features = ["mount", "fs", "signal"] }
+nix = { version = "0.32", features = ["mount", "fs", "signal"] }
 
 [dev-dependencies]
 tempfile = "3"

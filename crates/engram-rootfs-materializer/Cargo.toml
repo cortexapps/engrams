@@ -15,7 +15,6 @@ engram-chunk-store.workspace = true
 engram-oci.workspace = true
 async-trait.workspace = true
 crossbeam-channel.workspace = true
-filetime.workspace = true
 flate2.workspace = true
 futures.workspace = true
 hex.workspace = true

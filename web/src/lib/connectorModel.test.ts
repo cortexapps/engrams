@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 
 import {
   accessOf,
+  powerAccess,
   credentialActions,
   defaultDisplayName,
   defaultIconColor,
@@ -43,6 +44,13 @@ describe("identity defaults (mirror of the orchestrator)", () => {
 });
 
 describe("display derivations", () => {
+  test("powerAccess takes the level a power declares, else the operation's", () => {
+    expect(powerAccess("channels:read", "write")).toBe("read");
+    expect(powerAccess("issues:write", "read")).toBe("write");
+    expect(powerAccess("channels:manage", "read")).toBe("write");
+    expect(powerAccess("cloudsql.postgres.connect", "read")).toBe("read");
+  });
+
   test("accessOf reads from the HTTP method", () => {
     expect(accessOf("GET")).toBe("read");
     expect(accessOf("head")).toBe("read");

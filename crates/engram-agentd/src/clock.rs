@@ -20,7 +20,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use clock_steering::{unix::UnixClock, Clock, TimeOffset};
+use clock_steering::unix::UnixClock;
+use statime_base::{Clock, Timestamp, TAI, UTC};
 
 /// `kvm_ptp` exposes the host's `CLOCK_REALTIME` here.
 const PTP_DEVICE: &str = "/dev/ptp0";
@@ -43,7 +44,7 @@ struct ClockSync {
     /// The KVM PTP clock (= host wall time). `None` when the device isn't
     /// present (non-FC backends / dev hosts / tests) — then every op is a
     /// no-op and the guest clock is left untouched.
-    phc: Option<UnixClock>,
+    phc: Option<UnixClock<TAI>>,
     /// Latched "the PHC stopped answering" state, so a persistent read
     /// failure logs on the way in and on the way out instead of once per
     /// [`TICK`]. See [`ClockSync::step_if_needed`] for why the transition
@@ -78,7 +79,7 @@ impl ClockSync {
             }
         };
         #[cfg(not(target_os = "linux"))]
-        let phc: Option<UnixClock> = None;
+        let phc: Option<UnixClock<TAI>> = None;
         Self {
             phc,
             phc_degraded: AtomicBool::new(false),
@@ -118,16 +119,23 @@ impl ClockSync {
                 return;
             }
         };
-        let diff = offset_nanos(
-            (host.seconds as i128, host.nanos),
-            (sys.seconds as i128, sys.nanos),
-        );
-        if diff.abs() <= STEP_THRESHOLD_NANOS {
+        // The host read is a `Timestamp<TAI>` (clock-steering tags the PTP
+        // device timescale TAI generically) and the system read is
+        // `Timestamp<UTC>`, so they can't be subtracted directly. But
+        // `kvm_ptp` reports the host's `CLOCK_REALTIME` (wall time) and
+        // `Clock::now` applies no conversion — the raw value is the same
+        // nanosecond count either way. Rebase each on its own `UNIX_EPOCH`
+        // (= 0) to get its raw count as a `Duration`, then subtract those.
+        // `diff` is the signed offset to ADD to the system clock to reach the
+        // host; `step_clock` splits the signed `Duration` itself (the old
+        // in-tree `TimeOffset { seconds, nanos }` did that splitting by hand).
+        let diff = (host - Timestamp::<TAI>::UNIX_EPOCH) - (sys - Timestamp::<UTC>::UNIX_EPOCH);
+        if diff.as_nanos().abs() <= STEP_THRESHOLD_NANOS {
             return;
         }
-        match UnixClock::CLOCK_REALTIME.step_clock(to_time_offset(diff)) {
+        match UnixClock::CLOCK_REALTIME.step_clock(diff) {
             Ok(_) => tracing::info!(
-                offset_secs = (diff / NANOS_PER_SEC) as i64,
+                offset_secs = (diff.as_nanos() / NANOS_PER_SEC) as i64,
                 "stepped guest clock to host PTP"
             ),
             Err(e) => tracing::warn!(
@@ -135,22 +143,6 @@ impl ClockSync {
                 "step guest clock failed (need CAP_SYS_TIME?)"
             ),
         }
-    }
-}
-
-/// Signed nanoseconds to ADD to `sys` to reach `host`. Each arg is
-/// `(seconds, nanos)`.
-fn offset_nanos(host: (i128, u32), sys: (i128, u32)) -> i128 {
-    (host.0 * NANOS_PER_SEC + host.1 as i128) - (sys.0 * NANOS_PER_SEC + sys.1 as i128)
-}
-
-/// Normalize a signed ns offset into `clock-steering`'s [`TimeOffset`]
-/// (seconds floored, nanos in `0..1e9` — `div_euclid`/`rem_euclid` keep
-/// `nanos` non-negative even for a negative offset).
-fn to_time_offset(diff_ns: i128) -> TimeOffset {
-    TimeOffset {
-        seconds: diff_ns.div_euclid(NANOS_PER_SEC) as _,
-        nanos: diff_ns.rem_euclid(NANOS_PER_SEC) as u32,
     }
 }
 
@@ -218,18 +210,26 @@ pub fn step_to(host_unix_nanos: i64) -> Option<i64> {
                 return None;
             }
         };
-        let diff =
-            host_unix_nanos as i128 - (sys.seconds as i128 * NANOS_PER_SEC + sys.nanos as i128);
-        if diff.abs() <= STEP_THRESHOLD_NANOS {
+        // Host wall time as a UTC `Timestamp`, so the offset is the same
+        // signed-`Duration` subtraction used in `step_if_needed`. `i64`
+        // unix nanos is always ≥ 0 for any plausible host clock; the
+        // euclidean split keeps `nanos` in 0..1e9 regardless.
+        let host = Timestamp::from_seconds_nanos_since_unix_epoch(
+            host_unix_nanos.div_euclid(1_000_000_000_i64) as u64,
+            host_unix_nanos.rem_euclid(1_000_000_000_i64) as u32,
+        );
+        let diff = host - sys;
+        if diff.as_nanos().abs() <= STEP_THRESHOLD_NANOS {
             return None;
         }
-        match UnixClock::CLOCK_REALTIME.step_clock(to_time_offset(diff)) {
+        let applied = diff.as_nanos();
+        match UnixClock::CLOCK_REALTIME.step_clock(diff) {
             Ok(_) => {
                 tracing::info!(
-                    offset_secs = (diff / NANOS_PER_SEC) as i64,
+                    offset_secs = (applied / NANOS_PER_SEC) as i64,
                     "stepped guest clock to host-supplied time (StepClock)"
                 );
-                Some(diff as i64)
+                Some(applied as i64)
             }
             Err(e) => {
                 tracing::warn!(error = ?e, "StepClock step failed (need CAP_SYS_TIME?)");
@@ -248,37 +248,30 @@ pub fn step_to(host_unix_nanos: i64) -> Option<i64> {
 mod tests {
     use super::*;
 
+    /// The signed `host - sys` offset the new `Timestamp` subtraction gives,
+    /// expressed in nanos — the input to the `STEP_THRESHOLD_NANOS` check and
+    /// to `step_clock`. These pin the behavior the old `offset_nanos` +
+    /// `to_time_offset` helpers produced, now delegated to `statime_base`.
     #[test]
-    fn positive_offset_normalizes() {
-        // host 12h ahead of sys → +43200s, 0ns.
-        let diff = offset_nanos((1_000_043_200, 0), (1_000_000_000, 0));
-        assert_eq!(diff, 43_200 * NANOS_PER_SEC);
-        let off = to_time_offset(diff);
-        assert_eq!(off.seconds as i128, 43_200);
-        assert_eq!(off.nanos, 0);
+    fn positive_offset_is_additive_nanos() {
+        // host 12h ahead of sys → +43200s.
+        let host = Timestamp::<UTC>::from_seconds_nanos_since_unix_epoch(1_000_043_200, 0);
+        let sys = Timestamp::<UTC>::from_seconds_nanos_since_unix_epoch(1_000_000_000, 0);
+        assert_eq!((host - sys).as_nanos(), 43_200 * NANOS_PER_SEC);
     }
 
     #[test]
-    fn negative_offset_floors_with_nonnegative_nanos() {
-        // host 1.5s BEHIND sys → diff = -1.5e9 → seconds=-2, nanos=5e8.
-        let diff = offset_nanos((100, 0), (101, 500_000_000));
-        assert_eq!(diff, -1_500_000_000);
-        let off = to_time_offset(diff);
-        assert_eq!(off.seconds as i128, -2);
-        assert_eq!(off.nanos, 500_000_000);
-        // re-expanding gives back the original diff (no information lost).
-        assert_eq!(
-            off.seconds as i128 * NANOS_PER_SEC + off.nanos as i128,
-            diff
-        );
+    fn negative_offset_holds_sign() {
+        // host 1.5s BEHIND sys → -1.5e9 ns.
+        let host = Timestamp::<UTC>::from_seconds_nanos_since_unix_epoch(100, 0);
+        let sys = Timestamp::<UTC>::from_seconds_nanos_since_unix_epoch(101, 500_000_000);
+        assert_eq!((host - sys).as_nanos(), -1_500_000_000);
     }
 
     #[test]
     fn sub_second_fraction_preserved() {
-        let diff = offset_nanos((10, 250_000_000), (5, 0));
-        assert_eq!(diff, 5 * NANOS_PER_SEC + 250_000_000);
-        let off = to_time_offset(diff);
-        assert_eq!(off.seconds as i128, 5);
-        assert_eq!(off.nanos, 250_000_000);
+        let host = Timestamp::<UTC>::from_seconds_nanos_since_unix_epoch(10, 250_000_000);
+        let sys = Timestamp::<UTC>::from_seconds_nanos_since_unix_epoch(5, 0);
+        assert_eq!((host - sys).as_nanos(), 5 * NANOS_PER_SEC + 250_000_000);
     }
 }

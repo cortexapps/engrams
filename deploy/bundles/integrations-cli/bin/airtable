@@ -59,13 +59,9 @@ req() {
 get_q() {
     path="$1"
     shift
-    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
-    OLD_IFS=$IFS
-    IFS='
-'
-    # shellcheck disable=SC2086
-    set -- $flags
-    IFS=$OLD_IFS
+    nargs=$#
+    for kv in "$@"; do set -- "$@" --data-urlencode "$kv"; done
+    shift "$nargs"
     # -G folds the --data-urlencode pairs into the query string on a GET.
     req GET "$path" -G "$@"
 }

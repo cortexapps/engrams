@@ -98,13 +98,9 @@ request() {
 get() {
     p="$1"
     shift
-    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
-    OLD_IFS=$IFS
-    IFS='
-'
-    # shellcheck disable=SC2086
-    set -- $flags
-    IFS=$OLD_IFS
+    nargs=$#
+    for kv in "$@"; do set -- "$@" --data-urlencode "$kv"; done
+    shift "$nargs"
     # -G folds --data-urlencode pairs into the query string for a GET.
     request GET "$p" -G "$@" | pretty
 }
@@ -130,18 +126,8 @@ cmd="${1:-}"
 case "$cmd" in
 entities)
     # Both paging params are required by the API; default them.
-    extra=""
-    has_param page "$@" || extra="page=0"
-    if ! has_param pageSize "$@"; then
-        extra="${extra:+$extra
-}pageSize=50"
-    fi
-    OLD_IFS=$IFS
-    IFS='
-'
-    # shellcheck disable=SC2086
-    set -- "$@" $extra
-    IFS=$OLD_IFS
+    has_param page "$@" || set -- "$@" page=0
+    has_param pageSize "$@" || set -- "$@" pageSize=50
     get "/api/v1/catalog" "$@"
     ;;
 search)

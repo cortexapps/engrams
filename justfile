@@ -268,7 +268,7 @@ migrate-orchestrator:
     cd orchestrator && bun install --silent && \
         (PGPASSWORD=engram createdb -h localhost -p 5435 -U engram engram_orchestrator 2>/dev/null || true) && \
         ORCHESTRATOR_DATABASE_URL=postgres://engram:engram@localhost:5435/engram_orchestrator \
-        bun x drizzle-kit migrate
+        bun run migrate
 
 # Provision an orchestrator login (ADR 0051 better-auth). Prompts for
 # email / admin? / password, then creates the user through the running

@@ -107,7 +107,7 @@ export function ToolGroupTrigger({
           <span
             aria-hidden
             data-slot="tool-group-trigger-shimmer"
-            className="shimmer pointer-events-none absolute inset-0 motion-reduce:animate-none"
+            className="shimmer pointer-events-none absolute inset-0 overflow-hidden motion-reduce:animate-none"
           >
             {label}
           </span>

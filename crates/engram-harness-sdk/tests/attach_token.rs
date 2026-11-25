@@ -4,7 +4,8 @@ use std::time::Duration;
 use engram_harness_proto::attach_token::*;
 use engram_harness_proto::{read_msg, write_msg, AttachReject, HarnessAttach, HarnessAttachAck};
 use engram_harness_sdk::{
-    serve_with, BoxedReader, BoxedWriter, Channels, ConnectionConfig, SUPERSEDED_TOKEN_GRACE,
+    serve_with, BoxedReader, BoxedWriter, Channels, ConnectionConfig, ENGINE_EXIT_GRACE,
+    SUPERSEDED_TOKEN_GRACE,
 };
 use engram_ids::{SandboxId, SessionId};
 
@@ -215,4 +216,86 @@ async fn superseded_with_newer_token_file_redials_with_new_epoch() {
 #[tokio::test(start_paused = true)]
 async fn superseded_without_newer_token_exits_after_grace() {
     superseded_case(false).await;
+}
+
+/// A fenced harness exits even while another task still holds an event
+/// sender (a hook connection in flight), so agentd can start a fresh one.
+/// `engine_finishes = false`: the engine itself never finishes either.
+async fn fenced_exit_with_a_stray_event_sender(engine_finishes: bool) -> (ExitCode, Duration) {
+    let _lock = ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("token");
+    let original = token(1);
+    let _env = TokenEnv::set(&path, original);
+    original.write_atomic(&path).unwrap();
+    let channels = Channels::new();
+    let mut commands = channels.command_rx;
+    let stray = channels.event_tx.clone();
+    let _stray_task = tokio::spawn(async move {
+        let _held = stray;
+        std::future::pending::<()>().await;
+    });
+    let events = channels.event_tx;
+    let engine = tokio::spawn(async move {
+        let _events = events;
+        if engine_finishes {
+            while commands.recv().await.is_some() {}
+        } else {
+            std::future::pending::<()>().await;
+        }
+        ExitCode::SUCCESS
+    });
+    let (client, mut host) = tokio::io::duplex(4096);
+    let host_task = tokio::spawn(async move {
+        let _: HarnessAttach = read_msg(&mut host).await.unwrap();
+        write_msg(
+            &mut host,
+            &HarnessAttachAck {
+                ok: false,
+                reject: Some(AttachReject::Superseded),
+                message: None,
+            },
+        )
+        .await
+        .unwrap();
+    });
+    let mut stream = Some(client);
+    let start = tokio::time::Instant::now();
+    let served = tokio::time::timeout(
+        SUPERSEDED_TOKEN_GRACE + ENGINE_EXIT_GRACE + Duration::from_secs(60),
+        serve_with(
+            cfg(),
+            move || {
+                let stream = stream.take();
+                Box::pin(async move {
+                    stream.map(|s| {
+                        let (r, w) = tokio::io::split(s);
+                        (Box::new(r) as BoxedReader, Box::new(w) as BoxedWriter)
+                    })
+                })
+            },
+            engine,
+            channels.command_tx,
+            channels.event_rx,
+            channels.reattach,
+        ),
+    )
+    .await
+    .expect("a fenced harness must exit while a stray event sender is alive");
+    host_task.await.unwrap();
+    (served, start.elapsed())
+}
+
+#[tokio::test(start_paused = true)]
+async fn fenced_exit_does_not_wait_for_a_stray_event_sender() {
+    let (code, elapsed) = fenced_exit_with_a_stray_event_sender(true).await;
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(elapsed, SUPERSEDED_TOKEN_GRACE);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fenced_exit_aborts_an_engine_that_does_not_finish() {
+    let (code, elapsed) = fenced_exit_with_a_stray_event_sender(false).await;
+    assert_eq!(code, ExitCode::FAILURE);
+    assert_eq!(elapsed, SUPERSEDED_TOKEN_GRACE + ENGINE_EXIT_GRACE);
 }

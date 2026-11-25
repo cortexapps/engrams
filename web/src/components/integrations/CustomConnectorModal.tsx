@@ -42,7 +42,7 @@ import { Text } from "@/components/ui/text";
 import { useUpsertConnector, useUploadConnectorLogo } from "@/hooks/useIntegrations";
 import { useUploadSkill } from "@/hooks/useSkills";
 import { usePutOrgSecret } from "@/hooks/useOrgSecrets";
-import { accessOf, defaultIconMono, humanizeAction } from "@/lib/connectorModel";
+import { accessOf, defaultIconMono, humanizeAction, powerAccess } from "@/lib/connectorModel";
 import { ProviderTile } from "./ProviderTile";
 import { AccessTag } from "./chips";
 import { SecretField } from "./SecretField";
@@ -220,8 +220,10 @@ const OperationRow = memo(function OperationRow({
   onRemove: (id: number) => void;
 }) {
   const g = o.grant.trim();
-  const access =
-    o.kind === "graphql" ? (o.operation === "query" ? "read" : "write") : accessOf(o.method);
+  const access = powerAccess(
+    g,
+    o.kind === "graphql" ? (o.operation === "query" ? "read" : "write") : accessOf(o.method),
+  );
   return (
     <div className="flex flex-col gap-1.5">
       <div className="grid grid-cols-[1.4fr_5.5rem_1fr_2rem] items-center gap-2">

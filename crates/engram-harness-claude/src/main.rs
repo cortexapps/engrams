@@ -2444,10 +2444,8 @@ mod adapter {
         /// gap, then removed from claude's transcript before `--resume` (see
         /// `scrub_transcript`).
         suppressed_msg_ids: Vec<String>,
-        /// Telemetry: message ids whose `Generation` already fired this
-        /// turn (the CLI repeats `assistant` lines per content block with
-        /// the same id + usage; without this the tokens double-count).
-        emitted_generation_ids: HashSet<String>,
+        /// Telemetry: the turn's token usage (`Generation` events + totals).
+        generations: GenerationLedger,
     }
 
     /// A prompt waiting in the harness-owned queue (Phase 1b — type-ahead
@@ -2702,6 +2700,7 @@ mod adapter {
         // claude process (resets on respawn/`--resume`), so per-process
         // tracking here yields each turn's delta for `RunCost`.
         let mut last_cost_total_usd: f64 = 0.0;
+        let cost_source = CostSource::from_env();
 
         // ADR 0052 (2026-08-20 revision): the write-order ledger of
         // steered prompt ids. A mid-turn prompt is written straight to
@@ -2869,8 +2868,13 @@ mod adapter {
                                 // Explicit turn-end. Close the in-flight
                                 // run, then run the next queued prompt
                                 // back-to-back (no Idle gap) or announce Idle.
-                                if let Some(t) = turn.take() {
+                                if let Some(mut t) = turn.take() {
                                     *current_run_id.lock().await = None;
+                                    let mut flushed = Vec::new();
+                                    t.generations.finish(&t.run_id, &mut flushed);
+                                    for ev in flushed {
+                                        emit(evt_tx, ev).await;
+                                    }
                                     // ADR 0054 Part C: carry this turn's
                                     // suppressed narrate-past ids into the
                                     // session-level scrub set so they survive
@@ -2906,20 +2910,31 @@ mod adapter {
                                             marker.terminal_reason.as_deref().unwrap_or(""),
                                         "turn result"
                                     );
-                                    // Telemetry: cost passthrough. The
+                                    // Telemetry: the turn's cost. The CLI
                                     // marker's total is this process's
                                     // running sum, so the turn's cost is
-                                    // the delta since the previous result.
-                                    // A smaller total means the CLI reset
+                                    // the delta since the previous result;
+                                    // a smaller total means the CLI reset
                                     // its counter — rebaseline rather than
                                     // emit a bogus delta.
-                                    if let Some(total) = marker.total_cost_usd {
-                                        let delta = if total >= last_cost_total_usd {
-                                            total - last_cost_total_usd
-                                        } else {
-                                            total
-                                        };
-                                        last_cost_total_usd = total;
+                                    let turn_cost_usd = match cost_source {
+                                        CostSource::ClaudeCode => {
+                                            marker.total_cost_usd.map(|total| {
+                                                let delta = if total >= last_cost_total_usd {
+                                                    total - last_cost_total_usd
+                                                } else {
+                                                    total
+                                                };
+                                                last_cost_total_usd = total;
+                                                delta
+                                            })
+                                        }
+                                        CostSource::Router(pricing) => {
+                                            Some(pricing.cost_usd(t.generations.totals()))
+                                        }
+                                        CostSource::Unpriced => None,
+                                    };
+                                    if let Some(delta) = turn_cost_usd {
                                         let cost_micro_usd =
                                             (delta * 1_000_000.0).round() as u64;
                                         if cost_micro_usd > 0 {
@@ -3194,7 +3209,7 @@ mod adapter {
                                     &t.deferred_tool_names,
                                     &mut t.deferred_pending,
                                     &mut t.suppressed_msg_ids,
-                                    &mut t.emitted_generation_ids,
+                                    &mut t.generations,
                                 ) {
                                     for mut ev in translated {
                                         // The hook gave #64389 duplicates no
@@ -3664,8 +3679,13 @@ mod adapter {
         // Close out any turn that was still in flight when the process
         // died — always paired with the `RunStarted` we already emitted,
         // so the run never dangles open (the wedge we're eliminating).
-        if let Some(t) = turn.take() {
+        if let Some(mut t) = turn.take() {
             *current_run_id.lock().await = None;
+            let mut flushed = Vec::new();
+            t.generations.finish(&t.run_id, &mut flushed);
+            for ev in flushed {
+                emit(evt_tx, ev).await;
+            }
             let run_id = t.run_id;
             if channel_closed {
                 emit(evt_tx, HarnessEvent::RunInterrupted { run_id }).await;
@@ -3796,7 +3816,7 @@ mod adapter {
             deferred_tool_names: deferred_tool_names(&cli.tool_manifest),
             is_delivery_resume: false,
             suppressed_msg_ids: Vec::new(),
-            emitted_generation_ids: HashSet::new(),
+            generations: GenerationLedger::default(),
         }
     }
 
@@ -3843,7 +3863,7 @@ mod adapter {
             deferred_tool_names: deferred_tool_names(&cli.tool_manifest),
             is_delivery_resume: true,
             suppressed_msg_ids: Vec::new(),
-            emitted_generation_ids: HashSet::new(),
+            generations: GenerationLedger::default(),
         }
     }
 
@@ -4386,6 +4406,220 @@ mod adapter {
         )
     }
 
+    /// Per-turn token usage behind `Generation` events. A streamed message
+    /// takes its usage from its stream events: `message_start` carries the
+    /// input side and each `message_delta` the latest counts (a model router
+    /// such as OpenRouter sends zeros in `message_start`). The CLI's
+    /// `assistant` lines repeat the `message_start` usage, so they count only
+    /// for a message the CLI did not stream.
+    #[derive(Debug, Default)]
+    pub struct GenerationLedger {
+        /// Message ids whose `Generation` already fired this turn.
+        emitted: HashSet<String>,
+        /// The message streaming now, by `parent_tool_use_id` ("" = main loop).
+        streaming: HashMap<String, StreamingUsage>,
+        /// The sum of every `Generation` emitted this turn.
+        totals: TokenTotals,
+    }
+
+    #[derive(Debug)]
+    struct StreamingUsage {
+        message_id: String,
+        model: String,
+        usage: serde_json::Map<String, Value>,
+    }
+
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    pub struct TokenTotals {
+        pub input: u64,
+        pub output: u64,
+        pub cache_read: u64,
+        pub cache_creation: u64,
+    }
+
+    impl GenerationLedger {
+        pub fn totals(&self) -> TokenTotals {
+            self.totals
+        }
+
+        fn is_streaming(&self, message_id: &str) -> bool {
+            self.streaming
+                .values()
+                .any(|stream| stream.message_id == message_id)
+        }
+
+        fn start(
+            &mut self,
+            parent: &str,
+            message: &Value,
+            run_id: &str,
+            out: &mut Vec<HarnessEvent>,
+        ) {
+            // A message that ended without `message_stop` still spent its tokens.
+            self.stop(parent, run_id, out);
+            let Some(id) = message.get("id").and_then(Value::as_str) else {
+                return;
+            };
+            self.streaming.insert(
+                parent.to_string(),
+                StreamingUsage {
+                    message_id: id.to_string(),
+                    model: message
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    usage: message
+                        .get("usage")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default(),
+                },
+            );
+        }
+
+        fn delta(&mut self, parent: &str, usage: Option<&Value>) {
+            let (Some(stream), Some(usage)) = (
+                self.streaming.get_mut(parent),
+                usage.and_then(Value::as_object),
+            ) else {
+                return;
+            };
+            // Anthropic's delta counts are cumulative. Keeping the larger value
+            // also keeps a `message_start` count that a provider's delta
+            // reports as zero.
+            for (key, value) in usage {
+                let Some(count) = value.as_u64() else {
+                    continue;
+                };
+                let previous = stream.usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+                stream
+                    .usage
+                    .insert(key.clone(), Value::from(count.max(previous)));
+            }
+        }
+
+        /// Emit every message still streaming: a turn that ends (a result,
+        /// an interrupt, a crash) before `message_stop` still spent the
+        /// tokens its stream reported.
+        pub fn finish(&mut self, run_id: &str, out: &mut Vec<HarnessEvent>) {
+            let parents: Vec<String> = self.streaming.keys().cloned().collect();
+            for parent in parents {
+                self.stop(&parent, run_id, out);
+            }
+        }
+
+        fn stop(&mut self, parent: &str, run_id: &str, out: &mut Vec<HarnessEvent>) {
+            if let Some(stream) = self.streaming.remove(parent) {
+                self.emit(
+                    run_id,
+                    &stream.message_id,
+                    &stream.model,
+                    &stream.usage,
+                    out,
+                );
+            }
+        }
+
+        fn emit(
+            &mut self,
+            run_id: &str,
+            message_id: &str,
+            model: &str,
+            usage: &serde_json::Map<String, Value>,
+            out: &mut Vec<HarnessEvent>,
+        ) {
+            if message_id != "msg-?" && !self.emitted.insert(message_id.to_string()) {
+                return;
+            }
+            let tokens = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+            let input_tokens = tokens("input_tokens");
+            let output_tokens = tokens("output_tokens");
+            let cache_read_tokens = tokens("cache_read_input_tokens");
+            let cache_creation_tokens = tokens("cache_creation_input_tokens");
+            self.totals.input += input_tokens;
+            self.totals.output += output_tokens;
+            self.totals.cache_read += cache_read_tokens;
+            self.totals.cache_creation += cache_creation_tokens;
+            out.push(HarnessEvent::Generation {
+                run_id: run_id.to_string(),
+                message_id: message_id.to_string(),
+                model: model.to_string(),
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+            });
+        }
+    }
+
+    /// A model router's catalog prices, USD per token. Claude Code prices
+    /// every model with Anthropic's list, so a routed session's cost comes
+    /// from these instead.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct RouterPricing {
+        input: f64,
+        output: f64,
+        cache_read: f64,
+        cache_write: f64,
+    }
+
+    impl RouterPricing {
+        /// Parse an OpenRouter `pricing` object (decimal strings). A missing
+        /// cache price falls back to the input price, which prices
+        /// Anthropic-style cache writes (1.25× input) low. Per-request and
+        /// reasoning prices are not applied.
+        pub fn parse(json: &str) -> Option<Self> {
+            let pricing: Value = serde_json::from_str(json).ok()?;
+            let price = |key: &str| {
+                pricing
+                    .get(key)?
+                    .as_str()?
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|price| price.is_finite() && *price >= 0.0)
+            };
+            let input = price("prompt")?;
+            Some(Self {
+                input,
+                output: price("completion")?,
+                cache_read: price("input_cache_read").unwrap_or(input),
+                cache_write: price("input_cache_write").unwrap_or(input),
+            })
+        }
+
+        pub fn cost_usd(&self, tokens: TokenTotals) -> f64 {
+            tokens.input as f64 * self.input
+                + tokens.output as f64 * self.output
+                + tokens.cache_read as f64 * self.cache_read
+                + tokens.cache_creation as f64 * self.cache_write
+        }
+    }
+
+    /// Where a turn's `RunCost` comes from.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub enum CostSource {
+        /// The CLI's `total_cost_usd` (Anthropic models).
+        ClaudeCode,
+        /// The router's catalog prices applied to the turn's tokens.
+        Router(RouterPricing),
+        /// A routed session with no prices: no cost is better than a wrong one.
+        Unpriced,
+    }
+
+    impl CostSource {
+        pub fn from_env() -> Self {
+            if std::env::var("ENGRAM_MODEL_ROUTER_PROTOCOL").as_deref() != Ok("anthropic_messages")
+            {
+                return Self::ClaudeCode;
+            }
+            std::env::var("ENGRAM_MODEL_ROUTER_PRICING")
+                .ok()
+                .and_then(|json| RouterPricing::parse(&json))
+                .map_or(Self::Unpriced, Self::Router)
+        }
+    }
+
     /// Translate one JSONL line from Claude's `--output-format
     /// stream-json` into zero or more HarnessEvents, tagging them with
     /// the caller-owned `run_id` (minted on prompt-accept). The
@@ -4420,7 +4654,7 @@ mod adapter {
             &HashSet::new(),
             deferred_pending,
             suppressed_msg_ids,
-            &mut HashSet::new(),
+            &mut GenerationLedger::default(),
         )
     }
 
@@ -4454,11 +4688,8 @@ mod adapter {
         // this turn, recorded here so `scrub_transcript` can delete them from
         // claude's transcript before the answer-resume.
         suppressed_msg_ids: &mut Vec<String>,
-        // Telemetry: message ids whose `Generation` (token usage) already
-        // fired this turn. The CLI re-emits an `assistant` line per content
-        // block with the SAME `message.id` and usage — without this set the
-        // tokens would double-count.
-        emitted_generation_ids: &mut HashSet<String>,
+        // Telemetry: the turn's token usage, tracked across lines.
+        generations: &mut GenerationLedger,
     ) -> Option<Vec<HarnessEvent>> {
         let v: Value = serde_json::from_str(line).ok()?;
         let ty = v.get("type")?.as_str()?;
@@ -4470,21 +4701,27 @@ mod adapter {
                 // id — the SAME id the terminal `assistant` line will use —
                 // so we stash it and chunks correlate to the durable message.
                 // A `content_block_delta` with a `text_delta` is one live
-                // token chunk → emit an EPHEMERAL `AgentMessageChunk`.
-                // Everything else (block start/stop, message delta/stop,
-                // tool-input deltas) is ignored here: the durable
-                // `assistant`/`user` lines carry the authoritative content.
+                // token chunk → emit an EPHEMERAL `AgentMessageChunk`. The
+                // message start/delta/stop events carry its token usage.
+                // Everything else (block start/stop, tool-input deltas) is
+                // ignored here: the durable `assistant`/`user` lines carry
+                // the authoritative content.
                 let event = v.get("event")?;
+                let parent = v
+                    .get("parent_tool_use_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
                 match event.get("type").and_then(|s| s.as_str()).unwrap_or("") {
                     "message_start" => {
-                        if let Some(id) = event
-                            .get("message")
-                            .and_then(|m| m.get("id"))
-                            .and_then(|s| s.as_str())
-                        {
-                            *current_message_id = Some(id.to_string());
+                        if let Some(message) = event.get("message") {
+                            if let Some(id) = message.get("id").and_then(|s| s.as_str()) {
+                                *current_message_id = Some(id.to_string());
+                            }
+                            generations.start(parent, message, run_id, &mut out);
                         }
                     }
+                    "message_delta" => generations.delta(parent, event.get("usage")),
+                    "message_stop" => generations.stop(parent, run_id, &mut out),
                     "content_block_delta" => {
                         if let Some(delta) = event.get("delta") {
                             if delta.get("type").and_then(|s| s.as_str()) == Some("text_delta") {
@@ -4529,28 +4766,13 @@ mod adapter {
                     .unwrap_or("msg-?")
                     .to_string();
                 // Telemetry: one `Generation` per assistant message (one
-                // provider API call), main-loop and subagent alike — the
-                // tokens were spent either way. Emitted even for
-                // narrate-past-suppressed and tool_use-only messages, and
-                // deduped by `message.id` (the CLI repeats the line per
-                // content block with identical usage). Fields the CLI
-                // doesn't send read as 0.
-                if let Some(usage) = msg.get("usage").filter(|u| u.is_object()) {
-                    let tok = |k: &str| usage.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-                    if msg_id == "msg-?" || emitted_generation_ids.insert(msg_id.clone()) {
-                        out.push(HarnessEvent::Generation {
-                            run_id: rid.clone(),
-                            message_id: msg_id.clone(),
-                            model: msg
-                                .get("model")
-                                .and_then(|s| s.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            input_tokens: tok("input_tokens"),
-                            output_tokens: tok("output_tokens"),
-                            cache_read_tokens: tok("cache_read_input_tokens"),
-                            cache_creation_tokens: tok("cache_creation_input_tokens"),
-                        });
+                // provider API call), main loop and subagent alike, emitted
+                // even for narrate-past-suppressed and tool_use-only
+                // messages. A streamed message emits from its stream events.
+                if !generations.is_streaming(&msg_id) {
+                    if let Some(usage) = msg.get("usage").and_then(Value::as_object) {
+                        let model = msg.get("model").and_then(|s| s.as_str()).unwrap_or("");
+                        generations.emit(&rid, &msg_id, model, usage, &mut out);
                     }
                 }
                 if let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) {
@@ -4794,7 +5016,15 @@ mod adapter {
             Path::new("/tmp/mcp-config.json")
         }
 
-        /// The hook settings path for argv tests; production uses the state dir.
+        /// Waits for the engine after the test checks its events.
+        async fn engine_exits(engine: tokio::task::JoinHandle<ExitCode>, within: Duration) {
+            let _exit_code = tokio::time::timeout(within, engine)
+                .await
+                .expect("engine exits")
+                .expect("engine task does not panic");
+        }
+
+        /// The hook settings path for argv tests. Production uses the state dir.
         fn test_settings() -> &'static Path {
             Path::new("/tmp/engram-test-state/claude-settings.json")
         }
@@ -5882,10 +6112,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(script).await;
         }
 
@@ -5949,10 +6176,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(script).await;
         }
 
@@ -6000,10 +6224,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(script).await;
         }
 
@@ -6041,10 +6262,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(script).await;
         }
 
@@ -6121,10 +6339,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(script).await;
         }
 
@@ -6462,10 +6677,7 @@ mod adapter {
                 None => {} // channel closed = engine exited cleanly, no stray event
                 Some(ev) => panic!("unexpected event after a consumed-prompt dequeue: {ev:?}"),
             }
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine should exit on shutdown")
-                .expect("engine task should not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(&script).await;
         }
 
@@ -6580,10 +6792,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 5 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine should exit on shutdown")
-                .expect("engine task should not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(&script).await;
         }
 
@@ -7212,10 +7421,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 5 })
                 .await
                 .unwrap();
-            tokio::time::timeout(SUBPROCESS_TRANSITION_TIMEOUT, engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, SUBPROCESS_TRANSITION_TIMEOUT).await;
             let _ = tokio::fs::remove_file(&script).await;
         }
 
@@ -7354,10 +7560,7 @@ mod adapter {
 
             // Closing the command channel ends the engine cleanly.
             drop(cmd_tx);
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine should exit when the command channel closes")
-                .expect("engine task should not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(&script).await;
         }
 
@@ -7431,10 +7634,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 5 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine should exit on shutdown")
-                .expect("engine task should not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(&script).await;
         }
 
@@ -8323,10 +8523,13 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .unwrap()
-                .unwrap();
+            assert_eq!(
+                timeout(Duration::from_secs(5), engine)
+                    .await
+                    .expect("engine exits")
+                    .expect("engine task does not panic"),
+                ExitCode::SUCCESS
+            );
             assert_eq!(
                 engram_harness_sdk::mode_stamp::read_mode_stamp(&stamp),
                 "plan"
@@ -8374,10 +8577,13 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .unwrap()
-                .unwrap();
+            assert_eq!(
+                timeout(Duration::from_secs(5), engine)
+                    .await
+                    .expect("engine exits")
+                    .expect("engine task does not panic"),
+                ExitCode::SUCCESS
+            );
             tokio::fs::remove_file(script).await.unwrap();
             tokio::fs::remove_dir_all(dir).await.unwrap();
         }
@@ -8536,10 +8742,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
 
             // The respawn mode is asserted via the STAMP above (approve →
             // default); the stamp→argv mapping is covered by
@@ -8667,10 +8870,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             // The reject-keeps-plan-mode invariant is asserted via the STAMP
             // above; the raw argv record is fixture-timing-racy under this
             // test's fast manual driving (see the approve test).
@@ -8962,10 +9162,14 @@ mod adapter {
                     .send(HarnessCommand::Shutdown { grace_secs: 1 })
                     .await
                     .unwrap();
-                tokio::time::timeout(Duration::from_secs(5), engine)
-                    .await
-                    .unwrap()
-                    .unwrap();
+                assert_eq!(
+                    timeout(Duration::from_secs(5), engine)
+                        .await
+                        .expect("engine exits")
+                        .expect("engine task does not panic"),
+                    ExitCode::SUCCESS,
+                    "{case}"
+                );
                 tokio::fs::remove_file(script).await.unwrap();
                 tokio::fs::remove_file(gate).await.unwrap();
                 let expected = if expected_ids.is_empty() {
@@ -9062,10 +9266,14 @@ mod adapter {
                     .send(HarnessCommand::Shutdown { grace_secs: 1 })
                     .await
                     .unwrap();
-                tokio::time::timeout(Duration::from_secs(5), engine)
-                    .await
-                    .expect("engine exits")
-                    .expect("engine task");
+                assert_eq!(
+                    timeout(Duration::from_secs(5), engine)
+                        .await
+                        .expect("engine exits")
+                        .expect("engine task does not panic"),
+                    ExitCode::SUCCESS,
+                    "{case}"
+                );
                 let _ = tokio::fs::remove_file(script).await;
                 let _ = tokio::fs::remove_file(gate).await;
             }
@@ -9169,10 +9377,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(script).await;
             let _ = tokio::fs::remove_file(counter).await;
         }
@@ -9328,10 +9533,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(script).await;
             let _ = tokio::fs::remove_file(counter).await;
             let _ = tokio::fs::remove_file(invocations).await;
@@ -9436,10 +9638,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(script).await;
             let _ = tokio::fs::remove_file(counter).await;
         }
@@ -9573,10 +9772,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine exits")
-                .expect("engine task does not panic");
+            engine_exits(engine, Duration::from_secs(5)).await;
             let _ = tokio::fs::remove_file(script).await;
             let _ = tokio::fs::remove_file(idle_marker).await;
             let _ = tokio::fs::remove_file(captured).await;
@@ -9686,8 +9882,8 @@ mod tests {
     fn assistant_usage_emits_generation_once_per_message_id() {
         let line = r#"{"type":"assistant","message":{"id":"msg_1","model":"claude-sonnet-5","usage":{"input_tokens":12,"output_tokens":345,"cache_read_input_tokens":6789,"cache_creation_input_tokens":42},"content":[{"type":"text","text":"hi"}]}}"#;
         let mut tc = 0u32;
-        let mut gen_ids = std::collections::HashSet::new();
-        let translate = |tc: &mut u32, gen_ids: &mut std::collections::HashSet<String>| {
+        let mut gen_ids = GenerationLedger::default();
+        let translate = |tc: &mut u32, gen_ids: &mut GenerationLedger| {
             translate_jsonl_with_deferred_tools(
                 line,
                 "run-1",
@@ -9736,6 +9932,129 @@ mod tests {
         );
     }
 
+    /// A streamed message takes its usage from `message_start` merged with
+    /// `message_delta`: a router sends zeros in `message_start`, and the
+    /// `assistant` line repeats those zeros, so it must not count.
+    #[test]
+    fn streamed_message_usage_comes_from_message_delta() {
+        let lines = [
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_s","model":"moonshotai/kimi-k3.1-pro","usage":{"input_tokens":0,"output_tokens":0}}}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_s","model":"moonshotai/kimi-k3.1-pro","usage":{"input_tokens":0,"output_tokens":0},"content":[{"type":"text","text":"hi"}]}}"#,
+            r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":725,"output_tokens":144,"cache_read_input_tokens":160768}}}"#,
+            r#"{"type":"stream_event","event":{"type":"message_stop"}}"#,
+        ];
+        let mut tc = 0u32;
+        let mut ledger = GenerationLedger::default();
+        let mut generations = Vec::new();
+        for line in lines {
+            let evs = translate_jsonl_with_deferred_tools(
+                line,
+                "run-1",
+                &mut tc,
+                50,
+                &mut None,
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &std::collections::HashSet::new(),
+                &mut std::collections::HashSet::new(),
+                &mut Vec::new(),
+                &mut ledger,
+            )
+            .unwrap_or_default();
+            generations.extend(
+                evs.into_iter()
+                    .filter(|e| matches!(e, HarnessEvent::Generation { .. })),
+            );
+        }
+        assert_eq!(generations.len(), 1, "{generations:?}");
+        assert!(matches!(
+            &generations[0],
+            HarnessEvent::Generation {
+                message_id,
+                input_tokens: 725,
+                output_tokens: 144,
+                cache_read_tokens: 160768,
+                cache_creation_tokens: 0,
+                ..
+            } if message_id == "msg_s"
+        ));
+        assert_eq!(
+            ledger.totals(),
+            TokenTotals {
+                input: 725,
+                output: 144,
+                cache_read: 160768,
+                cache_creation: 0,
+            }
+        );
+    }
+
+    /// A turn that ends before `message_stop` still records the usage its
+    /// stream reported, and a delta's zero never erases a `message_start` count.
+    #[test]
+    fn an_unfinished_stream_flushes_its_usage_at_turn_end() {
+        let lines = [
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_i","model":"claude-sonnet-5","usage":{"input_tokens":100,"cache_read_input_tokens":50,"output_tokens":1}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"message_delta","delta":{},"usage":{"input_tokens":0,"output_tokens":7}}}"#,
+        ];
+        let mut tc = 0u32;
+        let mut ledger = GenerationLedger::default();
+        for line in lines {
+            let evs = translate_jsonl_with_deferred_tools(
+                line,
+                "run-1",
+                &mut tc,
+                50,
+                &mut None,
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &std::collections::HashSet::new(),
+                &mut std::collections::HashSet::new(),
+                &mut Vec::new(),
+                &mut ledger,
+            )
+            .unwrap_or_default();
+            assert!(!evs
+                .iter()
+                .any(|e| matches!(e, HarnessEvent::Generation { .. })));
+        }
+        let mut flushed = Vec::new();
+        ledger.finish("run-1", &mut flushed);
+        assert!(matches!(
+            flushed.as_slice(),
+            [HarnessEvent::Generation {
+                input_tokens: 100,
+                cache_read_tokens: 50,
+                output_tokens: 7,
+                ..
+            }]
+        ));
+        let mut again = Vec::new();
+        ledger.finish("run-1", &mut again);
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn router_pricing_prices_each_token_class() {
+        let pricing = RouterPricing::parse(
+            r#"{"prompt":"0.00000024","completion":"0.0000084","input_cache_read":"0.0000002"}"#,
+        )
+        .unwrap();
+        let cost = pricing.cost_usd(TokenTotals {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_read: 1_000_000,
+            cache_creation: 1_000_000,
+        });
+        // 0.24 + 8.40 + 0.20 + 0.24 (cache writes fall back to the input price).
+        assert!((cost - 9.08).abs() < 1e-9, "{cost}");
+        assert_eq!(RouterPricing::parse(r#"{"prompt":"0.1"}"#), None);
+        assert_eq!(
+            RouterPricing::parse(r#"{"prompt":"-1","completion":"0"}"#),
+            None
+        );
+    }
+
     /// Telemetry: a narrate-past-suppressed assistant message still emits
     /// its `Generation` — the tokens were genuinely spent — while the
     /// hallucinated `AgentMessage` text stays suppressed (ADR 0054).
@@ -9757,7 +10076,7 @@ mod tests {
             &std::collections::HashSet::new(),
             &mut deferred_pending,
             &mut suppressed,
-            &mut std::collections::HashSet::new(),
+            &mut GenerationLedger::default(),
         )
         .unwrap();
         assert_eq!(evs.len(), 1, "Generation only: {evs:?}");
@@ -10270,7 +10589,7 @@ mod tests {
             &deferred_names,
             &mut pending,
             &mut Vec::new(),
-            &mut std::collections::HashSet::new(),
+            &mut GenerationLedger::default(),
         )
         .unwrap();
         assert!(events
@@ -10290,7 +10609,7 @@ mod tests {
             &deferred_names,
             &mut pending,
             &mut Vec::new(),
-            &mut std::collections::HashSet::new(),
+            &mut GenerationLedger::default(),
         )
         .unwrap();
         assert!(
@@ -10361,7 +10680,7 @@ mod tests {
             &deferred_names,
             &mut pending,
             &mut suppressed,
-            &mut std::collections::HashSet::new(),
+            &mut GenerationLedger::default(),
         )
         .unwrap();
         assert!(
@@ -10381,7 +10700,7 @@ mod tests {
             &deferred_names,
             &mut pending,
             &mut suppressed,
-            &mut std::collections::HashSet::new(),
+            &mut GenerationLedger::default(),
         )
         .unwrap();
         assert!(

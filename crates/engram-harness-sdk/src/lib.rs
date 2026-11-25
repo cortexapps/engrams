@@ -316,6 +316,47 @@ where
 
 pub const SUPERSEDED_TOKEN_GRACE: Duration = Duration::from_secs(15);
 
+/// How long the transport waits for the engine to finish once it has closed
+/// the engine's channels.
+pub const ENGINE_EXIT_GRACE: Duration = Duration::from_secs(10);
+
+/// End the engine: close both of its channels, count the events it could not
+/// send, and wait at most [`ENGINE_EXIT_GRACE`] for it. Returns the engine's
+/// exit code, or `None` when it panicked or did not finish in time (it is then
+/// aborted).
+///
+/// The receiver is closed before the drain. A drain that waits for every
+/// sender to drop never ends while another task still holds one (a hook
+/// connection in flight), and a harness that cannot exit is never respawned.
+async fn close_out(
+    command_tx: mpsc::Sender<HarnessCommand>,
+    mut event_rx: mpsc::Receiver<HarnessEvent>,
+    mut engine: tokio::task::JoinHandle<ExitCode>,
+) -> (usize, Option<ExitCode>) {
+    drop(command_tx);
+    event_rx.close();
+    let mut undelivered = 0;
+    while event_rx.recv().await.is_some() {
+        undelivered += 1;
+    }
+    let code = match tokio::time::timeout(ENGINE_EXIT_GRACE, &mut engine).await {
+        Ok(Ok(code)) => Some(code),
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "harness engine task panicked");
+            None
+        }
+        Err(_) => {
+            tracing::error!(
+                grace_secs = ENGINE_EXIT_GRACE.as_secs(),
+                "harness engine did not finish after its channels closed; aborting it"
+            );
+            engine.abort();
+            None
+        }
+    };
+    (undelivered, code)
+}
+
 async fn serve_loop<D, L>(
     cfg: ConnectionConfig,
     mut dialer: D,
@@ -333,10 +374,7 @@ where
         Ok(token) => token,
         Err(e) => {
             tracing::error!(error = %e, "attach token unavailable");
-            drop(command_tx);
-            event_rx.close();
-            while event_rx.recv().await.is_some() {}
-            let _ = engine.await;
+            close_out(command_tx, event_rx, engine).await;
             return ExitCode::from(2);
         }
     };
@@ -402,15 +440,10 @@ where
                             epoch = token.binding_epoch,
                             "attach fence remained after token grace"
                         );
-                        drop(command_tx);
-                        // Drain the close-out events even though this generation cannot send.
                         let unacked = outbox.len();
-                        let mut undelivered = 0;
-                        while event_rx.recv().await.is_some() {
-                            undelivered += 1;
-                        }
+                        let (undelivered, code) = close_out(command_tx, event_rx, engine).await;
                         tracing::warn!(unacked, undelivered, "fenced harness exit");
-                        return engine.await.unwrap_or(ExitCode::FAILURE);
+                        return code.unwrap_or(ExitCode::FAILURE);
                     }
                     tokio::select! {
                         _ = reconnect_nudge.recv() => {},
@@ -441,17 +474,10 @@ where
             }
         }
     }
-    drop(command_tx);
     let unacked = outbox.len();
-    let mut undelivered = 0;
-    while event_rx.recv().await.is_some() {
-        undelivered += 1;
-    }
+    let (undelivered, code) = close_out(command_tx, event_rx, engine).await;
     tracing::info!(unacked, undelivered, "harness transport exit");
-    engine.await.unwrap_or_else(|e| {
-        tracing::error!(error = %e, "harness engine task panicked");
-        ExitCode::from(1)
-    })
+    code.unwrap_or(ExitCode::from(1))
 }
 
 async fn dial(cfg: &ConnectionConfig) -> Option<(BoxedReader, BoxedWriter)> {

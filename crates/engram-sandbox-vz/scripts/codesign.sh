@@ -77,15 +77,15 @@ if [ -x "$BIN" ] && [ -f "$BIN" ]; then
     examined=$((examined + 1))
 fi
 
-# Test binaries: target/$PROFILE/deps/engram_sandbox_vz-<16hex>
-# (the crate's unit/lib tests) and e2e_vz-<16hex> (the live
-# lifecycle integration test in tests/e2e_vz.rs — a separate test
-# target, so a separate binary name). Cargo emits .d / .o / .rmeta
-# siblings alongside the executable; filter via `file -b` to sign
-# only the Mach-O executable.
-shopt -s nullglob
-for T in target/"$PROFILE"/deps/engram_sandbox_vz-* target/"$PROFILE"/deps/e2e_vz-*; do
-    if [ -x "$T" ] && [ -f "$T" ]; then
+# Test binaries: engram_sandbox_vz-<16hex> (the crate's unit/lib
+# tests) and e2e_vz-<16hex> (the live lifecycle integration test in
+# tests/e2e_vz.rs — a separate test target, so a separate binary
+# name). Their directory under target/$PROFILE depends on the Cargo
+# version (`deps/`, or `build/<package>/<hash>/out/` from 1.100), so
+# search by name. Cargo emits .d / .o / .rmeta siblings alongside the
+# executable; filter via `file -b` to sign only the Mach-O executable.
+while IFS= read -r T; do
+    if [ -x "$T" ]; then
         # `file` word order varies by build: macOS /usr/bin/file says
         # "Mach-O 64-bit executable arm64", nix's file-5.45 says
         # "Mach-O 64-bit arm64 executable, flags:<...>". Match both —
@@ -98,7 +98,7 @@ for T in target/"$PROFILE"/deps/engram_sandbox_vz-* target/"$PROFILE"/deps/e2e_v
                 ;;
         esac
     fi
-done
+done < <(find "target/$PROFILE" -type f \( -name 'engram_sandbox_vz-*' -o -name 'e2e_vz-*' \))
 
 if [ "$examined" -eq 0 ]; then
     echo "codesign.sh: no binaries found under target/$PROFILE/ — was --tests forgotten?" >&2

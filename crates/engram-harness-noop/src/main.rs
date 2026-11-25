@@ -62,6 +62,9 @@ struct Cli {
     /// Actual tool delay in seconds; overrides the millisecond option.
     #[arg(long)]
     tool_sleep_secs: Option<u64>,
+    /// Keep each tool call open until this file exists.
+    #[arg(long)]
+    tool_release_file: Option<std::path::PathBuf>,
     /// Wait for a Prompt before starting a run.
     #[arg(long)]
     no_autorun: bool,
@@ -107,6 +110,7 @@ async fn main() -> ExitCode {
             .transcript_template
             .unwrap_or_else(|| "ok (noop)".into()),
         send_run_completed: cli.send_run_completed,
+        tool_release_file: cli.tool_release_file,
         ..Script::default()
     };
     let channels = Channels::new();

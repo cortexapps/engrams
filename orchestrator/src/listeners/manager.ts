@@ -11,6 +11,7 @@ import { SessionListener } from "./session-listener.ts";
 import { makeProductionOtelExporterConsumers } from "./otel-exporter-consumer.ts";
 import { makeProductionPrLinkConsumer } from "./pr-link-consumer.ts";
 import { makeProductionAutomationConsumer } from "./automation-consumer.ts";
+import { makeProductionChildReportConsumer } from "./child-report-consumer.ts";
 import { makeProductionTitleConsumer } from "./title-consumer.ts";
 import { makeProductionToolConsumer } from "./tool-consumer.ts";
 import { config } from "../config.ts";
@@ -227,6 +228,7 @@ export function makeProductionListenerManager(): ListenerManager {
           makeProductionPrLinkConsumer(),
           makeProductionAutomationConsumer(),
           makeProductionTitleConsumer(),
+          makeProductionChildReportConsumer(),
           makeSpecProjectionConsumer(productionSpecProjection),
           // [] when config.telemetry is unset — telemetry off costs nothing.
           ...makeProductionOtelExporterConsumers(config.telemetry),

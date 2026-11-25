@@ -59,17 +59,12 @@ api() {
 get_q() {
     qpath="$1"
     shift
-    # Build a newline-delimited "--data-urlencode\n<kv>\n…" list, rewriting team=.
-    flags=$(for kv in "$@"; do
-        kv=$(printf '%s' "$kv" | sed 's/^team=/teamId=/')
-        printf '%s\n%s\n' '--data-urlencode' "$kv"
-    done)
-    OLD_IFS=$IFS
-    IFS='
-'
-    # shellcheck disable=SC2086
-    set -- $flags
-    IFS=$OLD_IFS
+    nargs=$#
+    for kv in "$@"; do
+        case "$kv" in team=*) kv="teamId=${kv#team=}" ;; esac
+        set -- "$@" --data-urlencode "$kv"
+    done
+    shift "$nargs"
     curl -sS --get "$API$qpath" -H "$AUTH" "$@" | pretty
 }
 

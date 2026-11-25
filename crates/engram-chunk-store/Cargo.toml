@@ -24,7 +24,7 @@ metrics.workspace = true
 # the evictor yield to snapshots/checkpoints sharing the work_dir mount.
 # default-features=false keeps it to the `fs` wrapper — same pin the
 # host-agent / workspace-hack already lock to (nix 0.31).
-nix = { version = "0.31", default-features = false, features = ["fs"] }
+nix = { version = "0.32", default-features = false, features = ["fs"] }
 parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

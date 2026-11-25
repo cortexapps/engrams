@@ -948,7 +948,12 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
                     id,
                     "prompt_undeliverable",
                     serde_json::json!({
-                        "reason": "the prompt could not be delivered to the harness after                                    repeated attempts — the harness may be failing to start                                    (check the image is glibc-based and the session's                                    Diagnostics tab); send the prompt again to retry",
+                        "reason": concat!(
+                            "the prompt could not be delivered to the harness after repeated ",
+                            "attempts; the harness may be failing to start (check the image is ",
+                            "glibc-based and the session's Diagnostics tab). Send the prompt ",
+                            "again to retry.",
+                        ),
                         "prompt_id": row.prompt_id,
                         "attempts": row.attempts,
                     }),

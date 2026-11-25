@@ -650,6 +650,15 @@ export async function compileSessionCreateInput(
     harness.ENGRAM_MODEL_ROUTER_PROTOCOL = routerProtocol;
     harness.ENGRAM_MODEL_ROUTER_BASE_URL = `https://${routerHost}${router.protocols[routerProtocol].basePath}`;
     harness.ENGRAM_MODEL_ROUTER_MODEL = modelId;
+    // The harness prices the turn's tokens with these; Claude Code's own cost
+    // uses Anthropic's list, which is wrong for a routed model.
+    // Only the catalog sets it: a profile env var never prices a session.
+    const pricing = routedModel?.upstream.pricing;
+    if (pricing && typeof pricing === "object") {
+      harness.ENGRAM_MODEL_ROUTER_PRICING = JSON.stringify(pricing);
+    } else {
+      delete harness.ENGRAM_MODEL_ROUTER_PRICING;
+    }
   }
   // ADR 0031 §7: git commit attribution — the initiating human authors the
   // in-session commits (the guest turns these into /etc/gitconfig's [user]

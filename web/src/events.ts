@@ -231,6 +231,15 @@ export type SessionEvent =
   | { type: "prompt_edited"; prompt_id: string; summary: string | null; at: string }
   | { type: "prompt_dequeued"; prompt_id: string; at: string }
   | { type: "prompt_steered"; prompt_id: string; at: string }
+  // The coordinator gave up delivering a prompt to the harness. The prompt
+  // never runs; the user has to send it again.
+  | {
+      type: "prompt_undeliverable";
+      prompt_id: string;
+      reason?: string | null;
+      attempts?: number | null;
+      at?: string;
+    }
   // ADR 0056: a third-party integration surfaced a typed asset/action.
   // Subsumes the old `pull_request_opened` (a PR is provider:"forge",
   // asset_kind:"pull_request"). The wire is semantic-only — the web keys its

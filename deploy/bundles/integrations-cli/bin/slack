@@ -31,7 +31,8 @@ Usage:
   slack lookup <email>                    Find a member by email (users.lookupByEmail)
   slack create <name> [private]           Create a channel, private when asked (conversations.create)
   slack invite <channel> <user-id>[,...]  Invite members to a channel (conversations.invite)
-  slack upload <channel> <file> [title]   Upload a file (files.upload)
+  slack upload <channel-id> <file> [title]  Upload and share a file (files.getUploadURLExternal,
+                                          then files.completeUploadExternal)
   slack react <channel> <ts> <emoji>      Add a reaction (reactions.add)
   slack pin <channel> <ts>                Pin a message (pins.add)
   slack whoami                            Show the bot identity (auth.test)
@@ -41,6 +42,24 @@ Usage:
 channel, or the app needs the chat:write.public scope. Slack replies with JSON
 {"ok":true,...} or {"ok":false,"error":"..."} (always HTTP 200).
 EOF
+}
+
+# json_field <name> <json>: a top-level string field ("" when absent).
+json_field() {
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$2" | jq -r --arg k "$1" '.[$k] // empty | strings'
+    else
+        printf '%s' "$2" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" | sed 's#\\/#/#g'
+    fi
+}
+
+# json_string <text>: <text> as a JSON string literal.
+json_string() {
+    if command -v jq >/dev/null 2>&1; then
+        jq -Rn --arg s "$1" '$s'
+    else
+        printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+    fi
 }
 
 # Pretty-print JSON when jq is present; otherwise pass through.
@@ -98,35 +117,23 @@ invite)
     ;;
 channels)
     # Translate each field=value into a --data-urlencode pair (POSIX-safe, no arrays).
-    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
-    OLD_IFS=$IFS
-    IFS='
-'
-    # shellcheck disable=SC2086
-    set -- $flags
-    IFS=$OLD_IFS
+    nargs=$#
+    for kv in "$@"; do set -- "$@" --data-urlencode "$kv"; done
+    shift "$nargs"
     api conversations.list "$@"
     ;;
 users)
-    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
-    OLD_IFS=$IFS
-    IFS='
-'
-    # shellcheck disable=SC2086
-    set -- $flags
-    IFS=$OLD_IFS
+    nargs=$#
+    for kv in "$@"; do set -- "$@" --data-urlencode "$kv"; done
+    shift "$nargs"
     api users.list "$@"
     ;;
 history)
     ch="${1:?usage: slack history <channel> [field=value ...]}"
     shift
-    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
-    OLD_IFS=$IFS
-    IFS='
-'
-    # shellcheck disable=SC2086
-    set -- $flags
-    IFS=$OLD_IFS
+    nargs=$#
+    for kv in "$@"; do set -- "$@" --data-urlencode "$kv"; done
+    shift "$nargs"
     api conversations.history --data-urlencode "channel=$ch" "$@"
     ;;
 replies)
@@ -146,14 +153,27 @@ pin)
     api pins.add --data-urlencode "channel=$ch" --data-urlencode "timestamp=$ts"
     ;;
 upload)
-    ch="${1:?usage: slack upload <channel> <file> [title]}"
-    file="${2:?usage: slack upload <channel> <file> [title]}"
-    title="${3:-}"
-    if [ -n "$title" ]; then
-        api files.upload -F "channels=$ch" -F "file=@$file" -F "title=$title"
-    else
-        api files.upload -F "channels=$ch" -F "file=@$file"
+    ch="${1:?usage: slack upload <channel-id> <file> [title]}"
+    file="${2:?usage: slack upload <channel-id> <file> [title]}"
+    name=$(basename "$file")
+    title="${3:-$name}"
+    if [ ! -f "$file" ]; then
+        echo "slack: no such file: $file" >&2
+        exit 1
     fi
+    length=$(wc -c <"$file" | tr -d ' ')
+    ticket=$(curl -sS -X POST "$API/files.getUploadURLExternal" -H "Authorization: Bearer $TOKEN" \
+        --data-urlencode "filename=$name" --data-urlencode "length=$length")
+    upload_url=$(json_field upload_url "$ticket")
+    file_id=$(json_field file_id "$ticket")
+    if [ -z "$upload_url" ] || [ -z "$file_id" ]; then
+        printf '%s\n' "$ticket" | pretty
+        exit 1
+    fi
+    curl -sS -f -X POST "$upload_url" -F "filename=@$file" >/dev/null
+    api files.completeUploadExternal \
+        --data-urlencode "files=[{\"id\":\"$file_id\",\"title\":$(json_string "$title")}]" \
+        --data-urlencode "channel_id=$ch"
     ;;
 whoami)
     api auth.test
@@ -161,13 +181,9 @@ whoami)
 api)
     method="${1:?usage: slack api <method> [field=value ...]}"
     shift
-    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
-    OLD_IFS=$IFS
-    IFS='
-'
-    # shellcheck disable=SC2086
-    set -- $flags
-    IFS=$OLD_IFS
+    nargs=$#
+    for kv in "$@"; do set -- "$@" --data-urlencode "$kv"; done
+    shift "$nargs"
     api "$method" "$@"
     ;;
 "" | -h | --help | help)

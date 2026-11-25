@@ -4106,10 +4106,13 @@ done
             .send(HarnessCommand::Shutdown { grace_secs: 1 })
             .await
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), engine)
-            .await
-            .expect("fixture engine shutdown")
-            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), engine)
+                .await
+                .expect("fixture engine exits")
+                .expect("fixture engine task does not panic"),
+            ExitCode::SUCCESS
+        );
         let _ = tokio::fs::remove_dir_all(&harness_state).await;
         let _ = tokio::fs::remove_file(harness_state.with_extension("attach-token")).await;
     }

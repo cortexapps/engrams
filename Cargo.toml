@@ -69,12 +69,12 @@ edition = "2021"
 license = "AGPL-3.0-only"
 repository = "https://github.com/cortexapps/engrams"
 # The toolchain channel is `stable` (rust-toolchain.toml), so CI always builds
-# with the newest Rust. This field is the declared floor. sqlx 0.9 (the next
-# major of the database layer) requires Rust 1.94; the stale 1.80 declaration
-# below made Dependabot skip that bump entirely (its cargo updater refuses to
-# propose a version whose `rust_version` exceeds the workspace floor). Raise it
-# so the sqlx 0.9 proposal can arrive.
-rust-version = "1.94"
+# with the newest Rust. This field is the declared floor. Keep it at the max
+# MSRV of the accepted dependency set: sqlx 0.9 (the next major of the database
+# layer) wants 1.94, and clock-steering 0.3.1 + its statime-base dep declare
+# 1.95. Raising it is what lets Dependabot keep proposing versions whose
+# `rust_version` exceeds the floor.
+rust-version = "1.95"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -84,6 +84,13 @@ unsafe_code = "forbid"
 # (coordinator, postgres) get direct time/uuid calls denied; crates
 # without one have an empty list, so this is a no-op for them.
 disallowed_methods = "deny"
+
+[workspace.lints.cargo]
+# `workspace-hack` is a dependency of every crate and no crate names it, and a
+# dependency that one platform uses reads as unused on the other.
+unused_dependencies = "allow"
+# Dependabot reads `workspace.package.rust-version`; no member inherits it.
+unused_workspace_package_fields = "allow"
 
 [workspace.dependencies]
 # kubernetes — ADR 0044 K3 host-fleet rollout operator (engram-host-operator).
@@ -116,8 +123,6 @@ engram-protocol = { path = "crates/engram-protocol" }
 engram-upgrade-drain = { path = "crates/engram-upgrade-drain" }
 engram-postgres = { path = "crates/engram-postgres" }
 engram-coordinator = { path = "crates/engram-coordinator" }
-engram-dst = { path = "crates/engram-dst" }
-engram-dst-cosim = { path = "crates/engram-dst-cosim" }
 engram-sim = { path = "crates/engram-sim" }
 engram-testkit = { path = "crates/engram-testkit" }
 engram-sandbox-firecracker = { path = "crates/engram-sandbox-firecracker" }
@@ -160,7 +165,6 @@ engram-storage-s3 = { path = "crates/engram-storage-s3" }
 engram-storage-gcs = { path = "crates/engram-storage-gcs" }
 engram-blob-client = { path = "crates/engram-blob-client" }
 engram-app-client = { path = "crates/engram-app-client" }
-engram-cli = { path = "crates/engram-cli" }
 engram-tui = { path = "crates/engram-tui" }
 engram-chunk-store = { path = "crates/engram-chunk-store" }
 engram-fill = { path = "crates/engram-fill" }
@@ -176,7 +180,6 @@ futures-util = "0.3"
 # boot AND the teleport dest pipeline.
 rtnetlink = "0.24"
 bytes = "1"
-pin-project-lite = "0.2"
 # 0.23 added a default-on `simd-unsafe` feature, which is the only `unsafe` in
 # the crate — without it base64 is `#![forbid(unsafe_code)]`. We decode the KEK
 # and OAuth PKCE values with it, all cold paths on tiny inputs, so the SIMD
@@ -185,7 +188,10 @@ pin-project-lite = "0.2"
 base64 = { version = "0.23", default-features = false, features = ["std"] }
 # guest clock discipline — agentd steps CLOCK_REALTIME to the host KVM PTP
 # clock (/dev/ptp0) after snapshot/restore. The clock layer behind ntpd-rs.
-clock-steering = "0.2.1"
+clock-steering = "0.3.1"
+# clock-steering 0.3 moved its time types (Timestamp/Duration) and the
+# Clock trait out into this crate; agentd names them directly.
+statime-base = "0.1.1"
 
 # wire codecs
 bincode = "1.3"
@@ -195,7 +201,6 @@ serde_bytes = "0.11"
 axum = { version = "0.8", features = ["macros", "ws"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["trace", "cors"] }
-hyper = "1"
 h2 = "0.4"
 # reqwest 0.13 renamed the TLS features: 0.12's `rustls-tls` became `rustls`,
 # and `rustls` now turns on rustls's aws-lc-rs provider. `rustls-no-provider`
@@ -299,10 +304,6 @@ tar = "0.4"
 # inflate throughput (~2x miniz_oxide) — the OCI layer gzip decode is on
 # the enable critical path.
 flate2 = { version = "1.1", features = ["zlib-rs"] }
-# ADR 0080: engram-rootfs-materializer's deterministic-pack mtime clamp
-# (regular files, dirs, AND symlinks — std can't lutimes) and its OCI
-# layer xattr application. Both are already transitive deps of `tar`.
-filetime = "0.2"
 xattr = "1"
 # ADR 0055 P2: read user-uploaded .zip skill archives. Lean: deflate + store
 # only (no bzip2/zstd/aes), and extraction is budgeted against zip bombs.
@@ -323,7 +324,6 @@ zstd = { version = "0.14", default-features = false }
 # keys hang off byte-identical images — a version bump is a deliberate
 # fleet-wide chunk-cache invalidation event, never a float.
 mkext4 = "=0.0.4"
-once_cell = "1"
 # ADR 0088 addendum round 2: the flatten write pool's job dequeue. A
 # `Mutex<mpsc::Receiver>` shared by 16 workers burned 38s of CPU in
 # lock contention on a dev-brain profile; crossbeam's MPMC receiver is

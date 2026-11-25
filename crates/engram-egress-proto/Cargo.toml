@@ -14,6 +14,11 @@ description = "ADR 0121: the control protocol, manifest schema, and adopt decisi
 [lints.rust]
 unsafe_code = "allow"
 
+[lints.cargo]
+# `workspace-hack` is a dependency of every crate and no crate names it, and a
+# dependency that one platform uses reads as unused on the other.
+unused_dependencies = "allow"
+
 [lints.clippy]
 disallowed_methods = "deny"
 
@@ -25,7 +30,7 @@ tokio.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["socket", "uio"] }
+nix = { version = "0.32", default-features = false, features = ["socket", "uio"] }
 
 [dev-dependencies]
 tempfile = "3"

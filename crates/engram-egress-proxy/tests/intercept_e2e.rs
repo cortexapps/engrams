@@ -753,11 +753,21 @@ async fn guest_upgrade_header_cannot_reopen_the_bypass() {
     );
 }
 
-// ADR 0056: a request to an inject-gated host whose (method, path) matches
-// no policy is rejected — the secret is never injected and nothing reaches
-// upstream.
+// An inject-gated request that matches no policy never reaches upstream.
 #[tokio::test]
 async fn rejects_request_shape_outside_policy() {
+    let body = h1_policy_denial_body("POST", "/api/v2/metrics").await;
+    assert!(body.contains("\"error\":\"egress_policy_denied\""));
+    assert!(body.contains("POST /api/v2/metrics"));
+}
+
+#[tokio::test]
+async fn h1_rejects_head_with_a_403_and_no_body() {
+    let body = h1_policy_denial_body("HEAD", "/api/v2/logs").await;
+    assert!(body.is_empty(), "HEAD denial contains a body: {body:?}");
+}
+
+async fn h1_policy_denial_body(method: &str, path: &str) -> String {
     let ca = ca();
     let mint = Arc::new(CertMint::new(ca.clone()));
     let server_cfg = build_server_config(mint);
@@ -767,7 +777,6 @@ async fn rejects_request_shape_outside_policy() {
     let upstream_addr = fake_upstream(captured.clone()).await;
     let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
 
-    // Only GET /api/v2/logs* is allowed; the client tries POST /api/v2/metrics.
     let inj = inject_entry("dd-secret-xyz", &["GET"], &["/api/v2/logs*"]);
     let resolver = Arc::new(StaticResolver::new().with("fake-upstream", upstream_addr));
     let proxy_task = tokio::spawn(async move {
@@ -786,7 +795,7 @@ async fn rejects_request_shape_outside_policy() {
                 foreign_placeholders: &[],
                 session_id: SessionId::new(),
                 sink: None,
-                refresher: None, // WS4: no inject refresher in this test
+                refresher: None,
             },
             server_cfg,
             client_cfg,
@@ -795,18 +804,22 @@ async fn rejects_request_shape_outside_policy() {
     });
 
     let mut tls_client = tls_client_to(&ca, client_to_proxy).await;
-    tls_client
-        .write_all(
-            b"POST /api/v2/metrics HTTP/1.1\r\nHost: fake-upstream\r\nContent-Length: 0\r\n\r\n",
-        )
-        .await
-        .unwrap();
+    let request =
+        format!("{method} {path} HTTP/1.1\r\nHost: fake-upstream\r\nContent-Length: 0\r\n\r\n");
+    tls_client.write_all(request.as_bytes()).await.unwrap();
     tls_client.flush().await.unwrap();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        let mut buf = [0u8; 1024];
-        let _ = tls_client.read(&mut buf).await;
-    })
-    .await;
+    let mut response = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tls_client.read_to_string(&mut response),
+    )
+    .await
+    .expect("the proxy closes the denied connection")
+    .unwrap();
+
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    assert!(head.starts_with("HTTP/1.1 403 Forbidden\r\n"));
+    assert!(head.contains("\r\nContent-Type: application/json\r\n"));
 
     let outcome = proxy_task.await.unwrap();
     assert!(
@@ -817,16 +830,14 @@ async fn rejects_request_shape_outside_policy() {
         captured.lock().is_empty(),
         "upstream must see nothing when the request shape is rejected",
     );
+    body.to_owned()
 }
 
-// WS4 (campaign C2 regression): a rejected request must NEVER surface to the
-// guest as an empty success-shaped response. The reject path closes the
-// connection, so the guest reads ZERO bytes (an unambiguous transport failure)
-// — not a synthesized `HTTP/1.1 204`/`200` with an empty body that a stale-token
-// branch DELETE could be mistaken for succeeding. (The stale-token root cause is
-// fixed by the TTL-aware re-mint; this pins the shape invariant regardless.)
+// A rejected request must never reach the guest as a success: a synthesized
+// `204`/`200` would let a client read a denied branch DELETE as done. The guest
+// gets one `403` that names the denied request, and the connection closes.
 #[tokio::test]
-async fn reject_writes_no_response_to_the_guest() {
+async fn reject_answers_the_guest_with_a_403_that_names_the_request() {
     let ca = ca();
     let mint = Arc::new(CertMint::new(ca.clone()));
     let server_cfg = build_server_config(mint);
@@ -867,7 +878,7 @@ async fn reject_writes_no_response_to_the_guest() {
     let mut tls_client = tls_client_to(&ca, client_to_proxy).await;
     tls_client
         .write_all(
-            b"DELETE /repos/o/r/git/refs/heads/x HTTP/1.1\r\nHost: fake-upstream\r\nContent-Length: 0\r\n\r\n",
+            b"DELETE /repos/o/r/git/refs/heads/x HTTP/1.1\r\nHost: fake-upstream\r\nContent-Length: 11\r\n\r\n{\"sha\":\"x\"}",
         )
         .await
         .unwrap();
@@ -886,11 +897,14 @@ async fn reject_writes_no_response_to_the_guest() {
         matches!(outcome, Err(InterceptError::RequestRejected { .. })),
         "expected RequestRejected, got: {outcome:?}",
     );
+    let resp = String::from_utf8_lossy(&resp);
     assert!(
-        resp.is_empty(),
-        "reject must write NO response to the guest (no synthesized 2xx/204); got: {:?}",
-        String::from_utf8_lossy(&resp),
+        resp.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+        "reject must answer 403, never a 2xx; got: {resp:?}",
     );
+    assert!(resp.contains("Connection: close\r\n"));
+    assert!(resp.contains("\"error\":\"egress_policy_denied\""));
+    assert!(resp.contains("DELETE /repos/o/r/git/refs/heads/x"));
     assert!(
         captured.lock().is_empty(),
         "upstream must see nothing on reject"
@@ -2078,7 +2092,8 @@ async fn managed_default_allow_rejects_host_override_without_injecting_credentia
 async fn managed_h2_rejects_authority_override() {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let ca = ca();
-        let upstream = h2_upstream(Arc::new(Mutex::new(None))).await;
+        let seen_authorization = Arc::new(Mutex::new(None));
+        let upstream = h2_upstream(seen_authorization.clone()).await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let guest = TcpStream::connect(listener.local_addr().unwrap())
             .await
@@ -2121,16 +2136,28 @@ async fn managed_h2_rejects_authority_override() {
             .unwrap();
         let (mut client, connection) = h2::client::handshake(guest).await.unwrap();
         let connection = tokio::spawn(connection);
-        let request = http::Request::builder()
-            .uri("https://mcp.example/forbidden")
-            .body(())
-            .unwrap();
-        let (response, _) = client.send_request(request, true).unwrap();
-        assert_eq!(response.await.unwrap().status(), 403);
+        for method in [http::Method::GET, http::Method::HEAD] {
+            client = client.ready().await.unwrap();
+            let is_head = method == http::Method::HEAD;
+            let request = http::Request::builder()
+                .method(method)
+                .uri("https://mcp.example/forbidden")
+                .header("authorization", "Bearer guest-marker")
+                .body(())
+                .unwrap();
+            let (response, _) = client.send_request(request, true).unwrap();
+            let response = response.await.unwrap();
+            assert_eq!(response.status(), 403);
+            assert_eq!(response.headers()["content-type"], "application/json");
+            if is_head {
+                assert!(response.into_body().data().await.is_none());
+            }
+        }
         drop(client);
         connection.abort();
         let _ = connection.await;
         let _ = task.await.unwrap();
+        assert!(seen_authorization.lock().is_none());
     })
     .await
     .expect("bounded managed H2 authority test");

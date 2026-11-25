@@ -6,7 +6,7 @@
  *     `connectors/registry.ts` (defaultIcon{Mono,Color} / defaultDisplayName) so a
  *     provider with no catalog entry (e.g. a session event naming a since-deleted
  *     connector) still renders the SAME monogram + tint the server would have.
- *  2. Display derivations — `accessOf` (read/write from HTTP method),
+ *  2. Display derivations — `powerAccess` / `accessOf` (read/write),
  *     `humanizeAction`, `resourceOf`/`resourceLabel`, and `parseConnectorConfig`
  *     (the admin path: a connector's raw `config_json` → display + powers +
  *     credential posture). The slug stays canonical; labels are derived here.
@@ -90,6 +90,15 @@ export function fallbackIdentity(provider: string): ProviderIdentity {
 export function accessOf(method: string | undefined): Access {
   const m = (method ?? "").trim().toUpperCase();
   return m === "GET" || m === "HEAD" || m === "OPTIONS" ? "read" : "write";
+}
+
+/** A power's access is the level its name declares (`<resource>:read` reads,
+ * any other level writes); a power with no level takes its operation's.
+ * Mirrors the orchestrator's `powerAccess` (connectors/registry.ts). */
+export function powerAccess(action: string, operationAccess: Access): Access {
+  const colon = action.lastIndexOf(":");
+  if (colon < 0) return operationAccess;
+  return action.slice(colon + 1) === "read" ? "read" : "write";
 }
 
 /** The resource namespace of an action (`pulls:write` → `pulls`). */
@@ -366,7 +375,11 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
         continue;
       }
       seen.add(action);
-      capabilities.push({ action, access, ...(op.asset?.kind ? { asset: op.asset.kind } : {}) });
+      capabilities.push({
+        action,
+        access: powerAccess(action, access),
+        ...(op.asset?.kind ? { asset: op.asset.kind } : {}),
+      });
     }
   }
 

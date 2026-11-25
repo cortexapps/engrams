@@ -23,6 +23,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import { useEventCatalog } from "@/hooks/useAutomationEditor";
 import { useProfiles } from "@/hooks/useProfiles";
@@ -75,7 +76,8 @@ import { StepDetails } from "../runs/StepDetails";
 import { BlockInspector } from "./BlockInspector";
 import { AddAgentNode, AgentBus, AgentNode, AgentStub } from "./canvas/AgentNode";
 import { Canvas, TRIGGER_ROW_ID } from "./canvas/Canvas";
-import { MAX_SCALE, MIN_SCALE } from "./canvas/layout";
+import { layoutCanvas } from "./canvas/layout";
+import { ZoomFrame } from "./canvas/ZoomFrame";
 import { AgentInspector } from "./inspectors/AgentInspector";
 import { TestPanel } from "./test/TestPanel";
 import { TriggerInspector } from "./TriggerInspector";
@@ -254,9 +256,18 @@ export function BuildTab({
 }: BuildTabProps) {
   const ways = entrypointIds(definition);
   const active = projectEntrypoint(definition, entrypointId);
+  // One column per way in, as wide as its canvas draws; the agent bus joins
+  // the columns' centres.
+  const columns = useMemo(
+    () =>
+      entrypointIds(definition).map((way) => {
+        const projected = projectEntrypoint(definition, way);
+        return { way, projected, width: layoutCanvas(projected.blocks).width };
+      }),
+    [definition],
+  );
   const firstId = active.blocks[0]?.id ?? TRIGGER_ROW_ID;
   const [selectedId, setSelectedId] = useState<string>(firstId);
-  const [zoom, setZoom] = useState<number | "fit">("fit");
   const [adding, setAdding] = useState(false);
   const [draftWay, setDraftWay] = useState("");
   // Read once: `defaultSize` is only consulted on mount, and every later width
@@ -531,162 +542,127 @@ export function BuildTab({
               backgroundSize: "20px 20px",
             }}
           >
-            <div className="absolute top-3 right-3 z-30 flex items-center gap-1" aria-label="Zoom">
-              <Button
-                variant="outline"
-                size="sm"
-                className="h-7 w-7 px-0"
-                aria-label="Zoom out"
-                onClick={() => setZoom((z) => Math.max(MIN_SCALE, (z === "fit" ? 1 : z) - 0.1))}
-              >
-                −
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                className="h-7 w-7 px-0"
-                aria-label="Zoom in"
-                onClick={() => setZoom((z) => Math.min(MAX_SCALE, (z === "fit" ? 1 : z) + 0.1))}
-              >
-                +
-              </Button>
-              <Button variant="outline" size="sm" className="h-7" onClick={() => setZoom("fit")}>
-                Fit
-              </Button>
-            </div>
-            <div className="flex min-h-0 flex-1 gap-6 overflow-auto p-6 pt-12">
-              {/* Fit: every column shrinks and its canvas scales down, so the
-                  whole row is in view. An explicit zoom keeps each column at
-                  its canvas width and the row scrolls, so a later column is
-                  never painted under the "add" control beside the row.
-                  The row is as tall as its tallest column and the agent sits
-                  right under it: the diagram scrolls as a whole, so a stem
-                  never spans an empty viewport. */}
-              <div
-                className={cn(
-                  "flex flex-1 flex-col self-start",
-                  zoom === "fit" ? "min-w-0" : "min-w-max",
-                )}
-              >
-                <div className="flex gap-6">
-                  {ways.map((way) => {
-                    const projected =
-                      way === entrypointId ? active : projectEntrypoint(definition, way);
-                    const carried = wayCarried(way, projected.blocks);
-                    return (
-                      <div
-                        key={way}
-                        className={cn(
-                          "flex min-h-0 flex-1 flex-col",
-                          zoom === "fit" ? "min-w-0" : "min-w-[240px]",
-                        )}
+            <ZoomFrame
+              toolbar={
+                !builtin &&
+                !replay && (
+                  <Popover open={adding} onOpenChange={setAdding}>
+                    <PopoverTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-7 bg-card"
+                        data-testid="add-way-in"
                       >
-                        <Canvas
-                          trigger={projected.trigger}
-                          triggerSummary={triggerSummaryFor(way)}
-                          entrypointId={
-                            ways.length > 1 || way !== MAIN_ENTRYPOINT_ID ? way : undefined
-                          }
-                          blocks={projected.blocks}
-                          selectedId={way === entrypointId ? effectiveId : null}
-                          onSelect={(id) => select(way, id)}
-                          erroredIds={way === entrypointId ? erroredIds : new Set()}
-                          locked={builtin}
-                          onInsert={(at, index, kind) => onInsert(way, at, index, kind)}
-                          onMove={(at, from, to) => onMove(way, at, from, to)}
-                          onRemove={(id) => onRemove(way, id)}
-                          zoom={zoom}
-                          summaryFor={summaryFor}
-                          withAgent={agent !== undefined}
-                          {...(replay ? { replay: { map: replay.map, onPath: carried } } : {})}
+                        <Plus aria-hidden />
+                        Add another way in
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent align="start" className="w-[264px] p-3">
+                      <form
+                        className="flex flex-col gap-2"
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          confirmAddWay();
+                        }}
+                      >
+                        <Input
+                          value={draftWay}
+                          onChange={(e) => setDraftWay(e.target.value)}
+                          placeholder="review_feedback"
+                          aria-label="Name for the new way in"
+                          className="font-mono text-xs"
+                          autoFocus
                         />
-                        {agent && (
-                          <AgentStub
-                            role={roleOf(definition, way)}
-                            message={messageOf(definition, way)}
-                            dimmed={replay ? !carried : false}
-                            onSelect={() => select(way, TRIGGER_ROW_ID)}
-                          />
+                        {draftWayError && (
+                          <p className="text-xs text-muted-foreground">{draftWayError}</p>
                         )}
-                      </div>
-                    );
-                  })}
-                </div>
-                {agent ? (
-                  <AgentBus columns={ways.length}>
-                    <AgentNode
-                      summary={agentSummary}
-                      selected={agentSelected}
-                      errored={agentErrors.length > 0}
-                      {...(replayAgent ? { status: replayAgent.status } : {})}
-                      dimmed={replay ? !replayAgent : false}
-                      onSelect={() => setSelectedId(AGENT_NODE_ID)}
-                    />
-                  </AgentBus>
-                ) : (
-                  !builtin &&
-                  !replay && (
-                    <div className="flex shrink-0 justify-center pt-4">
-                      <AddAgentNode onAdd={addAgent} />
-                    </div>
-                  )
-                )}
-              </div>
-              {!builtin && !replay && (
-                <div className={cn("flex shrink-0 flex-col", adding ? "w-[264px]" : "w-auto")}>
-                  {adding ? (
-                    <form
-                      className="flex flex-col gap-2 rounded-lg border border-dashed bg-card/60 p-3"
-                      onSubmit={(e) => {
-                        e.preventDefault();
-                        confirmAddWay();
-                      }}
-                    >
-                      <Input
-                        value={draftWay}
-                        onChange={(e) => setDraftWay(e.target.value)}
-                        placeholder="review_feedback"
-                        aria-label="Name for the new way in"
-                        className="font-mono text-xs"
-                        autoFocus
+                        <div className="flex gap-2">
+                          <Button
+                            type="submit"
+                            size="sm"
+                            disabled={draftWay === "" || !!draftWayError}
+                          >
+                            Add
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => setAdding(false)}
+                          >
+                            Cancel
+                          </Button>
+                        </div>
+                      </form>
+                    </PopoverContent>
+                  </Popover>
+                )
+              }
+            >
+              {/* Each column is as wide as its canvas. The row is as tall as
+                  its tallest column and the agent sits right under it, so a
+                  stem never spans an empty viewport. */}
+              <div className="flex gap-6">
+                {columns.map(({ way, projected, width }) => {
+                  const carried = wayCarried(way, projected.blocks);
+                  return (
+                    <div key={way} className="flex flex-col" style={{ width }}>
+                      <Canvas
+                        trigger={projected.trigger}
+                        triggerSummary={triggerSummaryFor(way)}
+                        entrypointId={
+                          ways.length > 1 || way !== MAIN_ENTRYPOINT_ID ? way : undefined
+                        }
+                        blocks={projected.blocks}
+                        selectedId={way === entrypointId ? effectiveId : null}
+                        onSelect={(id) => select(way, id)}
+                        erroredIds={way === entrypointId ? erroredIds : new Set()}
+                        locked={builtin}
+                        onInsert={(at, index, kind) => onInsert(way, at, index, kind)}
+                        onMove={(at, from, to) => onMove(way, at, from, to)}
+                        onRemove={(id) => onRemove(way, id)}
+                        summaryFor={summaryFor}
+                        withAgent={agent !== undefined}
+                        {...(replay ? { replay: { map: replay.map, onPath: carried } } : {})}
                       />
-                      {draftWayError && (
-                        <p className="text-xs text-muted-foreground">{draftWayError}</p>
+                      {agent && (
+                        <AgentStub
+                          role={roleOf(definition, way)}
+                          message={messageOf(definition, way)}
+                          dimmed={replay ? !carried : false}
+                          onSelect={() => select(way, TRIGGER_ROW_ID)}
+                        />
                       )}
-                      <div className="flex gap-2">
-                        <Button
-                          type="submit"
-                          size="sm"
-                          disabled={draftWay === "" || !!draftWayError}
-                        >
-                          Add
-                        </Button>
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => setAdding(false)}
-                        >
-                          Cancel
-                        </Button>
-                      </div>
-                    </form>
-                  ) : (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      className="h-9 justify-start border border-dashed text-muted-foreground"
-                      onClick={() => setAdding(true)}
-                      data-testid="add-way-in"
-                    >
-                      <Plus aria-hidden />
-                      Add another way in
-                    </Button>
-                  )}
-                </div>
+                    </div>
+                  );
+                })}
+              </div>
+              {agent ? (
+                <AgentBus
+                  left={columns[0]!.width / 2}
+                  right={columns.at(-1)!.width / 2}
+                  joins={columns.length > 1}
+                >
+                  <AgentNode
+                    summary={agentSummary}
+                    selected={agentSelected}
+                    errored={agentErrors.length > 0}
+                    {...(replayAgent ? { status: replayAgent.status } : {})}
+                    dimmed={replay ? !replayAgent : false}
+                    onSelect={() => setSelectedId(AGENT_NODE_ID)}
+                  />
+                </AgentBus>
+              ) : (
+                !builtin &&
+                !replay && (
+                  <div className="flex shrink-0 justify-center pt-4">
+                    <AddAgentNode onAdd={addAgent} />
+                  </div>
+                )
               )}
-            </div>
+            </ZoomFrame>
           </div>
           {!replay && (
             <TestDrawer

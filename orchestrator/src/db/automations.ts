@@ -1678,6 +1678,7 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
             eq(automationRunTable.instanceId, instanceId),
             ...(excludeRunId !== undefined ? [ne(automationRunTable.id, excludeRunId)] : []),
             eq(automationSessionTable.keep, true),
+            eq(automationSessionTable.role, "primary"),
           ),
         )
         .orderBy(desc(automationSessionTable.createdAt))

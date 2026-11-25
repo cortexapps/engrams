@@ -1639,7 +1639,115 @@
       ],
       "match": {
         "method": "GET",
-        "path": "/repos/*"
+        "path": "segment-path:/repos/*/*"
+      }
+    },
+    {
+      "grants": [
+        "metadata:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/events"
+      }
+    },
+    {
+      "grants": [
+        "metadata:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/forks"
+      }
+    },
+    {
+      "grants": [
+        "metadata:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/license"
+      }
+    },
+    {
+      "grants": [
+        "metadata:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/stargazers"
+      }
+    },
+    {
+      "grants": [
+        "metadata:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/subscribers"
+      }
+    },
+    {
+      "grants": [
+        "metadata:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/stats/*"
+      }
+    },
+    {
+      "grants": [
+        "metadata:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/rules/branches/*"
+      }
+    },
+    {
+      "grants": [
+        "metadata:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/rulesets"
+      }
+    },
+    {
+      "grants": [
+        "metadata:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/rulesets/*"
+      }
+    },
+    {
+      "grants": [
+        "metadata:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/properties/values"
+      }
+    },
+    {
+      "grants": [
+        "metadata:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/topics"
+      }
+    },
+    {
+      "grants": [
+        "metadata:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/languages"
       }
     },
     {
@@ -1721,6 +1829,105 @@
       "match": {
         "method": "GET",
         "path": "/repos/*/releases*"
+      }
+    },
+    {
+      "grants": [
+        "contents:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/contents"
+      }
+    },
+    {
+      "grants": [
+        "contents:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/repos/*/compare/*"
+      }
+    },
+    {
+      "grants": [
+        "contents:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/repos/*/tarball/*"
+      }
+    },
+    {
+      "grants": [
+        "contents:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/repos/*/zipball/*"
+      }
+    },
+    {
+      "grants": [
+        "contents:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/dependency-graph/*"
+      }
+    },
+    {
+      "grants": [
+        "contents:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/dependency-graph/sbom"
+      }
+    },
+    {
+      "grants": [
+        "contents:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/activity"
+      }
+    },
+    {
+      "grants": [
+        "contents:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/codeowners/errors"
+      }
+    },
+    {
+      "grants": [
+        "contents:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/community/profile"
+      }
+    },
+    {
+      "grants": [
+        "contents:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/comments"
+      }
+    },
+    {
+      "grants": [
+        "contents:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/comments/*"
       }
     },
     {
@@ -1918,6 +2125,24 @@
     },
     {
       "grants": [
+        "issues:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/assignees"
+      }
+    },
+    {
+      "grants": [
+        "issues:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/assignees/*"
+      }
+    },
+    {
+      "grants": [
         "issues:write"
       ],
       "match": {
@@ -1991,6 +2216,24 @@
       "match": {
         "method": "GET",
         "path": "/repos/*/actions/*"
+      }
+    },
+    {
+      "grants": [
+        "actions:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/environments"
+      }
+    },
+    {
+      "grants": [
+        "actions:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/environments/*"
       }
     },
     {
@@ -2189,6 +2432,33 @@
       "match": {
         "method": "POST",
         "path": "/repos/*/deployments*"
+      }
+    },
+    {
+      "grants": [
+        "vulnerability_alerts:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/dependabot/alerts"
+      }
+    },
+    {
+      "grants": [
+        "vulnerability_alerts:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "segment-path:/repos/*/*/dependabot/alerts/*"
+      }
+    },
+    {
+      "grants": [
+        "vulnerability_alerts:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "segment-path:/repos/*/*/dependabot/alerts/*"
       }
     },
     {
@@ -2582,7 +2852,7 @@
     "dummyEnv": {
       "GITHUB_TOKEN": "x-engrams-managed"
     },
-    "doc": "Use `gh` to drive GitHub from this session \u2014 code, pull requests, issues, and GitHub Actions. Authentication is automatic: `GITHUB_TOKEN` is a managed placeholder the egress proxy replaces with a short-lived, capability-scoped GitHub App installation token on every request to api.github.com. The token's GitHub App permissions are MINTED from the powers your profile granted (e.g. `actions:write` \u2192 the App's `actions: write` permission), so a call your profile didn't grant fails as a 403 from GitHub, not a leak. Do NOT run `gh auth login` or set a real token.\n\nOpen a PR:\n1. Re-anchor on the live base (the baked checkout may be stale): `git fetch origin && git checkout -b my-feature origin/main`.\n2. Commit + push \u2014 git auth is brokered via GIT_ASKPASS, nothing to configure: `git add -A && git commit -m \"...\" && git push -u origin my-feature`.\n3. `gh pr create --base main --title \"...\" --body \"...\"` (add `--draft` for a draft). Requires `pulls:write`. Review/merge: `gh pr review`, `gh pr merge` (pulls:write); `gh pr checks` needs `checks:read`.\n\nIssues: `gh issue create/list/view/comment` (issues:read / issues:write). Labels & milestones ride the `issues` powers.\n\nGitHub Actions (CI/CD):\n- Runs: `gh run list`, `gh run view <id> --log`, `gh run watch <id>` need `actions:read`; `gh run rerun <id>`, `gh run cancel <id>` need `actions:write`.\n- Workflows: `gh workflow list/view` (actions:read); `gh workflow run <file> -f key=val` to dispatch (actions:write).\n- Artifacts & caches: list/download artifacts and `gh cache list` need `actions:read`; `gh cache delete` / deleting artifacts need `actions:write`.\n- Secrets: `gh secret list` needs `secrets:read`; `gh secret set NAME` / `gh secret delete NAME` need `secrets:write` (values are write-only \u2014 GitHub never returns them).\n- Variables: `gh variable list` needs `variables:read`; `gh variable set/delete` need `variables:write`.\n\nReleases: `gh release list/view/download` (contents:read); `gh release create` / asset upload (contents:write). Repo contents, branches, commits, tags, and the Git data API ride `contents:*`; repo/metadata listings ride `metadata:read`. Commit statuses: read via `statuses:read`, set via `statuses:write`. Deployments: `deployments:read` / `deployments:write`.\n\nRaw passthrough for anything else: `gh api repos/{owner}/{repo}/actions/runs` (GET) or `gh api --method POST repos/{owner}/{repo}/issues -f title=...`.\n\nGraphQL: many `gh` commands talk GraphQL (e.g. `gh pr view/list/merge/review/ready`, `gh issue view/list`, `gh repo view`) and `gh api graphql` runs it directly. These work \u2014 the egress proxy parses the GraphQL operation and gates it by the SAME power as the REST equivalent (a `mergePullRequest` mutation needs `pulls:write`, a `createIssue` mutation needs `issues:write`, read queries need a `:read` power). A GraphQL field your profile didn't grant is denied (403). Images in a PR body must be absolute URLs anchored to a commit SHA \u2014 relative repo paths do not render."
+    "doc": "Use `gh` to drive GitHub from this session \u2014 code, pull requests, issues, and GitHub Actions. Authentication is automatic: `GITHUB_TOKEN` is a managed placeholder the egress proxy replaces with a short-lived, capability-scoped GitHub App installation token on every request to api.github.com. The token's GitHub App permissions are MINTED from the powers your profile granted (e.g. `actions:write` \u2192 the App's `actions: write` permission), so a call your profile didn't grant fails as a 403 from GitHub, not a leak. Do NOT run `gh auth login` or set a real token.\n\nOpen a PR:\n1. Re-anchor on the live base (the baked checkout may be stale): `git fetch origin && git checkout -b my-feature origin/main`.\n2. Commit + push \u2014 git auth is brokered via GIT_ASKPASS, nothing to configure: `git add -A && git commit -m \"...\" && git push -u origin my-feature`.\n3. `gh pr create --base main --title \"...\" --body \"...\"` (add `--draft` for a draft). Requires `pulls:write`. Review/merge: `gh pr review`, `gh pr merge` (pulls:write); `gh pr checks` needs `checks:read`.\n\nIssues: `gh issue create/list/view/comment` (issues:read / issues:write). Labels & milestones ride the `issues` powers.\n\nGitHub Actions (CI/CD):\n- Runs: `gh run list`, `gh run view <id> --log`, `gh run watch <id>` need `actions:read`; `gh run rerun <id>`, `gh run cancel <id>` need `actions:write`.\n- Workflows: `gh workflow list/view` (actions:read); `gh workflow run <file> -f key=val` to dispatch (actions:write).\n- Artifacts & caches: list/download artifacts and `gh cache list` need `actions:read`; `gh cache delete` / deleting artifacts need `actions:write`.\n- Secrets: `gh secret list` needs `secrets:read`; `gh secret set NAME` / `gh secret delete NAME` need `secrets:write` (values are write-only \u2014 GitHub never returns them).\n- Variables: `gh variable list` needs `variables:read`; `gh variable set/delete` need `variables:write`.\n- Dependabot alerts: `gh api repos/<owner>/<repo>/dependabot/alerts` needs `vulnerability_alerts:read`; dismissing one (`PATCH .../dependabot/alerts/<n>`) needs `vulnerability_alerts:write`.\n\nReleases: `gh release list/view/download` (contents:read); `gh release create` / asset upload (contents:write). Repo contents, branches, commits, tags, and the Git data API ride `contents:*`; repo/metadata listings ride `metadata:read`. Commit statuses: read via `statuses:read`, set via `statuses:write`. Deployments: `deployments:read` / `deployments:write`.\n\nRaw passthrough for anything else: `gh api repos/{owner}/{repo}/actions/runs` (GET) or `gh api --method POST repos/{owner}/{repo}/issues -f title=...`.\n\nGraphQL: many `gh` commands talk GraphQL (e.g. `gh pr view/list/merge/review/ready`, `gh issue view/list`, `gh repo view`) and `gh api graphql` runs it directly. These work \u2014 the egress proxy parses the GraphQL operation and gates it by the SAME power as the REST equivalent (a `mergePullRequest` mutation needs `pulls:write`, a `createIssue` mutation needs `issues:write`, read queries need a `:read` power). A GraphQL field your profile didn't grant is denied (403). Images in a PR body must be absolute URLs anchored to a commit SHA \u2014 relative repo paths do not render."
   },
   "actions": [
     {

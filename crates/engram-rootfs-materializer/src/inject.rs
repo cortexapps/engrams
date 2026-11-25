@@ -446,11 +446,21 @@ pub async fn inject_init(
     // that used to normalize this write is retired — the shim (and the
     // dirs its creation touched) must land at the deterministic epoch
     // itself, or the packed ext4 bytes vary run to run.
-    let epoch = filetime::FileTime::from_unix_time(crate::ext4::DETERMINISTIC_EPOCH_SECS as i64, 0);
+    let epoch = std::time::SystemTime::UNIX_EPOCH
+        + std::time::Duration::from_secs(crate::ext4::DETERMINISTIC_EPOCH_SECS);
     let stamp = |p: std::path::PathBuf| async move {
-        tokio::task::spawn_blocking(move || filetime::set_symlink_file_times(&p, epoch, epoch))
-            .await
-            .map_err(std::io::Error::other)?
+        tokio::task::spawn_blocking(move || {
+            // `set_times_nofollow` so the walk also stamps any symlink
+            // it meets without following through to its target.
+            std::fs::set_times_nofollow(
+                &p,
+                std::fs::FileTimes::new()
+                    .set_accessed(epoch)
+                    .set_modified(epoch),
+            )
+        })
+        .await
+        .map_err(std::io::Error::other)?
     };
     stamp(init_dst.clone()).await?;
     let mut dir = init_dst.parent();
