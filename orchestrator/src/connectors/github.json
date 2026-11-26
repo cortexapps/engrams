@@ -17,6 +17,24 @@
     }
   },
   "userCredential": {
+    "oauth": {
+      "authorizeUrl": "https://github.com/login/oauth/authorize",
+      "acquisitionHosts": [
+        "github.com"
+      ],
+      "tokenUrl": "https://github.com/login/oauth/access_token",
+      "clientIdRef": "github_app.client_id",
+      "clientSecretRef": "github_app.client_secret",
+      "metadata": {
+        "probe": {
+          "path": "/user",
+          "map": {
+            "accountId": "id",
+            "displayName": "login"
+          }
+        }
+      }
+    },
     "token": {
       "hint": "Create a fine-grained personal access token under GitHub Settings \u2192 Developer settings, with the permissions you want sessions to hold.",
       "identity": {

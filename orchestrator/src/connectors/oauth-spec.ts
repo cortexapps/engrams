@@ -7,7 +7,12 @@
  */
 
 import { create } from "@bufbuild/protobuf";
-import type { Connector, OauthMetadataField, OauthMetadataProbe } from "./registry.ts";
+import type {
+  Connector,
+  OauthFacet,
+  OauthMetadataField,
+  OauthMetadataProbe,
+} from "./registry.ts";
 import {
   ClientCredentialsSpecSchema,
   RedirectMetadataProbeSchema,
@@ -58,8 +63,10 @@ export function userTokenIdentityProbe(connector: Connector): RedirectMetadataPr
 /** Build the wire spec for a connector's oauth facet. `extraParams` lets a
  * caller append flow extras (e.g. `prompt: "consent"` on a reconnect); facet
  * params win on collision so a connector's declared behavior is stable. */
-function wireMetadata(connector: Connector): RedirectMetadataSpec | undefined {
-  const oauth = connector.oauth;
+function wireMetadata(
+  connector: Connector,
+  oauth: OauthFacet | undefined = connector.oauth,
+): RedirectMetadataSpec | undefined {
   if (!oauth?.metadata) return undefined;
   return create(RedirectMetadataSpecSchema, {
     fromTokenResponse: wireMap(oauth.metadata.fromTokenResponse),
@@ -111,10 +118,18 @@ export function redirectOauthSpec(
 ): RedirectOauthSpec {
   const oauth = connector.oauth;
   if (!oauth) throw new Error(`connector "${connector.provider}" has no oauth facet`);
+  return redirectSpecFromFacet(connector, oauth, extraParams);
+}
+
+function redirectSpecFromFacet(
+  connector: Connector,
+  oauth: OauthFacet,
+  extraParams?: Record<string, string>,
+): RedirectOauthSpec {
   if (oauth.grant === "client_credentials" || oauth.authorizeUrl === undefined) {
     throw new Error(`connector "${connector.provider}" has no authorization-code flow`);
   }
-  const metadata = wireMetadata(connector);
+  const metadata = wireMetadata(connector, oauth);
   return create(RedirectOauthSpecSchema, {
     authorizeUrl: oauth.authorizeUrl,
     tokenUrl: oauth.tokenUrl,
@@ -141,6 +156,10 @@ export function userRedirectOauthSpec(
   connector: Connector,
   extraParams?: Record<string, string>,
 ): RedirectOauthSpec {
+  // A mint connector's personal flow is its own facet (GitHub: the App's
+  // user authorization); nothing org-side is inherited, so it applies as is.
+  const own = connector.userCredential?.oauthFacet;
+  if (own) return redirectSpecFromFacet(connector, own, extraParams);
   const oauth = connector.oauth;
   const mode = connector.userCredential?.oauth;
   if (!oauth || mode === undefined) {

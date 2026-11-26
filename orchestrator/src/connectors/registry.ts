@@ -325,7 +325,9 @@ export interface OauthMetadataProbe {
  * into the launching user's PERSONAL credential for human sessions.
  *
  * - `oauth: true` reuses the top-level {@link OauthFacet} (same BYO app, same
- *   scopes) with a user subject in the sealed store.
+ *   scopes) with a user subject in the sealed store. A mint connector has no
+ *   top-level facet, so its `oauth` is a complete authorization-code flow of
+ *   its own (GitHub: the App's user authorization).
  * - `token` accepts a pasted personal access token; `hint` is the setup line
  *   shown in Settings → Credentials.
  * - `inject` is required for MINT connectors only (the mint engine renders
@@ -358,8 +360,12 @@ export interface UserOauthOverrides {
 
 export interface UserCredentialFacet {
   /** `true` reuses the facet as-is (minus its authorize extras); an object
-   * overrides the user flow's shape. */
+   * overrides the user flow's shape. On a mint connector the JSON object is
+   * the flow itself, parsed into `oauthFacet`, and this is `true`. */
   oauth?: true | UserOauthOverrides;
+  /** A mint connector's own personal OAuth flow (GitHub: the App's user
+   * authorization). Mint connectors have no org OAuth facet to reuse. */
+  oauthFacet?: OauthFacet;
   token?: UserTokenFacet;
   inject?: { header: string; template: string };
 }
@@ -1303,9 +1309,27 @@ function parseMetadataProbe(
  * admin-authored connector can't ship it elsewhere); `authorizeUrl` may instead
  * sit on the facet's own `acquisitionHosts` — a browser-redirect surface that is
  * never compiled into the session egress policy. */
-function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
+function parseOauth(
+  where: string,
+  raw: unknown,
+  hosts: string[],
+  personal = false,
+): OauthFacet {
   if (typeof raw !== "object" || raw === null) fail(where, '"oauth" must be an object');
   const o0 = raw as Record<string, unknown>;
+  // A personal flow of its own (a mint connector has no org OAuth facet to
+  // reuse) is a member's consent screen: authorization code only, with no
+  // org-side secrets. Its token URL may sit on an acquisition host — GitHub
+  // exchanges codes on github.com, and putting github.com into `hosts` would
+  // open it to session injection.
+  if (personal) {
+    if (o0.grant !== undefined && o0.grant !== "authorization_code") {
+      fail(where, '"oauth.grant" must be "authorization_code" for a personal flow');
+    }
+    for (const field of ["signingSecretRef", "signingSecretHint", "serviceAccountKeyRef"]) {
+      if (o0[field] !== undefined) fail(where, `"oauth.${field}" does not apply to a personal flow`);
+    }
+  }
   let grant: OauthFacet["grant"] = "authorization_code";
   if (o0.grant !== undefined) {
     if (
@@ -1383,9 +1407,16 @@ function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
     ? undefined
     : httpsUrlOn("authorizeUrl", o.authorizeUrl, [...hosts, ...(acquisitionHosts ?? [])]);
   // Strict: the token exchange carries the client secret.
-  const tokenUrl = httpsUrlOn("tokenUrl", o.tokenUrl, hosts);
+  const tokenUrl = httpsUrlOn(
+    "tokenUrl",
+    o.tokenUrl,
+    personal ? [...hosts, ...(acquisitionHosts ?? [])] : hosts,
+  );
 
-  const scopes = asStringArray(`${where} oauth`, "scopes", o.scopes);
+  // A personal flow may name no scopes: a GitHub App's user token carries the
+  // App's permissions, and GitHub ignores the scope parameter.
+  const scopes =
+    personal && o.scopes === undefined ? [] : asStringArray(`${where} oauth`, "scopes", o.scopes);
   if (scopes.length > MAX_OAUTH_SCOPES) fail(where, `"oauth.scopes" has ${scopes.length} entries (max ${MAX_OAUTH_SCOPES})`);
   for (const s of scopes) {
     if (/[\s\r\n]/.test(s)) fail(where, `"oauth.scopes" entry "${s}" must not contain whitespace`);
@@ -2257,9 +2288,10 @@ export function parseConnector(
   //  - at least one mode (oauth / token);
   //  - inject connectors need exactly ONE header (the user value renders
   //    through it) and must NOT carry a `userCredential.inject`;
-  //  - mint connectors are token-only and MUST carry `userCredential.inject`
-  //    (the mint engine renders the org header, so user mode needs its own);
-  //  - `oauth: true` requires the top-level oauth facet.
+  //  - mint connectors MUST carry `userCredential.inject` (the mint engine
+  //    renders the org header, so user mode needs its own), and their
+  //    `oauth` is a full personal flow of its own;
+  //  - `oauth: true` on an inject connector requires the top-level facet.
   let userCredential: UserCredentialFacet | undefined;
   if (o.userCredential !== undefined) {
     const uw = `${where} userCredential`;
@@ -2268,7 +2300,17 @@ export function parseConnector(
     }
     const uc = o.userCredential as Record<string, unknown>;
     let userOauth: true | UserOauthOverrides | undefined;
-    if (uc.oauth !== undefined) {
+    let userOauthFacet: OauthFacet | undefined;
+    if (uc.oauth !== undefined && credential.source === "mint") {
+      if (typeof uc.oauth !== "object" || uc.oauth === null || Array.isArray(uc.oauth)) {
+        fail(
+          uw,
+          '"oauth" on a mint connector must declare its own flow (authorizeUrl, tokenUrl, client refs): there is no org OAuth facet to reuse',
+        );
+      }
+      userOauthFacet = parseOauth(uw, uc.oauth, hosts, true);
+      userOauth = true;
+    } else if (uc.oauth !== undefined) {
       if (uc.oauth === true) {
         userOauth = true;
       } else if (typeof uc.oauth === "object" && uc.oauth !== null && !Array.isArray(uc.oauth)) {
@@ -2426,15 +2468,13 @@ export function parseConnector(
         fail(uw, '"inject" is only for mint connectors (inject connectors render the user value through their existing header)');
       }
     } else {
-      if (userOauth !== undefined) {
-        fail(uw, 'mint connectors support "token" mode only (user-to-server OAuth is not implemented)');
-      }
       if (userInject === undefined) {
         fail(uw, '"inject" is required on a mint connector (the mint engine renders the org header, so user mode needs its own header spec)');
       }
     }
     userCredential = {
       ...(userOauth !== undefined ? { oauth: userOauth } : {}),
+      ...(userOauthFacet !== undefined ? { oauthFacet: userOauthFacet } : {}),
       ...(token ? { token } : {}),
       ...(userInject ? { inject: userInject } : {}),
     };
