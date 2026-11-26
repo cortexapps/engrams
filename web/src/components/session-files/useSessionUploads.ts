@@ -129,6 +129,8 @@ async function writeFile(
   };
 }
 
+const NO_TOKENS: UploadToken[] = [];
+
 export function serializeComposer(text: string, tokens: readonly UploadToken[]): string {
   let serialized = text.trim();
   for (const token of tokens) {
@@ -138,19 +140,36 @@ export function serializeComposer(text: string, tokens: readonly UploadToken[]):
   return serialized;
 }
 
-export function useSessionUploads(sessionId?: string) {
-  const [tokens, setTokens] = useState<UploadToken[]>([]);
+/**
+ * Upload tokens for one composer. `draftKey` scopes the token list: each key keeps
+ * its own list, so a composer that switches between sessions keeps every
+ * session's attachments separate. An upload still runs against the session it
+ * started for.
+ */
+export function useSessionUploads(sessionId?: string, draftKey = "") {
+  const [tokensByDraft, setTokensByDraft] = useState<Record<string, UploadToken[]>>({});
+  const tokens = tokensByDraft[draftKey] ?? NO_TOKENS;
   const tokensRef = useRef(tokens);
-  const knownTokensRef = useRef<UploadToken[]>([]);
+  const knownTokensRef = useRef(new Map<string, UploadToken[]>());
   tokensRef.current = tokens;
 
+  const setTokens = useCallback(
+    (update: (current: UploadToken[]) => UploadToken[]) =>
+      setTokensByDraft((all) => ({ ...all, [draftKey]: update(all[draftKey] ?? NO_TOKENS) })),
+    [draftKey],
+  );
+  const knownTokens = useCallback(
+    () => knownTokensRef.current.get(draftKey) ?? NO_TOKENS,
+    [draftKey],
+  );
+
   const patchToken = useCallback((id: string, patch: Partial<UploadToken>) => {
-    setTokens((current) =>
-      current.map((token) => (token.id === id ? { ...token, ...patch } : token)),
+    const apply = (list: UploadToken[]) =>
+      list.map((token) => (token.id === id ? { ...token, ...patch } : token));
+    setTokensByDraft((all) =>
+      Object.fromEntries(Object.entries(all).map(([key, list]) => [key, apply(list)])),
     );
-    knownTokensRef.current = knownTokensRef.current.map((token) =>
-      token.id === id ? { ...token, ...patch } : token,
-    );
+    for (const [key, list] of knownTokensRef.current) knownTokensRef.current.set(key, apply(list));
   }, []);
 
   const runUpload = useCallback(
@@ -173,20 +192,20 @@ export function useSessionUploads(sessionId?: string) {
   const addFiles = useCallback(
     (files: FileList | readonly File[]) => {
       const added = Array.from(files).map(tokenForFile);
-      knownTokensRef.current = [...knownTokensRef.current, ...added];
+      knownTokensRef.current.set(draftKey, [...knownTokens(), ...added]);
       setTokens((current) => [...current, ...added]);
       if (sessionId) {
         for (const token of added) void runUpload(sessionId, token).catch(() => {});
       }
       return added;
     },
-    [runUpload, sessionId],
+    [runUpload, sessionId, draftKey, knownTokens, setTokens],
   );
 
   const addCanonicalPath = useCallback(
     (path: string): boolean => {
       if (!CANONICAL_UPLOAD_PATH.test(path)) return false;
-      const known = knownTokensRef.current.find((token) => token.path === path);
+      const known = knownTokens().find((token) => token.path === path);
       if (!known && !sessionId) return false;
       const parts = path.split("/");
       const token =
@@ -198,18 +217,19 @@ export function useSessionUploads(sessionId?: string) {
           status: "uploaded",
           progress: 1,
         } satisfies UploadToken);
-      if (!known) knownTokensRef.current = [...knownTokensRef.current, token];
+      if (!known) knownTokensRef.current.set(draftKey, [...knownTokens(), token]);
       setTokens((current) =>
         current.some((candidate) => candidate.path === path) ? current : [...current, token],
       );
       return true;
     },
-    [sessionId],
+    [sessionId, draftKey, knownTokens, setTokens],
   );
 
-  const remove = useCallback((id: string) => {
-    setTokens((current) => current.filter((token) => token.id !== id));
-  }, []);
+  const remove = useCallback(
+    (id: string) => setTokens((current) => current.filter((token) => token.id !== id)),
+    [setTokens],
+  );
 
   const retry = useCallback(
     async (id: string) => {
@@ -232,9 +252,9 @@ export function useSessionUploads(sessionId?: string) {
   );
 
   const clear = useCallback(() => {
-    knownTokensRef.current = [];
-    setTokens([]);
-  }, []);
+    knownTokensRef.current.delete(draftKey);
+    setTokens(() => NO_TOKENS);
+  }, [draftKey, setTokens]);
 
   return {
     tokens,

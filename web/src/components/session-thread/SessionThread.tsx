@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   AssistantRuntimeProvider,
   useExternalStoreRuntime,
@@ -79,7 +79,7 @@ export function SessionThread({
   streamingText = "",
   transcriptWindow,
 }: SessionThreadProps) {
-  const uploads = useSessionUploads(sessionId);
+  const uploads = useSessionUploads(sessionId, sessionId);
   const {
     messages: serverMessages,
     isRunning,
@@ -300,14 +300,25 @@ export function SessionThread({
   // optimistic bubble (keyed by the client-minted prompt_id) covers the gap
   // until the server's role:user echo lands with the same id.
   // ADR 0107: the composer's mode. The server truth is `currentMode`
-  // (derived from the event log); `modeOverride` is the user's not-yet-sent
-  // toggle. The next prompt carries `harnessMode` only when it CHANGES the
-  // mode, so a steady state never spams mode markers.
-  const [modeOverride, setModeOverride] = useState<string | null>(null);
+  // (derived from the event log); the override is the user's not-yet-sent
+  // toggle, kept per session like the rest of the draft. The next prompt
+  // carries `harnessMode` only when it CHANGES the mode, so a steady state
+  // never spams mode markers.
+  const [modeOverrides, setModeOverrides] = useState<Record<string, string>>({});
+  const modeOverride = modeOverrides[sessionId] ?? null;
   const composerMode = modeOverride ?? currentMode;
+  const setModeOverride = useCallback(
+    (next: string | null) =>
+      setModeOverrides((all) => {
+        const rest = { ...all };
+        delete rest[sessionId];
+        return next === null ? rest : { ...rest, [sessionId]: next };
+      }),
+    [sessionId],
+  );
   const setMode = useCallback(
     (next: string) => setModeOverride(next === currentMode ? null : next),
-    [currentMode],
+    [currentMode, setModeOverride],
   );
 
   const submit = useCallback(
@@ -332,7 +343,7 @@ export function SessionThread({
           console.warn("sendPrompt failed", err);
         });
     },
-    [sessionId, sendPromptMutation, isRunning, modeOverride, currentMode, uploads],
+    [sessionId, sendPromptMutation, isRunning, modeOverride, setModeOverride, currentMode, uploads],
   );
 
   // Cancel a specific queued message (the rail's × button): dequeue it server-
@@ -389,6 +400,22 @@ export function SessionThread({
     // off; gated inside `interrupt` like every other caller (ADR 0108).
     onCancel: async () => interrupt("aui-cancel"),
   });
+
+  // The composer text lives in assistant-ui's composer state, which outlives a
+  // session switch. Swap it before paint so each session keeps its own
+  // unsent draft.
+  const draftsRef = useRef(new Map<string, string>());
+  const draftSessionRef = useRef(sessionId);
+  useLayoutEffect(() => {
+    const previous = draftSessionRef.current;
+    if (previous === sessionId) return;
+    draftSessionRef.current = sessionId;
+    const composer = runtime.thread.composer;
+    const text = composer.getState().text;
+    if (text) draftsRef.current.set(previous, text);
+    else draftsRef.current.delete(previous);
+    composer.setText(draftsRef.current.get(sessionId) ?? "");
+  }, [sessionId, runtime]);
 
   return (
     <SessionFileContext.Provider value={sessionId}>
