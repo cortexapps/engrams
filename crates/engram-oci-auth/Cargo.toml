@@ -25,7 +25,7 @@ chrono.workspace = true
 # gcloud CLI / SA file) and produces tokens with caching. ~30 transitive
 # deps; localized to this crate so coordinator's main tree doesn't
 # pull GCP unless the resolver is wired.
-gcp_auth = "0.12"
+gcp_auth = "0.13"
 # AWS ECR (ADR 0122): token exchange via the ambient IAM identity.
 # SdkConfig construction rides engram-aws (ring TLS, retries off).
 # `default-features = false` is load-bearing — see the aws sdk note in
