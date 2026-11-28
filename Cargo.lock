@@ -2876,7 +2876,7 @@ dependencies = [
  "libublk",
  "metrics",
  "metrics-exporter-prometheus",
- "nix 0.31.4",
+ "nix 0.32.0",
  "parking_lot 0.13.0",
  "reqwest",
  "rustls",
