@@ -16,6 +16,7 @@ pub mod image;
 pub mod integration;
 pub mod manifest;
 pub mod materialize;
+pub mod mcp;
 pub mod oauth;
 pub mod org_secret;
 pub mod outbox;
@@ -52,3 +53,18 @@ pub use snapshot::*;
 
 pub mod teleport;
 pub use teleport::*;
+
+pub mod mcp_policy;
+
+pub mod managed_deny;
+
+pub mod managed_cold;
+pub mod managed_create;
+
+pub mod managed_boot;
+
+pub mod managed_operator;
+
+pub mod managed_assets;
+
+pub mod managed_bridge;

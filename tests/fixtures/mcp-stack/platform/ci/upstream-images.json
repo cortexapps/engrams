@@ -1,0 +1,32 @@
+{
+  "postgres": {
+    "repository": "docker.io/library/postgres",
+    "version": "17.6-bookworm",
+    "amd64": "sha256:45cd22f8d32e189d245403954882f88e7a8714301fda80dab6da90f1265b25a3",
+    "arm64": "sha256:5d11ffb37e58a7c9a2285359e50f7674e216c99b9114e47b0e7f21187c11252c"
+  },
+  "registry": {
+    "repository": "docker.io/library/registry",
+    "version": "2.8.3",
+    "amd64": "sha256:46faa9a1ae6813194b53921a370f2f4f8c5e1aae228a89bceafef5847a6a3278",
+    "arm64": "sha256:fa647fc1e5d5df7d8d923fb6332aab8e78783f8fca1a1394efb4011f68f5a793"
+  },
+  "edge": {
+    "repository": "docker.io/library/nginx",
+    "version": "1.28.0-bookworm",
+    "amd64": "sha256:3b03dfd827515a07ccf4946000f0bbdd2a4fb6aca7499249fcb6b1f9726823d6",
+    "arm64": "sha256:b869934f513dcd08fc9de959e0bf6175e47ff3553a9c127afce9969722304356"
+  },
+  "blob": {
+    "repository": "docker.io/fsouza/fake-gcs-server",
+    "version": "1.52.3",
+    "amd64": "sha256:29e8b9db5339f370d999dd8ac57986b0b563614dde7ddfcd4e379e4aa3c4e528",
+    "arm64": "sha256:a3d621d29177b5fc75d297f3ff666576d433340243167d85c2738b75b6e5527a"
+  },
+  "dns": {
+    "repository": "docker.io/coredns/coredns",
+    "version": "1.12.3",
+    "amd64": "sha256:f0f40f86da53ab64fd07a0a4fd337d7707db446a7c94dd5565c2cad93eb55876",
+    "arm64": "sha256:f23708142ce31de03565029732bdae87a10bd0ca5edad61f554be511df819a98"
+  }
+}

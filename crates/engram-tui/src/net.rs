@@ -317,6 +317,7 @@ impl Net {
         tokio::spawn(async move {
             let res = c
                 .complete_tool_call(CompleteToolCallRequest {
+                    expected_mcp_plan_review: None,
                     session_id: session_id.clone(),
                     tool_call_id: tool_call_id.clone(),
                     result_json,

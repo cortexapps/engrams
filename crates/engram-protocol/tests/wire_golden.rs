@@ -1,48 +1,13 @@
-//! Byte-level golden + variant-index pins for the coord ↔ host-agent
-//! gRPC `bytes`-payload wire types.
+//! Byte-level pins for host payloads and their nested enum indices.
 //!
-//! ## Why this exists
+//! `golden/ordinary_v38` holds unchanged predecessor bytes. Ordinary policy
+//! tests use the transport codec; the other policy goldens pin the full internal
+//! type, including managed authority. Never regenerate the predecessor corpus.
 //!
-//! ADR 0013's host service carries structurally-complex payloads as
-//! bincode blobs inside proto `bytes` fields
-//! (`engram-protocol/src/grpc_client.rs::{encode,decode}_bincode`):
-//! `SandboxSpec`, `AgentSpec`, `SnapshotMetadata`, `ManifestRef`,
-//! `SessionEgressPolicy`. These are the AUTHORITATIVE in-process
-//! engram-core types — they cross the wire as-is, with no proto mirror
-//! per nested struct.
-//!
-//! `bincode` (1.x) is positional: enums encode by `u32` variant *index*,
-//! structs by field *order*. Neither is self-describing. The existing
-//! round-trip tests on these types cannot catch a format break — both
-//! ends recompile together in CI, so a reordered field/variant or an
-//! inserted (non-trailing) field round-trips green and then desyncs
-//! against a peer built from an older tree. Coord and host roll on
-//! independent (if close) schedules, so the skew window is real.
-//!
-//! This test pins the exact bytes (`golden/<name>.bin`) plus, for every
-//! enum, the `u32` variant index in `bytes[0..4]`. Reordering a variant
-//! or adding a non-trailing field fails here with a message naming the
-//! evolution rule, turning a silent wire desync into a CI failure.
-//!
-//! Also covered: the `wire.rs` mirror `WireExecRequest` — the pattern
-//! ADR 0013 says SHOULD eventually wrap every cross-boundary shape.
-//!
-//! ## Regenerating the corpus (only when you INTENTIONALLY evolve a type)
-//!
-//! Adding a *trailing* enum variant or a *trailing* struct field is the
-//! only wire-safe evolution. After such a change, regenerate:
-//!
-//! ```text
-//!   cargo test -p engram-protocol --test wire_golden -- --ignored regen_golden
-//! ```
-//!
-//! then `git add` the changed `golden/*.bin` and review the diff: an
-//! EXISTING golden file changing bytes is a RED FLAG (you broke the wire
-//! for a peer on the other side of a roll); only NEW files are expected.
-//! Persisted bincode is forbidden; use JSON for durable structured payloads.
-//!
-//! NOTE: every sample uses EMPTY or SINGLE-entry `HashMap`s and FIXED
-//! UUIDs / timestamps so the encoding is deterministic.
+//! The ignored `regen_golden` test writes only the current internal corpus.
+//! Field additions are not compatible merely because they are trailing: a
+//! positional bincode reader must agree on the complete payload shape.
+//! Samples use empty or single-entry maps and fixed IDs for deterministic bytes.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -91,9 +56,7 @@ where
          bincode is POSITIONAL — a reordered field/variant or an inserted \
          (non-trailing) field breaks the coord↔host gRPC payload for a \
          peer on the other side of a deploy roll.\n\
-         If this is an intentional, wire-SAFE evolution (a TRAILING \
-         field/variant only), regenerate the corpus per the module header \
-         and bump WIRE_VERSION."
+         Review the transport contract before changing this golden."
     );
     let decoded: T = bincode::deserialize(&golden).expect("bincode decode golden");
     assert_eq!(
@@ -221,6 +184,7 @@ fn snapshot_metadata() -> SnapshotMetadata {
 
 fn session_egress_policy() -> SessionEgressPolicy {
     SessionEgressPolicy {
+        managed_deny: None,
         session_id: SessionId::from(fixed_uuid(0x30)),
         sandbox_id: SandboxId::from(fixed_uuid(0x31)),
         guest_ip: Ipv4Addr::new(169, 254, 0, 21),
@@ -250,7 +214,7 @@ fn session_egress_policy() -> SessionEgressPolicy {
     }
 }
 
-/// The engrams-review outage (2026-08-01): every field of the inject/observe
+/// A populated minted policy: every field of the inject/observe
 /// ENTRY types populated — most importantly `mint_source: Some(..)`, which the
 /// empty-`injects` golden above can never exercise. `CredentialMintSource` was
 /// internally tagged (#931); bincode ENCODED that as a map but could never
@@ -260,6 +224,7 @@ fn session_egress_policy() -> SessionEgressPolicy {
 /// entry types can't silently drop off the corpus again.
 fn session_egress_policy_minted() -> SessionEgressPolicy {
     SessionEgressPolicy {
+        managed_deny: None,
         injects: vec![EgressInjectEntry {
             secret: "ghs_minted".into(),
             header_name: "authorization".into(),
@@ -312,6 +277,7 @@ fn session_egress_policy_minted() -> SessionEgressPolicy {
 ///   that #931 fixed stays pinned for a second provider.
 fn session_egress_policy_google() -> SessionEgressPolicy {
     SessionEgressPolicy {
+        managed_deny: None,
         network_allow_hosts: vec!["compute.googleapis.com".into()],
         injects: vec![EgressInjectEntry {
             secret: "ya29.minted".into(),
@@ -353,6 +319,7 @@ fn session_egress_policy_google() -> SessionEgressPolicy {
 /// variant's encoding (index 1) inside a fully-populated entry.
 fn session_egress_policy_oauth() -> SessionEgressPolicy {
     SessionEgressPolicy {
+        managed_deny: None,
         injects: vec![EgressInjectEntry {
             secret: "linear-access-token".into(),
             header_name: "Authorization".into(),
@@ -380,6 +347,7 @@ fn session_egress_policy_oauth() -> SessionEgressPolicy {
 /// fully-populated entry.
 fn session_egress_policy_oauth_user() -> SessionEgressPolicy {
     SessionEgressPolicy {
+        managed_deny: None,
         injects: vec![EgressInjectEntry {
             secret: "personal-access-token".into(),
             header_name: "Authorization".into(),
@@ -482,8 +450,7 @@ fn struct_payloads_golden() {
             sha256: "d".repeat(64),
         },
     );
-    // SessionEgressPolicy doesn't derive `PartialEq`; pin its encoded
-    // bytes (field-order regression catch).
+    // Pin the policy field order, including the optional managed deny.
     assert_golden_no_eq("session_egress_policy", &session_egress_policy());
     assert_golden_no_eq(
         "session_egress_policy_minted",
@@ -501,8 +468,7 @@ fn struct_payloads_golden() {
         "session_egress_policy_oauth_user",
         &session_egress_policy_oauth_user(),
     );
-    // `Vec<WarmStageRecord>` — the `CaptureProgress.warm_stages_bincode`
-    // payload (issue #539). `WarmStageRecord` derives `PartialEq`.
+    // Pin the persisted warm-stage shape.
     assert_golden("warm_stages", &warm_stages());
 
     // ADR 0080 phase 3b (wire v14) — the MaterializeImage payloads.
@@ -581,8 +547,7 @@ fn nested_enum_variant_indices() {
 
 #[test]
 fn wire_mirrors_golden() {
-    // The wire.rs mirror shapes (ADR 0013 — the pattern the rest should
-    // eventually adopt). WireExecRequest isn't `PartialEq`; pin bytes.
+    // Pin the exec request field order.
     assert_golden_no_eq(
         "wire_exec_request",
         &WireExecRequest {
@@ -601,111 +566,8 @@ fn wire_mirrors_golden() {
 
 #[test]
 fn wire_version_pinned() {
-    // The version stamp coord/host exchange. Bumping it is the deliberate
-    // signal that a payload shape changed; pin it so a payload change
-    // without a bump (or vice-versa) is a conscious decision.
-    //
-    // 9 -> 10: ADR 0073 (epic #542) — bind_session + AgentSpec carry
-    // binding_epoch, the shell-pin/rehandshake RPCs are deleted, heartbeat
-    // gains harness_attached. Goldens regenerated in the same change.
-    // 10 -> 11: ADR 0078 phase 2 (epic #548) — the heartbeat drops the
-    // never-populated `local_snapshots` advert (placement affinity reads
-    // PG `snapshots.host_id` instead). Goldens regenerated.
-    // 11 -> 12: ADR 0079 (#543) — fencing_epoch on session-scoped host
-    // RPCs (FencedSandboxRequest + the StartAgent/Restore pairs).
-    // Proto-native fields only; bincode goldens unchanged.
-    // 12 -> 13: ADR 0080 phase 2a — BuildBaseSnapshotRequest gains
-    // capture_egress_bincode (coordinator-assembled capture egress);
-    // WarmConfig (inside warm_bincode) gains `env`. Neither type is in
-    // the golden corpus (SessionEgressPolicy itself is unchanged), so
-    // bincode goldens are unchanged.
-    // 13 -> 14: ADR 0080 phase 3b — the new server-streaming
-    // `MaterializeImage` RPC (host-side materialization of standard
-    // docker images). NEW bincode payloads only (`ResolvedRegistryAuth`
-    // coord→host; `ManifestRef` — already pinned — and
-    // `OciRuntimeDefaults` host→coord), goldens ADDED for the new
-    // shapes; every existing golden is byte-identical.
-    // 14 -> 15: ADR 0084 (#546) — capture_jobs heartbeat dispatch/
-    // reporting. `Heartbeat.capture_job_reports` /
-    // `HeartbeatAck.capture_assignments`/`acked_capture_jobs` ride the
-    // JSON heartbeat/ack, NOT the gRPC bincode `bytes` payloads this
-    // corpus pins — no new golden entries here. BuildBaseSnapshot RPC
-    // deletion rides this bump too (removed in the cutover commit).
-    // 15 -> 16: ADR 0095 — `SnapshotMetadata` gains the TRAILING
-    // `peer_hints` field (peer-fill seed addrs for the restore
-    // destination). Goldens regenerated. The `PeerChunkGet` RPC and the
-    // JSON-ack `warm_peers` field ride this bump too (both are
-    // independently roll-safe; the bump pins the deploy posture — a v16
-    // coord never dispatches a peer-hinted restore to a v15 host).
-    // 16 -> 17: ADR 0100 — the coord↔host WriteFiles RPC carries new
-    // WireWriteFilesRequest/WireWriteFilesResponse bincode mirrors.
-    // 17 -> 18: ADR 0093 addendum — `MaterializeImageRequest.min_disk_gib`
-    // (the image's `suggested_disk_gib` now floors the packed ext4 size).
-    // Proto-native scalar only; no bincode payload changed, so every
-    // golden is byte-identical.
-    // 19 -> 20: ADR 0103 review hardening — ExecFrame gains the proto-native
-    // Refused terminal. No bincode payload changed.
-    // 20 -> 21: ADR 0109 — `SessionEgressPolicy.google_adc` is a trailing
-    // bincode field. The session-egress-policy golden was regenerated.
-    // 21 -> 22: `CredentialMintSource` becomes externally tagged — the
-    // internally-tagged form (#931) could never bincode-DECODE, so every
-    // minted-inject policy failed host-side at boot (the engrams-review
-    // outage, 2026-08-01). No existing golden changes bytes (the broken
-    // `Some` shape never had one); the minted-policy golden is ADDED.
-    // 22 -> 23: ADR 0109 seam — `SessionEgressPolicy.google_adc` became
-    // `metadata_flavor: Option<MetadataFlavor>`. A field REPLACEMENT, not an
-    // addition, so a v22 host cannot decode a v23 policy: the roll is
-    // lockstep. All three session-egress-policy goldens were regenerated, and
-    // the `session_egress_policy_google` fixture pinned the `Some(Gce)`
-    // encoding beside the `None` case the other two carry.
-    // 23 -> 24: ADR 0106 addendum — `CredentialMintSource` gains the TRAILING
-    // `OauthConnector` variant (connector OAuth on the inject rail). Existing
-    // goldens keep their bytes (trailing-variant addition); the oauth-policy
-    // golden is ADDED and the variant index is pinned at 1.
-    // 24 -> 25: ADR 0112 — `SandboxSpec` gains the TRAILING `swap_mib`
-    // field (ephemeral guest swap size). Only `sandbox_spec.bin` changed
-    // bytes (the fixture pins `Some(6144)`); every other golden embeds no
-    // spec and kept its bytes. Lockstep coord+host roll.
-    // 25 -> 26: ADR 0109 Cloud SQL addendum — the metadata listener becomes a
-    // generic guest gateway. `metadata_flavor` becomes registered
-    // `guest_services`, and `SessionEgressPolicy` gains generic tunnel entries.
-    // All session-policy goldens were regenerated; the Google fixture pins a
-    // service and a populated tunnel.
-    // 27 -> 28: ADR 0115 — `CredentialMintSource` gains the TRAILING
-    // `OauthUser` variant (a user's personal connector credential on the
-    // inject rail). Existing goldens keep their bytes (trailing-variant
-    // addition); the oauth-user-policy golden is ADDED and the variant index
-    // is pinned at 2.
-    // 28 -> 29: SnapshotHold adds an RPC; bincode payloads are unchanged.
-    // 29 -> 30: ADR 0045 C1 retired — `MigrationCapture`, `SnapshotWait`
-    // and the `Chunk`/`Sidecar`/`DiskManifest` export items are deleted;
-    // `MigrationSourceInfo` loses its C1-only fields (no golden embeds
-    // it: `snapshot_metadata.bin` pins `migration_source: None`). Lockstep
-    // coord+host roll.
-    // 30 -> 31: migration disk items carry the device role.
-    // 31 -> 32: SnapshotMetadata appends swap_manifest. Serde default does
-    // not decode old positional bincode; the exact-match wire gate makes the roll safe.
-    // snapshot_metadata.bin gains one trailing zero byte for None.
-    // Checkpoint adverts also carry the optional swap manifest.
-    // 32 -> 33: SandboxSpec appends swap_source and swap_manifest.
-    // HostUtilization also drops the committed-swap reservation.
-    // 33 -> 34: MigrationPresetup advertises the swap base lineage.
-    // Existing bincode goldens do not embed presetup; their bytes do not change.
-    // 34 -> 35: the memory image refusal is typed. No payload changes; the
-    // bump fences old hosts that refuse untyped.
-    // 35 -> 36: page-channel v6 fault windows require a lockstep host roll.
-    // Coordinator bincode payload bytes are unchanged.
-    // 36 -> 37: HostCapabilities appends page_idle.
-    // MigrationItem appends HotHint (bincode 3, protobuf 6). Existing item
-    // indices stay fixed; the optional hint is separate from immutable disk seals.
-    // Existing goldens embed neither payload and keep their bytes.
-    // 37 -> 38: MigrationItem::DiskBlockAt replaces DiskChunkAt at bincode
-    // index 2 (protobuf 7) and DiskPrecopyInfo is appended (bincode 4,
-    // protobuf 8); the capture reports block counts. No golden embeds either.
-    assert_eq!(
-        WIRE_VERSION, 38,
-        "WIRE_VERSION changed — confirm payload goldens were regenerated too"
-    );
+    assert_eq!(WIRE_VERSION, 38);
+    assert_eq!(engram_protocol::wire::MANAGED_PROTOCOL_VERSION, 43);
 }
 
 /// Writer for the golden corpus. `#[ignore]`d so a normal `cargo test`
@@ -740,6 +602,7 @@ fn regen_golden() {
         },
     );
     write("session_egress_policy", &session_egress_policy());
+    write("session_egress_policy_managed", &managed_egress_policy());
     write(
         "session_egress_policy_minted",
         &session_egress_policy_minted(),
@@ -798,30 +661,17 @@ fn regen_golden() {
     );
 }
 
-/// The engrams-review outage (2026-08-01): the internally-tagged
-/// `CredentialMintSource` (#931) bincode-ENCODED fine but could never DECODE
-/// (`deserialize_any`), so the encode-only golden pin above was green while
-/// every minted-inject policy failed host-side. This test pins the DECODE leg:
-/// a populated `Some(mint_source)` + `Some(expires_at)` must round-trip.
-/// `SessionEgressPolicy` has no `PartialEq`, so assert the fields that carry
-/// the regression.
+/// Populated minted credentials must retain every field through internal encoding.
 #[test]
 fn minted_inject_policy_bincode_round_trips() {
     let policy = session_egress_policy_minted();
     let bytes = bincode::serialize(&policy).expect("bincode encode minted policy");
     let back: SessionEgressPolicy =
         bincode::deserialize(&bytes).expect("bincode decode minted policy");
-    assert_eq!(back.injects.len(), 1);
-    assert_eq!(back.injects[0].mint_source, policy.injects[0].mint_source);
-    assert_eq!(back.injects[0].expires_at, policy.injects[0].expires_at);
-    assert_eq!(back.observes.len(), 1);
-    assert_eq!(
-        back.observes[0].url_fallback,
-        policy.observes[0].url_fallback
-    );
+    assert_eq!(back, policy);
 }
 
-/// ADR 0080 prod regression (dev-brain enable): `WarmConfig.env` holds
+/// ADR 0080 capture contract: `WarmConfig.env` holds
 /// `CaptureEnvValue`, an internally-tagged serde enum — bincode cannot
 /// DECODE that representation (`deserialize_any`), so a non-empty
 /// `[[warm.env]]` crossing the wire fails host-side at capture. The
@@ -862,4 +712,94 @@ fn warm_config_wire_shape_round_trips_only_when_stripped() {
         "tagged CaptureEnvValue became bincode-decodable — retire the coordinator's \
          wire-strip in enabled_images.rs and this pin together"
     );
+}
+
+fn managed_egress_policy() -> SessionEgressPolicy {
+    let mut policy = session_egress_policy();
+    policy.managed_deny = Some(
+        engram_core::types::managed_deny::ManagedDenyPolicy::new(
+            9,
+            ["mcp.example".into(), "alias.example".into()],
+        )
+        .unwrap(),
+    );
+    policy
+}
+#[test]
+fn managed_policy_internal_encoding_retains_authority() {
+    assert_golden("session_egress_policy_managed", &managed_egress_policy());
+}
+
+#[test]
+fn ordinary_v38_source_bytes_are_unchanged() {
+    for (name, policy) in [
+        ("session_egress_policy", session_egress_policy()),
+        (
+            "session_egress_policy_minted",
+            session_egress_policy_minted(),
+        ),
+        (
+            "session_egress_policy_google",
+            session_egress_policy_google(),
+        ),
+        ("session_egress_policy_oauth", session_egress_policy_oauth()),
+        (
+            "session_egress_policy_oauth_user",
+            session_egress_policy_oauth_user(),
+        ),
+    ] {
+        let old = std::fs::read(
+            golden_path(name)
+                .parent()
+                .unwrap()
+                .join("ordinary_v38")
+                .join(format!("{name}.bin")),
+        )
+        .unwrap();
+        assert_eq!(
+            engram_protocol::ordinary_policy::encode(&policy).unwrap(),
+            old,
+            "{name}"
+        );
+        assert_eq!(
+            engram_protocol::ordinary_policy::decode(&old).unwrap(),
+            policy
+        );
+        for cut in 0..old.len() {
+            assert!(engram_protocol::ordinary_policy::decode(&old[..cut]).is_err());
+        }
+        let mut trailing = old;
+        trailing.push(0);
+        assert!(engram_protocol::ordinary_policy::decode(&trailing).is_err());
+    }
+}
+
+#[test]
+fn ordinary_policy_rejects_managed_authority_even_when_empty() {
+    for hosts in [vec![], vec!["mcp.example".to_string()]] {
+        let mut policy = session_egress_policy();
+        policy.managed_deny =
+            Some(engram_core::types::managed_deny::ManagedDenyPolicy::new(1, hosts).unwrap());
+        assert!(engram_protocol::ordinary_policy::encode(&policy).is_err());
+    }
+}
+
+#[test]
+fn ordinary_policy_preserves_apps_and_secret_modes() {
+    for secret_mode in [SecretMode::Literal, SecretMode::Broker] {
+        let mut policy = session_egress_policy_google();
+        policy.apps.push(engram_core::types::egress::AppEndpoint {
+            hostname: "app.example".into(),
+            port: 8080,
+        });
+        policy.secret_mode = secret_mode;
+        policy.allow_all = true;
+        assert_eq!(
+            engram_protocol::ordinary_policy::decode(
+                &engram_protocol::ordinary_policy::encode(&policy).unwrap()
+            )
+            .unwrap(),
+            policy
+        );
+    }
 }

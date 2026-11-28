@@ -316,15 +316,28 @@ impl OAuthManager {
             .await?)
     }
 
-    pub async fn fetch_session(
+    async fn guest_binding(
         &self,
         session_id: SessionId,
-    ) -> Result<(String, i64, Vec<u8>), OAuthServiceError> {
+    ) -> Result<engram_core::types::oauth::SessionOAuthBinding, OAuthServiceError> {
         let binding = self
             .meta
             .get_session_oauth_binding(session_id)
             .await?
             .ok_or(OAuthServiceError::NotFound)?;
+        if binding.key.subject_kind == OAuthSubjectKind::Mcp {
+            return Err(OAuthServiceError::BadRequest(
+                "MCP credentials are not available to guest sessions".into(),
+            ));
+        }
+        Ok(binding)
+    }
+
+    pub async fn fetch_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(String, i64, Vec<u8>), OAuthServiceError> {
+        let binding = self.guest_binding(session_id).await?;
         let row = self
             .meta
             .get_oauth_credential(&binding.key)
@@ -344,11 +357,7 @@ impl OAuthManager {
         expected_version: i64,
         payload: &[u8],
     ) -> Result<(String, i64, Vec<u8>), OAuthServiceError> {
-        let binding = self
-            .meta
-            .get_session_oauth_binding(session_id)
-            .await?
-            .ok_or(OAuthServiceError::NotFound)?;
+        let binding = self.guest_binding(session_id).await?;
         let current = self
             .meta
             .get_oauth_credential(&binding.key)
@@ -389,11 +398,7 @@ impl OAuthManager {
         expected_version: i64,
         reason: &str,
     ) -> Result<(), OAuthServiceError> {
-        let binding = self
-            .meta
-            .get_session_oauth_binding(session_id)
-            .await?
-            .ok_or(OAuthServiceError::NotFound)?;
+        let binding = self.guest_binding(session_id).await?;
         match self
             .meta
             .mark_oauth_credential_broken(&binding.key, expected_version, reason)
@@ -645,6 +650,11 @@ impl From<MetaError> for OAuthServiceError {
 }
 
 pub(crate) fn validate_key(key: &OAuthCredentialKey) -> Result<(), OAuthServiceError> {
+    if key.subject_kind == OAuthSubjectKind::Mcp {
+        return Err(OAuthServiceError::BadRequest(
+            "MCP credentials require the dedicated control service".into(),
+        ));
+    }
     // Provider charset matches the connector-slug rule (`new_relic` carries
     // an underscore).
     if key.subject_id.trim().is_empty()
@@ -1092,6 +1102,22 @@ async fn read_bounded_private(path: &Path) -> Result<Vec<u8>, OAuthDriverError> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generic_oauth_acquisition_rejects_mcp_subjects() {
+        for kind in [
+            OAuthSubjectKind::User,
+            OAuthSubjectKind::Connector,
+            OAuthSubjectKind::UserConnector,
+            OAuthSubjectKind::Mcp,
+        ] {
+            let key = OAuthCredentialKey {
+                subject_kind: kind,
+                subject_id: "connection-a".into(),
+                provider: "registered-a".into(),
+            };
+            assert_eq!(validate_key(&key).is_ok(), kind != OAuthSubjectKind::Mcp);
+        }
+    }
     use super::*;
 
     #[cfg(unix)]

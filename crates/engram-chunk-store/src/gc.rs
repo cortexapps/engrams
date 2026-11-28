@@ -379,6 +379,7 @@ async fn collect_manifest_refs(meta: &dyn MetadataStore) -> Result<HashSet<Manif
     {
         refs.insert(r);
     }
+    refs.extend(meta.list_managed_disk_manifests().await?);
     // ADR 0084 §B6: source #6 — cold bases have no root of their own
     // besides this (no `snapshots` row); never a second GC.
     for r in meta.cold_base_manifest_refs().await? {
@@ -416,6 +417,7 @@ mod tests {
         snap_disk: Vec<ManifestRef>,
         snap_swap: Vec<ManifestRef>,
         snap_mem: Vec<ManifestRef>,
+        managed_disk: Vec<ManifestRef>,
         // ADR 0022 sources #4 + #5.
         enabled_base_mem: Vec<ManifestRef>,
         enabled_base_disk: Vec<ManifestRef>,
@@ -649,6 +651,9 @@ mod tests {
                 .chain(self.snap_swap.iter().map(|r| (None, Some(*r))))
                 .collect())
         }
+        async fn list_managed_disk_manifests(&self) -> Result<Vec<ManifestRef>, MetaError> {
+            Ok(self.managed_disk.clone())
+        }
         async fn list_recoverable_snapshot_memory_manifests(
             &self,
         ) -> Result<Vec<ManifestRef>, MetaError> {
@@ -724,6 +729,19 @@ mod tests {
         let meta = PinSetMockMeta::default();
         let pin_set = PinSet::collect(&meta, &store).await.expect("collect");
         assert!(pin_set.is_empty(), "empty meta must produce empty pin set");
+    }
+
+    #[tokio::test]
+    async fn managed_cold_inputs_pin_chunks_without_snapshot_rows() {
+        let (store, _dir) = fresh_store();
+        let manifest = seed_manifest(&store, &[b"managed-cold-input"], ManifestKind::Disk).await;
+        let meta = PinSetMockMeta {
+            managed_disk: vec![manifest],
+            ..Default::default()
+        };
+        let pins = PinSet::collect(&meta, &store).await.expect("collect");
+        assert!(pins.contains(&ChunkHash::of(b"managed-cold-input")));
+        assert_eq!(pins.len(), 1);
     }
 
     #[tokio::test]

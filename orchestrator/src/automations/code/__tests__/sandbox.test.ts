@@ -1,10 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import {
-  CODE_LOG_MAX_ENTRIES,
-  CODE_OUTPUT_MAX_BYTES,
-  evaluateCode,
-} from "../sandbox.ts";
+import { CODE_LOG_MAX_ENTRIES, CODE_OUTPUT_MAX_BYTES, evaluateCode } from "../sandbox.ts";
 
 /** The permanent Bun-compat gate for the QuickJS-on-WASM sandbox (ADR 0119
  * D6). If a Bun or variant upgrade breaks instantiation, limits, or dispose
@@ -135,7 +131,8 @@ describe("evaluateCode — limits", () => {
       "value",
     );
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(["StackError", "InternalError", "RangeError"]).toContain(result.error.name);
+    if (!result.ok)
+      expect(["StackError", "InternalError", "RangeError"]).toContain(result.error.name);
   });
 
   test("oversized output is an OutputError", async () => {
@@ -220,9 +217,112 @@ describe("evaluateCode — the cage", () => {
 });
 
 describe("evaluateCode — dispose discipline", () => {
+  test("host WebAssembly stack exhaustion leaves the next evaluation healthy", async () => {
+    const programs = [
+      {
+        source: `export default () => { globalThis.previousEvaluation = true; const f = () => f(); return f(); };`,
+        outcome: "stack",
+      },
+      {
+        source: `export default () => { const value = { [Symbol.toPrimitive]() { return +value; } }; return +value; };`,
+        outcome: "stack",
+      },
+      {
+        source: `export default () => ${"(".repeat(512)}1${")".repeat(512)};`,
+        outcome: "finite-or-stack",
+      },
+      {
+        source: `export default () => {
+          const stringify = JSON.stringify;
+          let calls = 0;
+          JSON.stringify = (value) => ++calls === 1 ? stringify(value) : {
+            toString() { return this.toString(); },
+          };
+          return 42;
+        };`,
+        outcome: "log-failure",
+      },
+      {
+        source: `export default () => {
+          let calls = 0;
+          JSON.stringify = () => ++calls === 1 ? "42" : "not JSON";
+          return 42;
+        };`,
+        outcome: "host-failure",
+      },
+      {
+        source: `export default () => { throw Promise.resolve(42); };`,
+        outcome: "guest-promise",
+      },
+    ];
+    const source = `
+      import assert from "node:assert/strict";
+      import { evaluateCode } from ${JSON.stringify(new URL("../sandbox.ts", import.meta.url).href)};
+      const { QuickJSContext, QuickJSRuntime } = await import(${JSON.stringify(import.meta.resolve("quickjs-emscripten-core"))});
+      const contextDispose = QuickJSContext.prototype.dispose;
+      const runtimeDispose = QuickJSRuntime.prototype.dispose;
+      let contexts = 0, runtimes = 0;
+      QuickJSContext.prototype.dispose = function () { contexts++; return contextDispose.call(this); };
+      QuickJSRuntime.prototype.dispose = function () { runtimes++; return runtimeDispose.call(this); };
+      try { for (const program of ${JSON.stringify(programs)}) {
+        const before = { contexts, runtimes };
+        const result = await evaluateCode(program.source, {}, "value");
+        if (program.outcome === "finite-or-stack" && result.ok) {
+          assert.equal(result.value, 1);
+        } else {
+          assert.equal(result.ok, false);
+          if (program.outcome === "guest-promise") {
+            assert.equal(contexts - before.contexts, 1);
+            assert.equal(runtimes - before.runtimes, 1);
+          } else if (program.outcome === "host-failure") {
+            assert.equal(result.error.name, "SandboxError");
+          } else if (program.outcome !== "log-failure") {
+            assert.ok(["StackError", "InternalError", "RangeError"].includes(result.error.name),
+              JSON.stringify(result.error));
+          }
+        }
+        const after = await evaluateCode(
+          'export default () => ({ value: 42, inherited: typeof globalThis.previousEvaluation });', {}, "value");
+        assert.equal(after.ok, true);
+        assert.deepEqual(after.value, { value: 42, inherited: "undefined" });
+      } } finally {
+        QuickJSContext.prototype.dispose = contextDispose;
+        QuickJSRuntime.prototype.dispose = runtimeDispose;
+      }
+    `;
+    const child = Bun.spawn([process.execPath, "--no-env-file", "--eval", source], {
+      env: {
+        NODE_ENV: "test",
+        BUN_JSC_useWasmIPInt: "false",
+        BUN_JSC_useBBQJIT: "true",
+        BUN_JSC_useOMGJIT: "false",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: 10_000,
+    });
+    try {
+      const [exitCode, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+      expect(exitCode, stderr).toBe(0);
+      expect(stdout).toBe("");
+      expect(stderr).toBe("");
+    } finally {
+      if (child.exitCode === null) child.kill();
+      await child.exited;
+    }
+  }, 20_000);
+
   test("200 sequential evaluations stay healthy", async () => {
     for (let i = 0; i < 200; i += 1) {
-      const result = await evaluateCode(`export default ({ inputs }) => inputs.i + 1;`, { inputs: { i } }, "value");
+      const result = await evaluateCode(
+        `export default ({ inputs }) => inputs.i + 1;`,
+        { inputs: { i } },
+        "value",
+      );
       expect(result.ok).toBe(true);
       if (result.ok) expect(result.value).toBe(i + 1);
     }

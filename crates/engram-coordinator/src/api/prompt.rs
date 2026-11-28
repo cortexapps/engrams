@@ -226,6 +226,14 @@ pub(crate) async fn complete_tool_call_core(
     if tool_call_id.is_empty() {
         return Err(ApiError::BadRequest("`tool_call_id` is required".into()));
     }
+    if state
+        .services
+        .meta
+        .managed_tool_target_gone(id, &tool_call_id)
+        .await?
+    {
+        return Ok("delivery target gone");
+    }
     let session = state.services.meta.get_session(id).await?;
     if session.status.is_terminal() {
         return Err(ApiError::Gone(format!(
@@ -272,7 +280,7 @@ pub(crate) async fn complete_tool_call_core(
         delivered_at: None,
         acked_at: None,
     };
-    state
+    let accepted = state
         .emit_with_outbox(
             id,
             SessionEvent::ToolResultSubmitted {
@@ -282,7 +290,19 @@ pub(crate) async fn complete_tool_call_core(
             },
             &row,
         )
-        .await?;
+        .await;
+    if let Err(error) = accepted {
+        let call = row.payload["tool_call_id"].as_str().unwrap_or_default();
+        if state
+            .services
+            .meta
+            .managed_tool_target_gone(id, call)
+            .await?
+        {
+            return Ok("delivery target gone");
+        }
+        return Err(error);
+    }
     crate::outbox_delivery::enqueue_deliver_op(state, id).await;
     state.outbox_wake.notify_one();
     Ok("tool result queued")
@@ -449,6 +469,73 @@ pub(crate) async fn dequeue_queued_prompt_core(
             .map_err(|e| ApiError::Internal(format!("dequeue queued prompt: {e}")))?;
     }
     Ok("queued prompt dequeued")
+}
+
+/// Same durable prompt/event path, included in the managed creation transaction.
+pub(crate) fn managed_initial_prompt(
+    state: &SharedState,
+    id: SessionId,
+    text: Option<String>,
+    mode: Option<String>,
+) -> Result<Option<engram_core::traits::metadata::ManagedInitialPrompt>, ApiError> {
+    let Some(text) = text.filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    if text.len() > MAX_PROMPT_BYTES {
+        return Err(ApiError::BadRequest(
+            "initial prompt exceeds size limit".into(),
+        ));
+    }
+    let now = state.services.clock.now_utc();
+    let prompt_id = format!("create:{id}");
+    let mut events = vec![
+        SessionEvent::PromptReceived {
+            prompt_id: prompt_id.clone(),
+            at: now,
+        },
+        SessionEvent::HarnessAgentMessage {
+            run_id: String::new(),
+            message_id: format!("user-{prompt_id}"),
+            role: AgentRole::User,
+            text: text.clone(),
+            prompt_id: Some(prompt_id.clone()),
+            at: now,
+        },
+    ];
+    if let Some(mode) = &mode {
+        events.push(SessionEvent::HarnessModeChanged {
+            mode: mode.clone(),
+            at: now,
+        });
+    }
+    let events = events
+        .into_iter()
+        .map(|e| {
+            Ok((
+                e.kind().to_string(),
+                serde_json::to_value(e)
+                    .map_err(|_| ApiError::Internal("prompt event encoding failed".into()))?,
+            ))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let payload = match mode {
+        Some(mode) => serde_json::json!({"text":text,"mode":mode}),
+        None => serde_json::json!({"text":text}),
+    };
+    Ok(Some(engram_core::traits::metadata::ManagedInitialPrompt {
+        events,
+        row: engram_core::types::outbox::OutboxRow {
+            prompt_id,
+            session_id: id,
+            kind: engram_core::types::outbox::OutboxKind::Prompt,
+            payload,
+            created_at: now,
+            not_before: now,
+            attempts: 0,
+            delivered_at: None,
+            acked_at: None,
+        },
+    }))
 }
 
 #[cfg(test)]

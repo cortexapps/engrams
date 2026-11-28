@@ -229,3 +229,46 @@ describe("named-connection credential broker", () => {
     expect(exchanges).toBe(0);
   });
 });
+
+test("mixed session audit hash includes the MCP binding envelope", async () => {
+  const { bindingAuthority } = await import("./mcp-binding-fixture.ts");
+  const { compileSessionBindings } = await import("../mcp/session-bindings.ts");
+  const { bindingSnapshotColumns } = await import("../mcp/binding-store.ts");
+  const authority = bindingAuthority();
+  const snapshot = compileSessionBindings({
+    launchPolicy: { profileId: authority.profileId, integrationGrants: authority.profileGrants },
+    liveAuthority: authority,
+    bindingEpoch: 0,
+  });
+  const source = authority.connections[0]!;
+  const columns = bindingSnapshotColumns(snapshot, [
+    {
+      id: source.id,
+      alias: source.alias,
+      displayName: "Docs",
+      provider: "mcp",
+      config: source.config,
+    },
+    connection,
+  ]);
+  const session = {
+    userId: "user-1",
+    principalId: "user-1",
+    profileId: authority.profileId,
+    integrationGrants: sessionGrants,
+    ...columns,
+  };
+  let auditHash = "";
+  const app = makeConnectionCredentialBrokerRoute({
+    db: {} as never,
+    bearer: "broker-secret",
+    sessions: { get: async () => session },
+    sessionStatus: async () => "active",
+    exchange: async (_config, identity) => {
+      auditHash = identity.profileSnapshotId;
+      return { accessToken: "token", expiresAt: new Date(Date.now() + 60000) };
+    },
+  });
+  expect((await app.request(path, post(body))).status).toBe(200);
+  expect(auditHash).toBe(integrationSnapshotHash(session));
+});

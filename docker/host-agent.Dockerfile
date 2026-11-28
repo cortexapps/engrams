@@ -51,12 +51,17 @@ FROM debian:trixie-slim
 #     bump that regresses it fails the image build loudly.
 #   - iproute2:  ip, for the tap device + guest netns
 #   - iptables:  egress NAT / firewall rules for guest networking
+#   - procps: sysctl, to set private managed network namespace controls
+#   - nftables: nft, to install and inspect the managed network fences
 #   - thin-provisioning-tools: thin_dump + thin_delta, which read the
 #     session-disk pool's metadata (device-mapper itself is an ioctl)
 # (ca-certificates: TLS to the blob backend — GCS/S3.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates e2fsprogs iproute2 iptables thin-provisioning-tools \
+    ca-certificates e2fsprogs iproute2 iptables procps nftables thin-provisioning-tools \
     && rm -rf /var/lib/apt/lists/*
+RUN set -eu; \
+    for tool in sysctl ip nft; do command -v "$tool"; done; \
+    sysctl --version; ip -Version; nft --version
 # ADR 0080/0036: fail the build if the base's mke2fs predates the
 # SOURCE_DATE_EPOCH support that deterministic packing relies on.
 RUN set -eux; \

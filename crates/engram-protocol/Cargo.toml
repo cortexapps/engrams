@@ -10,6 +10,11 @@ description = "Wire types for Engram coordinator<->host communication."
 workspace = true
 
 [dependencies]
+engram-tls.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+sha2.workspace = true
+hex.workspace = true
 engram-core.workspace = true
 engram-telemetry.workspace = true
 async-stream.workspace = true

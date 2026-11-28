@@ -181,6 +181,9 @@ pub enum SandboxError {
     /// gRPC boundary as a `failed_precondition` with a marker message
     /// (the `HarnessSpawn` precedent).
     MemoryImageUnusable(String),
+    /// The managed owner requires cold recovery. This error alone is not proof
+    /// of retirement; callers must read the exact authenticated boot receipt.
+    ManagedRecoveryRequired,
 }
 
 /// ADR 0116 B-D4: is a harness-spawn failure of this `kind`
@@ -224,6 +227,7 @@ impl fmt::Display for SandboxError {
                 write!(f, "harness_spawn: kind={kind} {message}")
             }
             Self::MemoryImageUnusable(msg) => write!(f, "memory_image_unusable: {msg}"),
+            Self::ManagedRecoveryRequired => write!(f, "managed sandbox requires cold recovery"),
         }
     }
 }

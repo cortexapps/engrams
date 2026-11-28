@@ -16,6 +16,7 @@
 mod control;
 mod coord;
 mod dialback;
+mod private;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -181,6 +182,17 @@ pub async fn run(args: DaemonArgs) -> i32 {
         }
     };
 
+    // Registration grants a live descriptor capability. Only the daemon owner
+    // can use this host-local control socket.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::set_permissions(&control_sock, std::fs::Permissions::from_mode(0o600)).is_err()
+        {
+            return 1;
+        }
+    }
+
     let listeners = match control::bind_with_retry(&proxy).await {
         Ok(l) => l,
         Err(e) => {
@@ -193,6 +205,7 @@ pub async fn run(args: DaemonArgs) -> i32 {
     // durable-at-the-point-it's-known rule, PR #1383 / ADR 0121).
     let identity = engram_egress_proto::manifest::self_identity();
     let hello = engram_egress_proto::HelloInfo {
+        incarnation: engram_core::SessionId::new().to_string(),
         proto_version: engram_egress_proto::PROTO_VERSION,
         source_fingerprint: SOURCE_FINGERPRINT.map(str::to_string),
         proxy_port: args.proxy_port,
@@ -227,7 +240,11 @@ pub async fn run(args: DaemonArgs) -> i32 {
     );
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let private = Arc::new(private::Ingress::default());
     let control_state = Arc::new(control::ControlState {
+        private: private.clone(),
+        proxy: Arc::new(proxy.clone()),
+        host_id: args.host_id,
         registry,
         gateway: guest_gateway,
         hello,
@@ -235,7 +252,7 @@ pub async fn run(args: DaemonArgs) -> i32 {
     });
     tokio::spawn(control::serve(control_listener, control_state));
 
-    tokio::select! {
+    let exit = tokio::select! {
         _ = proxy.serve(listeners) => {
             // `serve` loops forever on accept. If it returns, the data
             // plane is dead while iptables still REDIRECTs here: exit
@@ -249,7 +266,9 @@ pub async fn run(args: DaemonArgs) -> i32 {
             tracing::info!("graceful shutdown (control-socket Shutdown op)");
             0
         }
-    }
+    };
+    private.shutdown().await;
+    exit
 }
 
 /// cgroup-v2 self-migration (the ADR 0044 K2 escape, self-service

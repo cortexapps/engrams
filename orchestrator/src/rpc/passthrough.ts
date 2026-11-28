@@ -50,9 +50,7 @@ export interface PassthroughSpec {
  * Injected getSession implementation. The default is getSessionFromHeaders
  * (auth/session.ts); tests inject a stub.
  */
-export type GetSession = (
-  headers: Headers,
-) => Promise<{
+export type GetSession = (headers: Headers) => Promise<{
   user: { id: string; role?: string | null; email?: string | null };
 } | null>;
 
@@ -62,8 +60,13 @@ export type GetSession = (
  */
 export type ResolveOwner = (sessionId: string) => Promise<string | null>;
 
-/** Optional per-method pre-flight, keyed by policyKey ("ImageService.DisableImage").
- *  Runs AFTER the authz gate and BEFORE the upstream forward. Throws to block. */
+/** Optional handler after authorization and preflight; undefined forwards upstream. */
+export type UnaryOverride = (
+  req: unknown,
+  ctx: HandlerContext,
+) => Promise<{ response: unknown } | undefined>;
+
+/** Optional per-method preflight after authorization and before dispatch. */
 export type Preflight = (req: unknown, ctx: HandlerContext) => Promise<void>;
 
 /** Unary methods that log one line per call with the time of each stage. */
@@ -90,11 +93,11 @@ function elapsedMs(start: number): number {
  * meaningful (and actively harmful) on a Connect response.
  */
 const BLOCKED_RESPONSE_HEADERS = new Set([
-  "content-type",        // ConnectRouter owns this — forwarding application/grpc breaks browser parsing
-  "grpc-status",         // gRPC trailer, not a Connect response header
-  "grpc-message",        // gRPC trailer
+  "content-type", // ConnectRouter owns this — forwarding application/grpc breaks browser parsing
+  "grpc-status", // gRPC trailer, not a Connect response header
+  "grpc-message", // gRPC trailer
   "grpc-status-details-bin", // gRPC trailer
-  "transfer-encoding",   // hop-by-hop, must not be forwarded
+  "transfer-encoding", // hop-by-hop, must not be forwarded
 ]);
 
 /**
@@ -193,10 +196,9 @@ export function registerPassthrough(
   getSession?: GetSession,
   resolveOwner?: ResolveOwner,
   preflight?: Record<string, Preflight>,
+  overrides?: Record<string, UnaryOverride>,
 ): void {
-  const resolveSession: GetSession =
-    getSession ??
-    getSessionFromHeaders;
+  const resolveSession: GetSession = getSession ?? getSessionFromHeaders;
 
   const ownerResolver: ResolveOwner = resolveOwner ?? resolveSessionOwner;
 
@@ -210,10 +212,7 @@ export function registerPassthrough(
 
       // Only support unary and server-streaming (bidi/client-streaming live
       // on dedicated routes).
-      if (
-        m.methodKind !== "unary" &&
-        m.methodKind !== "server_streaming"
-      ) {
+      if (m.methodKind !== "unary" && m.methodKind !== "server_streaming") {
         continue;
       }
 
@@ -238,10 +237,7 @@ export function registerPassthrough(
         // 2. Look up policy (fail-closed: no entry → denied).
         const entry = POLICY[key];
         if (!entry) {
-          throw new ConnectError(
-            `no policy for ${key}`,
-            Code.PermissionDenied,
-          );
+          throw new ConnectError(`no policy for ${key}`, Code.PermissionDenied);
         }
 
         // 3. Build ability.
@@ -275,12 +271,7 @@ export function registerPassthrough(
 
           // Anti-enumeration: return NotFound even when the session exists
           // but is not owned by the caller — don't confirm existence.
-          if (
-            !ability.can(
-              entry.action,
-              subject("Session", { createdByUserId: ownerId }),
-            )
-          ) {
+          if (!ability.can(entry.action, subject("Session", { createdByUserId: ownerId }))) {
             throw new ConnectError("not found", Code.NotFound);
           }
         } else {
@@ -299,6 +290,8 @@ export function registerPassthrough(
           const pf = preflight?.[key];
           const preflightStart = performance.now();
           if (pf) await pf(req, ctx);
+          const handled = await overrides?.[key]?.(req, ctx);
+          if (handled) return handled.response;
           const preflightMs = elapsedMs(preflightStart);
           const forwardStart = performance.now();
           let ok = false;
@@ -356,7 +349,9 @@ export function registerPassthrough(
             // Same header-scrubbing rationale as the unary case above.
             upstreamHeaders(ctx.requestHeader),
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            (async function* () { yield req as any; })(),
+            (async function* () {
+              yield req as any;
+            })(),
             ctx.values,
           );
           copyHeaders(res.header, ctx.responseHeader);

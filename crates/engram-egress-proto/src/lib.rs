@@ -36,6 +36,7 @@
 
 pub mod adopt;
 pub mod manifest;
+pub mod private;
 
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::{SandboxId, SessionId};
@@ -44,7 +45,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bump on any wire-incompatible change. A mismatch in `Hello`
 /// position is never adopted — the caller kills and respawns.
-pub const PROTO_VERSION: u32 = 1;
+pub const PROTO_VERSION: u32 = 5;
 
 /// Frame size cap. `SyncPolicies` carries every live session's policy
 /// (resolved secrets included), so the cap is generous; both ends are
@@ -85,6 +86,14 @@ pub const BUILD_ENV_SOURCE_FINGERPRINT: &str = "ENGRAM_EGRESS_PROXYD_FINGERPRINT
 /// Host-agent → proxyd.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum ToProxyd {
+    /// Upgrade this host-only connection. A bounded private Allocation follows.
+    PrivateNetwork,
+    HandoffClosedPrivate(Box<private::ClosedPolicyHandoff>),
+    /// Drain and remove only the expected private allocation and registration.
+    RetirePrivateNetwork(Box<private::Allocation>),
+    ListManaged,
+    ReadManaged(engram_core::SessionId),
+    QuarantineManaged(engram_core::SessionId),
     /// First frame on every connection.
     Hello {
         proto_version: u32,
@@ -118,6 +127,8 @@ pub enum ToProxyd {
 /// proxyd → host-agent.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum FromProxyd {
+    ManagedSessions(Vec<SessionId>),
+    ManagedState(Option<engram_core::types::managed_deny::ManagedProxyState>),
     HelloAck(HelloInfo),
     Ok,
     Err(String),
@@ -141,6 +152,8 @@ pub struct GuestSummary {
 /// file, is the authority (the file can be stale or torn).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct HelloInfo {
+    #[serde(default)]
+    pub incarnation: String,
     pub proto_version: u32,
     /// The build-time source fingerprint, `None` for local builds.
     pub source_fingerprint: Option<String>,
@@ -304,6 +317,40 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn exact_retirement_frame_round_trip_and_torn_frames_fail_closed() {
+        let allocation = private::Allocation {
+            version: private::VERSION,
+            host_id: engram_core::HostId::new(),
+            host_incarnation: "host-1".into(),
+            proxy_incarnation: "proxy-1".into(),
+            session_id: SessionId::new(),
+            sandbox_id: SandboxId::new(),
+            boot_attempt: "boot-1".into(),
+            attachment_generation: 1,
+            guest_ip: "192.0.2.2".parse().unwrap(),
+            gateway_ip: "192.0.2.1".parse().unwrap(),
+            policy_revision: 1,
+            policy_digest: format!("sha256:{}", "a".repeat(64)),
+        };
+        allocation.validate().unwrap();
+        let message = ToProxyd::RetirePrivateNetwork(Box::new(allocation));
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &message).await.unwrap();
+        assert_eq!(
+            read_frame::<_, ToProxyd>(&mut bytes.as_slice())
+                .await
+                .unwrap(),
+            message
+        );
+        for end in 0..bytes.len() {
+            assert!(read_frame::<_, ToProxyd>(&mut &bytes[..end]).await.is_err());
+        }
+        let mut malformed = serde_json::to_value(&message).unwrap();
+        malformed["RetirePrivateNetwork"]["attachment_generation"] = serde_json::json!("bad");
+        assert!(serde_json::from_value::<ToProxyd>(malformed).is_err());
+    }
+
+    #[tokio::test]
     async fn frames_round_trip_async() {
         let msgs = vec![
             ToProxyd::Hello {
@@ -320,6 +367,7 @@ mod tests {
             assert_eq!(back, m);
         }
         let m = FromProxyd::HelloAck(HelloInfo {
+            incarnation: "test-incarnation".into(),
             proto_version: PROTO_VERSION,
             source_fingerprint: Some("abc123".into()),
             proxy_port: 8443,

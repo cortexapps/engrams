@@ -41,6 +41,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .file_descriptor_set_path(&descriptor_path)
+        .skip_debug([".engram.host.v1.ManagedBootRequest"])
         .compile_protos(&protos, &includes)?;
+    let mcp_out = std::path::PathBuf::from(std::env::var("OUT_DIR")?).join("mcp");
+    std::fs::create_dir_all(&mcp_out)?;
+    tonic_prost_build::configure()
+        .out_dir(mcp_out)
+        .build_server(true)
+        .build_client(true)
+        .extern_path(".engram.app.v1", "crate::app")
+        .skip_debug([
+            ".engram.mcp.v1.PutSecretRequest",
+            ".engram.mcp.v1.ReserveManagedCreateRequest",
+            ".engram.mcp.v1.CreatePolicySessionRequest",
+            ".engram.mcp.v1.CompleteAuthorizationRequest",
+            ".engram.mcp.v1.BeginAuthorizationResponse",
+            ".engram.mcp.v1.LeaseResponse",
+        ])
+        .compile_protos(
+            &[
+                "proto/engram/mcp/v1/control.proto",
+                "proto/engram/mcp/v1/operator.proto",
+                "proto/engram/mcp/v1/session_policy.proto",
+            ],
+            &includes,
+        )?;
     Ok(())
 }

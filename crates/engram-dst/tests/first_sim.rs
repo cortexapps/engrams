@@ -129,6 +129,18 @@ fn driver_coverage_is_declared() {
             "harness_desync",
             "not a timer driver, so no DriverKind: production runs run_once inside the host-heartbeat handler (api/host_http.rs), and the sim mirrors that exactly — Step::HostHeartbeats drives it with the world-derived running/attached sets right after touch_host_heartbeat (ADR 0108 A8; pinned in tests/ttft_attach.rs)",
         ),
+        (
+            "managed_boot",
+            "the DST workload creates no managed boots and SimHostClient does not implement managed prepare/finalize/start; managed_boot::tests::managed_boot_lost_start_reply_is_read_only_reconciled tests the real scanner with a synthetic host, while meta_conformance pairs boot persistence cases on SimMeta and Postgres",
+        ),
+        (
+            "managed_bridge",
+            "the DST workload creates no managed boot intents and SimHostClient does not implement managed asset inspection or capture; managed_boot::tests::managed_bridge_real_driver_claims_once_and_reconciles_prepared_reply tests the real bridge with a synthetic host, while meta_conformance pairs intent/claim/recovery persistence cases on SimMeta and Postgres",
+        ),
+        (
+            "mcp/operator",
+            "the scanner needs an operator publication candidate and managed host retirement proof, neither modeled by the DST scheduler; managed_boot::tests::operator_scanner_requires_retirement_and_retains_before_host_io tests the real scanner with a synthetic host, while meta_conformance pairs publication/readiness persistence cases on SimMeta and Postgres",
+        ),
     ];
 
     fn modules_for(kind: DriverKind) -> &'static [&'static str] {

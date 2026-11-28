@@ -1,5 +1,5 @@
 {
-  "id": "f29c0133-180b-46be-b4e2-8f580786223a",
+  "id": "be95abdb-f0a6-4282-ba6d-1d6574010f13",
   "prevId": "785b7a9a-c956-4d05-81af-fdf4b2849339",
   "version": "7",
   "dialect": "postgresql",
@@ -99,24 +99,24 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "account_user_id_user_id_fk": {
           "name": "account_user_id_user_id_fk",
           "tableFrom": "account",
+          "tableTo": "user",
           "columnsFrom": [
             "user_id"
           ],
-          "tableTo": "user",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -278,9 +278,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "apikey_key_idx": {
           "name": "apikey_key_idx",
@@ -293,24 +293,24 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "apikey_reference_id_user_id_fk": {
           "name": "apikey_reference_id_user_id_fk",
           "tableFrom": "apikey",
+          "tableTo": "user",
           "columnsFrom": [
             "reference_id"
           ],
-          "tableTo": "user",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -387,9 +387,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "artifact_visibility_idx": {
           "name": "artifact_visibility_idx",
@@ -402,24 +402,24 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "artifact_owner_user_id_user_id_fk": {
           "name": "artifact_owner_user_id_user_id_fk",
           "tableFrom": "artifact",
+          "tableTo": "user",
           "columnsFrom": [
             "owner_user_id"
           ],
-          "tableTo": "user",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "set null"
+          "onDelete": "set null",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -494,24 +494,24 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "artifact_version_artifact_id_artifact_id_fk": {
           "name": "artifact_version_artifact_id_artifact_id_fk",
           "tableFrom": "artifact_version",
+          "tableTo": "artifact",
           "columnsFrom": [
             "artifact_id"
           ],
-          "tableTo": "artifact",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {
@@ -662,9 +662,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "automation_draft_session_idx": {
           "name": "automation_draft_session_idx",
@@ -677,9 +677,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "automation_builtin_key_unique": {
           "name": "automation_builtin_key_unique",
@@ -692,10 +692,10 @@
             }
           ],
           "isUnique": true,
-          "with": {},
-          "method": "btree",
           "where": "builtin_key is not null",
-          "concurrently": false
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {},
@@ -740,15 +740,15 @@
         "automation_concurrency_claim_automation_id_automation_id_fk": {
           "name": "automation_concurrency_claim_automation_id_automation_id_fk",
           "tableFrom": "automation_concurrency_claim",
+          "tableTo": "automation",
           "columnsFrom": [
             "automation_id"
           ],
-          "tableTo": "automation",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {
@@ -834,24 +834,24 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "automation_drop_automation_id_automation_id_fk": {
           "name": "automation_drop_automation_id_automation_id_fk",
           "tableFrom": "automation_drop",
+          "tableTo": "automation",
           "columnsFrom": [
             "automation_id"
           ],
-          "tableTo": "automation",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -947,10 +947,10 @@
             }
           ],
           "isUnique": true,
-          "with": {},
-          "method": "btree",
           "where": "status = 'open'",
-          "concurrently": false
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         },
         "automation_instance_automation_idx": {
           "name": "automation_instance_automation_idx",
@@ -975,24 +975,24 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "automation_instance_automation_id_automation_id_fk": {
           "name": "automation_instance_automation_id_automation_id_fk",
           "tableFrom": "automation_instance",
+          "tableTo": "automation",
           "columnsFrom": [
             "automation_id"
           ],
-          "tableTo": "automation",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -1050,37 +1050,37 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "automation_instance_handle_automation_id_automation_id_fk": {
           "name": "automation_instance_handle_automation_id_automation_id_fk",
           "tableFrom": "automation_instance_handle",
+          "tableTo": "automation",
           "columnsFrom": [
             "automation_id"
           ],
-          "tableTo": "automation",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         },
         "automation_instance_handle_instance_id_automation_instance_id_fk": {
           "name": "automation_instance_handle_instance_id_automation_instance_id_fk",
           "tableFrom": "automation_instance_handle",
+          "tableTo": "automation_instance",
           "columnsFrom": [
             "instance_id"
           ],
-          "tableTo": "automation_instance",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {
@@ -1258,10 +1258,10 @@
             }
           ],
           "isUnique": false,
-          "with": {},
-          "method": "btree",
           "where": "ended_at is not null and details_pruned_at is null",
-          "concurrently": false
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         },
         "automation_run_occurrence_unique": {
           "name": "automation_run_occurrence_unique",
@@ -1292,10 +1292,10 @@
             }
           ],
           "isUnique": true,
-          "with": {},
-          "method": "btree",
           "where": "scheduled_for is not null",
-          "concurrently": false
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         },
         "automation_run_delivery_unique": {
           "name": "automation_run_delivery_unique",
@@ -1320,10 +1320,10 @@
             }
           ],
           "isUnique": true,
-          "with": {},
-          "method": "btree",
           "where": "delivery_key is not null and scheduled_for is null",
-          "concurrently": false
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         },
         "automation_run_automation_created_idx": {
           "name": "automation_run_automation_created_idx",
@@ -1342,9 +1342,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "automation_run_lease_idx": {
           "name": "automation_run_lease_idx",
@@ -1357,9 +1357,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "automation_run_concurrency_idx": {
           "name": "automation_run_concurrency_idx",
@@ -1384,37 +1384,37 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "automation_run_automation_id_automation_id_fk": {
           "name": "automation_run_automation_id_automation_id_fk",
           "tableFrom": "automation_run",
+          "tableTo": "automation",
           "columnsFrom": [
             "automation_id"
           ],
-          "tableTo": "automation",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         },
         "automation_run_task_id_task_id_fk": {
           "name": "automation_run_task_id_task_id_fk",
           "tableFrom": "automation_run",
+          "tableTo": "task",
           "columnsFrom": [
             "task_id"
           ],
-          "tableTo": "task",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "set null"
+          "onDelete": "set null",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -1479,24 +1479,24 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "automation_session_run_id_automation_run_id_fk": {
           "name": "automation_session_run_id_automation_run_id_fk",
           "tableFrom": "automation_session",
+          "tableTo": "automation_run",
           "columnsFrom": [
             "run_id"
           ],
-          "tableTo": "automation_run",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -1566,28 +1566,28 @@
         "automation_session_relay_session_id_automation_session_session_id_fk": {
           "name": "automation_session_relay_session_id_automation_session_session_id_fk",
           "tableFrom": "automation_session_relay",
+          "tableTo": "automation_session",
           "columnsFrom": [
             "session_id"
           ],
-          "tableTo": "automation_session",
           "columnsTo": [
             "session_id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         },
         "automation_session_relay_automation_id_automation_id_fk": {
           "name": "automation_session_relay_automation_id_automation_id_fk",
           "tableFrom": "automation_session_relay",
+          "tableTo": "automation",
           "columnsFrom": [
             "automation_id"
           ],
-          "tableTo": "automation",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -1645,15 +1645,15 @@
         "automation_state_automation_id_automation_id_fk": {
           "name": "automation_state_automation_id_automation_id_fk",
           "tableFrom": "automation_state",
+          "tableTo": "automation",
           "columnsFrom": [
             "automation_id"
           ],
-          "tableTo": "automation",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {
@@ -1736,15 +1736,15 @@
         "automation_step_run_run_id_automation_run_id_fk": {
           "name": "automation_step_run_run_id_automation_run_id_fk",
           "tableFrom": "automation_step_run",
+          "tableTo": "automation_run",
           "columnsFrom": [
             "run_id"
           ],
-          "tableTo": "automation_run",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {
@@ -1847,15 +1847,15 @@
         "automation_version_automation_id_automation_id_fk": {
           "name": "automation_version_automation_id_automation_id_fk",
           "tableFrom": "automation_version",
+          "tableTo": "automation",
           "columnsFrom": [
             "automation_id"
           ],
-          "tableTo": "automation",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {
@@ -2086,9 +2086,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {},
@@ -2317,9 +2317,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "device_code_user_code_idx": {
           "name": "device_code_user_code_idx",
@@ -2332,9 +2332,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {},
@@ -2359,6 +2359,48 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true
+        },
+        "mcp_credential": {
+          "name": "mcp_credential",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'::jsonb"
+        },
+        "config_revision": {
+          "name": "config_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        },
+        "auth_generation": {
+          "name": "auth_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        },
+        "credential_identity": {
+          "name": "credential_identity",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "''"
+        },
+        "catalog_revision": {
+          "name": "catalog_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "revoked": {
+          "name": "revoked",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
         },
         "provider": {
           "name": "provider",
@@ -2426,9 +2468,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "integration_connection_provider_default_unique": {
           "name": "integration_connection_provider_default_unique",
@@ -2441,10 +2483,10 @@
             }
           ],
           "isUnique": true,
-          "with": {},
-          "method": "btree",
           "where": "is_default",
-          "concurrently": false
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {},
@@ -2452,10 +2494,10 @@
       "uniqueConstraints": {
         "integration_connection_alias_unique": {
           "name": "integration_connection_alias_unique",
+          "nullsNotDistinct": false,
           "columns": [
             "alias"
-          ],
-          "nullsNotDistinct": false
+          ]
         }
       },
       "policies": {},
@@ -2541,9 +2583,9 @@
             }
           ],
           "isUnique": true,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "integration_event_conn_key_idx": {
           "name": "integration_event_conn_key_idx",
@@ -2568,24 +2610,24 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "integration_event_connection_id_integration_connection_id_fk": {
           "name": "integration_event_connection_id_integration_connection_id_fk",
           "tableFrom": "integration_event",
+          "tableTo": "integration_connection",
           "columnsFrom": [
             "connection_id"
           ],
-          "tableTo": "integration_connection",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -2666,10 +2708,10 @@
             }
           ],
           "isUnique": true,
-          "with": {},
-          "method": "btree",
           "where": "state = 'active'",
-          "concurrently": false
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {},
@@ -2677,6 +2719,1305 @@
       "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.mcp_admission": {
+      "name": "mcp_admission",
+      "schema": "",
+      "columns": {
+        "execution_id": {
+          "name": "execution_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "reservation_id": {
+          "name": "reservation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "gen_random_uuid()::text"
+        },
+        "deployment_id": {
+          "name": "deployment_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "connection_id": {
+          "name": "connection_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "phase": {
+          "name": "phase",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'execute'"
+        },
+        "schema_queue_expires_at": {
+          "name": "schema_queue_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "execute_queue_expires_at": {
+          "name": "execute_queue_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "execute_expires_at": {
+          "name": "execute_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "schema_digest": {
+          "name": "schema_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "mcp_admission_reservation_idx": {
+          "name": "mcp_admission_reservation_idx",
+          "columns": [
+            {
+              "expression": "reservation_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "mcp_admission_deployment_idx": {
+          "name": "mcp_admission_deployment_idx",
+          "columns": [
+            {
+              "expression": "deployment_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "state",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "mcp_admission_connection_idx": {
+          "name": "mcp_admission_connection_idx",
+          "columns": [
+            {
+              "expression": "connection_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "state",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "mcp_admission_session_idx": {
+          "name": "mcp_admission_session_idx",
+          "columns": [
+            {
+              "expression": "session_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "state",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "mcp_admission_execution_id_mcp_execution_id_fk": {
+          "name": "mcp_admission_execution_id_mcp_execution_id_fk",
+          "tableFrom": "mcp_admission",
+          "tableTo": "mcp_execution",
+          "columnsFrom": [
+            "execution_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "mcp_admission_deployment_id_mcp_admission_scope_id_fk": {
+          "name": "mcp_admission_deployment_id_mcp_admission_scope_id_fk",
+          "tableFrom": "mcp_admission",
+          "tableTo": "mcp_admission_scope",
+          "columnsFrom": [
+            "deployment_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "mcp_admission_connection_id_integration_connection_id_fk": {
+          "name": "mcp_admission_connection_id_integration_connection_id_fk",
+          "tableFrom": "mcp_admission",
+          "tableTo": "integration_connection",
+          "columnsFrom": [
+            "connection_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "mcp_admission_phase_check": {
+          "name": "mcp_admission_phase_check",
+          "value": "\"mcp_admission\".\"phase\" IN ('schema','execute')"
+        },
+        "mcp_admission_state_check": {
+          "name": "mcp_admission_state_check",
+          "value": "\"mcp_admission\".\"state\" IN ('queued','admitted','released')"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.mcp_admission_scope": {
+      "name": "mcp_admission_scope",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.mcp_approval": {
+      "name": "mcp_approval",
+      "schema": "",
+      "columns": {
+        "execution_id": {
+          "name": "execution_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "deployment_id": {
+          "name": "deployment_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "request_digest": {
+          "name": "request_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "decision": {
+          "name": "decision",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "actor_id": {
+          "name": "actor_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "decided_at": {
+          "name": "decided_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "consumed_at": {
+          "name": "consumed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "mcp_approval_pending_idx": {
+          "name": "mcp_approval_pending_idx",
+          "columns": [
+            {
+              "expression": "deployment_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "decision",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "mcp_approval_session_idx": {
+          "name": "mcp_approval_session_idx",
+          "columns": [
+            {
+              "expression": "session_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "decision",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "mcp_approval_execution_id_mcp_execution_id_fk": {
+          "name": "mcp_approval_execution_id_mcp_execution_id_fk",
+          "tableFrom": "mcp_approval",
+          "tableTo": "mcp_execution",
+          "columnsFrom": [
+            "execution_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "mcp_approval_decision_check": {
+          "name": "mcp_approval_decision_check",
+          "value": "\"mcp_approval\".\"decision\" IN ('pending','approved','denied','expired')"
+        },
+        "mcp_approval_consumed_check": {
+          "name": "mcp_approval_consumed_check",
+          "value": "\"mcp_approval\".\"consumed_at\" IS NULL OR (\"mcp_approval\".\"decision\" = 'approved' AND \"mcp_approval\".\"actor_id\" IS NOT NULL)"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.mcp_cancellation": {
+      "name": "mcp_cancellation",
+      "schema": "",
+      "columns": {
+        "execution_id": {
+          "name": "execution_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "actor_id": {
+          "name": "actor_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "cause": {
+          "name": "cause",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "expected_journal_revision": {
+          "name": "expected_journal_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "journal_revision": {
+          "name": "journal_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "mcp_cancellation_execution_id_mcp_execution_id_fk": {
+          "name": "mcp_cancellation_execution_id_mcp_execution_id_fk",
+          "tableFrom": "mcp_cancellation",
+          "tableTo": "mcp_execution",
+          "columnsFrom": [
+            "execution_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "mcp_cancellation_revision_check": {
+          "name": "mcp_cancellation_revision_check",
+          "value": "\"mcp_cancellation\".\"expected_journal_revision\" > 0 AND \"mcp_cancellation\".\"journal_revision\" = \"mcp_cancellation\".\"expected_journal_revision\" + 1"
+        },
+        "mcp_cancellation_state_check": {
+          "name": "mcp_cancellation_state_check",
+          "value": "\"mcp_cancellation\".\"state\" IN ('canceled','outcome_unknown')"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.mcp_catalog": {
+      "name": "mcp_catalog",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "connection_id": {
+          "name": "connection_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "revision": {
+          "name": "revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "config_revision": {
+          "name": "config_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "auth_generation": {
+          "name": "auth_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "credential_identity": {
+          "name": "credential_identity",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "tools": {
+          "name": "tools",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "fingerprint": {
+          "name": "fingerprint",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "actor_id": {
+          "name": "actor_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "mcp_catalog_connection_idx": {
+          "name": "mcp_catalog_connection_idx",
+          "columns": [
+            {
+              "expression": "connection_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "mcp_catalog_published_revision_idx": {
+          "name": "mcp_catalog_published_revision_idx",
+          "columns": [
+            {
+              "expression": "connection_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "revision",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "kind = 'published'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "mcp_catalog_connection_id_integration_connection_id_fk": {
+          "name": "mcp_catalog_connection_id_integration_connection_id_fk",
+          "tableFrom": "mcp_catalog",
+          "tableTo": "integration_connection",
+          "columnsFrom": [
+            "connection_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "mcp_catalog_kind_check": {
+          "name": "mcp_catalog_kind_check",
+          "value": "\"mcp_catalog\".\"kind\" IN ('draft','published') AND ((\"mcp_catalog\".\"kind\" = 'draft' AND \"mcp_catalog\".\"revision\" = 0) OR (\"mcp_catalog\".\"kind\" = 'published' AND \"mcp_catalog\".\"revision\" > 0))"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.mcp_discovery_admission": {
+      "name": "mcp_discovery_admission",
+      "schema": "",
+      "columns": {
+        "request_id": {
+          "name": "request_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "intent_id": {
+          "name": "intent_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "deployment_id": {
+          "name": "deployment_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "connection_id": {
+          "name": "connection_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "actor_id": {
+          "name": "actor_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "config_revision": {
+          "name": "config_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "auth_generation": {
+          "name": "auth_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "credential_identity": {
+          "name": "credential_identity",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "identity": {
+          "name": "identity",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "destination": {
+          "name": "destination",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "operation": {
+          "name": "operation",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{\"kind\":\"discover\"}'::jsonb"
+        },
+        "request_digest": {
+          "name": "request_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "status_digest": {
+          "name": "status_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "mcp_discovery_admission_intent_idx": {
+          "name": "mcp_discovery_admission_intent_idx",
+          "columns": [
+            {
+              "expression": "intent_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "mcp_discovery_admission_deployment_idx": {
+          "name": "mcp_discovery_admission_deployment_idx",
+          "columns": [
+            {
+              "expression": "deployment_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "state",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "mcp_discovery_admission_connection_idx": {
+          "name": "mcp_discovery_admission_connection_idx",
+          "columns": [
+            {
+              "expression": "connection_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "state",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "mcp_discovery_admission_deployment_id_mcp_admission_scope_id_fk": {
+          "name": "mcp_discovery_admission_deployment_id_mcp_admission_scope_id_fk",
+          "tableFrom": "mcp_discovery_admission",
+          "tableTo": "mcp_admission_scope",
+          "columnsFrom": [
+            "deployment_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "mcp_discovery_admission_connection_id_integration_connection_id_fk": {
+          "name": "mcp_discovery_admission_connection_id_integration_connection_id_fk",
+          "tableFrom": "mcp_discovery_admission",
+          "tableTo": "integration_connection",
+          "columnsFrom": [
+            "connection_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "mcp_administrative_operation_check": {
+          "name": "mcp_administrative_operation_check",
+          "value": "coalesce(\n      \"mcp_discovery_admission\".\"operation\" = '{\"kind\":\"discover\"}'::jsonb OR (\n        \"mcp_discovery_admission\".\"operation\"->>'kind' = 'validateSchemas' AND\n        \"mcp_discovery_admission\".\"operation\"->>'documentsDigest' ~ '^sha256:[0-9a-f]{64}$' AND\n        \"mcp_discovery_admission\".\"operation\" - 'kind' - 'documentsDigest' = '{}'::jsonb AND \"mcp_discovery_admission\".\"destination\" = ''\n      ), false)"
+        },
+        "mcp_discovery_admission_state_check": {
+          "name": "mcp_discovery_admission_state_check",
+          "value": "\"mcp_discovery_admission\".\"state\" IN ('reserved','dispatched','finished')"
+        },
+        "mcp_discovery_admission_expiry_check": {
+          "name": "mcp_discovery_admission_expiry_check",
+          "value": "\"mcp_discovery_admission\".\"expires_at\" = \"mcp_discovery_admission\".\"created_at\" + interval '30 seconds'"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.mcp_execution": {
+      "name": "mcp_execution",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "task_id": {
+          "name": "task_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "run_id": {
+          "name": "run_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "tool_call_id": {
+          "name": "tool_call_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "connection_id": {
+          "name": "connection_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "catalog_id": {
+          "name": "catalog_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "principal_id": {
+          "name": "principal_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "binding_hash": {
+          "name": "binding_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "request_digest": {
+          "name": "request_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "argument_hash": {
+          "name": "argument_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "original_arguments": {
+          "name": "original_arguments",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "request_context": {
+          "name": "request_context",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "upstream_name": {
+          "name": "upstream_name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "config_revision": {
+          "name": "config_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "auth_generation": {
+          "name": "auth_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "classification": {
+          "name": "classification",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "authorization_kind": {
+          "name": "authorization_kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "automation_grant_hash": {
+          "name": "automation_grant_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "version": {
+          "name": "version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        },
+        "boot_id": {
+          "name": "boot_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "intent_id": {
+          "name": "intent_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "intent_expires_at": {
+          "name": "intent_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "deadline": {
+          "name": "deadline",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "result": {
+          "name": "result",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "result_unavailable": {
+          "name": "result_unavailable",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "completion_enqueued_version": {
+          "name": "completion_enqueued_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "mcp_execution_task_session_idx": {
+          "name": "mcp_execution_task_session_idx",
+          "columns": [
+            {
+              "expression": "task_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "session_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "mcp_execution_call_idx": {
+          "name": "mcp_execution_call_idx",
+          "columns": [
+            {
+              "expression": "session_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "tool_call_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "mcp_execution_connection_state_idx": {
+          "name": "mcp_execution_connection_state_idx",
+          "columns": [
+            {
+              "expression": "connection_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "session_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "state",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "mcp_execution_catalog_idx": {
+          "name": "mcp_execution_catalog_idx",
+          "columns": [
+            {
+              "expression": "catalog_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "mcp_execution_pending_idx": {
+          "name": "mcp_execution_pending_idx",
+          "columns": [
+            {
+              "expression": "state",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "deadline",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "mcp_execution_lifecycle_active_idx": {
+          "name": "mcp_execution_lifecycle_active_idx",
+          "columns": [
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"mcp_execution\".\"state\" IN ('waiting_approval','authorized','dispatching')",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "mcp_execution_recovery_idx": {
+          "name": "mcp_execution_recovery_idx",
+          "columns": [
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"mcp_execution\".\"completion_enqueued_version\" < \"mcp_execution\".\"version\"",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "mcp_execution_intent_idx": {
+          "name": "mcp_execution_intent_idx",
+          "columns": [
+            {
+              "expression": "intent_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "mcp_execution_connection_id_integration_connection_id_fk": {
+          "name": "mcp_execution_connection_id_integration_connection_id_fk",
+          "tableFrom": "mcp_execution",
+          "tableTo": "integration_connection",
+          "columnsFrom": [
+            "connection_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "mcp_execution_catalog_id_mcp_catalog_id_fk": {
+          "name": "mcp_execution_catalog_id_mcp_catalog_id_fk",
+          "tableFrom": "mcp_execution",
+          "tableTo": "mcp_catalog",
+          "columnsFrom": [
+            "catalog_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "mcp_execution_task_id_session_id_task_session_task_id_session_id_fk": {
+          "name": "mcp_execution_task_id_session_id_task_session_task_id_session_id_fk",
+          "tableFrom": "mcp_execution",
+          "tableTo": "task_session",
+          "columnsFrom": [
+            "task_id",
+            "session_id"
+          ],
+          "columnsTo": [
+            "task_id",
+            "session_id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "mcp_execution_completion_version_check": {
+          "name": "mcp_execution_completion_version_check",
+          "value": "\"mcp_execution\".\"completion_enqueued_version\" >= 0 AND \"mcp_execution\".\"completion_enqueued_version\" <= \"mcp_execution\".\"version\""
+        },
+        "mcp_execution_state_check": {
+          "name": "mcp_execution_state_check",
+          "value": "\"mcp_execution\".\"state\" IN ('waiting_approval','authorized','dispatching','succeeded','failed','canceled','outcome_unknown')"
+        },
+        "mcp_execution_classification_check": {
+          "name": "mcp_execution_classification_check",
+          "value": "\"mcp_execution\".\"classification\" IN ('read','write')"
+        },
+        "mcp_execution_authorization_check": {
+          "name": "mcp_execution_authorization_check",
+          "value": "(\"mcp_execution\".\"authorization_kind\" = 'read' AND \"mcp_execution\".\"classification\" = 'read' AND \"mcp_execution\".\"automation_grant_hash\" IS NULL) OR (\"mcp_execution\".\"authorization_kind\" = 'approval' AND \"mcp_execution\".\"automation_grant_hash\" IS NULL) OR (\"mcp_execution\".\"authorization_kind\" = 'automation' AND \"mcp_execution\".\"classification\" = 'write' AND \"mcp_execution\".\"automation_grant_hash\" IS NOT NULL)"
+        },
+        "mcp_execution_dispatch_check": {
+          "name": "mcp_execution_dispatch_check",
+          "value": "\"mcp_execution\".\"state\" NOT IN ('dispatching','outcome_unknown','succeeded') OR (\"mcp_execution\".\"boot_id\" IS NOT NULL AND \"mcp_execution\".\"intent_id\" IS NOT NULL AND \"mcp_execution\".\"intent_expires_at\" IS NOT NULL)"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.mcp_resolution": {
+      "name": "mcp_resolution",
+      "schema": "",
+      "columns": {
+        "execution_id": {
+          "name": "execution_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "expected_context": {
+          "name": "expected_context",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "actor_id": {
+          "name": "actor_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "outcome": {
+          "name": "outcome",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "mcp_resolution_execution_id_mcp_execution_id_fk": {
+          "name": "mcp_resolution_execution_id_mcp_execution_id_fk",
+          "tableFrom": "mcp_resolution",
+          "tableTo": "mcp_execution",
+          "columnsFrom": [
+            "execution_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "mcp_resolution_outcome_check": {
+          "name": "mcp_resolution_outcome_check",
+          "value": "\"mcp_resolution\".\"outcome\" IN ('succeeded','failed','acknowledged')"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.org_setting": {
@@ -2820,9 +4161,9 @@
             }
           ],
           "isUnique": true,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "papercuts_created_at_idx": {
           "name": "papercuts_created_at_idx",
@@ -2835,9 +4176,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "papercuts_archived_at_idx": {
           "name": "papercuts_archived_at_idx",
@@ -2850,9 +4191,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {},
@@ -2927,9 +4268,9 @@
             }
           ],
           "isUnique": true,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "pending_tool_calls_session_idx": {
           "name": "pending_tool_calls_session_idx",
@@ -2942,9 +4283,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "pending_tool_calls_awaiting_idx": {
           "name": "pending_tool_calls_awaiting_idx",
@@ -2957,10 +4298,10 @@
             }
           ],
           "isUnique": false,
-          "with": {},
-          "method": "btree",
           "where": "\"pending_tool_calls\".\"handling\" = 'session' AND \"pending_tool_calls\".\"submitted_at\" IS NULL",
-          "concurrently": false
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {},
@@ -3053,9 +4394,9 @@
             }
           ],
           "isUnique": true,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "pr_ref_authoring_task_idx": {
           "name": "pr_ref_authoring_task_idx",
@@ -3068,9 +4409,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "pr_ref_session_idx": {
           "name": "pr_ref_session_idx",
@@ -3083,24 +4424,24 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "pr_ref_authoring_task_id_task_id_fk": {
           "name": "pr_ref_authoring_task_id_task_id_fk",
           "tableFrom": "pr_ref",
+          "tableTo": "task",
           "columnsFrom": [
             "authoring_task_id"
           ],
-          "tableTo": "task",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "set null"
+          "onDelete": "set null",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -3196,6 +4537,12 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'[]'::jsonb"
+        },
+        "mcp_grant_publication": {
+          "name": "mcp_grant_publication",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
         },
         "integration_grants": {
           "name": "integration_grants",
@@ -3396,9 +4743,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "review_task_idx": {
           "name": "review_task_idx",
@@ -3411,9 +4758,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "review_one_active_per_target_idx": {
           "name": "review_one_active_per_target_idx",
@@ -3426,10 +4773,10 @@
             }
           ],
           "isUnique": true,
-          "with": {},
-          "method": "btree",
           "where": "\"review\".\"status\" IN ('queued', 'finding', 'verifying')",
-          "concurrently": false
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         },
         "review_finder_session_idx": {
           "name": "review_finder_session_idx",
@@ -3442,9 +4789,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "review_verifier_session_idx": {
           "name": "review_verifier_session_idx",
@@ -3457,37 +4804,37 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "review_target_id_review_target_id_fk": {
           "name": "review_target_id_review_target_id_fk",
           "tableFrom": "review",
+          "tableTo": "review_target",
           "columnsFrom": [
             "target_id"
           ],
-          "tableTo": "review_target",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         },
         "review_task_id_task_id_fk": {
           "name": "review_task_id_task_id_fk",
           "tableFrom": "review",
+          "tableTo": "task",
           "columnsFrom": [
             "task_id"
           ],
-          "tableTo": "task",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "no action"
+          "onDelete": "no action",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -3551,24 +4898,24 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "review_event_review_id_review_id_fk": {
           "name": "review_event_review_id_review_id_fk",
           "tableFrom": "review_event",
+          "tableTo": "review",
           "columnsFrom": [
             "review_id"
           ],
-          "tableTo": "review",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -3724,9 +5071,9 @@
             }
           ],
           "isUnique": true,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "review_finding_review_idx": {
           "name": "review_finding_review_idx",
@@ -3739,24 +5086,24 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "review_finding_review_id_review_id_fk": {
           "name": "review_finding_review_id_review_id_fk",
           "tableFrom": "review_finding",
+          "tableTo": "review",
           "columnsFrom": [
             "review_id"
           ],
-          "tableTo": "review",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -3870,9 +5217,9 @@
             }
           ],
           "isUnique": true,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "review_target_coordinate_idx": {
           "name": "review_target_coordinate_idx",
@@ -3897,9 +5244,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {},
@@ -3982,9 +5329,9 @@
             }
           ],
           "isUnique": true,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "review_verdict_finding_unique": {
           "name": "review_verdict_finding_unique",
@@ -3997,24 +5344,24 @@
             }
           ],
           "isUnique": true,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "review_verdict_finding_id_review_finding_id_fk": {
           "name": "review_verdict_finding_id_review_finding_id_fk",
           "tableFrom": "review_verdict",
+          "tableTo": "review_finding",
           "columnsFrom": [
             "finding_id"
           ],
-          "tableTo": "review_finding",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -4149,9 +5496,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {},
@@ -4212,17 +5559,17 @@
         "router_model_policy_router_id_model_id_router_model_router_id_model_id_fk": {
           "name": "router_model_policy_router_id_model_id_router_model_router_id_model_id_fk",
           "tableFrom": "router_model_policy",
+          "tableTo": "router_model",
           "columnsFrom": [
             "router_id",
             "model_id"
           ],
-          "tableTo": "router_model",
           "columnsTo": [
             "router_id",
             "model_id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {
@@ -4352,34 +5699,34 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "session_user_id_user_id_fk": {
           "name": "session_user_id_user_id_fk",
           "tableFrom": "session",
+          "tableTo": "user",
           "columnsFrom": [
             "user_id"
           ],
-          "tableTo": "user",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {
         "session_token_unique": {
           "name": "session_token_unique",
+          "nullsNotDistinct": false,
           "columns": [
             "token"
-          ],
-          "nullsNotDistinct": false
+          ]
         }
       },
       "policies": {},
@@ -4453,9 +5800,9 @@
             }
           ],
           "isUnique": true,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "session_app_session_port_idx": {
           "name": "session_app_session_port_idx",
@@ -4474,9 +5821,9 @@
             }
           ],
           "isUnique": true,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "session_app_session_idx": {
           "name": "session_app_session_idx",
@@ -4489,9 +5836,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "session_app_owner_idx": {
           "name": "session_app_owner_idx",
@@ -4504,24 +5851,24 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "session_app_owner_user_id_user_id_fk": {
           "name": "session_app_owner_user_id_user_id_fk",
           "tableFrom": "session_app",
+          "tableTo": "user",
           "columnsFrom": [
             "owner_user_id"
           ],
-          "tableTo": "user",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -4697,9 +6044,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "spec_owner_idx": {
           "name": "spec_owner_idx",
@@ -4712,9 +6059,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "spec_session_idx": {
           "name": "spec_session_idx",
@@ -4727,50 +6074,50 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "spec_owner_user_id_user_id_fk": {
           "name": "spec_owner_user_id_user_id_fk",
           "tableFrom": "spec",
+          "tableTo": "user",
           "columnsFrom": [
             "owner_user_id"
           ],
-          "tableTo": "user",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "set null"
+          "onDelete": "set null",
+          "onUpdate": "no action"
         },
         "spec_template_id_spec_template_id_fk": {
           "name": "spec_template_id_spec_template_id_fk",
           "tableFrom": "spec",
+          "tableTo": "spec_template",
           "columnsFrom": [
             "template_id"
           ],
-          "tableTo": "spec_template",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "no action"
+          "onDelete": "no action",
+          "onUpdate": "no action"
         },
         "spec_published_by_user_id_fk": {
           "name": "spec_published_by_user_id_fk",
           "tableFrom": "spec",
+          "tableTo": "user",
           "columnsFrom": [
             "published_by"
           ],
-          "tableTo": "user",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "set null"
+          "onDelete": "set null",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -4839,37 +6186,37 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "spec_chat_message_spec_id_spec_id_fk": {
           "name": "spec_chat_message_spec_id_spec_id_fk",
           "tableFrom": "spec_chat_message",
+          "tableTo": "spec",
           "columnsFrom": [
             "spec_id"
           ],
-          "tableTo": "spec",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         },
         "spec_chat_message_author_user_id_user_id_fk": {
           "name": "spec_chat_message_author_user_id_user_id_fk",
           "tableFrom": "spec_chat_message",
+          "tableTo": "user",
           "columnsFrom": [
             "author_user_id"
           ],
-          "tableTo": "user",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "set null"
+          "onDelete": "set null",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -4962,37 +6309,37 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "spec_checkpoint_spec_id_spec_id_fk": {
           "name": "spec_checkpoint_spec_id_spec_id_fk",
           "tableFrom": "spec_checkpoint",
+          "tableTo": "spec",
           "columnsFrom": [
             "spec_id"
           ],
-          "tableTo": "spec",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         },
         "spec_checkpoint_author_user_id_user_id_fk": {
           "name": "spec_checkpoint_author_user_id_user_id_fk",
           "tableFrom": "spec_checkpoint",
+          "tableTo": "user",
           "columnsFrom": [
             "author_user_id"
           ],
-          "tableTo": "user",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "set null"
+          "onDelete": "set null",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -5079,35 +6426,35 @@
             }
           ],
           "isUnique": false,
-          "with": {},
-          "method": "btree",
           "where": "\"spec_drafting_seed\".\"state\" = 'pending'",
-          "concurrently": false
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {
         "spec_drafting_seed_spec_id_spec_id_fk": {
           "name": "spec_drafting_seed_spec_id_spec_id_fk",
           "tableFrom": "spec_drafting_seed",
+          "tableTo": "spec",
           "columnsFrom": [
             "spec_id"
           ],
-          "tableTo": "spec",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {
         "spec_drafting_seed_prompt_id_unique": {
           "name": "spec_drafting_seed_prompt_id_unique",
+          "nullsNotDistinct": false,
           "columns": [
             "prompt_id"
-          ],
-          "nullsNotDistinct": false
+          ]
         }
       },
       "policies": {},
@@ -5221,28 +6568,28 @@
         "spec_gap_check_finding_run_id_spec_gap_check_run_id_fk": {
           "name": "spec_gap_check_finding_run_id_spec_gap_check_run_id_fk",
           "tableFrom": "spec_gap_check_finding",
+          "tableTo": "spec_gap_check_run",
           "columnsFrom": [
             "run_id"
           ],
-          "tableTo": "spec_gap_check_run",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         },
         "spec_gap_check_finding_disposed_by_user_id_fk": {
           "name": "spec_gap_check_finding_disposed_by_user_id_fk",
           "tableFrom": "spec_gap_check_finding",
+          "tableTo": "user",
           "columnsFrom": [
             "disposed_by"
           ],
-          "tableTo": "user",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "set null"
+          "onDelete": "set null",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {
@@ -5343,9 +6690,9 @@
             }
           ],
           "isUnique": true,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "spec_gap_check_run_spec_created_idx": {
           "name": "spec_gap_check_run_spec_created_idx",
@@ -5364,37 +6711,37 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "spec_gap_check_run_spec_id_spec_id_fk": {
           "name": "spec_gap_check_run_spec_id_spec_id_fk",
           "tableFrom": "spec_gap_check_run",
+          "tableTo": "spec",
           "columnsFrom": [
             "spec_id"
           ],
-          "tableTo": "spec",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         },
         "spec_gap_check_run_started_by_user_id_fk": {
           "name": "spec_gap_check_run_started_by_user_id_fk",
           "tableFrom": "spec_gap_check_run",
+          "tableTo": "user",
           "columnsFrom": [
             "started_by"
           ],
-          "tableTo": "user",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "set null"
+          "onDelete": "set null",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -5493,50 +6840,50 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "spec_open_question_spec_id_spec_id_fk": {
           "name": "spec_open_question_spec_id_spec_id_fk",
           "tableFrom": "spec_open_question",
+          "tableTo": "spec",
           "columnsFrom": [
             "spec_id"
           ],
-          "tableTo": "spec",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         },
         "spec_open_question_opened_by_user_id_fk": {
           "name": "spec_open_question_opened_by_user_id_fk",
           "tableFrom": "spec_open_question",
+          "tableTo": "user",
           "columnsFrom": [
             "opened_by"
           ],
-          "tableTo": "user",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "set null"
+          "onDelete": "set null",
+          "onUpdate": "no action"
         },
         "spec_open_question_resolved_by_user_id_fk": {
           "name": "spec_open_question_resolved_by_user_id_fk",
           "tableFrom": "spec_open_question",
+          "tableTo": "user",
           "columnsFrom": [
             "resolved_by"
           ],
-          "tableTo": "user",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "set null"
+          "onDelete": "set null",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -5612,37 +6959,37 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "spec_participant_spec_id_spec_id_fk": {
           "name": "spec_participant_spec_id_spec_id_fk",
           "tableFrom": "spec_participant",
+          "tableTo": "spec",
           "columnsFrom": [
             "spec_id"
           ],
-          "tableTo": "spec",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         },
         "spec_participant_user_id_user_id_fk": {
           "name": "spec_participant_user_id_user_id_fk",
           "tableFrom": "spec_participant",
+          "tableTo": "user",
           "columnsFrom": [
             "user_id"
           ],
-          "tableTo": "user",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "set null"
+          "onDelete": "set null",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {
@@ -5785,24 +7132,24 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "spec_projection_spec_id_spec_id_fk": {
           "name": "spec_projection_spec_id_spec_id_fk",
           "tableFrom": "spec_projection",
+          "tableTo": "spec",
           "columnsFrom": [
             "spec_id"
           ],
-          "tableTo": "spec",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {
@@ -5934,38 +7281,38 @@
             }
           ],
           "isUnique": false,
-          "with": {},
-          "method": "btree",
           "where": "\"spec_publish\".\"state\" <> 'complete'",
-          "concurrently": false
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {
         "spec_publish_spec_id_spec_id_fk": {
           "name": "spec_publish_spec_id_spec_id_fk",
           "tableFrom": "spec_publish",
+          "tableTo": "spec",
           "columnsFrom": [
             "spec_id"
           ],
-          "tableTo": "spec",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         },
         "spec_publish_requested_by_user_id_fk": {
           "name": "spec_publish_requested_by_user_id_fk",
           "tableFrom": "spec_publish",
+          "tableTo": "user",
           "columnsFrom": [
             "requested_by"
           ],
-          "tableTo": "user",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "set null"
+          "onDelete": "set null",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -6021,28 +7368,28 @@
         "spec_section_state_spec_id_spec_id_fk": {
           "name": "spec_section_state_spec_id_spec_id_fk",
           "tableFrom": "spec_section_state",
+          "tableTo": "spec",
           "columnsFrom": [
             "spec_id"
           ],
-          "tableTo": "spec",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         },
         "spec_section_state_settled_by_user_id_fk": {
           "name": "spec_section_state_settled_by_user_id_fk",
           "tableFrom": "spec_section_state",
+          "tableTo": "user",
           "columnsFrom": [
             "settled_by"
           ],
-          "tableTo": "user",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "set null"
+          "onDelete": "set null",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {
@@ -6106,15 +7453,15 @@
         "spec_snapshot_spec_id_spec_id_fk": {
           "name": "spec_snapshot_spec_id_spec_id_fk",
           "tableFrom": "spec_snapshot",
+          "tableTo": "spec",
           "columnsFrom": [
             "spec_id"
           ],
-          "tableTo": "spec",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -6190,9 +7537,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {},
@@ -6299,37 +7646,37 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "spec_ticket_draft_spec_id_spec_id_fk": {
           "name": "spec_ticket_draft_spec_id_spec_id_fk",
           "tableFrom": "spec_ticket_draft",
+          "tableTo": "spec",
           "columnsFrom": [
             "spec_id"
           ],
-          "tableTo": "spec",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         },
         "spec_ticket_draft_parent_id_fk": {
           "name": "spec_ticket_draft_parent_id_fk",
           "tableFrom": "spec_ticket_draft",
+          "tableTo": "spec_ticket_draft",
           "columnsFrom": [
             "parent_id"
           ],
-          "tableTo": "spec_ticket_draft",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -6399,15 +7746,15 @@
         "spec_ticket_sync_config_spec_id_spec_id_fk": {
           "name": "spec_ticket_sync_config_spec_id_spec_id_fk",
           "tableFrom": "spec_ticket_sync_config",
+          "tableTo": "spec",
           "columnsFrom": [
             "spec_id"
           ],
-          "tableTo": "spec",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -6509,24 +7856,24 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "spec_ticket_sync_operation_caller_spec_id_spec_id_fk": {
           "name": "spec_ticket_sync_operation_caller_spec_id_spec_id_fk",
           "tableFrom": "spec_ticket_sync_operation",
+          "tableTo": "spec",
           "columnsFrom": [
             "caller_spec_id"
           ],
-          "tableTo": "spec",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {
@@ -6621,38 +7968,38 @@
             }
           ],
           "isUnique": false,
-          "with": {},
-          "method": "btree",
           "where": "\"spec_transcript_action\".\"delivered_at\" IS NULL",
-          "concurrently": false
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {
         "spec_transcript_action_spec_id_spec_id_fk": {
           "name": "spec_transcript_action_spec_id_spec_id_fk",
           "tableFrom": "spec_transcript_action",
+          "tableTo": "spec",
           "columnsFrom": [
             "spec_id"
           ],
-          "tableTo": "spec",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         },
         "spec_transcript_action_actor_user_id_user_id_fk": {
           "name": "spec_transcript_action_actor_user_id_user_id_fk",
           "tableFrom": "spec_transcript_action",
+          "tableTo": "user",
           "columnsFrom": [
             "actor_user_id"
           ],
-          "tableTo": "user",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "set null"
+          "onDelete": "set null",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -6715,15 +8062,15 @@
         "spec_update_log_spec_id_spec_id_fk": {
           "name": "spec_update_log_spec_id_spec_id_fk",
           "tableFrom": "spec_update_log",
+          "tableTo": "spec",
           "columnsFrom": [
             "spec_id"
           ],
-          "tableTo": "spec",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {
@@ -6880,14 +8227,14 @@
           "columns": [
             {
               "expression": "(source->>'team')",
-              "isExpression": true,
               "asc": true,
+              "isExpression": true,
               "nulls": "last"
             },
             {
               "expression": "(source->>'channel')",
-              "isExpression": true,
               "asc": true,
+              "isExpression": true,
               "nulls": "last"
             },
             {
@@ -6898,10 +8245,10 @@
             }
           ],
           "isUnique": false,
-          "with": {},
-          "method": "btree",
           "where": "source->>'provider' = 'slack'",
-          "concurrently": false
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         },
         "task_parent_idx": {
           "name": "task_parent_idx",
@@ -6914,9 +8261,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "task_root_idx": {
           "name": "task_root_idx",
@@ -6929,9 +8276,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         },
         "task_root_canonical_name_unique": {
           "name": "task_root_canonical_name_unique",
@@ -6950,10 +8297,10 @@
             }
           ],
           "isUnique": true,
-          "with": {},
-          "method": "btree",
           "where": "canonical_task_name IS NOT NULL",
-          "concurrently": false
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {},
@@ -7015,6 +8362,18 @@
           "primaryKey": false,
           "notNull": false
         },
+        "mcp_binding_envelope": {
+          "name": "mcp_binding_envelope",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "mcp_managed_lifecycle": {
+          "name": "mcp_managed_lifecycle",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
         "integration_snapshot_hash": {
           "name": "integration_snapshot_hash",
           "type": "text",
@@ -7041,37 +8400,37 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "task_session_task_id_task_id_fk": {
           "name": "task_session_task_id_task_id_fk",
           "tableFrom": "task_session",
+          "tableTo": "task",
           "columnsFrom": [
             "task_id"
           ],
-          "tableTo": "task",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         },
         "task_session_profile_id_profile_id_fk": {
           "name": "task_session_profile_id_profile_id_fk",
           "tableFrom": "task_session",
+          "tableTo": "profile",
           "columnsFrom": [
             "profile_id"
           ],
-          "tableTo": "profile",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "no action"
+          "onDelete": "no action",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {
@@ -7167,10 +8526,10 @@
       "uniqueConstraints": {
         "user_email_unique": {
           "name": "user_email_unique",
+          "nullsNotDistinct": false,
           "columns": [
             "email"
-          ],
-          "nullsNotDistinct": false
+          ]
         }
       },
       "policies": {},
@@ -7237,15 +8596,15 @@
         "user_session_secrets_user_id_user_id_fk": {
           "name": "user_session_secrets_user_id_user_id_fk",
           "tableFrom": "user_session_secrets",
+          "tableTo": "user",
           "columnsFrom": [
             "user_id"
           ],
-          "tableTo": "user",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {
@@ -7315,9 +8674,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {},
@@ -7394,9 +8753,9 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {},
@@ -7467,24 +8826,24 @@
             }
           ],
           "isUnique": false,
-          "with": {},
+          "concurrently": false,
           "method": "btree",
-          "concurrently": false
+          "with": {}
         }
       },
       "foreignKeys": {
         "webhook_sample_registration_id_webhook_registration_id_fk": {
           "name": "webhook_sample_registration_id_webhook_registration_id_fk",
           "tableFrom": "webhook_sample",
+          "tableTo": "webhook_registration",
           "columnsFrom": [
             "registration_id"
           ],
-          "tableTo": "webhook_registration",
           "columnsTo": [
             "id"
           ],
-          "onUpdate": "no action",
-          "onDelete": "cascade"
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -7496,10 +8855,10 @@
   },
   "enums": {},
   "schemas": {},
-  "views": {},
   "sequences": {},
   "roles": {},
   "policies": {},
+  "views": {},
   "_meta": {
     "columns": {},
     "schemas": {},

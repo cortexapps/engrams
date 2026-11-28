@@ -1,181 +1,20 @@
-//! Shared bincode-encoded payload types crossing the coord ↔ host
-//! gRPC boundary (ADR 0013).
-//!
-//! The gRPC service in `host_service.proto` carries these inside
-//! `bytes` fields — bincode round-trips Rust types without needing
-//! a proto mirror for every nested struct (SandboxSpec,
-//! SnapshotMetadata, SessionEgressPolicy, AgentSpec, etc. stay
-//! authoritative). Coord + host deploy together (OSS image tag →
-//! engrams-internal Helm pin) so bincode skew can't happen across
-//! versions.
-//!
-//! Pre-0013 this file held the full `Frame`/`RequestKind`/`ResponseKind`/
-//! `NotifyKind` enum surface for the bincode-over-WS protocol. ADR 0013
-//! retired that protocol; what's left here is just the shared shapes.
+//! Payloads and protocol markers for the coordinator-to-host gRPC boundary.
+//! Ordinary policy has an explicit wire type in [`crate::ordinary_policy`].
+//! Managed RPCs use their own marker and authenticated transport.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-/// Version stamp for the bincode payloads crossing the coord ↔ host
-/// gRPC boundary. Bumped on every bincode-payload-incompatible change
-/// (a new field on `SandboxSpec`, etc.).
-///
-/// Issue #229: this is NO LONGER advisory. A Helm rollout is not
-/// atomic — coord pods finish in ~1 min while a 40-node host DaemonSet
-/// rolls over ~20 min — so a mixed-version fleet is a *normal*,
-/// transient state, not a misconfiguration. During that window the
-/// version is enforced on both ends:
-///   - The coordinator stamps every coord→host gRPC request with this
-///     value in the [`WIRE_VERSION_METADATA_KEY`] metadata header
-///     (via `TraceparentInjector`).
-///   - The host-agent's gRPC server rejects a request whose stamped
-///     version differs from its own with `failed_precondition` BEFORE
-///     any bincode decode, so the caller sees an explicit, retryable
-///     `WireSkew` (→ HTTP 503) instead of a misleading 400 "invalid
-///     sandbox spec" decode error.
-///   - The host reports its version on every heartbeat; the scheduler
-///     excludes version-mismatched hosts so a rolling deploy becomes a
-///     graceful drain rather than a stream of hard failures.
-// v3 (ADR 0056 Phase 3b): added `injects` to `SessionEgressPolicy` (coord→host).
-// v4 (ADR 0056 Phase 4b): added `observes`. A mixed-version fleet fails fast on
-// the version gate above rather than misparsing the positional bincode payload.
-// v5 (ADR 0059): added `graphql_operation`/`graphql_field` to the inject + observe
-// entries (+ `success_no_graphql_errors` on observe) for GraphQL operation gating.
-// v6: added `capture_env_bincode` to `BuildBaseSnapshotRequest` — the resolved
-// capture-time env injected into the `[warm]` hook at base-snapshot capture.
-// v7: capture-VM egress for the `[warm]` hook — `WarmConfig` gains a
-// `network: Option<NetworkPolicy>` (the `warm_bincode` field of
-// `BuildBaseSnapshotRequest`) and `SessionEgressPolicy` gains `allow_all`. The
-// host registers a matching egress policy (allow-all or allowlist) for the
-// capture VM's guest IP so the warm boot can reach the network.
-// v8 (issue #539): `BuildBaseSnapshot` becomes server-streaming
-// (`BuildBaseSnapshotEvent` — `progress`/`done`/`failed`) instead of unary,
-// carrying the `[warm]`-hook progress protocol's `CaptureProgress` events
-// and a structured `CaptureFailed` terminal frame. Clean break — coord+host
-// roll together, no dual-decode ladder.
-// v9 (issue #529): `SnapshotMetadata` gains `paused_at: Option<DateTime<Utc>>` —
-// the host's exact pause instant, carried over the coord↔host RPC boundary
-// (the eviction/snapshot response) so the composed eviction path can resolve
-// the `session_events` coherence cursor from it instead of coord wall-clock
-// `now` sampled after the capture returns.
-// v10 (ADR 0073 / epic #542): bind_session carries binding_epoch; AgentSpec
-// carries binding_epoch; the shell-pin RPCs (AcquireShell/ReleaseShell/
-// RenewShell) and RehandshakeHarness are deleted; heartbeat gains
-// harness_attached. Lockstep coord+host roll, no fallback ladder.
-// v11 (issue #548 / ADR 0078): the never-populated `local_snapshots`
-// heartbeat mirror is retired end-to-end — the `Heartbeat.local_snapshots`
-// wire field, `HostRecord`/`HostHeartbeat` fields, the `hosts.local_snapshots`
-// PG column (migration 0091), and the fleet-view proto count (reserved 7).
-// Clean break — coord+host roll together; skewed hosts drain off scheduling
-// via `host_wire_version_ok` until the host MIG rolls.
-// v12 (ADR 0079 / #543): fencing_epoch on session-scoped host RPCs — the
-// SandboxIdMessage-shaped lifecycle RPCs (destroy / snapshot family /
-// pause / resume) migrate to `FencedSandboxRequest{uuid, fencing_epoch,
-// session_id}`; StartAgent / Restore / RestoreBaseForSession gain the
-// same (session_id, fencing_epoch) pair. Lockstep coord+host roll.
-// v13 (ADR 0080 Phase 2a): `BuildBaseSnapshotRequest` gains
-// `capture_egress_bincode` — the capture VM's `[warm]`-hook egress policy
-// is assembled COORDINATOR-side (one `SessionEgressPolicy` builder for
-// sessions and captures alike) and shipped ready-to-register; the host's
-// own `capture_egress_policy` builder (from `WarmConfig.network`) is
-// retired, and the host no longer interprets `warm.env`/`warm.network`
-// out of `warm_bincode`. Lockstep coord+host roll.
-// v14 (ADR 0080 Phase 3b): new server-streaming `MaterializeImage` RPC —
-// enable-time host-side materialization of a STANDARD docker/OCI image
-// (pull → flatten → pack → chunk) replacing the coordinator's
-// engram-artifact pull (`fetch_and_seal_artifact`/`materialize_disk_chunks`
-// retired). Carries bincode `Option<ResolvedRegistryAuth>` coord→host and
-// bincode `ManifestRef`/`OciRuntimeDefaults` host→coord. A proto RPC
-// ADDITION is protobuf-compatible, but the bump makes the deploy posture
-// explicit: an enable driven by a v14 coord must never land on a v13 host
-// (which would answer `Unimplemented`), so skewed hosts drain off
-// scheduling until the MIG rolls. Lockstep coord+host roll.
-// v15 (ADR 0084): capture_jobs heartbeat dispatch/reporting (#546) —
-// `Heartbeat.capture_job_reports`, `HeartbeatAck.capture_assignments`/
-// `acked_capture_jobs`. BuildBaseSnapshot RPC deletion rides this bump
-// (removed in the cutover commit).
-// v16 (ADR 0095): `SnapshotMetadata.peer_hints` — peer-fill seed addrs
-// for the restore destination (bincode field addition). The standing
-// `PeerChunkGet` RPC + the heartbeat-ack `warm_peers` field ride this
-// bump too (both are independently mixed-roll-safe — proto addition /
-// serde-default JSON — but the bump makes the deploy posture explicit:
-// a v16 coord never dispatches a peer-hinted restore to a v15 host,
-// whose bincode decode would fail loudly). Lockstep coord+host roll.
-// v17 (ADR 0100): `WriteFiles` coord↔host RPC and its bincode request /
-// response mirrors. Lockstep coord+host roll.
-// v18 (ADR 0093 addendum): `MaterializeImageRequest.min_disk_gib` — the
-// image's `suggested_disk_gib` now floors the packed ext4 size. Proto
-// field addition (mixed-roll-safe: an old host ignores it and packs
-// content-sized), bumped so the deploy posture is explicit — an enable
-// on a v17 host silently loses the floor.
-// v19 (ADR 0103): durable ExecRequest ticket/resume fields and the
-// CancelExec coord↔host RPC. Lockstep coord+host roll.
-// v20 (ADR 0103 review hardening): ExecFrame carries terminal refusals as
-// their own oneof variant instead of collapsing them into Exit(None).
-// v21 (ADR 0109): `SessionEgressPolicy.google_adc` tells the host whether
-// to expose the session-local Google metadata endpoint. Trailing bincode
-// field addition. Lockstep coordinator and host roll.
-// v22 (issue: engrams-review outage 2026-08-01): `CredentialMintSource`
-// becomes externally tagged. The internally-tagged form (#931) bincode-
-// ENCODED as a map but could never DECODE (`deserialize_any`), so every
-// `SessionEgressPolicy` carrying a minted inject failed host-side at
-// boot — no peer ever decoded the old `Some(mint_source)` bytes. The
-// bump makes the mixed-fleet posture explicit. Lockstep coord+host roll.
-// v23 (ADR 0109 seam): `SessionEgressPolicy.google_adc` became
-// `metadata_flavor: Option<MetadataFlavor>`. The boolean conflated "does
-// this session need a metadata endpoint?" with "is it Google's?", so a
-// second cloud would have needed a second boolean and the proxy would
-// have had to decide which one wins. The enum makes it one value, and a
-// wildcard-free match makes a new variant a compile error. Bincode field
-// REPLACEMENT (not an addition), so the roll is lockstep: a v22 host
-// cannot decode a v23 policy.
-// v24 (ADR 0106 addendum): `CredentialMintSource` gains the trailing
-// `OauthConnector` variant (connector OAuth tokens resolved from the sealed
-// credential store) on `SessionEgressPolicy` inject entries and the
-// host→coord inject/refresh route. Trailing-variant addition: every existing
-// encoding is unchanged, but a v23 host cannot decode a policy carrying the
-// new variant, so the roll is lockstep.
-// v25 (ADR 0112): `SandboxSpec.swap_mib` — the guest's ephemeral swap
-// device size, opt-in per image. Trailing bincode field addition on the
-// create/spec wire (and the JSON sidecar, which is serde-defaulted), so
-// the roll is lockstep: a v24 host cannot decode a v25 create spec.
-// v26 (ADR 0109 Cloud SQL addendum): the metadata listener becomes a
-// session-scoped guest gateway. `metadata_flavor` becomes the extensible
-// `guest_services` set, and `SessionEgressPolicy` gains provider-neutral
-// tunnels selected by an opaque id and a registered host connector. A
-// credential purpose becomes a provider-owned string, and tunnel mint
-// authority is optional. Bincode field replacement and addition; coordinator
-// and host roll in lockstep.
-// v27 (ADR 0113): HostService gains streamed session-file upload and read
-// operations. The payload itself is protobuf, but an older host cannot serve
-// the new methods. Fence mixed fleets so the coordinator retries after the
-// host roll instead of accepting a prompt whose required file was not copied.
-// v28 (ADR 0115): `CredentialMintSource` gains the trailing `OauthUser`
-// variant (a user's personal connector credential resolved from the sealed
-// store) on `SessionEgressPolicy` inject entries and the host→coord
-// inject/refresh route. Trailing-variant addition: every existing encoding
-// is unchanged, but a v27 host cannot decode a policy carrying the new
-// variant, so the roll is lockstep.
-// v29 (ADR 0123): SnapshotHold keeps a source paused through teleport commit.
-// Older hosts cannot provide this capture contract. Roll coordinator and hosts together.
-// v30 removes stop-and-copy capture and its artifact kinds.
-// v31 tags migration disk items with their device role.
-// v32 appends SnapshotMetadata.swap_manifest; coordinator and hosts roll together.
-// v33 appends the chunked swap source and manifest to SandboxSpec.
-// v34 carries the swap base lineage in live migration presetup.
-// v35 types the memory image refusal (`memory_image_unusable:` marker). The
-// payloads do not change. The bump fences mixed fleets: an older host refuses
-// the same snapshot with an untyped error, which the resume verb counts toward
-// the Dead budget instead of recovering from disk.
-// v36 gates page-channel v6 fault windows for a lockstep host roll.
-// v37 appends HostCapabilities.page_idle and the optional MigrationItem::HotHint.
-// v38 moves disk changes in 64 KiB blocks and carries the presetup's
-// snapshot before the pause: MigrationItem::DiskBlockAt replaces
-// DiskChunkAt at the same index, DiskPrecopyInfo is appended, and the
-// capture reports sealed and precopy block counts.
+/// Ordinary coordinator-to-host payload contract. Hosts advertise this version
+/// for registration and placement. Managed RPCs also require their own marker.
 pub const WIRE_VERSION: u32 = 38;
+
+/// Exact contract for the additive managed host RPCs.
+pub const MANAGED_PROTOCOL_VERSION: u32 = 43;
+/// Managed contract marker, independent of the ordinary wire version.
+pub const MANAGED_PROTOCOL_METADATA_KEY: &str = "x-engram-managed-protocol";
 
 /// Whether a host-agent build can adopt the microVMs the previous build left
 /// running (ADR 0126). Two builds with the same number can reattach each
@@ -190,11 +29,8 @@ pub const WIRE_VERSION: u32 = 38;
 /// which an earlier build cannot serve again after a restart.
 pub const REATTACH_GENERATION: u32 = 3;
 
-/// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
-/// every coord→host request (issue #229). ASCII, lowercase — tonic
-/// rejects non-lowercase ASCII metadata keys. Absent on requests from a
-/// coordinator that predates this field, which the host-agent tolerates
-/// (it can't compare what it didn't receive).
+/// Ordinary wire version on coordinator-to-host requests. Ordinary HTTP/2
+/// tolerates an absent header; authenticated managed requests require it.
 pub const WIRE_VERSION_METADATA_KEY: &str = "x-engram-wire-version";
 
 /// Marker prefix for the host-agent's wire-version-skew rejection
@@ -254,6 +90,9 @@ pub fn parse_harness_spawn_message(msg: &str) -> Option<(String, String)> {
     }
     Some((kind.to_string(), message.trim().to_string()))
 }
+
+/// Exact failed-precondition marker. It is an outcome, not retirement proof.
+pub const MANAGED_RECOVERY_REQUIRED_STATUS: &str = "managed_recovery_required";
 
 /// Marker prefix for the host-agent's "memory image unusable" restore
 /// refusal ([`engram_core::SandboxError::MemoryImageUnusable`], the

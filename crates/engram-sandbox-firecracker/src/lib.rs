@@ -104,6 +104,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 pub mod client;
+pub mod managed;
 pub mod net;
 pub mod paths;
 pub mod pidfd;
@@ -2573,9 +2574,7 @@ impl FirecrackerBackend {
         // ADR 0026: artifact-upload bridge accept loop.
         self.spawn_upload_listener(sandbox_id, &vsock_uds_path)
             .await?;
-        let agent_ready_rx = self
-            .spawn_agent_ready_listener(sandbox_id, &vsock_uds_path)
-            .await?;
+        let agent_ready_rx = Self::spawn_agent_ready_listener(sandbox_id, &vsock_uds_path).await?;
 
         api.put_action(ActionType::InstanceStart).await?;
 
@@ -2670,7 +2669,6 @@ impl FirecrackerBackend {
     /// successful dial (subsequent dials are no-ops — agentd only
     /// signals once per process lifetime).
     async fn spawn_agent_ready_listener(
-        &self,
         sandbox_id: SandboxId,
         vsock_uds_path: &Path,
     ) -> Result<AgentReadiness, SandboxError> {
@@ -9086,7 +9084,9 @@ Pss:             8200000 kB
         // Keep the UDS below macOS's 104-byte path limit.
         let sockets = tempfile::tempdir_in("/tmp").unwrap();
         let vsock = sockets.path().join("vsock.sock");
-        let readiness = be.spawn_agent_ready_listener(id, &vsock).await.unwrap();
+        let readiness = FirecrackerBackend::spawn_agent_ready_listener(id, &vsock)
+            .await
+            .unwrap();
         let listener_abort = readiness.listener.as_ref().unwrap().abort_handle();
         let mut child = tokio::process::Command::new("sleep")
             .arg("30")

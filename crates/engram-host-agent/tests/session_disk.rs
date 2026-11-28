@@ -216,7 +216,9 @@ async fn a_host_agent_restart_keeps_the_guest_and_every_write() {
             .with_checkpoint_dir(rig.work.path().join("checkpoints")),
     );
     generation_b.set_self_ref(&generation_b);
-    generation_b.reconcile_volumes().await;
+    let bindings =
+        engram_host_agent::bindings::BindingStore::open(rig.work.path().join("bindings")).unwrap();
+    generation_b.reconcile_volumes(&bindings).await;
     assert_eq!(
         counted.writes.load(Ordering::Relaxed),
         disk_writes_before,

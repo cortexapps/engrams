@@ -7,6 +7,8 @@
  */
 
 import { useMemo, useState } from "react";
+import { useQuery } from "@connectrpc/connect-query";
+import { getMcpSetup } from "@/gen/engram/app/v1/integration-IntegrationService_connectquery";
 import { PlusIcon, SearchIcon } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
@@ -16,6 +18,7 @@ import { Input } from "@/components/ui/input";
 import { ConnectSheet } from "@/components/integrations/ConnectSheet";
 import { CustomConnectorModal } from "@/components/integrations/CustomConnectorModal";
 import { ProviderCard } from "@/components/integrations/ProviderCard";
+import { McpConnections } from "@/components/integrations/McpConnections";
 import { CategoryFilter } from "@/components/integrations/CategoryFilter";
 import { GoogleCloudConnectDialog } from "@/components/integrations/GoogleCloudConnections";
 import { useConnectorViews, type ConnectorView } from "@/components/integrations/useConnectorViews";
@@ -23,7 +26,9 @@ import { PageHeading } from "../page-heading";
 import { WebhookRegistrationsPanel } from "./WebhookRegistrationsPanel";
 
 export function IntegrationsPanel() {
-  const { views, isLoading, error } = useConnectorViews();
+  const { views: allViews, isLoading, error } = useConnectorViews();
+  const views = useMemo(() => allViews.filter((view) => view.provider !== "mcp"), [allViews]);
+  const mcpSetup = useQuery(getMcpSetup, {});
   const [q, setQ] = useState("");
   const [cat, setCat] = useState("all");
   const [connect, setConnect] = useState<string | null>(null);
@@ -111,6 +116,18 @@ export function IntegrationsPanel() {
           {shown.length === 0 && <EmptyState>No providers match "{q}".</EmptyState>}
         </>
       )}
+
+      <section className="rounded-lg border bg-card p-4" aria-label="External MCP">
+        <h2 className="text-sm font-semibold">External MCP</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          {mcpSetup.isPending
+            ? "Checking availability…"
+            : mcpSetup.isError || !mcpSetup.data?.enabled || mcpSetup.data.destinations.length === 0
+              ? "External MCP is unavailable."
+              : "Choose an approved endpoint to configure a connection."}
+        </p>
+        {mcpSetup.data && <McpConnections setup={mcpSetup.data} />}
+      </section>
 
       {/* Custom webhook endpoints are ingress credentials, so they live with
           the other connections rather than under the automations list. */}

@@ -163,7 +163,7 @@ impl StagePath {
     }
 }
 
-fn transient_name(sandbox: SandboxId, role: DiskRole) -> VolumeName {
+pub fn transient_name(sandbox: SandboxId, role: DiskRole) -> VolumeName {
     VolumeName::new(format!(
         "{TRANSIENT_PREFIX}{}-{}",
         sandbox.as_uuid().simple(),

@@ -54,6 +54,7 @@ interface CachedToken {
 }
 
 export interface CredentialBrokerSession {
+  mcpBindingEnvelope?: import("../mcp/binding-store.ts").McpBindingEnvelope | null;
   userId: string | null;
   principalId: string | null;
   profileId: string | null;
@@ -135,6 +136,7 @@ export function makeConnectionCredentialBrokerRoute(deps: {
         profileId: taskSession.profileId,
         integrationGrants: taskSession.integrationGrants,
         integrationConnections: taskSession.integrationConnections,
+        mcpBindingEnvelope: taskSession.mcpBindingEnvelope,
       }).from(taskSession).innerJoin(task, eq(taskSession.taskId, task.id)).where(
         eq(taskSession.sessionId, sessionId),
       ).limit(1);
@@ -178,6 +180,7 @@ export function makeConnectionCredentialBrokerRoute(deps: {
       profileId: session.profileId,
       integrationGrants: grants,
       integrationConnections: connections,
+      mcpBindingEnvelope: session.mcpBindingEnvelope,
     });
 
     let outcome = "denied";

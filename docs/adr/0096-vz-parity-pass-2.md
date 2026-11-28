@@ -229,6 +229,28 @@ fallback (machine.vzs deleted) keeps the un-synced disk write and loses
 tmpfs, parked snapshots stay parked, and pre-D7 manifests parse
 (`warm: None`) by unit test.
 
+### D7 amendment (2026-11-03): saved configuration revision
+
+Status: **Accepted.**
+
+Each new VZ configuration includes one virtio entropy device. The warm
+manifest records `configuration_revision = 1` for this device layout.
+A missing revision decodes as 0. The existing warm gate requires exact
+revision equality before the platform restore call. Legacy and unknown
+future revisions use the existing cold-boot path; the saved disk remains
+available, but the old memory state is not reused. New snapshots after
+that cold boot use the current configuration.
+
+Future incompatible default device changes must increase this revision.
+The revision is an explicit device-layout contract, not a fingerprint of
+the full configuration. Existing identity, cmdline, bundle and MAC checks
+still apply. Guest images do not need a rebuild for this host-only change.
+
+Implemented in `vz: supply boot entropy and gate saved configurations`.
+Unit tests cover the native device, legacy revision decoding, exact revision
+checks and manifest round-trip. The original live VZ lifecycle test passes
+its shell, durable snapshot and restore checks with unchanged guest images.
+
 ## Out of scope (permanent divergences, not regressions)
 
 UFFD lazy restore, base-shm density, dirty-page diff snapshots, the NBD chunked

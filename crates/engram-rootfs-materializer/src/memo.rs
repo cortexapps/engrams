@@ -18,7 +18,7 @@ use crate::pull::{LayerPlan, Platform};
 /// hit returns the output of the earlier layout.
 /// The pinned fixture manifest in `tests/materialize.rs` fails when the
 /// output changes.
-pub const LAYOUT_VERSION: u32 = 1;
+pub const LAYOUT_VERSION: u32 = 2;
 
 const PREFIX: &str = "materialize-memo/";
 

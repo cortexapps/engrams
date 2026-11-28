@@ -161,6 +161,7 @@ mod tests {
 
     fn hello() -> HelloInfo {
         HelloInfo {
+            incarnation: "test-incarnation".into(),
             proto_version: crate::PROTO_VERSION,
             source_fingerprint: Some(FP.into()),
             proxy_port: 8443,

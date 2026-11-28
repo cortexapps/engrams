@@ -1,3 +1,4 @@
+import { McpSessionPanel } from "../components/session-thread/McpSessionPanel";
 import { Link, useParams } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, PanelsTopLeft, Pencil } from "lucide-react";
@@ -403,6 +404,7 @@ export function SessionDetail() {
   const leftColumn = (
     <div className="work-sheet flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg border bg-background">
       {masthead}
+      <McpSessionPanel key={id} sessionId={id} />
       <div className="min-h-0 flex-1 overflow-hidden">{transcript}</div>
     </div>
   );

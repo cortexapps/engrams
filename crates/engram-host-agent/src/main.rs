@@ -338,6 +338,8 @@ async fn main() -> Result<(), HostAgentError> {
     let (migrate_peer_listen_addr, _) = parse_grpc_listen(&cli.migrate_peer_listen_addr);
 
     let cfg = HostAgentConfig {
+        managed_tls: engram_host_agent::managed_tls::ManagedHostTls::from_env()
+            .map_err(engram_host_agent::HostAgentError::Config)?,
         work_dir: cli.work_dir.clone(),
         coordinator_endpoint: cli.coordinator.clone(),
         coordinator_token: cli.coordinator_token.clone(),
@@ -359,6 +361,11 @@ async fn main() -> Result<(), HostAgentError> {
         ..HostAgentConfig::default()
     };
 
+    let managed_ownership = engram_host_agent::managed_policy::ManagedOwnership::for_mode(
+        &cli.work_dir.join("bindings"),
+        cfg.managed_tls.is_some(),
+    )?;
+
     // ADR 0044 K2 (GAP 1): STABLE across restarts (persisted in work_dir,
     // node-name-seeded on K8s) so a DaemonSet pod restart keeps its host
     // identity and the coordinator's session→host binding survives.
@@ -371,10 +378,8 @@ async fn main() -> Result<(), HostAgentError> {
     // sweep can never delete an enabled image's pre-warmed base file.
     let base_shm_protected = engram_host_agent::base_shm_gc::ProtectedPaths::new();
 
-    // ADR 0007: blob backend + chunk store. Created before the backend
-    // match so the inner VZ backend can be wired with its own chunk
-    // store (snapshots chunk the rootfs clone and report the manifest
-    // ref). Misconfiguration fails closed at startup — better than
+    // ADR 0007: blob backend for the pooled disk and snapshot owner.
+    // Misconfiguration fails closed at startup — better than
     // pretending to be ready and failing every session create. Shares
     // the same `BlobStorage` the coordinator's chunk store (the
     // enable-time materializer) writes to (a shared GCS bucket in
@@ -389,6 +394,7 @@ async fn main() -> Result<(), HostAgentError> {
     // for non-FC backends — the live-attach pass becomes a no-op
     // and the host-agent starts clean-slate.
     let fc_for_reattach: Option<Arc<engram_sandbox_firecracker::FirecrackerBackend>>;
+    let mut managed_backend = None;
     let sandbox: Arc<dyn SandboxBackend> = match cli.sandbox_backend {
         BackendChoice::Firecracker => {
             let kernel = cli.kernel_image_path.clone().ok_or_else(|| {
@@ -540,10 +546,31 @@ async fn main() -> Result<(), HostAgentError> {
                         cli.guest_gateway_port,
                     );
                 fc_for_reattach = None;
-                Arc::new(
+                let vz = Arc::new(
                     engram_sandbox_vz::VzBackend::new(cli.work_dir.clone(), vz_cfg)
                         .map_err(|e| HostAgentError::Config(format!("vz backend: {e}")))?,
-                )
+                );
+                if cfg.managed_tls.is_some() {
+                    let path = std::env::var_os("ENGRAM_MANAGED_NETSTACK_PATH")
+                        .map(PathBuf::from)
+                        .ok_or_else(|| {
+                            HostAgentError::Config("managed network helper path required".into())
+                        })?;
+                    let sha256 = std::env::var("ENGRAM_MANAGED_NETSTACK_SHA256").map_err(|_| {
+                        HostAgentError::Config("managed network helper digest required".into())
+                    })?;
+                    if !path.is_absolute() || !engram_core::types::managed_cold::is_sha256(&sha256)
+                    {
+                        return Err(HostAgentError::Config(
+                            "invalid managed network helper artifact".into(),
+                        ));
+                    }
+                    managed_backend = Some(engram_host_agent::managed_boot::ManagedBackend::Vz {
+                        backend: vz.clone(),
+                        helper: engram_sandbox_vz::ManagedHelperArtifact { path, sha256 },
+                    });
+                }
+                vz
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -610,6 +637,17 @@ async fn main() -> Result<(), HostAgentError> {
             Arc::new(disk)
         }
     };
+    #[cfg(target_os = "linux")]
+    if cfg.managed_tls.is_some() {
+        if let Some(backend) = fc_for_reattach.as_ref() {
+            managed_backend = Some(
+                engram_host_agent::managed_boot::ManagedBackend::Firecracker {
+                    backend: backend.clone(),
+                    disk: session_disk.clone(),
+                },
+            );
+        }
+    }
     let cloud = Arc::new(StaticCloud::detect().map_err(HostAgentError::Backend)?);
 
     // ADR 0070: NVMe-backed chunk cache with a disk-derived absolute
@@ -642,8 +680,7 @@ async fn main() -> Result<(), HostAgentError> {
     // (Spawned below once the chunk store exists; see substrate_spawn.)
 
     // ADR 0007: chunk store for the PooledBackend wrapper (materialize +
-    // base-snapshot residency). `blob` was created above the backend
-    // match so the inner VZ backend could share it; reuse it here. Wire the
+    // base-snapshot residency). Reuse the configured blob backend. Wire the
     // SAME local cache the UFFD handler + disk stage read from
     // (`work_dir/chunk-cache`) as a write-through tier, so a chunk this host
     // produces — e.g. an idle-eviction re-chunk of divergent memory — is
@@ -711,12 +748,16 @@ async fn main() -> Result<(), HostAgentError> {
     let observe_token = cfg.coordinator_token.clone();
 
     let mut agent = HostAgent::new(cfg, sandbox, cloud)
+        .with_managed_ownership(managed_ownership)
         .with_fill(fill)
         .with_chunk_cache(chunk_cache)
         .with_session_disk(session_disk)
         .with_image_cache(image_cache)
         .with_host_id(host_id)
         .with_base_shm_protected(base_shm_protected);
+    if let Some(backend) = managed_backend {
+        agent = agent.with_managed_backend(backend);
+    }
     if let Some(fc) = fc_for_reattach {
         agent = agent.with_fc_reattach(fc);
     }

@@ -650,6 +650,30 @@ async fn run_iptables(line: &str) -> Result<(), NetError> {
     run_cmd("iptables", &argv).await
 }
 
+#[cfg(any(target_os = "linux", test))]
+async fn ensure_sysctl_enabled(path: &str) -> Result<(), NetError> {
+    let value = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| NetError::Spawn(format!("read {path}"), e))?;
+    if value.trim() == "1" {
+        return Ok(());
+    }
+    tokio::fs::write(path, b"1")
+        .await
+        .map_err(|e| NetError::Spawn(format!("write {path}"), e))?;
+    let value = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| NetError::Spawn(format!("read {path}"), e))?;
+    if value.trim() != "1" {
+        return Err(NetError::Failed {
+            cmd: format!("read {path}"),
+            status: -1,
+            stderr: "expected sysctl value 1 after write".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Apply the static ruleset. Idempotent — each rule has a unique
 /// `--comment` tag and we check-then-insert so a coord restart
 /// doesn't double up.
@@ -660,12 +684,7 @@ pub async fn host_startup(
     guest_gateway_port: Option<u16>,
     guest_otel_port: Option<u16>,
 ) -> Result<(), NetError> {
-    if let Err(e) = tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1").await {
-        return Err(NetError::Spawn(
-            "write /proc/sys/net/ipv4/ip_forward".into(),
-            e,
-        ));
-    }
+    ensure_sysctl_enabled("/proc/sys/net/ipv4/ip_forward").await?;
     // Required when proxy mode is on: iptables PREROUTING REDIRECT
     // rewrites a guest-bound 1.2.3.4 destination to 127.0.0.1 (the
     // proxy's listener). Without `route_localnet`, the kernel marks
@@ -674,12 +693,7 @@ pub async fn host_startup(
     // Setting `all` covers all current and future TAPs without
     // having to set it per-interface.
     if proxy_port.is_some() {
-        if let Err(e) = tokio::fs::write("/proc/sys/net/ipv4/conf/all/route_localnet", b"1").await {
-            return Err(NetError::Spawn(
-                "write /proc/sys/net/ipv4/conf/all/route_localnet".into(),
-                e,
-            ));
-        }
+        ensure_sysctl_enabled("/proc/sys/net/ipv4/conf/all/route_localnet").await?;
     }
     // Clear any prior engram proxy/dns/redirect/otlp rules before
     // re-applying. The `-C`-then-insert loop below is history-BLIND: if a
@@ -1495,6 +1509,102 @@ pub async fn teardown(_setup: &NetSetup, _allocator: &parking_lot::Mutex<Network
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[tokio::test]
+    async fn sysctl_accepts_preconfigured_read_only_value_without_write() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        std::fs::write(path, b" \t1\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(path).is_ok() {
+            eprintln!("skipped permission assertions: this user can write read-only files");
+            return;
+        }
+        let before = std::fs::metadata(path).unwrap();
+        assert_eq!(
+            std::fs::write(path, b"1").unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "this regression test needs a user that cannot write the read-only fixture"
+        );
+
+        ensure_sysctl_enabled(path).await.unwrap();
+
+        assert_eq!(std::fs::read(path).unwrap(), b" \t1\n");
+        let after = std::fs::metadata(path).unwrap();
+        assert_eq!(after.mode(), before.mode());
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+        assert_eq!(
+            (after.ctime(), after.ctime_nsec()),
+            (before.ctime(), before.ctime_nsec())
+        );
+    }
+
+    #[tokio::test]
+    async fn sysctl_repairs_disabled_and_malformed_values() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        for value in ["0\n", "01\n", "true\n", "", "11\n"] {
+            std::fs::write(path, value).unwrap();
+            ensure_sysctl_enabled(path).await.unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), b"1", "input: {value:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sysctl_rejects_read_only_values_that_are_not_exactly_one() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for value in ["0\n", "01\n", "true\n", "", "11\n"] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let path = file.path().to_str().unwrap();
+            std::fs::write(path, value).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444)).unwrap();
+            if std::fs::OpenOptions::new().write(true).open(path).is_ok() {
+                eprintln!("skipped permission assertions: this user can write read-only files");
+                return;
+            }
+            assert!(matches!(
+                ensure_sysctl_enabled(path).await,
+                Err(NetError::Spawn(op, e))
+                    if op == format!("write {path}")
+                        && e.kind() == std::io::ErrorKind::PermissionDenied
+            ));
+            assert_eq!(std::fs::read_to_string(path).unwrap(), value);
+        }
+    }
+
+    #[tokio::test]
+    async fn sysctl_rejects_missing_and_unreadable_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let path = missing.to_str().unwrap();
+        assert!(matches!(
+            ensure_sysctl_enabled(path).await,
+            Err(NetError::Spawn(op, e))
+                if op == format!("read {path}") && e.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert!(!missing.exists());
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        std::fs::write(path, b"1\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(path).is_ok() {
+            eprintln!("skipped permission assertions: this user can read unreadable files");
+            return;
+        }
+        assert!(matches!(
+            ensure_sysctl_enabled(path).await,
+            Err(NetError::Spawn(op, e))
+                if op == format!("read {path}")
+                    && e.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+    }
 
     fn id() -> SandboxId {
         SandboxId::new()

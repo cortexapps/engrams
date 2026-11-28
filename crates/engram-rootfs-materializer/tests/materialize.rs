@@ -453,7 +453,7 @@ async fn materialize_is_deterministic_and_scrubs_scratch() {
 /// The disk manifest of the arm64 fixture. A memo hit returns the
 /// output of an earlier materialize, so a change to the packed bytes
 /// must come with a new `memo::LAYOUT_VERSION`.
-const PINNED_ARM64_DISK_MANIFEST: &str = "e23f6cc8-e0aa-8a55-814c-b7cf9b2d7fa7@v1";
+const PINNED_ARM64_DISK_MANIFEST: &str = "8724d704-ec4e-87fb-bf7c-670134aacb2e@v1";
 
 /// A second materialize of unchanged layers into the same store reads
 /// the memo: the same result, and no layer blob is downloaded.

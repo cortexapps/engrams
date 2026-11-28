@@ -11,7 +11,7 @@
 //! authz lives over there, not here.
 
 pub mod auth;
-mod convert;
+pub(crate) mod convert;
 mod fleet;
 mod harness_catalog;
 mod image;

@@ -1,6 +1,7 @@
+import { makeSessionPolicyOverrides } from "./mcp/session-policy.ts";
 import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
-import { logger as honoLogger } from "hono/logger";
+import { makeHttpLog } from "./http-log.ts";
 import { config } from "./config.ts";
 import { log } from "./log.ts";
 import { buildServer } from "./server.ts";
@@ -70,6 +71,13 @@ import type { ConnectRouter } from "@connectrpc/connect";
 // ABOVE the initDbos() call below so their workflows/steps are registered
 // before DBOS.launch(). Imports below register the finite Slack-thread and
 // tool-execution workflows.
+import "./workflows/mcp-exec.ts";
+import { makeMcpRecoveryScanner } from "./mcp/recovery-scanner.ts";
+import { installMcpRecovery } from "./mcp/recovery.ts";
+import { makeMcpRuntime } from "./mcp/runtime.ts";
+import { loadMcpRuntimeConfiguration, mcpStartupSettings } from "./mcp/runtime-config.ts";
+import { installMcpSessionCapabilities } from "./mcp/session-capabilities.ts";
+import { makeManagedSessionScanner } from "./mcp/managed-scanner.ts";
 import { initDbos, shutdownDbos } from "./workflows/dbos.ts";
 import { startSpecTicketSyncWorkflow } from "./workflows/spec-ticket-sync.ts";
 import { makeProductionListenerManager } from "./listeners/manager.ts";
@@ -267,10 +275,9 @@ const specSyncHub = new SpecSyncHub({
 });
 setSpecPresence(specSyncHub);
 
-// Request logging (hono/logger) routed through pino, so every HTTP leg — the
-// Slack webhooks included — logs `<-- METHOD path` / `--> METHOD path status ms`.
+// Request metadata only. OAuth codes and state in query strings are not logged.
 const httpLog = log.child({ component: "http" });
-app.use(honoLogger((message) => httpLog.info(message)));
+app.use(makeHttpLog((record) => httpLog.info(record, "HTTP request")));
 
 // ADR 0064 P2b: live-host preview reverse-proxy. Mounted FIRST so a request to
 // `<slug>.<previewBaseDomain>` is resolved + tunneled to the guest port before
@@ -467,6 +474,24 @@ app.route("/", ideApp);
 // Default 404 for unmatched Hono paths.
 app.notFound((c) => c.json({ error: "not found" }, 404));
 
+// Keep durable bookkeeping and completion recovery installed on disabled deployments.
+const mcpSettings = mcpStartupSettings(process.env);
+const mcpRuntime = makeMcpRuntime({
+  configuration: mcpSettings.path ? await loadMcpRuntimeConfiguration(mcpSettings.path) : undefined,
+  deploymentId: config.deploymentId,
+  enabled: () => mcpSettings.enabled,
+  bridge: (control) => ({
+    readManagedCreationState: (request) => control.readManagedCreationState(request),
+    prepareManagedBoot: (request) => control.prepareManagedBoot(request),
+    recoverManagedBoot: (request) => control.recoverManagedBoot(request),
+  }),
+});
+const mcpServices = mcpRuntime.services;
+installMcpRecovery(mcpRuntime.recovery);
+if (mcpRuntime.capabilities) installMcpSessionCapabilities(mcpRuntime.capabilities);
+const managedSessionScanner = mcpRuntime.lifecycle
+  ? makeManagedSessionScanner({ store: mcpRuntime.store, runtime: mcpRuntime.lifecycle })
+  : undefined;
 const server = buildServer(
   app,
   (router: ConnectRouter) => {
@@ -514,7 +539,7 @@ const server = buildServer(
 
     // Native IntegrationService (ADR 0057 C3): admin-gated connector catalog CRUD
     // (Plane B) over the orchestrator's own DB; built-ins are read-only seeds.
-    registerIntegration(router);
+    registerIntegration(router, { mcp: mcpServices });
 
     // Native AutomationService + WebhookRegistrationService (ADR 0102):
     // admin-authored triggers, render preview, run/sample history, and sealed
@@ -570,16 +595,24 @@ const server = buildServer(
     // to the control plane with per-method CASL authz gate (ADR 0051 Task 18).
     // ADR 0053 §3: a DisableImage pre-flight blocks disabling an image that
     // any active profile still references (the coordinator only knows sessions).
-    registerPassthrough(router, SURFACE, controlPlaneTransport, undefined, undefined, {
-      "ImageService.DisableImage": makeDisableImageGuard(),
-      "SessionService.CompleteToolCall": makeExternalToolCompletionGuard(),
-      "SessionService.SendPrompt": async (request) => {
-        const sessionId = (request as { sessionId?: unknown }).sessionId;
-        if (typeof sessionId !== "string") return;
-        const response = await controlPlaneSessions.getSession({ sessionId });
-        await productionSpecProjection.preparePrompt(sessionId, response.session?.status ?? "");
+    registerPassthrough(
+      router,
+      SURFACE,
+      controlPlaneTransport,
+      undefined,
+      undefined,
+      {
+        "ImageService.DisableImage": makeDisableImageGuard(),
+        "SessionService.CompleteToolCall": makeExternalToolCompletionGuard(),
+        "SessionService.SendPrompt": async (request) => {
+          const sessionId = (request as { sessionId?: unknown }).sessionId;
+          if (typeof sessionId !== "string") return;
+          const response = await controlPlaneSessions.getSession({ sessionId });
+          await productionSpecProjection.preparePrompt(sessionId, response.session?.status ?? "");
+        },
       },
-    });
+      makeSessionPolicyOverrides({ control: mcpRuntime.control }),
+    );
   },
   // Raw WS-upgrade hooks, tried in order: the preview proxy first
   // (Host-keyed — a preview host is a different origin, so it wins
@@ -660,6 +693,13 @@ void retireProviderWebhookSchemes({
 }).catch((err) => log.error({ err }, "provider webhook scheme retirement failed"));
 if (process.env.ENGRAM_DEV_TOOLS === "1") registerDevTools();
 await initDbos();
+const mcpRecoveryScanner = makeMcpRecoveryScanner({
+  deploymentId: config.deploymentId,
+  journal: mcpRuntime.services.journal,
+  runtime: () => mcpRuntime.recovery,
+});
+await mcpRecoveryScanner.start();
+await managedSessionScanner?.start();
 assertSweepPoliciesExhaustive();
 // ADR 0119 D1: the block registry is static and must be populated before the
 // first RPC validates a definition — registration was lazy (first interpreter
@@ -731,6 +771,8 @@ process.on("SIGTERM", () => {
     modelRouterRefresher.stop();
     await automationScheduler.stop();
     await integrationEventSweeper.stop();
+    await managedSessionScanner?.stop();
+    await mcpRecoveryScanner.stop();
     await listenerManager.stop();
     await specPublishScanner.stop();
     await draftingSeedScanner.stop();

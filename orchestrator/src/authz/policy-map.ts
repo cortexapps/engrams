@@ -54,6 +54,11 @@ export const POLICY: Record<string, PolicyEntry> = {
     subject: "Session",
     sessionIdField: "sessionId",
   },
+  "SessionService.GetMcpWritePolicy": {
+    action: "read",
+    subject: "Session",
+    sessionIdField: "sessionId",
+  },
   "SessionService.DeleteSession": {
     action: "delete",
     subject: "Session",

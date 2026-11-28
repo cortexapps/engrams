@@ -60,3 +60,5 @@ pub use sni::{peek_sni, PeekError as SniPeekError};
 pub use substitute::{scan_for_violation, substitute};
 pub use tunnel_pool::{EndpointFactory, PoolConfig, PooledConn, TunnelEndpoint, TunnelPool};
 pub use violation::first_match as scan_for_placeholder;
+
+mod connections;

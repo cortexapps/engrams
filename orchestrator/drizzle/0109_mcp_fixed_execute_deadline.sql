@@ -1,0 +1,2 @@
+ALTER TABLE "mcp_admission" ADD COLUMN "execute_expires_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "mcp_admission" ADD CONSTRAINT "mcp_admission_phase_check" CHECK ("mcp_admission"."phase" IN ('schema','execute'));

@@ -600,9 +600,9 @@ impl HostHeadroom {
         }
     }
 
-    /// Whether the host has measured its RAM. An unmeasured host does
-    /// not gate placement (a brand-new or dev host must still work) and
-    /// never parks a session.
+    /// Whether the host has measured its RAM. Unmeasured RAM does not
+    /// gate placement; a reported CPU budget still gates. A host with
+    /// unmeasured RAM never parks a session.
     pub fn measured(&self) -> bool {
         self.allocatable_mib > 0
     }

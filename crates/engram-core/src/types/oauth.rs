@@ -68,7 +68,8 @@ pub struct SessionOAuthBinding {
 /// Provider-approved metadata safe to return to clients and logs.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuthAccountMetadata {
-    /// Provider-stable identity used to reject account switching on refresh.
+    /// Authority identity used to reject account switching on refresh. MCP uses
+    /// an authorization-ceremony identity with sealed provider provenance.
     /// This value is not rendered by the UI.
     pub account_id: String,
     pub display_name: Option<String>,

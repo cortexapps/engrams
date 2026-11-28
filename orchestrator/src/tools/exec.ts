@@ -60,6 +60,7 @@ export type ToolExecutionOutcome =
   | { kind: "submit"; result: unknown };
 
 export interface ToolExecDeps {
+  resolveMcpBoundTool?: import("../mcp/session-resolver.ts").SessionBindingResolver["resolveBoundTool"];
   registry: ToolRegistry;
   resolveContext(sessionId: string): Promise<SessionToolContext>;
   pendingCalls: PendingToolCallStore;
@@ -113,6 +114,27 @@ export async function executeToolCall(
     "tool exec start",
   );
   try {
+    if (input.toolName.startsWith("mcp_")) {
+      // Raw remote schemas never enter Zod or the global registry. Task 5d owns effects.
+      try {
+        const context = await deps.resolveContext(input.sessionId);
+        if (context.sessionId !== input.sessionId) throw new Error("session changed");
+        const bound = await deps.resolveMcpBoundTool?.({
+          sessionId: input.sessionId,
+          modelToolName: input.toolName,
+        });
+        return {
+          kind: "submit",
+          result: {
+            error: bound
+              ? "external MCP execution is not configured"
+              : "external MCP tool is unavailable",
+          },
+        };
+      } catch {
+        return { kind: "submit", result: { error: "external MCP tool is unavailable" } };
+      }
+    }
     const tool = deps.registry.get(input.toolName);
     if (!tool || tool.handling !== "handled") {
       throw new Error(`handled tool is not registered: ${input.toolName}`);

@@ -240,6 +240,7 @@ async fn substitutes_placeholder_in_intercept_path() {
             Vec::new(),
             resolver,
             intercept::StreamContext {
+                strict_authority: false,
                 sni: "fake-upstream",
                 port: upstream_addr.port(),
                 secrets: &secrets,
@@ -335,6 +336,7 @@ async fn violation_returned_when_placeholder_targets_disallowed_host() {
     // this host disallow?" always got an empty answer. The detector could not
     // fire in production, and this test could not notice.
     let session = SessionState {
+        managed_deny: None,
         session_id: SessionId::new(),
         sandbox_id: engram_core::SandboxId::new(),
         guest_ip: "10.200.0.2".parse().unwrap(),
@@ -382,6 +384,7 @@ async fn violation_returned_when_placeholder_targets_disallowed_host() {
             Vec::new(),
             resolver,
             intercept::StreamContext {
+                strict_authority: false,
                 sni: "fake-upstream",
                 port: upstream_addr.port(),
                 secrets: &secrets,
@@ -462,6 +465,7 @@ async fn injects_header_on_allowed_request() {
             Vec::new(),
             resolver,
             intercept::StreamContext {
+                strict_authority: false,
                 sni: "fake-upstream",
                 port: upstream_addr.port(),
                 secrets: &[],
@@ -537,6 +541,7 @@ async fn keep_alive_second_request_cannot_bypass_the_gate() {
             Vec::new(),
             resolver,
             intercept::StreamContext {
+                strict_authority: false,
                 sni: "fake-upstream",
                 port: upstream_addr.port(),
                 secrets: &[],
@@ -662,6 +667,7 @@ async fn guest_upgrade_header_cannot_reopen_the_bypass() {
             Vec::new(),
             resolver,
             intercept::StreamContext {
+                strict_authority: false,
                 sni: "fake-upstream",
                 port: upstream_addr.port(),
                 secrets: &[],
@@ -747,11 +753,21 @@ async fn guest_upgrade_header_cannot_reopen_the_bypass() {
     );
 }
 
-// ADR 0056: a request to an inject-gated host whose (method, path) matches
-// no policy is rejected — the secret is never injected and nothing reaches
-// upstream.
+// An inject-gated request that matches no policy never reaches upstream.
 #[tokio::test]
 async fn rejects_request_shape_outside_policy() {
+    let body = h1_policy_denial_body("POST", "/api/v2/metrics").await;
+    assert!(body.contains("\"error\":\"egress_policy_denied\""));
+    assert!(body.contains("POST /api/v2/metrics"));
+}
+
+#[tokio::test]
+async fn h1_rejects_head_with_a_403_and_no_body() {
+    let body = h1_policy_denial_body("HEAD", "/api/v2/logs").await;
+    assert!(body.is_empty(), "HEAD denial contains a body: {body:?}");
+}
+
+async fn h1_policy_denial_body(method: &str, path: &str) -> String {
     let ca = ca();
     let mint = Arc::new(CertMint::new(ca.clone()));
     let server_cfg = build_server_config(mint);
@@ -761,7 +777,6 @@ async fn rejects_request_shape_outside_policy() {
     let upstream_addr = fake_upstream(captured.clone()).await;
     let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
 
-    // Only GET /api/v2/logs* is allowed; the client tries POST /api/v2/metrics.
     let inj = inject_entry("dd-secret-xyz", &["GET"], &["/api/v2/logs*"]);
     let resolver = Arc::new(StaticResolver::new().with("fake-upstream", upstream_addr));
     let proxy_task = tokio::spawn(async move {
@@ -771,6 +786,7 @@ async fn rejects_request_shape_outside_policy() {
             Vec::new(),
             resolver,
             intercept::StreamContext {
+                strict_authority: false,
                 sni: "fake-upstream",
                 port: upstream_addr.port(),
                 secrets: &[],
@@ -779,7 +795,7 @@ async fn rejects_request_shape_outside_policy() {
                 foreign_placeholders: &[],
                 session_id: SessionId::new(),
                 sink: None,
-                refresher: None, // WS4: no inject refresher in this test
+                refresher: None,
             },
             server_cfg,
             client_cfg,
@@ -788,18 +804,22 @@ async fn rejects_request_shape_outside_policy() {
     });
 
     let mut tls_client = tls_client_to(&ca, client_to_proxy).await;
-    tls_client
-        .write_all(
-            b"POST /api/v2/metrics HTTP/1.1\r\nHost: fake-upstream\r\nContent-Length: 0\r\n\r\n",
-        )
-        .await
-        .unwrap();
+    let request =
+        format!("{method} {path} HTTP/1.1\r\nHost: fake-upstream\r\nContent-Length: 0\r\n\r\n");
+    tls_client.write_all(request.as_bytes()).await.unwrap();
     tls_client.flush().await.unwrap();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        let mut buf = [0u8; 1024];
-        let _ = tls_client.read(&mut buf).await;
-    })
-    .await;
+    let mut response = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tls_client.read_to_string(&mut response),
+    )
+    .await
+    .expect("the proxy closes the denied connection")
+    .unwrap();
+
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    assert!(head.starts_with("HTTP/1.1 403 Forbidden\r\n"));
+    assert!(head.contains("\r\nContent-Type: application/json\r\n"));
 
     let outcome = proxy_task.await.unwrap();
     assert!(
@@ -810,6 +830,7 @@ async fn rejects_request_shape_outside_policy() {
         captured.lock().is_empty(),
         "upstream must see nothing when the request shape is rejected",
     );
+    body.to_owned()
 }
 
 // A rejected request must never reach the guest as a success: a synthesized
@@ -837,6 +858,7 @@ async fn reject_answers_the_guest_with_a_403_that_names_the_request() {
             Vec::new(),
             resolver,
             intercept::StreamContext {
+                strict_authority: false,
                 sni: "fake-upstream",
                 port: upstream_addr.port(),
                 secrets: &[],
@@ -950,6 +972,7 @@ async fn near_expiry_inject_is_reminted_before_forwarding() {
             Vec::new(),
             resolver,
             intercept::StreamContext {
+                strict_authority: false,
                 sni: "fake-upstream",
                 port: upstream_addr.port(),
                 secrets: &[],
@@ -1120,6 +1143,7 @@ async fn observes_response_and_emits_asset() {
             Vec::new(),
             resolver,
             intercept::StreamContext {
+                strict_authority: false,
                 sni: "fake-upstream",
                 port: upstream_addr.port(),
                 secrets: &[],
@@ -1220,6 +1244,7 @@ async fn failed_status_emits_no_asset() {
             Vec::new(),
             resolver,
             intercept::StreamContext {
+                strict_authority: false,
                 sni: "fake-upstream",
                 port: upstream_addr.port(),
                 secrets: &[],
@@ -1340,6 +1365,7 @@ async fn run_graphql_inject(
             Vec::new(),
             resolver,
             intercept::StreamContext {
+                strict_authority: false,
                 sni: "fake-upstream",
                 port: upstream_addr.port(),
                 secrets: &[],
@@ -1574,6 +1600,7 @@ async fn run_graphql_observe(
             Vec::new(),
             resolver,
             intercept::StreamContext {
+                strict_authority: false,
                 sni: "fake-upstream",
                 port: upstream_addr.port(),
                 secrets: &[],
@@ -1840,6 +1867,7 @@ async fn h2_intercept_injects_and_redacts_across_headers_body_and_trailers() {
             Vec::new(),
             resolver,
             intercept::StreamContext {
+                strict_authority: false,
                 sni: "fake-upstream",
                 port: upstream_addr.port(),
                 secrets: &[],
@@ -1953,6 +1981,7 @@ async fn h2_intercept_denies_a_grpc_credential_method() {
             Vec::new(),
             resolver,
             intercept::StreamContext {
+                strict_authority: false,
                 sni: "iam.googleapis.com",
                 port: upstream_addr.port(),
                 secrets: &[],
@@ -2013,4 +2042,123 @@ async fn h2_intercept_denies_a_grpc_credential_method() {
     drop(guest);
     driver.abort();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), proxy_task).await;
+}
+
+#[tokio::test]
+async fn managed_default_allow_rejects_host_override_without_injecting_credentials() {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        for (authority, succeeds) in [("mcp.example", false), ("API.EXAMPLE.", true)] {
+            let ca = ca();
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let upstream_addr = fake_upstream(captured.clone()).await;
+            let mut session = SessionState {
+                managed_deny: Some(engram_core::types::managed_deny::ManagedDenyPolicy::new(1, ["mcp.example".into()]).unwrap()),
+                session_id: SessionId::new(), sandbox_id: engram_core::SandboxId::new(), guest_ip: "127.0.0.1".parse().unwrap(),
+                network_allow: HostList::from_manifest(&[], &[]).unwrap(), allow_all: true,
+                secrets: vec![], injects: vec![], observes: vec![], guest_services: vec![], tunnels: vec![], apps: vec![],
+            };
+            let Decision::Intercept { secrets, injects, observes, .. } = session.decide("api.example") else { panic!("managed Literal/default-allow TLS must be inspected"); };
+            assert!(secrets.is_empty() && injects.is_empty() && observes.is_empty());
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let guest = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (proxy, _) = listener.accept().await.unwrap();
+            let server_cfg = build_server_config(Arc::new(CertMint::new(ca.clone())));
+            let task = tokio::spawn(async move {
+                intercept::run(proxy, vec![], Arc::new(StaticResolver::new().with("api.example", upstream_addr)), intercept::StreamContext {
+                    strict_authority: true, sni: "api.example", port: 443, secrets: &[], injects: &[], observes: &[], foreign_placeholders: &[], session_id: SessionId::new(), sink: None, refresher: None,
+                }, server_cfg, build_client_config()).await
+            });
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in rustls_pemfile::certs(&mut ca.cert_pem.as_bytes()) { roots.add(cert.unwrap()).unwrap(); }
+            let connector = TlsConnector::from(Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth()));
+            let mut guest = connector.connect("api.example".try_into().unwrap(), guest).await.unwrap();
+            guest.write_all(format!("GET / HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\nGET /other HTTP/1.1\r\nHost: mcp.example\r\n\r\n").as_bytes()).await.unwrap();
+            guest.shutdown().await.unwrap();
+            let mut response = Vec::new(); let _ = guest.read_to_end(&mut response).await;
+            let result = task.await.unwrap();
+            assert_eq!(result.is_ok(), succeeds);
+            let request = String::from_utf8_lossy(&captured.lock()).into_owned();
+            if succeeds {
+                assert!(request.contains("Host: api.example\r\n"));
+                assert!(!request.contains("Authorization") && !request.contains("/other") && !request.contains("mcp.example"));
+            } else { assert!(request.is_empty()); }
+            session.managed_deny = None;
+            assert!(matches!(session.decide("api.example"), Decision::Bypass));
+        }
+    }).await.expect("bounded managed HTTP authority test");
+}
+
+#[tokio::test]
+async fn managed_h2_rejects_authority_override() {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let ca = ca();
+        let seen_authorization = Arc::new(Mutex::new(None));
+        let upstream = h2_upstream(seen_authorization.clone()).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let guest = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (proxy, _) = listener.accept().await.unwrap();
+        let server = build_server_config(Arc::new(CertMint::new(ca.clone())));
+        let task = tokio::spawn(async move {
+            intercept::run(
+                proxy,
+                vec![],
+                Arc::new(StaticResolver::new().with("api.example", upstream)),
+                intercept::StreamContext {
+                    strict_authority: true,
+                    sni: "api.example",
+                    port: 443,
+                    secrets: &[],
+                    injects: &[],
+                    observes: &[],
+                    foreign_placeholders: &[],
+                    session_id: SessionId::new(),
+                    sink: None,
+                    refresher: None,
+                },
+                server,
+                build_client_config(),
+            )
+            .await
+        });
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut ca.cert_pem.as_bytes()) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let mut cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        cfg.alpn_protocols = vec![b"h2".to_vec()];
+        let guest = TlsConnector::from(Arc::new(cfg))
+            .connect("api.example".try_into().unwrap(), guest)
+            .await
+            .unwrap();
+        let (mut client, connection) = h2::client::handshake(guest).await.unwrap();
+        let connection = tokio::spawn(connection);
+        for method in [http::Method::GET, http::Method::HEAD] {
+            client = client.ready().await.unwrap();
+            let is_head = method == http::Method::HEAD;
+            let request = http::Request::builder()
+                .method(method)
+                .uri("https://mcp.example/forbidden")
+                .header("authorization", "Bearer guest-marker")
+                .body(())
+                .unwrap();
+            let (response, _) = client.send_request(request, true).unwrap();
+            let response = response.await.unwrap();
+            assert_eq!(response.status(), 403);
+            assert_eq!(response.headers()["content-type"], "application/json");
+            if is_head {
+                assert!(response.into_body().data().await.is_none());
+            }
+        }
+        drop(client);
+        connection.abort();
+        let _ = connection.await;
+        let _ = task.await.unwrap();
+        assert!(seen_authorization.lock().is_none());
+    })
+    .await
+    .expect("bounded managed H2 authority test");
 }

@@ -94,37 +94,58 @@ where
 }
 
 pub async fn read_file<S>(
-    mut connection: S,
+    connection: S,
     path: String,
 ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    write_msg(
-        &mut connection,
-        &WireRequest::DownloadStream { path: path.clone() },
-    )
-    .await
-    .map_err(|error| vm_error("send DownloadStream request", error))?;
-    let (size_bytes, sha256) = match read_msg::<_, WireResponse>(&mut connection).await {
-        Ok(WireResponse::DownloadStreamReady { size_bytes, sha256 }) => (size_bytes, sha256),
-        Ok(WireResponse::Error { kind, message }) => {
-            return Err(SandboxError::Vm(
-                format!("agentd rejected DownloadStream ({kind}): {message}").into(),
-            ));
+    read_file_until_closed(connection, path, std::future::pending()).await
+}
+
+/// Keep the connection bound to the supplied owner until the download ends.
+pub async fn read_file_until_closed<S>(
+    mut connection: S,
+    path: String,
+    closed: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut closed = Box::pin(closed);
+    let setup = async {
+        write_msg(
+            &mut connection,
+            &WireRequest::DownloadStream { path: path.clone() },
+        )
+        .await
+        .map_err(|error| vm_error("send DownloadStream request", error))?;
+        let (size_bytes, sha256) = match read_msg::<_, WireResponse>(&mut connection).await {
+            Ok(WireResponse::DownloadStreamReady { size_bytes, sha256 }) => (size_bytes, sha256),
+            Ok(WireResponse::Error { kind, message }) => {
+                return Err(SandboxError::Vm(
+                    format!("agentd rejected DownloadStream ({kind}): {message}").into(),
+                ));
+            }
+            Ok(other) => {
+                return Err(SandboxError::Vm(
+                    format!("unexpected DownloadStream response: {other:?}").into(),
+                ));
+            }
+            Err(error) => return Err(vm_error("read DownloadStream metadata", error)),
+        };
+        if size_bytes > MAX_SESSION_FILE_BYTES {
+            return Err(SandboxError::InvalidSpec(format!(
+                "file exceeds {MAX_SESSION_FILE_BYTES} bytes"
+            )));
         }
-        Ok(other) => {
-            return Err(SandboxError::Vm(
-                format!("unexpected DownloadStream response: {other:?}").into(),
-            ));
-        }
-        Err(error) => return Err(vm_error("read DownloadStream metadata", error)),
+        Ok((size_bytes, sha256))
     };
-    if size_bytes > MAX_SESSION_FILE_BYTES {
-        return Err(SandboxError::InvalidSpec(format!(
-            "file exceeds {MAX_SESSION_FILE_BYTES} bytes"
-        )));
-    }
+    let (size_bytes, sha256) = tokio::select! {
+        biased;
+        _ = &mut closed => Err(SandboxError::Unavailable("file transfer owner closed".into())),
+        result = setup => result,
+    }?;
     let metadata = SessionFileMetadata {
         path,
         size_bytes,
@@ -132,41 +153,58 @@ where
     };
     let (tx, rx) = mpsc::channel(8);
     tokio::spawn(async move {
-        let mut received = 0u64;
-        let mut hasher = Sha256::new();
-        while received < size_bytes {
-            let WireFileChunk { bytes } = match read_msg(&mut connection).await {
-                Ok(frame) => frame,
-                Err(error) => {
-                    let _ = tx
-                        .send(Err(vm_error("read DownloadStream chunk", error)))
-                        .await;
+        let download = async {
+            let mut received = 0u64;
+            let mut hasher = Sha256::new();
+            while received < size_bytes {
+                let WireFileChunk { bytes } = match read_msg(&mut connection).await {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(vm_error("read DownloadStream chunk", error)))
+                            .await;
+                        return;
+                    }
+                };
+                let next = match received.checked_add(bytes.len() as u64) {
+                    Some(next) if next <= size_bytes => next,
+                    _ => {
+                        let _ = tx
+                            .send(Err(SandboxError::Unavailable(
+                                "download stream exceeds declared size".into(),
+                            )))
+                            .await;
+                        return;
+                    }
+                };
+                hasher.update(&bytes);
+                received = next;
+                if tx.send(Ok(Bytes::from(bytes))).await.is_err() {
                     return;
                 }
-            };
-            let next = match received.checked_add(bytes.len() as u64) {
-                Some(next) if next <= size_bytes => next,
-                _ => {
-                    let _ = tx
-                        .send(Err(SandboxError::Unavailable(
-                            "download stream exceeds declared size".into(),
-                        )))
-                        .await;
-                    return;
-                }
-            };
-            hasher.update(&bytes);
-            received = next;
-            if tx.send(Ok(Bytes::from(bytes))).await.is_err() {
-                return;
             }
-        }
-        let actual_sha256 = digest_hex(hasher.finalize());
-        if actual_sha256 != sha256 {
+            let actual_sha256 = digest_hex(hasher.finalize());
+            if actual_sha256 != sha256 {
+                let _ = tx
+                    .send(Err(SandboxError::Unavailable(format!(
+                        "download SHA-256 mismatch: expected {sha256}, received {actual_sha256}"
+                    ))))
+                    .await;
+            }
+        };
+        let owner_closed = tokio::select! {
+            biased;
+            _ = tx.closed() => false,
+            _ = closed => true,
+            () = download => false,
+        };
+        // Close I/O before a terminal error can wait on receiver backpressure.
+        drop(connection);
+        if owner_closed {
             let _ = tx
-                .send(Err(SandboxError::Unavailable(format!(
-                    "download SHA-256 mismatch: expected {sha256}, received {actual_sha256}"
-                ))))
+                .send(Err(SandboxError::Unavailable(
+                    "file transfer owner closed".into(),
+                )))
                 .await;
         }
     });
@@ -181,6 +219,78 @@ mod tests {
     use super::*;
     use crate::proto::{read_msg, write_msg, WireFileChunk, WireRequest, WireResponse};
     use futures::stream;
+
+    #[tokio::test]
+    async fn owner_close_stops_stalled_download_socket_before_receiver_drop() {
+        use tokio::io::AsyncReadExt;
+        let (client, mut peer) = tokio::net::UnixStream::pair().unwrap();
+        let server = tokio::spawn(async move {
+            assert!(matches!(
+                read_msg::<_, WireRequest>(&mut peer).await.unwrap(),
+                WireRequest::DownloadStream { .. }
+            ));
+            write_msg(
+                &mut peer,
+                &WireResponse::DownloadStreamReady {
+                    size_bytes: 3,
+                    sha256: digest_hex(Sha256::digest(b"abc")),
+                },
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.read(&mut [0])).await
+        });
+        let (owner, mut closed) = tokio::sync::watch::channel(());
+        let (_, mut stream) =
+            read_file_until_closed(client, "/tmp/stalled.bin".into(), async move {
+                let _ = closed.changed().await;
+            })
+            .await
+            .unwrap();
+        owner.send_replace(());
+        let eof = server
+            .await
+            .unwrap()
+            .expect("owner close must close the socket before receiver drop")
+            .unwrap();
+        assert_eq!(eof, 0);
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(SandboxError::Unavailable(_)))
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_stalled_download_closes_owned_socket() {
+        use tokio::io::AsyncReadExt;
+        let (client, mut peer) = tokio::net::UnixStream::pair().unwrap();
+        let server = tokio::spawn(async move {
+            assert!(matches!(
+                read_msg::<_, WireRequest>(&mut peer).await.unwrap(),
+                WireRequest::DownloadStream { .. }
+            ));
+            write_msg(
+                &mut peer,
+                &WireResponse::DownloadStreamReady {
+                    size_bytes: 3,
+                    sha256: digest_hex(Sha256::digest(b"abc")),
+                },
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.read(&mut [0])).await
+        });
+        let (_, stream) = read_file(client, "/tmp/stalled.bin".into()).await.unwrap();
+        tokio::task::yield_now().await;
+        drop(stream);
+        let eof = server
+            .await
+            .unwrap()
+            .expect("dropping the download must close its socket without peer data")
+            .unwrap();
+        assert_eq!(eof, 0);
+    }
 
     #[tokio::test]
     async fn upload_streams_more_than_the_old_unary_limit_with_exact_bytes() {
