@@ -637,7 +637,7 @@ dependencies = [
  "lru",
  "percent-encoding",
  "regex-lite",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tracing",
  "url",
 ]
@@ -708,7 +708,7 @@ dependencies = [
  "hmac 0.13.0",
  "http",
  "percent-encoding",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "time",
  "tracing",
 ]
@@ -741,7 +741,7 @@ dependencies = [
  "md-5 0.11.0",
  "pin-project-lite",
  "sha1 0.11.0",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tracing",
 ]
 
@@ -2251,7 +2251,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "statime-base",
  "tempfile",
  "tokio",
@@ -2332,7 +2332,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
  "tokio",
  "tracing",
@@ -2475,7 +2475,7 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "sqlx",
  "tar",
  "tempfile",
@@ -2509,7 +2509,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tokio",
  "toml",
  "tracing",
@@ -2605,7 +2605,7 @@ dependencies = [
  "rand 0.10.2",
  "rand_chacha 0.10.0",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
  "tokio",
  "toml",
@@ -2647,7 +2647,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "socket2",
  "tempfile",
  "time",
@@ -2678,7 +2678,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
  "tokio",
  "tokio-rustls",
@@ -2882,7 +2882,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tempfile",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
@@ -2950,7 +2950,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "uuid",
  "workspace-hack",
 ]
@@ -3012,7 +3012,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tar",
  "tempfile",
  "tokio",
@@ -3120,7 +3120,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tar",
  "tempfile",
  "tokio",
@@ -3162,7 +3162,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tar",
  "tempfile",
  "tokio",
@@ -3190,7 +3190,7 @@ dependencies = [
  "parking_lot 0.13.0",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tar",
  "tempfile",
  "tokio",
@@ -3396,7 +3396,7 @@ dependencies = [
  "engram-core",
  "engram-postgres",
  "futures",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "sqlx",
  "tokio",
  "uuid",
@@ -3469,7 +3469,7 @@ dependencies = [
  "sendfd",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "socket2",
  "tempfile",
  "tokio",
@@ -5745,7 +5745,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -7414,9 +7414,9 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.11.1"
+version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
+checksum = "5b0e5c7d67bc53f435386b2130fdc900488c5703770f6d8a4633060e34288a27"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
@@ -7974,7 +7974,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.6",
  "windows-sys 0.61.2",
